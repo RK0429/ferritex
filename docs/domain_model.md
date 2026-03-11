@@ -1,0 +1,691 @@
+# Ferritex ドメインモデル
+
+## メタ情報
+
+| 項目    | 内容              |
+| ----- | --------------- |
+| バージョン | 0.1.0           |
+| 最終更新日 | 2026-03-11      |
+| ステータス | ドラフト            |
+| 作成者   | Claude Opus 4.6 |
+| レビュー者 | —               |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.0 |
+
+## 1. サブドメイン分類
+
+| サブドメイン | 分類 | 理由 |
+|---|---|---|
+| パーサー/マクロエンジン | **コア** | TeX の本質。カテゴリコード・マクロ展開の正確さが互換性を決定 |
+| タイプセッティング | **コア** | Knuth-Plass 行分割・ページ分割・数式組版が出力品質を決定 |
+| 差分コンパイル | **コア** | 100倍高速化の差別化要因。依存グラフ・キャッシュが独自価値 |
+| PDF 生成 | 支援 | 確立された仕様（PDF規格）に従う変換処理 |
+| フォント管理 | 支援 | OpenType/TFM の読み込み・探索は確立された仕様に基づく |
+| 開発者ツール | 支援 | LSP / プレビュー / CLI はコアエンジンの公開インターフェース |
+
+**パッケージ互換レイヤーの位置づけ**: 独立サブドメインとはせず、各サブドメインの拡張ポイントとして実現する。汎用パッケージ読み込み機構（`.sty` ファイルのパース・マクロ登録）はパーサー/マクロエンジンの一部。個別パッケージの振る舞い（amsmath → 数式組版、hyperref → PDF リンク、tikz → グラフィック描画、fontspec → フォント管理）は対応するサブドメイン内で処理する。
+
+## 2. コンテキストマップ
+
+```mermaid
+graph LR
+    subgraph コアドメイン
+        PE["パーサー/マクロエンジン<br/>Parser & Macro Engine"]
+        TS["タイプセッティング<br/>Typesetting Engine"]
+        IC["差分コンパイル<br/>Incremental Compilation"]
+    end
+
+    subgraph 支援ドメイン
+        PG["PDF 生成<br/>PDF Generator"]
+        FM["フォント管理<br/>Font Management"]
+        DT["開発者ツール<br/>Developer Tools"]
+    end
+
+    PE -->|"OHS: トークンストリーム"| TS
+    PE -->|"OHS: 依存情報"| IC
+    TS -->|"OHS: ボックスツリー"| PG
+    TS -->|"顧客/供給者: メトリクス要求"| FM
+    FM -->|"OHS: フォントデータ"| PG
+    IC -->|"OHS: キャッシュ/変更範囲"| PE
+    IC -->|"OHS: キャッシュ/変更範囲"| TS
+    DT -->|"ACL: LSP→パース要求"| PE
+    DT -->|"ACL: ファイル監視→差分コンパイル"| IC
+    PG -->|"OHS: PDF"| DT
+```
+
+**統合パターンの選択根拠:**
+
+- コアドメイン間は **OHS（公開ホストサービス）** — 明確に定義されたストリーム/データ構造で接続
+- 開発者ツール → コアは **ACL（腐敗防止層）** — LSP プロトコル等の外部仕様をコアドメインの言語に変換
+- タイプセッティング → フォント管理は **顧客/供給者** — タイプセッティングが必要なメトリクスを要求し、フォント管理が供給
+
+## 3. ドメインモデル図
+
+### 3.1 パーサー/マクロエンジン コンテキスト
+
+```mermaid
+classDiagram
+    class Lexer {
+        <<Entity>>
+        +CatcodeTable catcodes
+        +InputSource source
+        +nextToken() Token
+        +setCatcode(char, Catcode) void
+    }
+    class CatcodeTable {
+        <<ValueObject>>
+        +Map~char‚ Catcode~ entries
+        +get(char) Catcode
+        +set(char, Catcode) CatcodeTable
+    }
+    class Token {
+        <<ValueObject>>
+        +TokenKind kind
+        +SourceLocation location
+    }
+    class ControlSequenceToken {
+        <<ValueObject>>
+        +String name
+    }
+    class CharacterToken {
+        <<ValueObject>>
+        +char value
+        +Catcode catcode
+    }
+    class MacroEngine {
+        <<Entity>>
+        +ScopeStack scopes
+        +RegisterBank registers
+        +expand(TokenStream) TokenStream
+        +defineLocal(String, MacroDefinition) void
+        +defineGlobal(String, MacroDefinition) void
+    }
+    class MacroDefinition {
+        <<ValueObject>>
+        +String name
+        +ParameterPattern pattern
+        +TokenList replacementText
+        +ExpansionKind kind
+    }
+    class ScopeStack {
+        <<Entity>>
+        +push() void
+        +pop() void
+        +lookup(String) MacroDefinition
+    }
+    class RegisterBank {
+        <<Entity>>
+        +RegisterValue get(RegisterKind, int) RegisterValue
+        +set(RegisterKind, int, RegisterValue) void
+    }
+    class InputSource {
+        <<Entity>>
+        +FilePath path
+        +int line
+        +int column
+        +read() char
+    }
+    class ConditionalEvaluator {
+        <<Service>>
+        +evaluate(ConditionKind, TokenStream) Branch
+    }
+    class FileResolver {
+        <<Service>>
+        +resolve(String, SearchPath) FilePath
+    }
+    class ErrorRecovery {
+        <<Service>>
+        +recover(ParseError, TokenStream) TokenStream
+    }
+    class SourceLocation {
+        <<ValueObject>>
+        +FilePath file
+        +int line
+        +int column
+    }
+
+    Token <|-- ControlSequenceToken
+    Token <|-- CharacterToken
+    Lexer --> CatcodeTable
+    Lexer --> InputSource
+    Lexer ..> Token : produces
+    MacroEngine --> ScopeStack
+    MacroEngine --> RegisterBank
+    MacroEngine ..> MacroDefinition : uses
+    MacroEngine ..> ConditionalEvaluator : uses
+    ScopeStack o-- MacroDefinition
+    Lexer ..> FileResolver : uses
+    Token --> SourceLocation
+```
+
+### 3.2 タイプセッティング コンテキスト
+
+```mermaid
+classDiagram
+    class Paragraph {
+        <<Entity>>
+        +HorizontalList items
+        +breakIntoLines(LineBreakParams) List~LineBox~
+    }
+    class LineBreakParams {
+        <<ValueObject>>
+        +int tolerance
+        +Dimen emergencyStretch
+        +int looseness
+        +HyphenationPatterns patterns
+    }
+    class Box {
+        <<ValueObject>>
+        +Dimen width
+        +Dimen height
+        +Dimen depth
+    }
+    class HBox {
+        <<ValueObject>>
+        +List~Node~ content
+    }
+    class VBox {
+        <<ValueObject>>
+        +List~Node~ content
+    }
+    class Glue {
+        <<ValueObject>>
+        +Dimen natural
+        +Dimen stretch
+        +Dimen shrink
+    }
+    class Penalty {
+        <<ValueObject>>
+        +int value
+    }
+    class Node {
+        <<ValueObject>>
+    }
+    class MathList {
+        <<Entity>>
+        +List~MathAtom~ atoms
+        +MathStyle style
+        +typeset() Box
+    }
+    class MathAtom {
+        <<ValueObject>>
+        +AtomKind kind
+        +Box nucleus
+        +Box superscript
+        +Box subscript
+    }
+    class PageBuilder {
+        <<Entity>>
+        +VerticalList mainList
+        +FloatQueue floats
+        +FootnoteQueue footnotes
+        +Dimen pageHeight
+        +breakPage() PageBox
+    }
+    class FloatQueue {
+        <<Entity>>
+        +List~FloatItem~ pending
+        +enqueue(FloatItem) void
+        +tryPlace(PlacementSpec, Dimen) FloatPlacement
+        +forceFlush() List~FloatPlacement~
+    }
+    class FloatItem {
+        <<ValueObject>>
+        +PlacementSpec spec
+        +Box content
+    }
+    class CrossReferenceResolver {
+        <<Entity>>
+        +Map~String‚ LabelInfo~ labels
+        +List~UnresolvedRef~ unresolved
+        +int passCount
+        +registerLabel(String, LabelInfo) void
+        +resolve(String) ResolvedRef
+        +isStable() bool
+    }
+    class LabelInfo {
+        <<ValueObject>>
+        +String key
+        +String value
+        +int pageNumber
+    }
+
+    Box <|-- HBox
+    Box <|-- VBox
+    Node <|-- Box
+    Node <|-- Glue
+    Node <|-- Penalty
+    Paragraph --> LineBreakParams
+    Paragraph o-- Node
+    PageBuilder o-- Node
+    PageBuilder --> FloatQueue
+    FloatQueue o-- FloatItem
+    MathList o-- MathAtom
+    MathAtom --> Box
+    CrossReferenceResolver o-- LabelInfo
+```
+
+### 3.3 差分コンパイル コンテキスト
+
+```mermaid
+classDiagram
+    class DependencyGraph {
+        <<Entity>>
+        +Map~NodeId‚ DepNode~ nodes
+        +Map~NodeId‚ Set~NodeId~~ edges
+        +addNode(DepNode) void
+        +addEdge(NodeId, NodeId) void
+        +affectedBy(Set~NodeId~) Set~NodeId~
+        +persist(StoragePath) void
+        +restore(StoragePath) DependencyGraph
+    }
+    class DepNode {
+        <<ValueObject>>
+        +NodeId id
+        +DepNodeKind kind
+        +ContentHash hash
+    }
+    class ChangeDetector {
+        <<Service>>
+        +detect(DependencyGraph, Set~FileChange~) RecompilationScope
+    }
+    class FileChange {
+        <<ValueObject>>
+        +FilePath path
+        +ContentHash previousHash
+        +ContentHash currentHash
+    }
+    class RecompilationScope {
+        <<ValueObject>>
+        +Set~NodeId~ affectedNodes
+        +bool referencesAffected
+        +bool requiresFullRecompile
+    }
+    class CompilationCache {
+        <<Entity>>
+        +CacheConfig config
+        +store(NodeId, CacheEntry) void
+        +retrieve(NodeId) CacheEntry
+        +invalidate(Set~NodeId~) void
+        +verify() CacheIntegrity
+    }
+    class CacheEntry {
+        <<ValueObject>>
+        +NodeId nodeId
+        +ContentHash sourceHash
+        +bytes data
+        +Instant lastAccessed
+    }
+    class CacheConfig {
+        <<ValueObject>>
+        +usize maxSizeBytes
+        +EvictionPolicy policy
+    }
+
+    DependencyGraph o-- DepNode
+    ChangeDetector ..> DependencyGraph : reads
+    ChangeDetector ..> FileChange : input
+    ChangeDetector ..> RecompilationScope : output
+    CompilationCache o-- CacheEntry
+    CompilationCache --> CacheConfig
+```
+
+### 3.4 PDF 生成 コンテキスト
+
+```mermaid
+classDiagram
+    class PdfDocument {
+        <<Entity>>
+        +PdfMetadata metadata
+        +List~PdfPage~ pages
+        +PdfOutline outline
+        +render() bytes
+    }
+    class PdfPage {
+        <<ValueObject>>
+        +int pageNumber
+        +ContentStream content
+        +List~Annotation~ annotations
+        +ResourceDict resources
+    }
+    class ContentStream {
+        <<ValueObject>>
+        +List~PdfOperator~ operators
+    }
+    class PdfOperator {
+        <<ValueObject>>
+        +String operator
+        +List~Operand~ operands
+    }
+    class Annotation {
+        <<ValueObject>>
+        +AnnotKind kind
+        +Rect rect
+        +String destination
+    }
+    class PdfOutline {
+        <<ValueObject>>
+        +List~OutlineEntry~ entries
+    }
+    class EmbeddedFont {
+        <<ValueObject>>
+        +FontId id
+        +bytes subsetData
+        +CMap toUnicode
+    }
+    class EmbeddedImage {
+        <<ValueObject>>
+        +ImageFormat format
+        +bytes data
+        +Dimen width
+        +Dimen height
+    }
+    class SyncTexData {
+        <<ValueObject>>
+        +Map~SourceLocation‚ PdfPosition~ forwardMap
+        +Map~PdfPosition‚ SourceLocation~ inverseMap
+    }
+
+    PdfDocument o-- PdfPage
+    PdfDocument --> PdfOutline
+    PdfDocument --> SyncTexData
+    PdfPage --> ContentStream
+    PdfPage o-- Annotation
+    ContentStream o-- PdfOperator
+    PdfDocument o-- EmbeddedFont
+    PdfDocument o-- EmbeddedImage
+```
+
+### 3.5 フォント管理 コンテキスト
+
+```mermaid
+classDiagram
+    class FontManager {
+        <<Service>>
+        +loadFont(FontSpec) LoadedFont
+        +searchFont(String) FilePath
+    }
+    class LoadedFont {
+        <<Entity>>
+        +FontId id
+        +FontMetrics metrics
+        +GlyphStore glyphs
+    }
+    class FontMetrics {
+        <<ValueObject>>
+        +Map~GlyphId‚ GlyphMetric~ widths
+        +KerningTable kerning
+        +LigatureTable ligatures
+    }
+    class GlyphMetric {
+        <<ValueObject>>
+        +Dimen width
+        +Dimen height
+        +Dimen depth
+        +Dimen italicCorrection
+    }
+    class OpenTypeFont {
+        <<Entity>>
+        +CmapTable cmap
+        +GposTable gpos
+        +GsubTable gsub
+    }
+    class TfmFont {
+        <<Entity>>
+        +TfmHeader header
+        +List~CharInfo~ charInfos
+    }
+    class FontSearchPath {
+        <<ValueObject>>
+        +List~FilePath~ texmfPaths
+        +Map~String‚ FilePath~ mapEntries
+    }
+    class GlyphSubsetter {
+        <<Service>>
+        +subset(LoadedFont, Set~GlyphId~) bytes
+    }
+
+    LoadedFont --> FontMetrics
+    FontMetrics o-- GlyphMetric
+    LoadedFont <|-- OpenTypeFont
+    LoadedFont <|-- TfmFont
+    FontManager --> FontSearchPath
+    FontManager ..> LoadedFont : produces
+    GlyphSubsetter ..> LoadedFont : reads
+```
+
+### 3.6 開発者ツール コンテキスト
+
+```mermaid
+classDiagram
+    class LspServer {
+        <<Entity>>
+        +ServerCapabilities capabilities
+        +handleRequest(LspRequest) LspResponse
+    }
+    class DiagnosticProvider {
+        <<Service>>
+        +diagnose(TextDocument) List~Diagnostic~
+    }
+    class CompletionProvider {
+        <<Service>>
+        +complete(TextDocument, Position) List~CompletionItem~
+    }
+    class DefinitionProvider {
+        <<Service>>
+        +findDefinition(TextDocument, Position) Location
+    }
+    class FileWatcher {
+        <<Entity>>
+        +Set~FilePath~ watchedPaths
+        +Duration debounce
+        +start() void
+        +stop() void
+    }
+    class PreviewServer {
+        <<Entity>>
+        +int port
+        +List~Connection~ clients
+        +deliverPdf(bytes) void
+    }
+    class CliRunner {
+        <<Service>>
+        +compile(CompileOptions) ExitCode
+        +watch(WatchOptions) void
+        +lsp() void
+    }
+    class CompileOptions {
+        <<ValueObject>>
+        +FilePath input
+        +FilePath outputDir
+        +String jobname
+        +int jobs
+        +bool noCache
+        +InteractionMode interaction
+        +bool synctex
+        +bool shellEscape
+    }
+
+    LspServer --> DiagnosticProvider
+    LspServer --> CompletionProvider
+    LspServer --> DefinitionProvider
+    FileWatcher ..> CliRunner : triggers
+    PreviewServer ..> CliRunner : receives PDF
+    CliRunner --> CompileOptions
+```
+
+## 4. 状態遷移図
+
+### 4.1 コンパイルジョブ
+
+```mermaid
+stateDiagram-v2
+    [*] --> Initialized: compile(file)
+    Initialized --> Parsing: start pipeline
+    Parsing --> Expanding: token stream ready
+    Expanding --> Typesetting: expansion complete
+    Typesetting --> GeneratingPdf: pages ready
+    GeneratingPdf --> ResolvingRefs: pass N < 3 & refs unstable
+    ResolvingRefs --> Parsing: next pass
+    GeneratingPdf --> Completed: refs stable or pass 3
+    Parsing --> Failed: fatal error
+    Expanding --> Failed: fatal error
+    Typesetting --> Failed: fatal error
+    GeneratingPdf --> Failed: fatal error
+```
+
+### 4.2 フロート配置
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: float inserted
+    Pending --> TryingHere: spec contains 'h'
+    Pending --> TryingTop: spec starts with 't'
+    TryingHere --> Placed: fits at current position
+    TryingHere --> TryingTop: doesn't fit
+    TryingTop --> Placed: fits at page top
+    TryingTop --> TryingBottom: doesn't fit
+    TryingBottom --> Placed: fits at page bottom
+    TryingBottom --> Deferred: doesn't fit
+    Deferred --> TryingTop: next page
+    Deferred --> ForceFlushed: \\clearpage
+    Placed --> [*]
+    ForceFlushed --> [*]
+```
+
+### 4.3 差分コンパイルキャッシュ
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty
+    Empty --> Cached: full compile completed
+    Cached --> Invalidated: change detected in deps
+    Invalidated --> Cached: incremental recompile
+    Cached --> Corrupted: integrity check failed
+    Corrupted --> Empty: fallback to full compile
+```
+
+## 5. 用語集
+
+### 5.1 パーサー/マクロエンジン コンテキスト
+
+| 用語 | 定義 | 関連概念 |
+|---|---|---|
+| トークン (Token) | 字句解析が生成する処理の最小単位。コントロールシーケンストークンと文字トークンの 2 種 | カテゴリコード, Lexer |
+| カテゴリコード (Catcode) | 各文字に割り当てる種別コード（0〜15）。字句解析の挙動を制御 | トークン, CatcodeTable |
+| マクロ定義 (MacroDefinition) | `\def` 等で定義されたパターンと置換テキストの組 | マクロ展開, スコープ |
+| スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタの有効範囲 | ScopeStack |
+| レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
+| ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
+
+### 5.2 タイプセッティング コンテキスト
+
+| 用語 | 定義 | 関連概念 |
+|---|---|---|
+| ボックス (Box) | 幅・高さ・深さを持つ組版の基本レイアウト単位 | HBox, VBox |
+| グルー (Glue) | 自然長・伸び量・縮み量を持つ伸縮可能なスペース | 行分割 |
+| ペナルティ (Penalty) | 行/ページ分割の位置を制御する整数値。高いほど分割されにくい | 行分割, ページ分割 |
+| 行分割 (Line Breaking) | Knuth-Plass アルゴリズムにより段落の最適な改行位置を決定する処理 | Paragraph, LineBreakParams |
+| フロート (Float) | テキストの流れから独立して配置されるオブジェクト。配置指定子で制御 | FloatQueue, PageBuilder |
+| 相互参照 (Cross Reference) | `\label`/`\ref` による文書内の参照。最大 3 パスで解決 | CrossReferenceResolver |
+| 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
+
+### 5.3 差分コンパイル コンテキスト
+
+| 用語 | 定義 | 関連概念 |
+|---|---|---|
+| 依存グラフ (DependencyGraph) | ファイル・マクロ・ラベル間の依存関係を表す有向グラフ | DepNode, 変更検知 |
+| 依存ノード (DepNode) | 依存グラフの頂点。ファイル/マクロ/ラベルのいずれか | DependencyGraph |
+| コンテンツハッシュ (ContentHash) | ファイル/ノード内容のハッシュ値。変更検知に使用 | ChangeDetector |
+| 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
+| キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
+
+### 5.4 PDF 生成 コンテキスト
+
+| 用語 | 定義 | 関連概念 |
+|---|---|---|
+| コンテンツストリーム (ContentStream) | PDF ページの描画命令列 | PdfOperator |
+| アノテーション (Annotation) | PDF 上のリンク・しおり等のインタラクティブ要素 | hyperref |
+| 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
+| SyncTeX データ | ソース位置と PDF 位置の双方向マッピング | SourceLocation |
+
+### 5.5 フォント管理 コンテキスト
+
+| 用語 | 定義 | 関連概念 |
+|---|---|---|
+| フォントメトリクス (FontMetrics) | 文字幅・高さ・深さ・カーニング・リガチャ情報の集合 | GlyphMetric |
+| OpenType フォント | OTF/TTF 形式のモダンフォント。GPOS/GSUB テーブルで高度な組版を制御 | fontspec |
+| TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 | Computer Modern |
+| グリフサブセット化 | 使用グリフのみを抽出してフォントデータを縮小する処理 | PDF 埋め込み |
+
+## 6. 判断記録
+
+### 6.1 パイプライン並列化をインフラストラクチャ層に配置
+
+- **日付**: 2026-03-11
+- **関連コンテキスト**: 全コンテキスト横断
+- **判断内容**: パイプライン並列化（ステージ間バッファリング・スレッドプール管理）はドメインモデルに含めず、インフラストラクチャ層の関心事とする
+- **根拠**:
+  - 観測事実: BR-6「並列処理の出力はシングルスレッド実行と同一」— ドメインロジックは実行モデルに依存しない
+  - 代替案: `PipelineOrchestrator` をドメインモデルに含める
+  - 分離証人: 逐次実行でも並列実行でも全ビジネスルール（行分割・ページ分割・参照解決等）の帰結は同一。パイプラインの存在でのみ表現可能なビジネスルールが存在しない
+- **等価性への影響**: 理論等価（ドメインの振る舞いは変化しない）
+- **語彙への影響**: なし
+
+### 6.2 依存グラフとコンパイルキャッシュの独立永続化
+
+- **日付**: 2026-03-11
+- **関連コンテキスト**: 差分コンパイル
+- **判断内容**: `DependencyGraph` は `CompilationCache` とは独立したストレージに永続化する
+- **根拠**:
+  - 観測事実: BR-9「キャッシュ破損時はフルコンパイルにフォールバック」。依存グラフが失われると変更検知自体が不可能になり、フォールバックのコストが不必要に増大する
+  - 代替案: `DependencyGraph` を `CompilationCache` の一部として同一ストレージに保存する
+  - 分離証人: キャッシュ破損＋依存グラフ健全のケース。独立永続化モデルでは依存グラフから変更範囲を特定し「変更範囲のみフルリビルド」が可能。同一ストレージモデルではグラフも失われるため全ファイルの再パースから開始する必要がある
+- **等価性への影響**: 観測的等価（正常時の出力は同一。異常時の復旧効率が異なる）
+- **語彙への影響**: なし
+
+### 6.3 RecompilationScope への参照影響フラグ追加
+
+- **日付**: 2026-03-11
+- **関連コンテキスト**: 差分コンパイル / タイプセッティング
+- **判断内容**: `RecompilationScope` に `referencesAffected: bool` を追加し、差分コンパイル時の参照再計算要否を明示する
+- **根拠**:
+  - 観測事実: BR-5「差分コンパイルの出力はフルコンパイルと同一」。ページ番号がずれると目次・相互参照の再計算が必要
+  - 代替案: 差分コンパイル時は常に参照を再計算する
+  - 分離証人: 本文中のタイポ修正（ページ番号に影響しない変更）のケース。フラグありモデルでは `referencesAffected == false` で参照再計算をスキップし高速化。常時再計算モデルでは不要なパスが実行される
+- **等価性への影響**: 理論等価（出力は同一。処理効率が異なる）
+- **語彙への影響**: 「再コンパイル範囲」の定義に「参照影響の有無」を追加
+
+### 6.4 パッケージ互換レイヤーを独立サブドメインとしない
+
+- **日付**: 2026-03-11
+- **関連コンテキスト**: 全コンテキスト横断
+- **判断内容**: パッケージ互換を独立サブドメインとせず、各サブドメインの拡張ポイントとして実現する
+- **根拠**:
+  - 観測事実: 個別パッケージの振る舞いは異なるサブドメインに属する（amsmath → 数式組版、hyperref → PDF リンク、tikz → グラフィック描画）
+  - 代替案: 「パッケージ互換」を独立した境界づけられたコンテキストとする
+  - 分離証人: 独立コンテキストモデルでは、amsmath の数式環境を処理するために「パッケージ互換コンテキスト」がタイプセッティングの内部（MathList, MathAtom）を知る必要があり、密結合が生じる。拡張ポイントモデルではこの問題が発生しない
+- **等価性への影響**: 理論等価（機能は同一。モジュール構造が異なる）
+- **語彙への影響**: なし
+
+## 7. ビジネスルール一覧
+
+要件定義書から抽出した主要なビジネスルール・不変条件の一覧。
+
+| # | ルール | 出典 | 関連コンテキスト |
+|---|---|---|---|
+| BR-1 | カテゴリコードは `\catcode` により動的に変更可能。字句解析は現在のカテゴリコードテーブルを常に参照する | REQ-FUNC-001 | パーサー/マクロエンジン |
+| BR-2 | マクロ展開の再帰深度は上限あり（デフォルト 1000）。超過時はエラー | REQ-FUNC-002 | パーサー/マクロエンジン |
+| BR-3 | 相互参照は最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
+| BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
+| BR-5 | 差分コンパイルの出力はフルコンパイルと同一でなければならない | REQ-FUNC-030 | 差分コンパイル |
+| BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
+| BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ | REQ-NF-005 | 開発者ツール |
+| BR-8 | ファイル書き込みはプロジェクトディレクトリと TEXMF ツリーに制限 | REQ-NF-006 | パーサー/マクロエンジン |
+| BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
+| BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
+
+## 変更履歴
+
+| バージョン | 日付         | 変更内容 | 変更者             |
+| ----- | ---------- | ---- | --------------- |
+| 0.1.0 | 2026-03-11 | 初版作成 | Claude Opus 4.6 |
