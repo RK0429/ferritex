@@ -18,11 +18,12 @@
 | パーサー/マクロエンジン | **コア** | TeX の本質。カテゴリコード・マクロ展開の正確さが互換性を決定 |
 | タイプセッティング | **コア** | Knuth-Plass 行分割・ページ分割・数式組版が出力品質を決定 |
 | 差分コンパイル | **コア** | 100倍高速化の差別化要因。依存グラフ・キャッシュが独自価値 |
+| アセットランタイム | 支援 | クラス・パッケージ・フォント資産を事前インデックス化し、実行時の探索コストを最小化 |
 | PDF 生成 | 支援 | 確立された仕様（PDF規格）に従う変換処理 |
 | フォント管理 | 支援 | OpenType/TFM の読み込み・探索は確立された仕様に基づく |
 | 開発者ツール | 支援 | LSP / プレビュー / CLI はコアエンジンの公開インターフェース |
 
-**パッケージ互換レイヤーの位置づけ**: 独立サブドメインとはせず、各サブドメインの拡張ポイントとして実現する。汎用パッケージ読み込み機構（`.sty` ファイルのパース・マクロ登録）はパーサー/マクロエンジンの一部。個別パッケージの振る舞い（amsmath → 数式組版、hyperref → PDF リンク、tikz → グラフィック描画、fontspec → フォント管理）は対応するサブドメイン内で処理する。
+**パッケージ互換レイヤーの位置づけ**: 独立サブドメインとはせず、パーサー/マクロエンジン内の `DocumentClassRegistry` / `PackageRegistry` / `CommandRegistry` / `EnvironmentRegistry` を拡張点として実現する。資産の実体はアセットランタイムが供給し、汎用パッケージ読み込み機構（`.sty` ファイルのパース・スナップショット読み込み・マクロ登録）はパーサー/マクロエンジンの責務とする。個別パッケージの振る舞い（amsmath → 数式組版、hyperref → PDF リンク、tikz → グラフィック描画、fontspec → フォント管理）は対応するサブドメイン内で処理する。
 
 ## 2. コンテキストマップ
 
@@ -35,25 +36,29 @@ graph LR
     end
 
     subgraph 支援ドメイン
+        AR["アセットランタイム<br/>Asset Runtime"]
         PG["PDF 生成<br/>PDF Generator"]
         FM["フォント管理<br/>Font Management"]
         DT["開発者ツール<br/>Developer Tools"]
     end
 
-    PE -->|"OHS: トークンストリーム"| TS
-    PE -->|"OHS: 依存情報"| IC
+    AR -->|"OHS: クラス/パッケージ資産"| PE
+    AR -->|"OHS: フォント資産"| FM
+    PE -->|"OHS: トークンストリーム/コンパイルセッション"| TS
+    PE -->|"OHS: 依存情報/状態スナップショット"| IC
     TS -->|"OHS: ボックスツリー"| PG
     TS -->|"顧客/供給者: メトリクス要求"| FM
     FM -->|"OHS: フォントデータ"| PG
     IC -->|"OHS: キャッシュ/変更範囲"| PE
     IC -->|"OHS: キャッシュ/変更範囲"| TS
-    DT -->|"ACL: LSP→パース要求"| PE
+    DT -->|"ACL: CLI/LSP→実行要求/ポリシー"| PE
     DT -->|"ACL: ファイル監視→差分コンパイル"| IC
-    PG -->|"OHS: PDF"| DT
+    PG -->|"OHS: PDF/SyncTeX"| DT
 ```
 
 **統合パターンの選択根拠:**
 
+- アセットランタイム → コア/支援は **OHS（公開ホストサービス）** — 事前インデックス化された不変資産を供給
 - コアドメイン間は **OHS（公開ホストサービス）** — 明確に定義されたストリーム/データ構造で接続
 - 開発者ツール → コアは **ACL（腐敗防止層）** — LSP プロトコル等の外部仕様をコアドメインの言語に変換
 - タイプセッティング → フォント管理は **顧客/供給者** — タイプセッティングが必要なメトリクスを要求し、フォント管理が供給
@@ -64,16 +69,24 @@ graph LR
 
 ```mermaid
 classDiagram
-    class Lexer {
+    class CompilationSession {
         <<Entity>>
         +CatcodeTable catcodes
+        +DocumentState documentState
+        +ScopeStack scopes
+        +RegisterBank registers
+        +CommandRegistry commands
+        +EnvironmentRegistry environments
+        +ExecutionPolicy policy
+    }
+    class Lexer {
+        <<Entity>>
         +InputSource source
-        +nextToken() Token
-        +setCatcode(char, Catcode) void
+        +nextToken(CompilationSession) Token
     }
     class CatcodeTable {
         <<ValueObject>>
-        +Map~char‚ Catcode~ entries
+        +Map~char, Catcode~ entries
         +get(char) Catcode
         +set(char, Catcode) CatcodeTable
     }
@@ -93,11 +106,9 @@ classDiagram
     }
     class MacroEngine {
         <<Entity>>
-        +ScopeStack scopes
-        +RegisterBank registers
-        +expand(TokenStream) TokenStream
-        +defineLocal(String, MacroDefinition) void
-        +defineGlobal(String, MacroDefinition) void
+        +expand(TokenStream, CompilationSession) TokenStream
+        +defineLocal(String, MacroDefinition, CompilationSession) void
+        +defineGlobal(String, MacroDefinition, CompilationSession) void
     }
     class MacroDefinition {
         <<ValueObject>>
@@ -117,6 +128,86 @@ classDiagram
         +RegisterValue get(RegisterKind, int) RegisterValue
         +set(RegisterKind, int, RegisterValue) void
     }
+    class DocumentState {
+        <<Entity>>
+        +CounterStore counters
+        +AuxState aux
+    }
+    class CounterStore {
+        <<Entity>>
+        +step(String) int
+        +set(String, int) void
+        +get(String) int
+    }
+    class AuxState {
+        <<Entity>>
+        +Map~String, LabelInfo~ labels
+        +List~AuxWrite~ pendingWrites
+        +mergePreviousPass(AuxSnapshot) void
+        +registerLabel(String, LabelInfo) void
+    }
+    class CommandRegistry {
+        <<Entity>>
+        +register(String, ExecutableCommand) void
+        +lookup(String) ExecutableCommand
+    }
+    class EnvironmentRegistry {
+        <<Entity>>
+        +register(String, ExecutableEnvironment) void
+        +lookup(String) ExecutableEnvironment
+    }
+    class DocumentClassRegistry {
+        <<Entity>>
+        +resolve(String, ClassOptions) ClassSnapshot
+    }
+    class PackageRegistry {
+        <<Entity>>
+        +resolve(String, PackageOptions) PackageSnapshot
+    }
+    class PackageLoader {
+        <<Service>>
+        +load(String, CompilationSession) PackageExtension
+    }
+    class DocumentClassLoader {
+        <<Service>>
+        +load(String, CompilationSession) ClassSnapshot
+    }
+    class PackageExtension {
+        <<Interface>>
+        +register(CompilationSession) void
+    }
+    class AmsmathExtension {
+        <<Extension>>
+    }
+    class HyperrefExtension {
+        <<Extension>>
+    }
+    class TikzExtension {
+        <<Extension>>
+    }
+    class FontspecExtension {
+        <<Extension>>
+    }
+    class AssetResolver {
+        <<Service>>
+        +resolve(LogicalPath, ResolutionContext) AssetHandle
+    }
+    class ShellCommandGateway {
+        <<Service>>
+        +execute(CommandRequest, ExecutionPolicy) CommandResult
+    }
+    class ExecutionPolicy {
+        <<ValueObject>>
+        +bool shellEscapeEnabled
+        +PathAccessPolicy pathPolicy
+        +Duration commandTimeout
+    }
+    class PathAccessPolicy {
+        <<ValueObject>>
+        +FilePath projectRoot
+        +List~FilePath~ bundleRoots
+        +FilePath cacheDir
+    }
     class InputSource {
         <<Entity>>
         +FilePath path
@@ -127,10 +218,6 @@ classDiagram
     class ConditionalEvaluator {
         <<Service>>
         +evaluate(ConditionKind, TokenStream) Branch
-    }
-    class FileResolver {
-        <<Service>>
-        +resolve(String, SearchPath) FilePath
     }
     class ErrorRecovery {
         <<Service>>
@@ -145,15 +232,33 @@ classDiagram
 
     Token <|-- ControlSequenceToken
     Token <|-- CharacterToken
-    Lexer --> CatcodeTable
+    CompilationSession --> CatcodeTable
+    CompilationSession --> DocumentState
+    CompilationSession --> ScopeStack
+    CompilationSession --> RegisterBank
+    CompilationSession --> CommandRegistry
+    CompilationSession --> EnvironmentRegistry
+    CompilationSession --> ExecutionPolicy
+    DocumentState --> CounterStore
+    DocumentState --> AuxState
+    Lexer --> CompilationSession : reads
     Lexer --> InputSource
     Lexer ..> Token : produces
-    MacroEngine --> ScopeStack
-    MacroEngine --> RegisterBank
+    MacroEngine --> CompilationSession
     MacroEngine ..> MacroDefinition : uses
     MacroEngine ..> ConditionalEvaluator : uses
     ScopeStack o-- MacroDefinition
-    Lexer ..> FileResolver : uses
+    PackageLoader --> PackageRegistry
+    PackageLoader --> AssetResolver
+    PackageLoader ..> PackageExtension : instantiates
+    DocumentClassLoader --> DocumentClassRegistry
+    DocumentClassLoader --> AssetResolver
+    PackageExtension <|.. AmsmathExtension
+    PackageExtension <|.. HyperrefExtension
+    PackageExtension <|.. TikzExtension
+    PackageExtension <|.. FontspecExtension
+    ShellCommandGateway --> ExecutionPolicy
+    ExecutionPolicy --> PathAccessPolicy
     Token --> SourceLocation
 ```
 
@@ -213,6 +318,10 @@ classDiagram
         +Box superscript
         +Box subscript
     }
+    class SectioningEngine {
+        <<Service>>
+        +typesetHeading(SectionCommand, DocumentState) HBox
+    }
     class PageBuilder {
         <<Entity>>
         +VerticalList mainList
@@ -233,13 +342,23 @@ classDiagram
         +PlacementSpec spec
         +Box content
     }
-    class CrossReferenceResolver {
+    class DocumentState {
         <<Entity>>
-        +Map~String‚ LabelInfo~ labels
-        +List~UnresolvedRef~ unresolved
+        +CounterStore counters
+        +CrossReferenceTable references
         +int passCount
         +registerLabel(String, LabelInfo) void
         +resolve(String) ResolvedRef
+    }
+    class CounterStore {
+        <<Entity>>
+        +step(String) int
+        +get(String) int
+    }
+    class CrossReferenceTable {
+        <<Entity>>
+        +Map~String, LabelInfo~ labels
+        +List~UnresolvedRef~ unresolved
         +isStable() bool
     }
     class LabelInfo {
@@ -258,10 +377,14 @@ classDiagram
     Paragraph o-- Node
     PageBuilder o-- Node
     PageBuilder --> FloatQueue
+    PageBuilder --> DocumentState
     FloatQueue o-- FloatItem
     MathList o-- MathAtom
     MathAtom --> Box
-    CrossReferenceResolver o-- LabelInfo
+    SectioningEngine --> DocumentState
+    DocumentState --> CounterStore
+    DocumentState --> CrossReferenceTable
+    CrossReferenceTable o-- LabelInfo
 ```
 
 ### 3.3 差分コンパイル コンテキスト
@@ -270,8 +393,8 @@ classDiagram
 classDiagram
     class DependencyGraph {
         <<Entity>>
-        +Map~NodeId‚ DepNode~ nodes
-        +Map~NodeId‚ Set~NodeId~~ edges
+        +Map~NodeId, DepNode~ nodes
+        +Map~NodeId, Set~NodeId~~ edges
         +addNode(DepNode) void
         +addEdge(NodeId, NodeId) void
         +affectedBy(Set~NodeId~) Set~NodeId~
@@ -329,7 +452,60 @@ classDiagram
     CompilationCache --> CacheConfig
 ```
 
-### 3.4 PDF 生成 コンテキスト
+### 3.4 アセットランタイム コンテキスト
+
+```mermaid
+classDiagram
+    class AssetBundle {
+        <<Entity>>
+        +BundleVersion version
+        +BundleManifest manifest
+        +AssetIndex index
+        +open(BundlePath) void
+    }
+    class BundleManifest {
+        <<ValueObject>>
+        +String schemaVersion
+        +String sourceSnapshot
+    }
+    class AssetIndex {
+        <<ValueObject>>
+        +lookupClass(String) AssetHandle
+        +lookupPackage(String) AssetHandle
+        +lookupFont(String) AssetHandle
+    }
+    class OverlaySet {
+        <<Entity>>
+        +List~OverlayLayer~ layers
+        +resolve(LogicalAssetId) AssetHandle
+    }
+    class PackageSnapshot {
+        <<ValueObject>>
+        +String name
+        +SemVer version
+        +MacroIr ir
+    }
+    class ClassSnapshot {
+        <<ValueObject>>
+        +String name
+        +SemVer version
+        +MacroIr ir
+    }
+    class FontSnapshot {
+        <<ValueObject>>
+        +FontId id
+        +ContentHash hash
+    }
+
+    AssetBundle --> BundleManifest
+    AssetBundle --> AssetIndex
+    OverlaySet --> AssetBundle
+    AssetIndex o-- PackageSnapshot
+    AssetIndex o-- ClassSnapshot
+    AssetIndex o-- FontSnapshot
+```
+
+### 3.5 PDF 生成 コンテキスト
 
 ```mermaid
 classDiagram
@@ -381,8 +557,8 @@ classDiagram
     }
     class SyncTexData {
         <<ValueObject>>
-        +Map~SourceLocation‚ PdfPosition~ forwardMap
-        +Map~PdfPosition‚ SourceLocation~ inverseMap
+        +Map~SourceLocation, PdfPosition~ forwardMap
+        +Map~PdfPosition, SourceLocation~ inverseMap
     }
 
     PdfDocument o-- PdfPage
@@ -395,14 +571,14 @@ classDiagram
     PdfDocument o-- EmbeddedImage
 ```
 
-### 3.5 フォント管理 コンテキスト
+### 3.6 フォント管理 コンテキスト
 
 ```mermaid
 classDiagram
     class FontManager {
         <<Service>>
-        +loadFont(FontSpec) LoadedFont
-        +searchFont(String) FilePath
+        +resolveFont(FontSpec) AssetHandle
+        +loadFont(FontSpec, AssetHandle) LoadedFont
     }
     class LoadedFont {
         <<Entity>>
@@ -410,9 +586,19 @@ classDiagram
         +FontMetrics metrics
         +GlyphStore glyphs
     }
+    class FontCatalog {
+        <<Entity>>
+        +Map~String, FontDescriptor~ byPostScriptName
+        +Map~String, FontDescriptor~ byFamilyStyle
+    }
+    class FontResolverCache {
+        <<Entity>>
+        +Map~FontSpec, AssetHandle~ entries
+        +resolve(FontSpec) AssetHandle
+    }
     class FontMetrics {
         <<ValueObject>>
-        +Map~GlyphId‚ GlyphMetric~ widths
+        +Map~GlyphId, GlyphMetric~ widths
         +KerningTable kerning
         +LigatureTable ligatures
     }
@@ -434,11 +620,6 @@ classDiagram
         +TfmHeader header
         +List~CharInfo~ charInfos
     }
-    class FontSearchPath {
-        <<ValueObject>>
-        +List~FilePath~ texmfPaths
-        +Map~String‚ FilePath~ mapEntries
-    }
     class GlyphSubsetter {
         <<Service>>
         +subset(LoadedFont, Set~GlyphId~) bytes
@@ -448,12 +629,13 @@ classDiagram
     FontMetrics o-- GlyphMetric
     LoadedFont <|-- OpenTypeFont
     LoadedFont <|-- TfmFont
-    FontManager --> FontSearchPath
+    FontManager --> FontCatalog
+    FontManager --> FontResolverCache
     FontManager ..> LoadedFont : produces
     GlyphSubsetter ..> LoadedFont : reads
 ```
 
-### 3.6 開発者ツール コンテキスト
+### 3.7 開発者ツール コンテキスト
 
 ```mermaid
 classDiagram
@@ -493,6 +675,10 @@ classDiagram
         +watch(WatchOptions) void
         +lsp() void
     }
+    class ExecutionPolicyFactory {
+        <<Service>>
+        +build(CompileOptions, WorkspaceContext) ExecutionPolicy
+    }
     class CompileOptions {
         <<ValueObject>>
         +FilePath input
@@ -500,6 +686,7 @@ classDiagram
         +String jobname
         +int jobs
         +bool noCache
+        +FilePath assetBundle
         +InteractionMode interaction
         +bool synctex
         +bool shellEscape
@@ -511,6 +698,7 @@ classDiagram
     FileWatcher ..> CliRunner : triggers
     PreviewServer ..> CliRunner : receives PDF
     CliRunner --> CompileOptions
+    CliRunner --> ExecutionPolicyFactory
 ```
 
 ## 4. 状態遷移図
@@ -575,6 +763,7 @@ stateDiagram-v2
 | マクロ定義 (MacroDefinition) | `\def` 等で定義されたパターンと置換テキストの組 | マクロ展開, スコープ |
 | スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタの有効範囲 | ScopeStack |
 | レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
+| コンパイルセッション (CompilationSession) | 1 回のコンパイルパスで共有される可変 TeX 状態の集約。カテゴリコード、レジスタ、ラベル、実行ポリシーを保持する | DocumentState, ExecutionPolicy |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 
 ### 5.2 タイプセッティング コンテキスト
@@ -586,7 +775,8 @@ stateDiagram-v2
 | ペナルティ (Penalty) | 行/ページ分割の位置を制御する整数値。高いほど分割されにくい | 行分割, ページ分割 |
 | 行分割 (Line Breaking) | Knuth-Plass アルゴリズムにより段落の最適な改行位置を決定する処理 | Paragraph, LineBreakParams |
 | フロート (Float) | テキストの流れから独立して配置されるオブジェクト。配置指定子で制御 | FloatQueue, PageBuilder |
-| 相互参照 (Cross Reference) | `\label`/`\ref` による文書内の参照。最大 3 パスで解決 | CrossReferenceResolver |
+| ドキュメント状態 (DocumentState) | カウンタ、ラベル、参照安定性など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable |
+| 相互参照 (Cross Reference) | `\label`/`\ref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
 | 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
 
 ### 5.3 差分コンパイル コンテキスト
@@ -599,7 +789,15 @@ stateDiagram-v2
 | 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
 
-### 5.4 PDF 生成 コンテキスト
+### 5.4 アセットランタイム コンテキスト
+
+| 用語 | 定義 | 関連概念 |
+|---|---|---|
+| Ferritex Asset Bundle | 実行時に参照するクラス・パッケージ・フォント資産の不変スナップショット | AssetIndex, OverlaySet |
+| Asset Index | 論理名から資産ハンドルを高速解決する索引構造 | AssetBundle |
+| オーバーレイ (Overlay) | 公式バンドルの上に project-local 資産を重ねる解決レイヤー | OverlaySet |
+
+### 5.5 PDF 生成 コンテキスト
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
@@ -608,7 +806,7 @@ stateDiagram-v2
 | 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
 | SyncTeX データ | ソース位置と PDF 位置の双方向マッピング | SourceLocation |
 
-### 5.5 フォント管理 コンテキスト
+### 5.6 フォント管理 コンテキスト
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
@@ -667,6 +865,42 @@ stateDiagram-v2
 - **等価性への影響**: 理論等価（機能は同一。モジュール構造が異なる）
 - **語彙への影響**: なし
 
+### 6.5 Ferritex Asset Bundle を実行時の唯一の共有資産源とする
+
+- **日付**: 2026-03-11
+- **関連コンテキスト**: アセットランタイム / パーサー/マクロエンジン / フォント管理
+- **判断内容**: クラス・パッケージ・フォント資産は、Ferritex Asset Bundle とそのオーバーレイからのみ解決し、TeX Live / kpathsea は実行時依存にしない
+- **根拠**:
+  - 観測事実: 要件は pdfLaTeX 比 100 倍の高速化を求め、単一バイナリ + バンドルでの起動を要求する
+  - 代替案: 実行時に `TEXMF` ツリーを走査し、kpathsea 互換の探索を行う
+  - 分離証人: クリーンマシンでのコールドスタートコンパイル。Asset Bundle モデルでは memory-mapped index 1回 + ハッシュ探索でクラス/パッケージ/フォントを解決できるが、実行時探索モデルではディレクトリ走査・`ls-R` 解析・OS フォント探索が必要になる
+- **等価性への影響**: 観測的非等価（展開・配備方式は変わるが、文書処理機能の目標は同一）
+- **語彙への影響**: 「Ferritex Asset Bundle」「Asset Index」を導入
+
+### 6.6 CompilationSession を可変 TeX 状態の集約境界とする
+
+- **日付**: 2026-03-11
+- **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング
+- **判断内容**: カテゴリコード、スコープ、レジスタ、カウンタ、ラベル、`.aux` 書き込み、コマンド/環境レジストリ、実行ポリシーを `CompilationSession` に集約する
+- **根拠**:
+  - 観測事実: `\section` によるカウンタ更新、`\label` の登録、`\ref` の解決、パッケージ読み込みは同一パスの逐次状態に依存する
+  - 代替案: それぞれを独立サービスとして保持し、暗黙の共有状態またはグローバル状態で同期する
+  - 分離証人: `\section{A}\label{sec:a}` のケース。集約モデルでは同一セッション内で最新カウンタ値とラベル登録を原子的に扱えるが、分散サービスモデルでは「カウンタ更新後にどの値をラベルへ固定するか」が隠れた結合になる
+- **等価性への影響**: 理論等価（外部仕様は同一だが、整合性の表現力が向上する）
+- **語彙への影響**: 「CompilationSession」「DocumentState」を導入
+
+### 6.7 実行制御を CLI フラグではなく ExecutionPolicy として表現する
+
+- **日付**: 2026-03-11
+- **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
+- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する
+- **根拠**:
+  - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれる
+  - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
+  - 分離証人: watch モードと CLI の双方で `\write18` を含む文書を処理するケース。Policy モデルでは両者に同一判定を適用できるが、入口ごとの分岐モデルでは実装漏れで片方だけ許可される不整合が起こり得る
+- **等価性への影響**: 理論等価（外部仕様は同一で、実装の一貫性が向上する）
+- **語彙への影響**: 「ExecutionPolicy」「PathAccessPolicy」を導入
+
 ## 7. ビジネスルール一覧
 
 要件定義書から抽出した主要なビジネスルール・不変条件の一覧。
@@ -679,10 +913,12 @@ stateDiagram-v2
 | BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
 | BR-5 | 差分コンパイルの出力はフルコンパイルと同一でなければならない | REQ-FUNC-030 | 差分コンパイル |
 | BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
-| BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ | REQ-NF-005 | 開発者ツール |
-| BR-8 | ファイル書き込みはプロジェクトディレクトリと TEXMF ツリーに制限 | REQ-NF-006 | パーサー/マクロエンジン |
+| BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。すべての実行要求は `ExecutionPolicy` を経由する | REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン |
+| BR-8 | ファイル読み書きはプロジェクトディレクトリ、Asset Bundle、キャッシュディレクトリに制限される | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
+| BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイと Ferritex Asset Bundle から解決し、実行時の `TEXMF` 全走査を行わない | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
+| BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationSession` の `DocumentState` に対して行われる | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 | パーサー/マクロエンジン / タイプセッティング |
 
 ## 変更履歴
 
