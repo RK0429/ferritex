@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.13          |
+| バージョン | 0.1.14          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -133,6 +133,8 @@
 | Preview Session | プレビュー接続 1 件分の状態。接続と直近の閲覧位置を束ね、PDF 更新時の view restore に使う |
 | Preview View State | プレビューアの現在ページ、ページ内オフセット、ズーム倍率など、更新後も保持すべき閲覧位置情報 |
 | Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
+| Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
+| Live Analysis Snapshot | `Open Document Buffer` と最新のコンパイル由来状態（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、4 コア以上の CPU、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
@@ -681,8 +683,10 @@
 #### REQ-FUNC-034: 構文エラー診断
 
 - **説明**: LSP プロトコルに準拠し、TeX/LaTeX ソースの構文エラー・警告をリアルタイムにエディタへ通知する
-- **入力**: 編集中の TeX ソース（`textDocument/didOpen`, `textDocument/didChange`）
+- **入力**: 編集中の TeX ソースと最新の `Open Document Buffer`（`textDocument/didOpen`, `textDocument/didChange`）
 - **処理**:
+  - `textDocument/didOpen` / `textDocument/didChange` を `Open Document Buffer` へ反映する
+  - `Open Document Buffer` を優先して `Live Analysis Snapshot` を構築する
   - インクリメンタルなパース・マクロ展開によるエラー検出
   - エラー位置（行・列）の特定
   - エラーの重大度分類（Error, Warning, Information, Hint）
@@ -691,6 +695,7 @@
 - **受け入れ基準**:
   - Given `\begin{equation}` に対応する `\end` がない文書, When エディタで開く, Then 該当行にエラー診断が表示される
   - Given `\begin{equation}` に対応する `\end{equation}` がない文書, When `textDocument/codeAction` を要求, Then `\end{equation}` を補う修正候補が返される
+  - Given 未保存の編集で不足していた `\end{equation}` を補った `Open Document Buffer`, When `textDocument/didChange` 後に再診断, Then 保存前でも当該エラー診断が消える
   - Given ソース編集後, When 保存前の段階で, Then 500ms 以内に診断が更新される
 - **優先度**: Must
 - **出典**: ユーザー明示
@@ -698,24 +703,28 @@
 #### REQ-FUNC-035: 補完
 
 - **説明**: TeX/LaTeX のコマンド・環境名・ラベル・参考文献キーの補完候補を提供する
-- **入力**: カーソル位置のコンテキスト（`textDocument/completion`）
+- **入力**: カーソル位置のコンテキストと最新の `Open Document Buffer`（`textDocument/completion`）
 - **処理**:
+  - `Open Document Buffer` と最新のコンパイル由来状態から `Live Analysis Snapshot` を構築する
   - `\` 入力後にコマンド名候補を提示（使用中パッケージのコマンドを含む）
   - `\begin{` 入力後に環境名候補を提示
   - `\ref{` 入力後に定義済みラベル一覧を提示
   - `\cite{` 入力後に参考文献キー一覧を提示
 - **出力**: `CompletionItem` のリスト
 - **受け入れ基準**:
+  - Given `graphicx` を使用中の文書で `\includegr` と入力, When 補完要求, Then `\includegraphics` が候補に含まれる
   - Given amsmath を使用中の文書で `\begin{al` と入力, When 補完要求, Then `align`, `alignat`, `aligned` 等が候補に含まれる
-  - Given 文書内に `\label{fig:overview}` が定義済み, When `\ref{fig:` と入力, Then `fig:overview` が候補に表示される
+  - Given 未保存の `Open Document Buffer` 内に `\label{fig:overview}` が定義済み, When `\ref{fig:` と入力, Then 保存前でも `fig:overview` が候補に表示される
+  - Given `.bbl` スナップショットに `knuth1984` が含まれる文書, When `\cite{kn` と入力, Then `knuth1984` が候補に表示される
 - **優先度**: Must
 - **出典**: ユーザー明示
 
 #### REQ-FUNC-036: 定義ジャンプ
 
 - **説明**: `\label`, `\ref`, `\cite`, マクロ定義へのジャンプ機能を提供する
-- **入力**: カーソル位置（`textDocument/definition`）
+- **入力**: カーソル位置と最新の `Open Document Buffer`（`textDocument/definition`）
 - **処理**:
+  - `Open Document Buffer` を優先して現在カーソル位置のシンボルを解決する
   - マクロ定義、ラベル、参考文献エントリの Definition Provenance をシンボル索引として保持する
   - `\ref{label}` → 対応する `\label{label}` の位置
   - `\cite{key}` → 対応する参考文献エントリの位置（`.bbl` スナップショット上の定義位置、または保持していれば元ソース位置）
@@ -731,8 +740,10 @@
 #### REQ-FUNC-037: ホバー情報
 
 - **説明**: コマンドにカーソルを合わせた際にドキュメント情報を表示する
-- **入力**: カーソル位置（`textDocument/hover`）
-- **処理**: コマンド名に基づくドキュメントの検索と表示
+- **入力**: カーソル位置と最新の `Open Document Buffer`（`textDocument/hover`）
+- **処理**:
+  - `Open Document Buffer` と有効なクラス/パッケージ状態から `Live Analysis Snapshot` を構築する
+  - コマンド名に基づくドキュメントの検索と表示
 - **出力**: ホバー情報（Markdown 形式）
 - **受け入れ基準**:
   - Given `\frac` にカーソルを合わせた状態, When ホバー, Then 構文と使用例を含む説明が表示される
@@ -865,11 +876,12 @@
 - **入力**: `ferritex lsp`
 - **処理**:
   - 標準入出力（stdio）を介した LSP プロトコル通信の開始
-  - `initialize` ハンドシェイクでサーバーケイパビリティの通知
+  - `initialize` ハンドシェイクでサポート対象のサーバーケイパビリティを通知し、optional provider の capability は有効時のみ advertise する
   - プロジェクトルートの自動検出
 - **出力**: LSP プロトコルに準拠したリクエスト/レスポンス
 - **受け入れ基準**:
-  - Given `ferritex lsp` を起動, When エディタから `initialize` リクエストを受信, Then ケイパビリティ（diagnostics, completion, definition, hover, codeAction）を含む応答が返される
+  - Given `ferritex lsp` を起動, When エディタから `initialize` リクエストを受信, Then ケイパビリティ（diagnostics, completion, definition, codeAction）を含む応答が返される
+  - Given hover provider が有効なビルド, When `initialize` リクエストを受信, Then `hover` capability を含む応答が返される
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -1040,6 +1052,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.14 | 2026-03-12 | LSP 要件に Open Document Buffer / Live Analysis Snapshot を導入し、completion の受け入れ基準と hover capability 条件を整合化 | Codex |
 | 0.1.13 | 2026-03-12 | 性能要件の共通 benchmark profile `FTX-BENCH-001` を導入し、絶対速度/相対速度/差分速度の判定条件を統一 | Codex |
 | 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch 対象集合の依存グラフ同期、preview の最近傍ページ fallback を追記 | Codex |
 | 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch 再トリガーの scheduler/queue、preview の view state を追記 | Codex |

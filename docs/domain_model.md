@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.15          |
+| バージョン | 0.1.16          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.13 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.14 |
 
 ## 1. サブドメイン分類
 
@@ -1071,7 +1071,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。章単位並列化では `ChapterPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立章を `ChapterPartitionPlan` として切り出し、`PaginationMergeCoordinator` が章ごとの `ChapterLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出し、`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
 
 ```mermaid
 classDiagram
@@ -1125,31 +1125,34 @@ classDiagram
         +bool referencesStable
         +int passesUsed
     }
-    class ChapterPartitionPlanner {
+    class DocumentPartitionPlanner {
         <<Service>>
-        +plan(DependencyGraph, DocumentState) ChapterPartitionPlan
+        +plan(DependencyGraph, DocumentState) DocumentPartitionPlan
     }
-    class ChapterPartitionPlan {
+    class DocumentPartitionPlan {
         <<ValueObject>>
-        +List~ChapterWorkUnit~ units
+        +List~DocumentWorkUnit~ units
         +bool preservesSequentialPageNumbers
     }
-    class ChapterWorkUnit {
+    class DocumentWorkUnit {
         <<ValueObject>>
         +LogicalPath entryFile
+        +PartitionKind kind
+        +String partitionId
         +Set~String~ importedRefs
         +Set~String~ exportedRefs
         +bool canTypesetInIsolation
     }
-    class ChapterLayoutFragment {
+    class DocumentLayoutFragment {
         <<ValueObject>>
         +LogicalPath entryFile
+        +PartitionKind kind
         +List~PageBox~ pages
         +Map~String, int~ localLabelPages
     }
     class PaginationMergeCoordinator {
         <<Service>>
-        +merge(ChapterPartitionPlan, List~ChapterLayoutFragment~, DocumentState) PaginationMergeResult
+        +merge(DocumentPartitionPlan, List~DocumentLayoutFragment~, DocumentState) PaginationMergeResult
     }
     class PaginationMergeResult {
         <<ValueObject>>
@@ -1184,12 +1187,12 @@ classDiagram
     IncrementalCompilationCoordinator ..> RecompilationScope : consumes
     IncrementalCompilationCoordinator ..> CompilationJob : drives passes
     IncrementalCompilationCoordinator ..> DependencyGraph : reads
-    ChapterPartitionPlanner ..> DependencyGraph : analyzes chapter deps
-    ChapterPartitionPlanner ..> DocumentState : reads ref stability
-    ChapterPartitionPlanner --> ChapterPartitionPlan
-    ChapterPartitionPlan o-- ChapterWorkUnit
-    PaginationMergeCoordinator ..> ChapterPartitionPlan : consumes
-    PaginationMergeCoordinator ..> ChapterLayoutFragment : merges
+    DocumentPartitionPlanner ..> DependencyGraph : analyzes partition deps
+    DocumentPartitionPlanner ..> DocumentState : reads ref stability
+    DocumentPartitionPlanner --> DocumentPartitionPlan
+    DocumentPartitionPlan o-- DocumentWorkUnit
+    PaginationMergeCoordinator ..> DocumentPartitionPlan : consumes
+    PaginationMergeCoordinator ..> DocumentLayoutFragment : merges
     PaginationMergeCoordinator ..> DocumentState : reconciles refs/pages
     PaginationMergeCoordinator --> PaginationMergeResult
     IncrementalCompilationCoordinator --> CompilationMergePlan
@@ -1654,7 +1657,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。`CompletionProvider` は active なコマンド/環境レジストリと `DocumentState` の label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSession` ごとの閲覧位置を保持し、PDF 更新のたびに保存済み view を再適用したうえで、新しい PDF のページ数に合わせて最近傍の有効ページへ clamp する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の `CompilationSession` / `DocumentState` と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSession` ごとの閲覧位置を保持し、PDF 更新のたびに保存済み view を再適用したうえで、新しい PDF のページ数に合わせて最近傍の有効ページへ clamp する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1663,17 +1666,40 @@ classDiagram
         +ServerCapabilities capabilities
         +handleRequest(LspRequest) LspResponse
     }
+    class OpenDocumentStore {
+        <<Entity>>
+        +Map~String, OpenDocumentBuffer~ buffers
+        +open(String, int, String) OpenDocumentBuffer
+        +update(String, int, String) OpenDocumentBuffer
+        +lookup(String) OpenDocumentBuffer
+    }
+    class OpenDocumentBuffer {
+        <<Entity>>
+        +String uri
+        +int version
+        +String text
+    }
+    class LiveAnalysisSnapshotFactory {
+        <<Service>>
+        +build(OpenDocumentBuffer, CompilationSession, DocumentState) LiveAnalysisSnapshot
+    }
+    class LiveAnalysisSnapshot {
+        <<ValueObject>>
+        +OpenDocumentBuffer buffer
+        +CompilationSession session
+        +DocumentState documentState
+    }
     class DiagnosticProvider {
         <<Service>>
-        +diagnose(TextDocument) List~Diagnostic~
+        +diagnose(LiveAnalysisSnapshot) List~Diagnostic~
     }
     class CompletionProvider {
         <<Service>>
-        +complete(TextDocument, Position) List~CompletionItem~
+        +complete(LiveAnalysisSnapshot, Position) List~CompletionItem~
     }
     class CompletionIndex {
         <<Entity>>
-        +rebuild(CompilationSession, DocumentState) void
+        +rebuild(LiveAnalysisSnapshot) void
         +lookupCommands(String) List~CompletionCandidate~
         +lookupEnvironments(String) List~CompletionCandidate~
         +lookupLabels(String) List~CompletionCandidate~
@@ -1689,21 +1715,21 @@ classDiagram
     }
     class DefinitionProvider {
         <<Service>>
-        +findDefinition(TextDocument, Position) Location
+        +findDefinition(LiveAnalysisSnapshot, Position) Location
     }
     class SymbolIndex {
         <<Entity>>
         +Map~SymbolKey, DefinitionProvenance~ entries
-        +rebuild(CompilationSession) void
+        +rebuild(LiveAnalysisSnapshot) void
         +lookup(TextDocument, Position) DefinitionProvenance
     }
     class HoverProvider {
         <<Service>>
-        +hover(TextDocument, Position) Hover
+        +hover(LiveAnalysisSnapshot, Position) Hover
     }
     class HoverDocCatalog {
         <<Entity>>
-        +rebuild(CompilationSession) void
+        +rebuild(LiveAnalysisSnapshot) void
         +lookup(SymbolKey) HoverDoc
     }
     class HoverDoc {
@@ -1715,7 +1741,7 @@ classDiagram
     }
     class CodeActionProvider {
         <<Service>>
-        +suggest(TextDocument, Range, Diagnostic) List~CodeAction~
+        +suggest(LiveAnalysisSnapshot, Range, Diagnostic) List~CodeAction~
     }
     class FileWatcher {
         <<Entity>>
@@ -1839,16 +1865,29 @@ classDiagram
     LspServer --> DefinitionProvider
     LspServer --> HoverProvider
     LspServer --> CodeActionProvider
+    LspServer --> OpenDocumentStore
+    LspServer --> LiveAnalysisSnapshotFactory
     LspServer --> ExecutionPolicyFactory
     LspServer --> RuntimeOptions : normalizes
+    OpenDocumentStore o-- OpenDocumentBuffer
+    LiveAnalysisSnapshotFactory --> OpenDocumentBuffer
+    LiveAnalysisSnapshotFactory ..> CompilationSession : combines latest compile state
+    LiveAnalysisSnapshotFactory ..> DocumentState : combines latest document state
+    LiveAnalysisSnapshotFactory --> LiveAnalysisSnapshot
+    LiveAnalysisSnapshot --> OpenDocumentBuffer
     CompletionProvider --> CompletionIndex
     DefinitionProvider --> SymbolIndex
     HoverProvider --> HoverDocCatalog
+    DiagnosticProvider ..> LiveAnalysisSnapshot : analyzes
+    CompletionProvider ..> LiveAnalysisSnapshot : reads
+    DefinitionProvider ..> LiveAnalysisSnapshot : reads
+    HoverProvider ..> LiveAnalysisSnapshot : reads
+    CodeActionProvider ..> LiveAnalysisSnapshot : suggests on
     CompletionIndex --> CompletionCandidate
-    CompletionIndex ..> CompilationSession : projects command/env registry
-    CompletionIndex ..> DocumentState : projects labels/citations
+    CompletionIndex ..> LiveAnalysisSnapshot : projects buffer + registries
     HoverDocCatalog --> HoverDoc
-    HoverDocCatalog ..> CompilationSession : projects active package/class docs
+    SymbolIndex ..> LiveAnalysisSnapshot : projects symbols
+    HoverDocCatalog ..> LiveAnalysisSnapshot : projects active package/class docs
     FileWatcher ..> FileChangeEvent : emits
     FileWatcher --> RecompileScheduler : notifies
     RecompileScheduler --> FileWatcher : refreshes watch set
@@ -2006,9 +2045,9 @@ stateDiagram-v2
 | 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
 | コンパイルマージプラン (CompilationMergePlan) | 再構築ノードと再利用ノードの境界、および参照安定化の要否を表す計画 | IncrementalCompilationCoordinator |
 | 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
-| 章分割計画 (ChapterPartitionPlan) | 章単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画 | ChapterPartitionPlanner, ChapterWorkUnit |
-| 章ワークユニット (ChapterWorkUnit) | 1 章ぶんの入力ファイル、輸入/輸出する参照、独立組版可否を表す単位 | ChapterPartitionPlan, PaginationMergeCoordinator |
-| ページ統合調停役 (PaginationMergeCoordinator) | 章ごとの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | ChapterLayoutFragment, PaginationMergeResult |
+| 文書パーティション計画 (DocumentPartitionPlan) | 章またはセクション単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画 | DocumentPartitionPlanner, DocumentWorkUnit |
+| 文書ワークユニット (DocumentWorkUnit) | 1 つの章またはセクションに対応する入力ファイル、パーティション種別、輸入/輸出する参照、独立組版可否を表す単位 | DocumentPartitionPlan, PaginationMergeCoordinator |
+| ページ統合調停役 (PaginationMergeCoordinator) | 各文書パーティションの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | DocumentLayoutFragment, PaginationMergeResult |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
 
 ### 5.5 アセットランタイム コンテキスト
@@ -2060,10 +2099,13 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, CompilationSession |
-| 補完索引 (CompletionIndex) | active な command/environment registry と label/citation 状態を LSP 補完向けに射影した read model | CompletionProvider, CompletionCandidate |
+| 補完索引 (CompletionIndex) | `LiveAnalysisSnapshot` から active な command/environment registry、未保存 buffer、label/citation 状態を LSP 補完向けに射影した read model | CompletionProvider, CompletionCandidate |
 | 補完候補 (CompletionCandidate) | コマンド、環境、ラベル、参考文献キーの補完項目。表示名、挿入文字列、由来情報を保持する | CompletionIndex |
-| hover 文書カタログ (HoverDocCatalog) | active な class/package snapshot の説明資産をコマンドごとに索引化した read model | HoverProvider, HoverDoc |
+| hover 文書カタログ (HoverDocCatalog) | `LiveAnalysisSnapshot` から active な class/package snapshot の説明資産をコマンドごとに索引化した read model | HoverProvider, HoverDoc |
 | hover 文書 (HoverDoc) | コマンドの構文、要約、使用例、由来パッケージを保持する説明データ | HoverDocCatalog |
+| オープンドキュメントバッファ (OpenDocumentBuffer) | エディタ上の未保存変更を含む最新テキスト。LSP 機能は保存済みファイルよりこれを優先して参照する | OpenDocumentStore, LiveAnalysisSnapshot |
+| オープンドキュメントストア (OpenDocumentStore) | 現在開かれているテキスト文書の buffer と version を保持する LSP セッション内ストア | LspServer, OpenDocumentBuffer |
+| ライブ解析スナップショット (LiveAnalysisSnapshot) | `OpenDocumentBuffer` と最新の `CompilationSession` / `DocumentState` を合成した LSP 共通入力。diagnostic/completion/definition/hover が同じ解析基盤を共有する | LiveAnalysisSnapshotFactory, CompletionIndex, SymbolIndex, HoverDocCatalog |
 | 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら再コンパイルを逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph |
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
 | プレビューセッション (PreviewSession) | 接続 1 件分の preview 状態。閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewServer, PreviewViewState |
@@ -2378,10 +2420,10 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
-- **判断内容**: `CompletionProvider` / `HoverProvider` はその場で registry や package snapshot を走査せず、補完用の `CompletionIndex` と説明用の `HoverDocCatalog` を参照する。`CompletionIndex` は active な command/environment registry と `DocumentState` の label/citation 状態から再構築し、`HoverDocCatalog` は active な class/package snapshot の説明資産をコマンド単位に正規化する
+- **判断内容**: `CompletionProvider` / `HoverProvider` はその場で registry や package snapshot を走査せず、補完用の `CompletionIndex` と説明用の `HoverDocCatalog` を参照する。`CompletionIndex` は `LiveAnalysisSnapshot` から active な command/environment registry、未保存 buffer、label/citation 状態を再構築し、`HoverDocCatalog` は同じ `LiveAnalysisSnapshot` から active な class/package snapshot の説明資産をコマンド単位に正規化する
 - **根拠**:
   - 観測事実: REQ-FUNC-035 は package-aware な command/environment 補完と label/cite 補完を Must とし、REQ-FUNC-037 はコマンドの構文と使用例を含む hover を要求している
-  - 代替案: `CompletionProvider` / `HoverProvider` が毎回 `CommandRegistry` / `EnvironmentRegistry` / package snapshot を直接探索する
+  - 代替案: `CompletionProvider` / `HoverProvider` が毎回 `CommandRegistry` / `EnvironmentRegistry` / package snapshot を直接探索し、未保存 buffer は provider ごとに個別解決する
   - 分離証人: `amsmath` を読み込んだ文書で `\begin{al` を補完しつつ `\frac` の hover を引くケース。専用 read model なら active package 群に応じた候補と説明を同じ再コンパイル成果から安定して返せるが、都度探索モデルでは候補生成と説明検索の根拠が分散し差分更新時の整合性を説明しにくい
 - **等価性への影響**: 理論等価（外部仕様は同一で、LSP の参照元が明確になる）
 - **語彙への影響**: 「CompletionIndex」「CompletionCandidate」「HoverDocCatalog」「HoverDoc」を導入
@@ -2398,17 +2440,29 @@ stateDiagram-v2
 - **等価性への影響**: 理論等価（外部仕様は同一で、fontspec の責務境界が明確になる）
 - **語彙への影響**: 「FontSpec」「FontFeatureSet」「FontFallbackChain」「FontFamilyRef」を導入
 
-### 6.28 章単位並列化の独立性判定とページ統合は ChapterPartitionPlanner / PaginationMergeCoordinator が所有する
+### 6.28 文書パーティション単位並列化の独立性判定とページ統合は DocumentPartitionPlanner / PaginationMergeCoordinator が所有する
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 差分コンパイル / タイプセッティング
-- **判断内容**: REQ-FUNC-032 の章単位並列化は、実行スケジューリング自体ではなく、`DependencyGraph` / `DocumentState` を用いた独立章判定を `ChapterPartitionPlanner` が、章ごとの組版結果から逐次ページ番号と参照整合性を復元する処理を `PaginationMergeCoordinator` が所有する
+- **判断内容**: REQ-FUNC-032 の章・セクション単位並列化は、実行スケジューリング自体ではなく、`DependencyGraph` / `DocumentState` を用いた独立パーティション判定を `DocumentPartitionPlanner` が、各パーティションの組版結果から逐次ページ番号と参照整合性を復元する処理を `PaginationMergeCoordinator` が所有する
 - **根拠**:
-  - 観測事実: REQ-FUNC-032 は章間独立性判定、並列組版、結果マージとページ番号統合を 1 つの要件として要求している
-  - 代替案: インフラストラクチャ層の scheduler が heuristic に章を分割し、統合も単純連結に任せる
-  - 分離証人: 10 章文書のうち 3 章だけが前章ラベルを参照するケース。`ChapterPartitionPlanner` モデルでは参照依存を見て安全な章だけ並列化し、`PaginationMergeCoordinator` が最終ページオフセットを適用して sequential compile と同じページ番号へ戻せるが、heuristic 分割モデルではどの章が独立か、どこでページ番号を再調停するかが曖昧になる
-- **等価性への影響**: 理論等価（外部仕様は同一で、章単位並列化の責務が明確になる）
-- **語彙への影響**: 「ChapterPartitionPlanner」「ChapterPartitionPlan」「ChapterWorkUnit」「ChapterLayoutFragment」「PaginationMergeCoordinator」「PaginationMergeResult」を導入
+  - 観測事実: REQ-FUNC-032 は章間だけでなく、chapter を持たない文書クラスでは section 単位の独立性判定、並列組版、結果マージとページ番号統合も要求している
+  - 代替案: インフラストラクチャ層の scheduler が heuristic に章だけを分割し、統合も単純連結に任せる
+  - 分離証人: `book` では章単位、`article` ではセクション単位で独立性が変わる文書群を同じ機構で扱うケース。`DocumentPartitionPlanner` モデルでは partition kind を見て安全な単位だけ並列化し、`PaginationMergeCoordinator` が最終ページオフセットを適用して sequential compile と同じページ番号へ戻せるが、chapter 固定モデルでは `article` 系文書の分割責務が表現できない
+- **等価性への影響**: 理論等価（外部仕様は同一で、文書パーティション単位並列化の責務が明確になる）
+- **語彙への影響**: 「DocumentPartitionPlanner」「DocumentPartitionPlan」「DocumentWorkUnit」「DocumentLayoutFragment」「PaginationMergeCoordinator」「PaginationMergeResult」を導入
+
+### 6.29 LSP 機能は OpenDocumentBuffer と LiveAnalysisSnapshot を共通入力にする
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: 開発者ツール / パーサー/マクロエンジン
+- **判断内容**: `diagnostics` / `completion` / `definition` / `hover` / `codeAction` は、保存済みファイルを個別に再読込するのではなく、`OpenDocumentStore` が保持する `OpenDocumentBuffer` と最新の `CompilationSession` / `DocumentState` から `LiveAnalysisSnapshot` を構築し、それを共通入力として扱う
+- **根拠**:
+  - 観測事実: REQ-FUNC-034/035/036/037 は保存前の `didChange` 状態に対して一貫した診断・補完・定義ジャンプ・hover を返す必要がある
+  - 代替案: provider ごとに保存済みファイルと最新コンパイル結果を別々に参照する
+  - 分離証人: 未保存の `\label{fig:new}` 追加直後に `\ref{fig:` 補完と hover を引き、同時に diagnostics を更新するケース。`LiveAnalysisSnapshot` モデルでは全 provider が同じ buffer version を観測できるが、個別参照モデルでは completion だけ新しい label を見えて diagnostics/hover が古い状態を返しうる
+- **等価性への影響**: 理論等価（外部仕様は同一で、LSP の一貫した入力境界が明確になる）
+- **語彙への影響**: 「OpenDocumentStore」「OpenDocumentBuffer」「LiveAnalysisSnapshot」「LiveAnalysisSnapshotFactory」を導入
 
 ## 7. ビジネスルール一覧
 
@@ -2441,15 +2495,17 @@ stateDiagram-v2
 | BR-23 | amsmath の複数行 display math は `DisplayMathBlock` が保持し、各 `MathAlignmentRow` は `EquationTag` により自動番号/`\tag`/`\notag` を表現する。`AmsmathLayoutEngine` は `CounterStore` を参照して行揃えと番号付けを確定する | REQ-FUNC-009 / REQ-FUNC-021 | タイプセッティング / パーサー/マクロエンジン |
 | BR-24 | `\input` / `\include` / `\InputIfFileExists` は `InputStack` を push/pop し、current-file 基準の `ResolutionContext.currentDirectory` で解決される。`\include` の重複抑止と分離 `.aux` 出力先は `IncludeState` が管理する | REQ-FUNC-005 | パーサー/マクロエンジン |
 | BR-25 | フロート指定子は `PlacementSpec.priorityOrder` と `force` へ正規化され、`FloatQueue` は選択された配置領域とページ内矩形を `FloatPlacement` として返し `PageBox` に保持する | REQ-FUNC-010 | タイプセッティング |
-| BR-26 | LSP 補完は `CompletionIndex` が active な command/environment registry と `DocumentState` の label/citation 状態から再構築され、package-aware な command/environment 候補と `\ref` / `\cite` 候補だけを返す | REQ-FUNC-035 | パーサー/マクロエンジン / 開発者ツール |
-| BR-27 | LSP hover は `HoverDocCatalog` が active な class/package snapshot の説明資産をコマンド単位に索引化し、構文・要約・使用例を返す | REQ-FUNC-037 | パーサー/マクロエンジン / 開発者ツール |
+| BR-26 | LSP 補完は `CompletionIndex` が `LiveAnalysisSnapshot` から active な command/environment registry、未保存 buffer、label/citation 状態を再構築し、package-aware な command/environment 候補と `\ref` / `\cite` 候補だけを返す | REQ-FUNC-035 | パーサー/マクロエンジン / 開発者ツール |
+| BR-27 | LSP hover は `HoverDocCatalog` が `LiveAnalysisSnapshot` から active な class/package snapshot の説明資産をコマンド単位に索引化し、構文・要約・使用例を返す | REQ-FUNC-037 | パーサー/マクロエンジン / 開発者ツール |
 | BR-28 | `fontspec` によるフォント指定は `FontSpec` へ正規化され、OpenType feature は `FontFeatureSet`、代替フォント列は `FontFallbackChain` で保持される。`FontManager` / `FontResolverCache` はこの canonical form を解決キーとして扱う | REQ-FUNC-025 / REQ-FUNC-017 / REQ-FUNC-019 | パーサー/マクロエンジン / フォント管理 |
-| BR-29 | 章単位並列化では `ChapterPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立章だけを `ChapterWorkUnit` として抽出し、`PaginationMergeCoordinator` が章ごとの組版結果を順序付きに統合して sequential compile と同じページ番号へ復元する | REQ-FUNC-032 | 差分コンパイル / タイプセッティング |
+| BR-29 | 章またはセクション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立パーティションだけを `DocumentWorkUnit` として抽出し、`PaginationMergeCoordinator` が各パーティションの組版結果を順序付きに統合して sequential compile と同じページ番号へ復元する | REQ-FUNC-032 | 差分コンパイル / タイプセッティング |
+| BR-30 | LSP の diagnostics/completion/definition/hover/codeAction は `OpenDocumentStore` 上の未保存 `OpenDocumentBuffer` を優先し、最新の `CompilationSession` / `DocumentState` と合成した `LiveAnalysisSnapshot` を共通入力として評価する | REQ-FUNC-034 / REQ-FUNC-035 / REQ-FUNC-036 / REQ-FUNC-037 | 開発者ツール / パーサー/マクロエンジン |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.16 | 2026-03-12 | LSP の OpenDocumentBuffer/LiveAnalysisSnapshot を追加し、章固定の partition モデルを章/セクション両対応の document partition へ一般化 | Codex |
 | 0.1.15 | 2026-03-12 | CompletionIndex/HoverDocCatalog、FontSpec/FontFeatureSet/FallbackChain、章単位並列化の partition/merge 責務を追加し REQ-FUNC-025/032/035/037 のトレーサビリティを補強 | Codex |
 | 0.1.14 | 2026-03-12 | amsmath の複数行 display math、ファイル入力スタック/include 状態、フロート配置の入出力型を追加して REQ-FUNC-005/009/010/021 のトレーサビリティを補強 | Codex |
 | 0.1.13 | 2026-03-12 | フォント埋め込み計画器、tikz/pgf の階層 scope/clip/arrow、脚注キュー、preview view restore の必須化を反映 | Codex |
