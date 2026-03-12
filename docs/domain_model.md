@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.14          |
+| バージョン | 0.1.15          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.12 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.13 |
 
 ## 1. サブドメイン分類
 
@@ -1071,7 +1071,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。章単位並列化では `ChapterPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立章を `ChapterPartitionPlan` として切り出し、`PaginationMergeCoordinator` が章ごとの `ChapterLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
 
 ```mermaid
 classDiagram
@@ -1125,6 +1125,37 @@ classDiagram
         +bool referencesStable
         +int passesUsed
     }
+    class ChapterPartitionPlanner {
+        <<Service>>
+        +plan(DependencyGraph, DocumentState) ChapterPartitionPlan
+    }
+    class ChapterPartitionPlan {
+        <<ValueObject>>
+        +List~ChapterWorkUnit~ units
+        +bool preservesSequentialPageNumbers
+    }
+    class ChapterWorkUnit {
+        <<ValueObject>>
+        +LogicalPath entryFile
+        +Set~String~ importedRefs
+        +Set~String~ exportedRefs
+        +bool canTypesetInIsolation
+    }
+    class ChapterLayoutFragment {
+        <<ValueObject>>
+        +LogicalPath entryFile
+        +List~PageBox~ pages
+        +Map~String, int~ localLabelPages
+    }
+    class PaginationMergeCoordinator {
+        <<Service>>
+        +merge(ChapterPartitionPlan, List~ChapterLayoutFragment~, DocumentState) PaginationMergeResult
+    }
+    class PaginationMergeResult {
+        <<ValueObject>>
+        +List~PageBox~ mergedPages
+        +Map~LogicalPath, int~ pageOffsets
+    }
     class CompilationCache {
         <<Entity>>
         +CacheConfig config
@@ -1153,6 +1184,14 @@ classDiagram
     IncrementalCompilationCoordinator ..> RecompilationScope : consumes
     IncrementalCompilationCoordinator ..> CompilationJob : drives passes
     IncrementalCompilationCoordinator ..> DependencyGraph : reads
+    ChapterPartitionPlanner ..> DependencyGraph : analyzes chapter deps
+    ChapterPartitionPlanner ..> DocumentState : reads ref stability
+    ChapterPartitionPlanner --> ChapterPartitionPlan
+    ChapterPartitionPlan o-- ChapterWorkUnit
+    PaginationMergeCoordinator ..> ChapterPartitionPlan : consumes
+    PaginationMergeCoordinator ..> ChapterLayoutFragment : merges
+    PaginationMergeCoordinator ..> DocumentState : reconciles refs/pages
+    PaginationMergeCoordinator --> PaginationMergeResult
     IncrementalCompilationCoordinator --> CompilationMergePlan
     IncrementalCompilationCoordinator --> IncrementalCompilationResult
     IncrementalCompilationCoordinator --> CompilationCache
@@ -1517,8 +1556,32 @@ classDiagram
 
 ### 3.7 フォント管理 コンテキスト
 
+`FontSpec` は `fontspec` の `\setmainfont` / `\setsansfont` / `\setmonofont` や typesetting 時の `TextStyle` から正規化される標準的なフォント要求値であり、ファミリ選択、OpenType feature 群、fallback chain を 1 つの値オブジェクトに束ねる。`FontManager` はこの正規化済み表現を Asset Bundle / overlay / Host Font Catalog に対して解決する。
+
 ```mermaid
 classDiagram
+    class FontSpec {
+        <<ValueObject>>
+        +String family
+        +FontWeight weight
+        +FontStyle style
+        +FontFeatureSet features
+        +FontFallbackChain fallbackChain
+    }
+    class FontFeatureSet {
+        <<ValueObject>>
+        +Map~String, String~ options
+        +String script
+        +String language
+    }
+    class FontFallbackChain {
+        <<ValueObject>>
+        +List~FontFamilyRef~ families
+    }
+    class FontFamilyRef {
+        <<ValueObject>>
+        +String family
+    }
     class FontManager {
         <<Service>>
         +resolveFont(FontSpec) AssetHandle
@@ -1578,16 +1641,20 @@ classDiagram
     FontMetrics o-- GlyphMetric
     LoadedFont <|-- OpenTypeFont
     LoadedFont <|-- TfmFont
+    FontSpec --> FontFeatureSet
+    FontSpec --> FontFallbackChain
+    FontFallbackChain o-- FontFamilyRef
     FontManager --> OverlaySet
     FontManager --> FontResolverCache
     OverlaySet --> HostFontCatalog
+    FontManager --> FontSpec
     FontManager ..> LoadedFont : produces
     GlyphSubsetter ..> LoadedFont : reads
 ```
 
 ### 3.8 開発者ツール コンテキスト
 
-`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSession` ごとの閲覧位置を保持し、PDF 更新のたびに保存済み view を再適用したうえで、新しい PDF のページ数に合わせて最近傍の有効ページへ clamp する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。`CompletionProvider` は active なコマンド/環境レジストリと `DocumentState` の label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSession` ごとの閲覧位置を保持し、PDF 更新のたびに保存済み view を再適用したうえで、新しい PDF のページ数に合わせて最近傍の有効ページへ clamp する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1604,6 +1671,22 @@ classDiagram
         <<Service>>
         +complete(TextDocument, Position) List~CompletionItem~
     }
+    class CompletionIndex {
+        <<Entity>>
+        +rebuild(CompilationSession, DocumentState) void
+        +lookupCommands(String) List~CompletionCandidate~
+        +lookupEnvironments(String) List~CompletionCandidate~
+        +lookupLabels(String) List~CompletionCandidate~
+        +lookupCitations(String) List~CompletionCandidate~
+    }
+    class CompletionCandidate {
+        <<ValueObject>>
+        +CompletionKind kind
+        +String label
+        +String insertText
+        +String detail
+        +String origin
+    }
     class DefinitionProvider {
         <<Service>>
         +findDefinition(TextDocument, Position) Location
@@ -1617,6 +1700,18 @@ classDiagram
     class HoverProvider {
         <<Service>>
         +hover(TextDocument, Position) Hover
+    }
+    class HoverDocCatalog {
+        <<Entity>>
+        +rebuild(CompilationSession) void
+        +lookup(SymbolKey) HoverDoc
+    }
+    class HoverDoc {
+        <<ValueObject>>
+        +String syntax
+        +String summary
+        +String example
+        +String origin
     }
     class CodeActionProvider {
         <<Service>>
@@ -1746,7 +1841,14 @@ classDiagram
     LspServer --> CodeActionProvider
     LspServer --> ExecutionPolicyFactory
     LspServer --> RuntimeOptions : normalizes
+    CompletionProvider --> CompletionIndex
     DefinitionProvider --> SymbolIndex
+    HoverProvider --> HoverDocCatalog
+    CompletionIndex --> CompletionCandidate
+    CompletionIndex ..> CompilationSession : projects command/env registry
+    CompletionIndex ..> DocumentState : projects labels/citations
+    HoverDocCatalog --> HoverDoc
+    HoverDocCatalog ..> CompilationSession : projects active package/class docs
     FileWatcher ..> FileChangeEvent : emits
     FileWatcher --> RecompileScheduler : notifies
     RecompileScheduler --> FileWatcher : refreshes watch set
@@ -1904,6 +2006,9 @@ stateDiagram-v2
 | 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
 | コンパイルマージプラン (CompilationMergePlan) | 再構築ノードと再利用ノードの境界、および参照安定化の要否を表す計画 | IncrementalCompilationCoordinator |
 | 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
+| 章分割計画 (ChapterPartitionPlan) | 章単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画 | ChapterPartitionPlanner, ChapterWorkUnit |
+| 章ワークユニット (ChapterWorkUnit) | 1 章ぶんの入力ファイル、輸入/輸出する参照、独立組版可否を表す単位 | ChapterPartitionPlan, PaginationMergeCoordinator |
+| ページ統合調停役 (PaginationMergeCoordinator) | 章ごとの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | ChapterLayoutFragment, PaginationMergeResult |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
 
 ### 5.5 アセットランタイム コンテキスト
@@ -1942,6 +2047,9 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | フォントメトリクス (FontMetrics) | 文字幅・高さ・深さ・カーニング・リガチャ情報の集合 | GlyphMetric |
+| フォント指定 (FontSpec) | `fontspec` と `TextStyle` から正規化されるフォント要求。family、weight/style、OpenType feature、fallback chain を 1 つの値にまとめる | FontFeatureSet, FontFallbackChain |
+| フォント feature 集合 (FontFeatureSet) | `Ligatures`, `Numbers`, `Script`, `Language` などの OpenType feature 指定を正規化した値 | FontSpec |
+| フォント fallback chain (FontFallbackChain) | 第 1 候補が解決できない場合に試す追加フォントファミリ列 | FontSpec, FontFamilyRef |
 | Host Font Catalog | platform font discovery API に基づき永続化されたホストフォント索引。`fontspec` 解決時に hot path で再走査しない fallback overlay であり、project/configured overlay と Asset Bundle に一致候補がない場合にのみ参照する。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外 | HostFontCatalog, FontResolverCache |
 | OpenType フォント | OTF/TTF 形式のモダンフォント。GPOS/GSUB テーブルで高度な組版を制御 | fontspec |
 | TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 | Computer Modern |
@@ -1952,6 +2060,10 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, CompilationSession |
+| 補完索引 (CompletionIndex) | active な command/environment registry と label/citation 状態を LSP 補完向けに射影した read model | CompletionProvider, CompletionCandidate |
+| 補完候補 (CompletionCandidate) | コマンド、環境、ラベル、参考文献キーの補完項目。表示名、挿入文字列、由来情報を保持する | CompletionIndex |
+| hover 文書カタログ (HoverDocCatalog) | active な class/package snapshot の説明資産をコマンドごとに索引化した read model | HoverProvider, HoverDoc |
+| hover 文書 (HoverDoc) | コマンドの構文、要約、使用例、由来パッケージを保持する説明データ | HoverDocCatalog |
 | 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら再コンパイルを逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph |
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
 | プレビューセッション (PreviewSession) | 接続 1 件分の preview 状態。閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewServer, PreviewViewState |
@@ -2262,6 +2374,42 @@ stateDiagram-v2
 - **等価性への影響**: 理論等価（外部仕様は同一で、フロート配置アルゴリズムの入出力境界が明確になる）
 - **語彙への影響**: 「PlacementSpec」「FloatPlacement」を導入
 
+### 6.26 LSP 補完と hover は専用 read model に投影する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
+- **判断内容**: `CompletionProvider` / `HoverProvider` はその場で registry や package snapshot を走査せず、補完用の `CompletionIndex` と説明用の `HoverDocCatalog` を参照する。`CompletionIndex` は active な command/environment registry と `DocumentState` の label/citation 状態から再構築し、`HoverDocCatalog` は active な class/package snapshot の説明資産をコマンド単位に正規化する
+- **根拠**:
+  - 観測事実: REQ-FUNC-035 は package-aware な command/environment 補完と label/cite 補完を Must とし、REQ-FUNC-037 はコマンドの構文と使用例を含む hover を要求している
+  - 代替案: `CompletionProvider` / `HoverProvider` が毎回 `CommandRegistry` / `EnvironmentRegistry` / package snapshot を直接探索する
+  - 分離証人: `amsmath` を読み込んだ文書で `\begin{al` を補完しつつ `\frac` の hover を引くケース。専用 read model なら active package 群に応じた候補と説明を同じ再コンパイル成果から安定して返せるが、都度探索モデルでは候補生成と説明検索の根拠が分散し差分更新時の整合性を説明しにくい
+- **等価性への影響**: 理論等価（外部仕様は同一で、LSP の参照元が明確になる）
+- **語彙への影響**: 「CompletionIndex」「CompletionCandidate」「HoverDocCatalog」「HoverDoc」を導入
+
+### 6.27 fontspec 指定は FontSpec / FontFeatureSet / FontFallbackChain へ正規化する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: パーサー/マクロエンジン / フォント管理
+- **判断内容**: `fontspec` の `\setmainfont` / `\setsansfont` / `\setmonofont` と `TextStyle` のフォント要求は、生の文字列オプションのまま保持せず `FontSpec` へ正規化する。OpenType feature は `FontFeatureSet`、代替フォント列は `FontFallbackChain` で表現し、`FontManager` / `FontResolverCache` はこの canonical form をキーに解決する
+- **根拠**:
+  - 観測事実: REQ-FUNC-025 はフォント名解決、OpenType feature 適用、fallback chain を Should として要求し、REQ-FUNC-017/019 は OpenType 読み込みとフォント解決を要求している
+  - 代替案: `fontspec` オプション文字列を各 call site で個別解釈し、キャッシュキーは family 名だけにする
+  - 分離証人: `\setmainfont{Noto Serif}[Ligatures=TeX,Numbers=OldStyle]` と記号用 fallback font を併用するケース。`FontSpec` モデルなら feature と fallback の差が解決キーと描画責務に残るが、文字列ばらまきモデルでは feature 差分と fallback 順序がキャッシュ境界から失われやすい
+- **等価性への影響**: 理論等価（外部仕様は同一で、fontspec の責務境界が明確になる）
+- **語彙への影響**: 「FontSpec」「FontFeatureSet」「FontFallbackChain」「FontFamilyRef」を導入
+
+### 6.28 章単位並列化の独立性判定とページ統合は ChapterPartitionPlanner / PaginationMergeCoordinator が所有する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: 差分コンパイル / タイプセッティング
+- **判断内容**: REQ-FUNC-032 の章単位並列化は、実行スケジューリング自体ではなく、`DependencyGraph` / `DocumentState` を用いた独立章判定を `ChapterPartitionPlanner` が、章ごとの組版結果から逐次ページ番号と参照整合性を復元する処理を `PaginationMergeCoordinator` が所有する
+- **根拠**:
+  - 観測事実: REQ-FUNC-032 は章間独立性判定、並列組版、結果マージとページ番号統合を 1 つの要件として要求している
+  - 代替案: インフラストラクチャ層の scheduler が heuristic に章を分割し、統合も単純連結に任せる
+  - 分離証人: 10 章文書のうち 3 章だけが前章ラベルを参照するケース。`ChapterPartitionPlanner` モデルでは参照依存を見て安全な章だけ並列化し、`PaginationMergeCoordinator` が最終ページオフセットを適用して sequential compile と同じページ番号へ戻せるが、heuristic 分割モデルではどの章が独立か、どこでページ番号を再調停するかが曖昧になる
+- **等価性への影響**: 理論等価（外部仕様は同一で、章単位並列化の責務が明確になる）
+- **語彙への影響**: 「ChapterPartitionPlanner」「ChapterPartitionPlan」「ChapterWorkUnit」「ChapterLayoutFragment」「PaginationMergeCoordinator」「PaginationMergeResult」を導入
+
 ## 7. ビジネスルール一覧
 
 要件定義書から抽出した主要なビジネスルール・不変条件の一覧。
@@ -2293,11 +2441,16 @@ stateDiagram-v2
 | BR-23 | amsmath の複数行 display math は `DisplayMathBlock` が保持し、各 `MathAlignmentRow` は `EquationTag` により自動番号/`\tag`/`\notag` を表現する。`AmsmathLayoutEngine` は `CounterStore` を参照して行揃えと番号付けを確定する | REQ-FUNC-009 / REQ-FUNC-021 | タイプセッティング / パーサー/マクロエンジン |
 | BR-24 | `\input` / `\include` / `\InputIfFileExists` は `InputStack` を push/pop し、current-file 基準の `ResolutionContext.currentDirectory` で解決される。`\include` の重複抑止と分離 `.aux` 出力先は `IncludeState` が管理する | REQ-FUNC-005 | パーサー/マクロエンジン |
 | BR-25 | フロート指定子は `PlacementSpec.priorityOrder` と `force` へ正規化され、`FloatQueue` は選択された配置領域とページ内矩形を `FloatPlacement` として返し `PageBox` に保持する | REQ-FUNC-010 | タイプセッティング |
+| BR-26 | LSP 補完は `CompletionIndex` が active な command/environment registry と `DocumentState` の label/citation 状態から再構築され、package-aware な command/environment 候補と `\ref` / `\cite` 候補だけを返す | REQ-FUNC-035 | パーサー/マクロエンジン / 開発者ツール |
+| BR-27 | LSP hover は `HoverDocCatalog` が active な class/package snapshot の説明資産をコマンド単位に索引化し、構文・要約・使用例を返す | REQ-FUNC-037 | パーサー/マクロエンジン / 開発者ツール |
+| BR-28 | `fontspec` によるフォント指定は `FontSpec` へ正規化され、OpenType feature は `FontFeatureSet`、代替フォント列は `FontFallbackChain` で保持される。`FontManager` / `FontResolverCache` はこの canonical form を解決キーとして扱う | REQ-FUNC-025 / REQ-FUNC-017 / REQ-FUNC-019 | パーサー/マクロエンジン / フォント管理 |
+| BR-29 | 章単位並列化では `ChapterPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立章だけを `ChapterWorkUnit` として抽出し、`PaginationMergeCoordinator` が章ごとの組版結果を順序付きに統合して sequential compile と同じページ番号へ復元する | REQ-FUNC-032 | 差分コンパイル / タイプセッティング |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.15 | 2026-03-12 | CompletionIndex/HoverDocCatalog、FontSpec/FontFeatureSet/FallbackChain、章単位並列化の partition/merge 責務を追加し REQ-FUNC-025/032/035/037 のトレーサビリティを補強 | Codex |
 | 0.1.14 | 2026-03-12 | amsmath の複数行 display math、ファイル入力スタック/include 状態、フロート配置の入出力型を追加して REQ-FUNC-005/009/010/021 のトレーサビリティを補強 | Codex |
 | 0.1.13 | 2026-03-12 | フォント埋め込み計画器、tikz/pgf の階層 scope/clip/arrow、脚注キュー、preview view restore の必須化を反映 | Codex |
 | 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch set の依存グラフ同期、preview の最近傍ページ fallback を追加 | Codex |
