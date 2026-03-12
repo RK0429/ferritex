@@ -4,7 +4,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.12          |
+| バージョン | 0.1.13          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -499,7 +499,7 @@ classDiagram
 
 ### 3.2 タイプセッティング コンテキスト
 
-ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。
+ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。
 
 ```mermaid
 classDiagram
@@ -631,6 +631,24 @@ classDiagram
         +FootnoteQueue footnotes
         +Dimen pageHeight
         +breakPage() PageBox
+    }
+    class FootnoteQueue {
+        <<Entity>>
+        +List~FootnoteItem~ pending
+        +enqueue(FootnoteItem) void
+        +reserveForPage(Dimen) List~FootnotePlacement~
+        +spillRemaining() List~FootnoteItem~
+    }
+    class FootnoteItem {
+        <<ValueObject>>
+        +HBox marker
+        +VBox content
+        +SourceSpan sourceSpan
+    }
+    class FootnotePlacement {
+        <<ValueObject>>
+        +FootnoteItem item
+        +Rect rect
     }
     class FloatQueue {
         <<Entity>>
@@ -794,8 +812,11 @@ classDiagram
     Paragraph o-- Node
     PageBuilder o-- Node
     PageBuilder --> FloatQueue
+    PageBuilder --> FootnoteQueue
     PageBuilder --> DocumentState
     PageBuilder --> PageBox
+    FootnoteQueue o-- FootnoteItem
+    FootnoteQueue --> FootnotePlacement
     FloatQueue o-- FloatItem
     MathList o-- MathAtom
     MathAtom --> Box
@@ -837,6 +858,8 @@ classDiagram
 
 ### 3.3 グラフィック描画 コンテキスト
 
+`GraphicsScene` はフラットな描画命令列ではなく、tikz/pgf の style 継承・クリッピング・矢印指定を保持する階層スコープを持つ。`GraphicGroup` が group/scope 単位の継承スタイルと clip path を表し、`VectorPath` は path ごとの矢印指定を保持したまま PDF 射影へ渡される。
+
 ```mermaid
 classDiagram
     class GraphicsBox {
@@ -854,11 +877,19 @@ classDiagram
         +Rect bounds
         +int zIndex
     }
+    class GraphicGroup {
+        <<Entity>>
+        +List~GraphicNode~ children
+        +GraphicStyle inheritedStyle
+        +ClipPath clipPath
+        +Transform transform
+    }
     class VectorPath {
         <<ValueObject>>
         +List~PathCommand~ commands
         +PaintStyle stroke
         +PaintStyle fill
+        +ArrowSpec arrows
         +Transform transform
     }
     class ExternalGraphic {
@@ -888,6 +919,22 @@ classDiagram
         +PathVerb verb
         +List~Dimen~ operands
     }
+    class GraphicStyle {
+        <<ValueObject>>
+        +PaintStyle stroke
+        +PaintStyle fill
+        +Color textColor
+    }
+    class ClipPath {
+        <<ValueObject>>
+        +List~PathCommand~ commands
+        +FillRule fillRule
+    }
+    class ArrowSpec {
+        <<ValueObject>>
+        +ArrowHeadKind start
+        +ArrowHeadKind end
+    }
     class PaintStyle {
         <<ValueObject>>
         +Color color
@@ -914,14 +961,19 @@ classDiagram
         +loadGraphic(LogicalPath, ResolutionContext) ExternalGraphic
     }
 
+    GraphicNode <|-- GraphicGroup
     GraphicNode <|-- VectorPath
     GraphicNode <|-- ExternalGraphic
     GraphicNode <|-- GraphicText
+    GraphicGroup o-- GraphicNode
+    GraphicGroup --> GraphicStyle
+    GraphicGroup --> ClipPath
     ExternalGraphic <|-- RasterImage
     ExternalGraphic <|-- PdfGraphic
     GraphicsBox --> GraphicsScene
     GraphicsScene o-- GraphicNode
     VectorPath o-- PathCommand
+    VectorPath --> ArrowSpec
     VectorPath --> PaintStyle
     VectorPath --> Transform
     ExternalGraphic --> Transform
@@ -1096,7 +1148,7 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
-`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`FontEmbeddingPlanner` は `TextRun` 群からページ横断の使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` と `ToUnicode CMap` を構築する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
 
 ```mermaid
 classDiagram
@@ -1262,6 +1314,23 @@ classDiagram
         +Rect mediaBox
         +bytes formXObjectData
     }
+    class FontSubsetPlan {
+        <<ValueObject>>
+        +FontId fontId
+        +Set~GlyphId~ usedGlyphs
+        +bool emitToUnicode
+    }
+    class FontEmbeddingPlanner {
+        <<Service>>
+        +plan(List~PageRenderPlan~) List~FontSubsetPlan~
+        +embed(List~FontSubsetPlan~) List~EmbeddedFont~
+    }
+    class FontManager {
+        <<Upstream Service>>
+    }
+    class GlyphSubsetter {
+        <<Upstream Service>>
+    }
     class GraphicResourceEncoder {
         <<Service>>
         +embedRaster(RasterImage) EmbeddedImage
@@ -1295,6 +1364,7 @@ classDiagram
     }
 
     PdfRenderer --> PdfDocument
+    PdfRenderer --> FontEmbeddingPlanner
     PdfRenderer --> GraphicResourceEncoder
     PdfRenderer --> SyncTexBuilder
     PdfRenderer --> NavigationState : consumes
@@ -1330,6 +1400,11 @@ classDiagram
     PdfDocument o-- EmbeddedFont
     PdfDocument o-- EmbeddedImage
     PdfDocument o-- EmbeddedPdfGraphic
+    FontEmbeddingPlanner --> FontSubsetPlan
+    FontEmbeddingPlanner --> EmbeddedFont
+    FontEmbeddingPlanner ..> TextRun : aggregates glyphs
+    FontEmbeddingPlanner ..> FontManager : loads fonts
+    FontEmbeddingPlanner ..> GlyphSubsetter : subsets
     GraphicResourceEncoder --> EmbeddedImage
     GraphicResourceEncoder --> EmbeddedPdfGraphic
     GraphicResourceEncoder ..> RasterImage : encodes
@@ -1417,7 +1492,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSession` ごとの閲覧位置を保持し、新しい PDF のページ数に合わせて最近傍の有効ページへ clamp する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSession` ごとの閲覧位置を保持し、PDF 更新のたびに保存済み view を再適用したうえで、新しい PDF のページ数に合わせて最近傍の有効ページへ clamp する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1505,7 +1580,6 @@ classDiagram
     class PreviewUpdate {
         <<ValueObject>>
         +bytes pdf
-        +bool retainView
         +int pageCount
     }
     class RuntimeOptions {
@@ -1686,6 +1760,8 @@ stateDiagram-v2
 | ペナルティ (Penalty) | 行/ページ分割の位置を制御する整数値。高いほど分割されにくい | 行分割, ページ分割 |
 | 行分割 (Line Breaking) | Knuth-Plass アルゴリズムにより段落の最適な改行位置を決定する処理 | Paragraph, LineBreakParams |
 | フロート (Float) | テキストの流れから独立して配置されるオブジェクト。配置指定子で制御 | FloatQueue, PageBuilder |
+| 脚注キュー (FootnoteQueue) | ページ下部へ配置待ちの脚注を保持し、現在ページへ割り当てる脚注高さを予約するキュー | PageBuilder, FootnoteItem |
+| 脚注項目 (FootnoteItem) | 脚注マーカー、本文、由来ソース範囲を持つ脚注 1 件 | FootnoteQueue, FootnotePlacement |
 | ドキュメント状態 (DocumentState) | カウンタ、ラベル、参考文献、目次、索引、ナビゲーション状態など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable, BibliographyState, TableOfContentsState, IndexState, NavigationState |
 | 相互参照 (Cross Reference) | `\label`/`\ref`/`\pageref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
 | 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table と参考文献エントリを保持し、`\cite` を解決する状態 | CitationTable, BblSnapshot |
@@ -1706,7 +1782,11 @@ stateDiagram-v2
 |---|---|---|
 | グラフィックシーン (GraphicsScene) | `tikz` / `graphicx` の結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した描画単位 | GraphicsBox, GraphicNode |
 | GraphicsBox | 組版結果に埋め込める寸法付きの描画ボックス | GraphicsScene, PlacementContext |
+| GraphicGroup | tikz/pgf の group/scope に対応する階層ノード。継承スタイルと clip path を子ノードへ適用する | GraphicsScene, GraphicStyle, ClipPath |
+| GraphicStyle | グループ単位で継承される描画スタイル。線・塗り・テキスト色の既定値を保持する | GraphicGroup, PaintStyle |
+| ClipPath | group/scope に対して適用されるクリッピング形状 | GraphicGroup, PathCommand |
 | VectorPath | 線・矩形・曲線などのベクター描画要素 | PathCommand, PaintStyle |
+| ArrowSpec | パスの始点/終点に付与される矢印指定 | VectorPath |
 | ExternalGraphic | 外部ファイル由来のグラフィック要素。共通のクリッピング・変換情報を持つ | RasterImage, PdfGraphic |
 | RasterImage | PNG/JPEG 画像などのラスタ要素 | GraphicAssetResolver, Transform |
 | PdfGraphic | 埋め込み元 PDF のページをベクター性を保持したまま扱う外部グラフィック要素 | GraphicAssetResolver, Transform |
@@ -1743,6 +1823,8 @@ stateDiagram-v2
 | リンク先 (LinkTarget) | 内部 named destination または外部 URI を表すリンク解決先 | LinkAnnotationPlan, Annotation |
 | リンク装飾 (LinkStyle) | リンクテキスト色と PDF 注釈境界線の描画規則 | LinkAnnotationPlan, Annotation |
 | アノテーション (Annotation) | PDF 上のリンク・しおり等のインタラクティブ要素 | hyperref |
+| フォントサブセット計画 (FontSubsetPlan) | 1 フォントについて PDF に埋め込む使用グリフ集合と ToUnicode CMap 生成要否を保持する計画 | FontEmbeddingPlanner, EmbeddedFont |
+| フォント埋め込み計画器 (FontEmbeddingPlanner) | `TextRun` 群から使用グリフを集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` を構築するサービス | FontSubsetPlan, EmbeddedFont |
 | PDF メタデータ草案 (PdfMetadataDraft) | hyperref が収集した `pdftitle` / `pdfauthor` などの中間状態。`PdfRenderer` が `PdfMetadata` へ変換する | NavigationState |
 | アウトライン草案エントリ (OutlineDraftEntry) | セクショニングや hyperref から収集したしおり候補。`PdfRenderer` が PDF の `OutlineEntry` へ変換する | NavigationState |
 | 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
@@ -1997,13 +2079,49 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール
-- **判断内容**: `PreviewServer` は生の接続一覧ではなく `PreviewSession` を保持し、各セッションが `PreviewViewState` として現在ページ・ページ内オフセット・ズーム倍率を持つ。PDF 更新時は `PreviewUpdate.retainView` に従って閲覧位置を再適用し、保持ページが新 PDF に存在しない場合は `PreviewUpdate.pageCount` を用いて最近傍の有効ページへ clamp する
+- **判断内容**: `PreviewServer` は生の接続一覧ではなく `PreviewSession` を保持し、各セッションが `PreviewViewState` として現在ページ・ページ内オフセット・ズーム倍率を持つ。PDF 更新時は常に保存済みの閲覧位置を再適用し、保持ページが新 PDF に存在しない場合は `PreviewUpdate.pageCount` を用いて最近傍の有効ページへ clamp する
 - **根拠**:
   - 観測事実: REQ-FUNC-040 はホットリロード後も閲覧ページ位置が維持されること、および保持ページが消滅した場合は最近傍の有効ページへフォールバックすることを要求している
   - 代替案: preview クライアントが暗黙に位置復元すると仮定し、サーバー側モデルでは raw PDF 配信だけを表現する
   - 分離証人: 20 ページ目を閲覧中に再コンパイル後の PDF が 15 ページへ短縮されるケース。`PreviewSession` + `PreviewViewState.clampToPageCount` モデルでは 15 ページ目へ決定的にフォールバックできるが、raw 配信モデルでは fallback 先が実装依存になり位置維持要件を満たせない
 - **等価性への影響**: 理論等価（外部仕様は同一で、preview view restore の責務境界が明確になる）
 - **語彙への影響**: 「PreviewSession」「PreviewViewState」「PreviewUpdate」を導入
+
+### 6.20 フォント埋め込み計画は FontEmbeddingPlanner が所有する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: PDF 生成 / フォント管理
+- **判断内容**: PDF へ埋め込むフォントの使用グリフ収集、subset 化、ToUnicode CMap 生成は `FontEmbeddingPlanner` が所有し、`TextRun` 群から `FontSubsetPlan` を作成したうえで `FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` を構築する
+- **根拠**:
+  - 観測事実: REQ-FUNC-014 は使用グリフ収集、サブセット埋め込み、ToUnicode CMap 生成を Must として要求している
+  - 代替案: `PdfRenderer` または `FontManager` が暗黙に subset を構築する
+  - 分離証人: 同じ OpenType フォントが複数ページにまたがって部分的に使用されるケース。`FontEmbeddingPlanner` モデルでは全ページの `TextRun` を集約して 1 つの `FontSubsetPlan` に落とせるが、暗黙モデルでは subset 対象の集約境界が不明確になり、重複埋め込みや ToUnicode CMap 欠落を説明しにくい
+- **等価性への影響**: 理論等価（外部仕様は同一で、フォント埋め込み責務の所有者が明確になる）
+- **語彙への影響**: 「FontEmbeddingPlanner」「FontSubsetPlan」を導入
+
+### 6.21 tikz/pgf の継承スタイルとクリッピングは GraphicGroup で保持する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: グラフィック描画 / PDF 生成
+- **判断内容**: `GraphicsScene` は flat なノード列ではなく `GraphicGroup` を含む階層構造とし、tikz/pgf の scope 単位で継承される style と clip path を `GraphicGroup` に保持する。path ごとの矢印指定は `VectorPath.arrows` で保持する
+- **根拠**:
+  - 観測事実: REQ-FUNC-023 は変換、スタイル継承、クリッピング、矢印指定を Must として要求している
+  - 代替案: すべての描画要素を style 解決済みの flat `GraphicNode` へ潰し込む
+  - 分離証人: `scope` 内で線色と clip を設定し、その内部で `\draw[->] ...` を行う tikzpicture。`GraphicGroup` モデルでは group 単位の継承規則と clip を後段へ保ったまま path ごとの矢印指定を追加できるが、flat モデルでは style 由来と clip 境界が失われやすい
+- **等価性への影響**: 理論等価（外部仕様は同一で、tikz/pgf の中間表現力が向上する）
+- **語彙への影響**: 「GraphicGroup」「GraphicStyle」「ClipPath」「ArrowSpec」を導入
+
+### 6.22 脚注配置は FootnoteQueue が所有する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: タイプセッティング
+- **判断内容**: `PageBuilder` は `FootnoteQueue` を所有し、脚注本文の保留、現在ページ下部への予約、あふれた脚注の次ページ繰り延べを `FootnoteItem` / `FootnotePlacement` で表現する
+- **根拠**:
+  - 観測事実: REQ-FUNC-008 は脚注を含むページ分割を Must として要求している
+  - 代替案: 脚注を `FloatQueue` と同一視する、または inline box の後処理として扱う
+  - 分離証人: 本文末尾で複数の脚注が追加され、すべてを現在ページ下部へ収めると本文領域を侵食するケース。`FootnoteQueue` モデルでは脚注予約量と繰り延べを `PageBuilder` と同じ境界で決定できるが、float/後処理モデルでは本文と脚注のページ高調停が分裂する
+- **等価性への影響**: 理論等価（外部仕様は同一で、脚注配置責務の所有者が明確になる）
+- **語彙への影響**: 「FootnoteQueue」「FootnoteItem」「FootnotePlacement」を導入
 
 ## 7. ビジネスルール一覧
 
@@ -2029,12 +2147,16 @@ stateDiagram-v2
 | BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に、named destination は `PlacedDestination` に正規化される。`LinkStyle.textColor` は必要に応じて `TextRun.style.fillColor` へコピーされ、`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / text color / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
 | BR-17 | SyncTeX は `PageBox` に含まれる `PlacedNode` の `SourceSpan` と配置矩形から `SyncTexBuilder` が `SyncTraceFragment` 群を生成し、forward search では SourceLocation に交差する fragment 群を、inverse search では `PdfPosition` を含む fragment に対応する `SourceSpan` を返す | REQ-FUNC-041 | タイプセッティング / PDF 生成 |
 | BR-18 | watch 実行中の追加変更は `RecompileScheduler` が `PendingChangeQueue` へ集約し、コンパイル中に並列実行せず、現在のコンパイル完了後に coalesce 済み変更集合で再コンパイルする。各コンパイル完了後は最新 `DependencyGraph` から `FileWatcher.watchedPaths` を再同期する | REQ-FUNC-038 / REQ-FUNC-039 | 開発者ツール / 差分コンパイル |
-| BR-19 | PDF プレビュー配信は `PreviewSession` ごとに `PreviewViewState` を保持し、PDF 更新時は可能な限り同じページ位置とズームを再適用する。保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする | REQ-FUNC-040 | 開発者ツール |
+| BR-19 | PDF プレビュー配信は `PreviewSession` ごとに `PreviewViewState` を保持し、PDF 更新時は保存済みの同じページ位置とズームを再適用する。保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする | REQ-FUNC-040 | 開発者ツール |
+| BR-20 | PDF フォント埋め込みは `FontEmbeddingPlanner` が `TextRun` 群から使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して subset font と ToUnicode CMap を生成する | REQ-FUNC-014 / REQ-FUNC-017 | PDF 生成 / フォント管理 |
+| BR-21 | tikz/pgf の描画は `GraphicGroup` が継承スタイルと clip path を保持し、`VectorPath` が path ごとの矢印指定を保持したまま PDF 射影へ渡される | REQ-FUNC-023 | グラフィック描画 / PDF 生成 |
+| BR-22 | 脚注は `FootnoteQueue` に蓄積され、`PageBuilder` が現在ページ下部へ予約できる脚注だけを `FootnotePlacement` として確定し、残りを次ページへ繰り延べる | REQ-FUNC-008 | タイプセッティング |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.13 | 2026-03-12 | フォント埋め込み計画器、tikz/pgf の階層 scope/clip/arrow、脚注キュー、preview view restore の必須化を反映 | Codex |
 | 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch set の依存グラフ同期、preview の最近傍ページ fallback を追加 | Codex |
 | 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch scheduler/queue、preview session/view state を追加 | Codex |
 | 0.1.10 | 2026-03-12 | SourceSpan / PlacedNode / PlacedDestination / SyncTexBuilder、colorlinks の text-side style、FileAccessGate を追加 | Codex |
