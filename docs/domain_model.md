@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.1           |
+| バージョン | 0.1.3           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.1 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.3 |
 
 ## 1. サブドメイン分類
 
@@ -226,9 +226,11 @@ classDiagram
     class PathAccessPolicy {
         <<ValueObject>>
         +FilePath projectRoot
+        +List~FilePath~ overlayRoots
         +List~FilePath~ bundleRoots
         +FilePath cacheDir
         +List~FilePath~ outputRoots
+        +Set~String~ outputReadbackExtensions
         +FilePath privateTempRoot
     }
     class InputSource {
@@ -448,12 +450,21 @@ classDiagram
         +PaintStyle fill
         +Transform transform
     }
-    class RasterImage {
+    class ExternalGraphic {
         <<ValueObject>>
-        +AssetHandle imageAsset
-        +Size intrinsicSize
+        +AssetHandle sourceAsset
         +Rect clipRect
         +Transform transform
+    }
+    class RasterImage {
+        <<ValueObject>>
+        +ImageFormat format
+        +Size intrinsicSize
+    }
+    class PdfGraphic {
+        <<ValueObject>>
+        +int pageIndex
+        +Rect mediaBox
     }
     class GraphicText {
         <<ValueObject>>
@@ -487,23 +498,25 @@ classDiagram
         +Point anchor
         +Size availableArea
     }
-    class ImageResolver {
+    class GraphicAssetResolver {
         <<Service>>
-        +loadImage(LogicalPath, ResolutionContext) RasterImage
+        +loadGraphic(LogicalPath, ResolutionContext) ExternalGraphic
     }
 
     GraphicNode <|-- VectorPath
-    GraphicNode <|-- RasterImage
+    GraphicNode <|-- ExternalGraphic
     GraphicNode <|-- GraphicText
+    ExternalGraphic <|-- RasterImage
+    ExternalGraphic <|-- PdfGraphic
     GraphicsBox --> GraphicsScene
     GraphicsScene o-- GraphicNode
     VectorPath o-- PathCommand
     VectorPath --> PaintStyle
     VectorPath --> Transform
-    RasterImage --> Transform
+    ExternalGraphic --> Transform
     GraphicText --> Transform
     GraphicsCompiler --> PlacementContext
-    GraphicsCompiler --> ImageResolver
+    GraphicsCompiler --> GraphicAssetResolver
 ```
 
 ### 3.4 差分コンパイル コンテキスト
@@ -687,6 +700,13 @@ classDiagram
         +Dimen width
         +Dimen height
     }
+    class EmbeddedPdfGraphic {
+        <<ValueObject>>
+        +AssetHandle sourceAsset
+        +int sourcePageIndex
+        +Rect mediaBox
+        +bytes formXObjectData
+    }
     class SyncTexData {
         <<ValueObject>>
         +Map~SourceLocation, PdfPosition~ forwardMap
@@ -701,6 +721,7 @@ classDiagram
     ContentStream o-- PdfOperator
     PdfDocument o-- EmbeddedFont
     PdfDocument o-- EmbeddedImage
+    PdfDocument o-- EmbeddedPdfGraphic
 ```
 
 ### 3.7 フォント管理 コンテキスト
@@ -711,6 +732,10 @@ classDiagram
         <<Service>>
         +resolveFont(FontSpec) AssetHandle
         +loadFont(FontSpec, AssetHandle) LoadedFont
+    }
+    class OverlaySet {
+        <<Entity>>
+        +resolve(LogicalAssetId) AssetHandle
     }
     class LoadedFont {
         <<Entity>>
@@ -762,8 +787,9 @@ classDiagram
     FontMetrics o-- GlyphMetric
     LoadedFont <|-- OpenTypeFont
     LoadedFont <|-- TfmFont
-    FontManager --> HostFontCatalog
+    FontManager --> OverlaySet
     FontManager --> FontResolverCache
+    OverlaySet --> HostFontCatalog
     FontManager ..> LoadedFont : produces
     GlyphSubsetter ..> LoadedFont : reads
 ```
@@ -788,6 +814,14 @@ classDiagram
     class DefinitionProvider {
         <<Service>>
         +findDefinition(TextDocument, Position) Location
+    }
+    class HoverProvider {
+        <<Service>>
+        +hover(TextDocument, Position) Hover
+    }
+    class CodeActionProvider {
+        <<Service>>
+        +suggest(TextDocument, Range, Diagnostic) List~CodeAction~
     }
     class FileWatcher {
         <<Entity>>
@@ -828,6 +862,8 @@ classDiagram
     LspServer --> DiagnosticProvider
     LspServer --> CompletionProvider
     LspServer --> DefinitionProvider
+    LspServer --> HoverProvider
+    LspServer --> CodeActionProvider
     FileWatcher ..> CliRunner : triggers
     PreviewServer ..> CliRunner : receives PDF
     CliRunner --> CompileOptions
@@ -897,7 +933,7 @@ stateDiagram-v2
 | スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタの有効範囲 | ScopeStack |
 | レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
 | コンパイルセッション (CompilationSession) | 1 回のコンパイルパスで共有される可変 TeX 状態の集約。カテゴリコード、レジスタ、ラベル、実行ポリシーを保持する | DocumentState, ExecutionPolicy |
-| パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / bundle roots / cache dir / output roots / private temp root を保持する実行ポリシー | ExecutionPolicy |
+| パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する実行ポリシー | ExecutionPolicy |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 
 ### 5.2 タイプセッティング コンテキスト
@@ -917,10 +953,12 @@ stateDiagram-v2
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
-| グラフィックシーン (GraphicsScene) | `tikz` / `graphicx` の結果を PDF 非依存のベクター・ラスタ・テキスト要素へ正規化した描画単位 | GraphicsBox, GraphicNode |
+| グラフィックシーン (GraphicsScene) | `tikz` / `graphicx` の結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した描画単位 | GraphicsBox, GraphicNode |
 | GraphicsBox | 組版結果に埋め込める寸法付きの描画ボックス | GraphicsScene, PlacementContext |
 | VectorPath | 線・矩形・曲線などのベクター描画要素 | PathCommand, PaintStyle |
-| RasterImage | PNG/JPEG/PDF 画像などのラスタ/外部画像要素 | ImageResolver, Transform |
+| ExternalGraphic | 外部ファイル由来のグラフィック要素。共通のクリッピング・変換情報を持つ | RasterImage, PdfGraphic |
+| RasterImage | PNG/JPEG 画像などのラスタ要素 | GraphicAssetResolver, Transform |
+| PdfGraphic | 埋め込み元 PDF のページをベクター性を保持したまま扱う外部グラフィック要素 | GraphicAssetResolver, Transform |
 
 ### 5.4 差分コンパイル コンテキスト
 
@@ -938,7 +976,7 @@ stateDiagram-v2
 |---|---|---|
 | Ferritex Asset Bundle | 実行時に参照するクラス・パッケージ・フォント資産の不変スナップショット | AssetIndex, OverlaySet |
 | Asset Index | 論理名から資産ハンドルを高速解決する索引構造 | AssetBundle |
-| オーバーレイ (Overlay) | 公式バンドルの上に project-local 資産と host-local font catalog を重ねる解決レイヤー | OverlaySet |
+| オーバーレイ (Overlay) | 公式バンドルの上に project-local 資産、設定済み read-only overlay roots、host-local font catalog を重ねる解決レイヤー | OverlaySet |
 | Host Font Catalog | platform font discovery API から収集したホストフォント索引。overlay の一種として解決面に参加する | PlatformFontScanner, FontSnapshot |
 
 ### 5.6 PDF 生成 コンテキスト
@@ -948,6 +986,7 @@ stateDiagram-v2
 | コンテンツストリーム (ContentStream) | PDF ページの描画命令列 | PdfOperator |
 | アノテーション (Annotation) | PDF 上のリンク・しおり等のインタラクティブ要素 | hyperref |
 | 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
+| 埋め込み PDF グラフィック (EmbeddedPdfGraphic) | 外部 PDF ページを Form XObject 化して PDF 内へ再利用可能にした描画資産 | PdfGraphic |
 | SyncTeX データ | ソース位置と PDF 位置の双方向マッピング | SourceLocation |
 
 ### 5.7 フォント管理 コンテキスト
@@ -955,7 +994,7 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | フォントメトリクス (FontMetrics) | 文字幅・高さ・深さ・カーニング・リガチャ情報の集合 | GlyphMetric |
-| Host Font Catalog | platform font discovery API に基づき永続化されたホストフォント索引。`fontspec` 解決時に hot path で再走査しない | HostFontCatalog, FontResolverCache |
+| Host Font Catalog | platform font discovery API に基づき永続化されたホストフォント索引。`fontspec` 解決時に hot path で再走査しないが、host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外 | HostFontCatalog, FontResolverCache |
 | OpenType フォント | OTF/TTF 形式のモダンフォント。GPOS/GSUB テーブルで高度な組版を制御 | fontspec |
 | TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 | Computer Modern |
 | グリフサブセット化 | 使用グリフのみを抽出してフォントデータを縮小する処理 | PDF 埋め込み |
@@ -1014,7 +1053,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: アセットランタイム / パーサー/マクロエンジン / フォント管理
-- **判断内容**: クラス・パッケージ・フォント資産は、Ferritex Asset Bundle とそのオーバーレイからのみ解決し、TeX Live / kpathsea は実行時依存にしない。Host Font Catalog は第三の資産源ではなく host-local overlay として扱う
+- **判断内容**: クラス・パッケージ・フォント資産は、Ferritex Asset Bundle とそのオーバーレイからのみ解決し、TeX Live / kpathsea は実行時依存にしない。オーバーレイは project-local 資産、設定済み read-only overlay roots、Host Font Catalog で構成し、Host Font Catalog は第三の資産源ではなく host-local overlay として扱う。ただし host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする
 - **根拠**:
   - 観測事実: 要件は pdfLaTeX 比 100 倍の高速化を求め、単一バイナリ + バンドルでの起動を要求する
   - 代替案: 実行時に `TEXMF` ツリーを走査し、kpathsea 互換の探索を行う
@@ -1038,7 +1077,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
-- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。`--output-dir` は明示的 `outputRoots` へ変換し、private temp root は Ferritex が管理する専用ディレクトリに限定する
+- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root は Ferritex 自身が生成した補助ファイルの readback に限って再読込を許可する
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれる
   - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
@@ -1059,15 +1098,17 @@ stateDiagram-v2
 | BR-5 | 差分コンパイルの出力はフルコンパイルと同一でなければならない | REQ-FUNC-030 | 差分コンパイル |
 | BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
 | BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。すべての実行要求は `ExecutionPolicy` を経由する | REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン |
-| BR-8 | ファイル読み書きはプロジェクトディレクトリ、Asset Bundle、キャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
+| BR-8 | ファイル読み書きは、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は Ferritex 自身が生成した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
-| BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、host-local Font Catalog overlay、Ferritex Asset Bundle から解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
+| BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、設定済み read-only overlay roots、host-local Font Catalog overlay、Ferritex Asset Bundle から解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 / REQ-NF-008 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
 | BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationSession` の `DocumentState` に対して行われる | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 | パーサー/マクロエンジン / タイプセッティング |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.3 | 2026-03-12 | output root の補助ファイル readback、host-local font の再現性境界、EmbeddedPdfGraphic、LSP codeAction/hover を反映 | Codex |
+| 0.1.2 | 2026-03-12 | overlayRoots、PdfGraphic、FontManager→OverlaySet を追加し、資産解決とアクセス境界の整合性を修正 | Codex |
 | 0.1.1 | 2026-03-12 | グラフィック描画コンテキスト、host-local overlay、共有 DocumentState、output roots/private temp root を反映 | Codex |
 | 0.1.0 | 2026-03-11 | 初版作成 | Claude Opus 4.6 |
