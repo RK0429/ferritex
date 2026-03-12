@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.0           |
-| 最終更新日 | 2026-03-11      |
+| バージョン | 0.1.1           |
+| 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.0 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.1 |
 
 ## 1. サブドメイン分類
 
@@ -19,11 +19,12 @@
 | タイプセッティング | **コア** | Knuth-Plass 行分割・ページ分割・数式組版が出力品質を決定 |
 | 差分コンパイル | **コア** | 100倍高速化の差別化要因。依存グラフ・キャッシュが独自価値 |
 | アセットランタイム | 支援 | クラス・パッケージ・フォント資産を事前インデックス化し、実行時の探索コストを最小化 |
+| グラフィック描画 | 支援 | `tikz` と `graphicx` の描画結果を PDF 非依存のプリミティブへ正規化し、出力責務を集約 |
 | PDF 生成 | 支援 | 確立された仕様（PDF規格）に従う変換処理 |
 | フォント管理 | 支援 | OpenType/TFM の読み込み・探索は確立された仕様に基づく |
 | 開発者ツール | 支援 | LSP / プレビュー / CLI はコアエンジンの公開インターフェース |
 
-**パッケージ互換レイヤーの位置づけ**: 独立サブドメインとはせず、パーサー/マクロエンジン内の `DocumentClassRegistry` / `PackageRegistry` / `CommandRegistry` / `EnvironmentRegistry` を拡張点として実現する。資産の実体はアセットランタイムが供給し、汎用パッケージ読み込み機構（`.sty` ファイルのパース・スナップショット読み込み・マクロ登録）はパーサー/マクロエンジンの責務とする。個別パッケージの振る舞い（amsmath → 数式組版、hyperref → PDF リンク、tikz → グラフィック描画、fontspec → フォント管理）は対応するサブドメイン内で処理する。
+**パッケージ互換レイヤーの位置づけ**: 独立サブドメインとはせず、パーサー/マクロエンジン内の `DocumentClassRegistry` / `PackageRegistry` / `CommandRegistry` / `EnvironmentRegistry` を拡張点として実現する。資産の実体はアセットランタイムが供給し、汎用パッケージ読み込み機構（`.sty` ファイルのパース・スナップショット読み込み・マクロ登録）はパーサー/マクロエンジンの責務とする。個別パッケージの振る舞い（amsmath → 数式組版、hyperref → PDF リンク、graphicx / tikz → グラフィック描画、fontspec → フォント管理）は対応するサブドメイン内で処理する。
 
 ## 2. コンテキストマップ
 
@@ -37,17 +38,22 @@ graph LR
 
     subgraph 支援ドメイン
         AR["アセットランタイム<br/>Asset Runtime"]
+        GR["グラフィック描画<br/>Graphics Rendering"]
         PG["PDF 生成<br/>PDF Generator"]
         FM["フォント管理<br/>Font Management"]
         DT["開発者ツール<br/>Developer Tools"]
     end
 
     AR -->|"OHS: クラス/パッケージ資産"| PE
-    AR -->|"OHS: フォント資産"| FM
+    AR -->|"OHS: フォント資産/host-local overlay"| FM
     PE -->|"OHS: トークンストリーム/コンパイルセッション"| TS
+    PE -->|"OHS: graphics command stream / asset refs"| GR
     PE -->|"OHS: 依存情報/状態スナップショット"| IC
+    TS -->|"OHS: 配置制約付き graphics box"| GR
     TS -->|"OHS: ボックスツリー"| PG
+    GR -->|"OHS: 描画プリミティブ"| PG
     TS -->|"顧客/供給者: メトリクス要求"| FM
+    GR -->|"顧客/供給者: テキストノード用フォント要求"| FM
     FM -->|"OHS: フォントデータ"| PG
     IC -->|"OHS: キャッシュ/変更範囲"| PE
     IC -->|"OHS: キャッシュ/変更範囲"| TS
@@ -61,6 +67,7 @@ graph LR
 - アセットランタイム → コア/支援は **OHS（公開ホストサービス）** — 事前インデックス化された不変資産を供給
 - コアドメイン間は **OHS（公開ホストサービス）** — 明確に定義されたストリーム/データ構造で接続
 - 開発者ツール → コアは **ACL（腐敗防止層）** — LSP プロトコル等の外部仕様をコアドメインの言語に変換
+- グラフィック描画 → PDF 生成は **OHS（公開ホストサービス）** — PDF 非依存の描画プリミティブを供給
 - タイプセッティング → フォント管理は **顧客/供給者** — タイプセッティングが必要なメトリクスを要求し、フォント管理が供給
 
 ## 3. ドメインモデル図
@@ -131,7 +138,11 @@ classDiagram
     class DocumentState {
         <<Entity>>
         +CounterStore counters
+        +CrossReferenceTable references
         +AuxState aux
+        +int passCount
+        +registerLabel(String, LabelInfo) void
+        +resolve(String) ResolvedRef
     }
     class CounterStore {
         <<Entity>>
@@ -141,10 +152,20 @@ classDiagram
     }
     class AuxState {
         <<Entity>>
-        +Map~String, LabelInfo~ labels
         +List~AuxWrite~ pendingWrites
         +mergePreviousPass(AuxSnapshot) void
-        +registerLabel(String, LabelInfo) void
+    }
+    class CrossReferenceTable {
+        <<Entity>>
+        +Map~String, LabelInfo~ labels
+        +List~UnresolvedRef~ unresolved
+        +isStable() bool
+    }
+    class LabelInfo {
+        <<ValueObject>>
+        +String key
+        +String value
+        +int pageNumber
     }
     class CommandRegistry {
         <<Entity>>
@@ -207,6 +228,8 @@ classDiagram
         +FilePath projectRoot
         +List~FilePath~ bundleRoots
         +FilePath cacheDir
+        +List~FilePath~ outputRoots
+        +FilePath privateTempRoot
     }
     class InputSource {
         <<Entity>>
@@ -240,7 +263,9 @@ classDiagram
     CompilationSession --> EnvironmentRegistry
     CompilationSession --> ExecutionPolicy
     DocumentState --> CounterStore
+    DocumentState --> CrossReferenceTable
     DocumentState --> AuxState
+    CrossReferenceTable o-- LabelInfo
     Lexer --> CompilationSession : reads
     Lexer --> InputSource
     Lexer ..> Token : produces
@@ -263,6 +288,8 @@ classDiagram
 ```
 
 ### 3.2 タイプセッティング コンテキスト
+
+ここで参照する `DocumentState` は、3.1 の `CompilationSession.documentState` と同一の共有エンティティである。
 
 ```mermaid
 classDiagram
@@ -343,17 +370,18 @@ classDiagram
         +Box content
     }
     class DocumentState {
-        <<Entity>>
+        <<Shared Entity>>
         +CounterStore counters
         +CrossReferenceTable references
+        +AuxState aux
         +int passCount
         +registerLabel(String, LabelInfo) void
         +resolve(String) ResolvedRef
     }
-    class CounterStore {
+    class AuxState {
         <<Entity>>
-        +step(String) int
-        +get(String) int
+        +List~AuxWrite~ pendingWrites
+        +mergePreviousPass(AuxSnapshot) void
     }
     class CrossReferenceTable {
         <<Entity>>
@@ -366,6 +394,12 @@ classDiagram
         +String key
         +String value
         +int pageNumber
+    }
+    class CounterStore {
+        <<Entity>>
+        +step(String) int
+        +set(String, int) void
+        +get(String) int
     }
 
     Box <|-- HBox
@@ -383,11 +417,96 @@ classDiagram
     MathAtom --> Box
     SectioningEngine --> DocumentState
     DocumentState --> CounterStore
+    DocumentState --> AuxState
     DocumentState --> CrossReferenceTable
     CrossReferenceTable o-- LabelInfo
 ```
 
-### 3.3 差分コンパイル コンテキスト
+### 3.3 グラフィック描画 コンテキスト
+
+```mermaid
+classDiagram
+    class GraphicsBox {
+        <<ValueObject>>
+        +Size size
+        +GraphicsScene scene
+    }
+    class GraphicsScene {
+        <<Entity>>
+        +List~GraphicNode~ nodes
+        +Rect viewport
+    }
+    class GraphicNode {
+        <<ValueObject>>
+        +Rect bounds
+        +int zIndex
+    }
+    class VectorPath {
+        <<ValueObject>>
+        +List~PathCommand~ commands
+        +PaintStyle stroke
+        +PaintStyle fill
+        +Transform transform
+    }
+    class RasterImage {
+        <<ValueObject>>
+        +AssetHandle imageAsset
+        +Size intrinsicSize
+        +Rect clipRect
+        +Transform transform
+    }
+    class GraphicText {
+        <<ValueObject>>
+        +String text
+        +FontSpec font
+        +Transform transform
+    }
+    class PathCommand {
+        <<ValueObject>>
+        +PathVerb verb
+        +List~Dimen~ operands
+    }
+    class PaintStyle {
+        <<ValueObject>>
+        +Color color
+        +Dimen lineWidth
+        +LineJoin join
+        +LineCap cap
+        +DashPattern dash
+    }
+    class Transform {
+        <<ValueObject>>
+        +Matrix3 matrix
+    }
+    class GraphicsCompiler {
+        <<Service>>
+        +compile(GraphicsCommandStream, PlacementContext) GraphicsBox
+    }
+    class PlacementContext {
+        <<ValueObject>>
+        +Point anchor
+        +Size availableArea
+    }
+    class ImageResolver {
+        <<Service>>
+        +loadImage(LogicalPath, ResolutionContext) RasterImage
+    }
+
+    GraphicNode <|-- VectorPath
+    GraphicNode <|-- RasterImage
+    GraphicNode <|-- GraphicText
+    GraphicsBox --> GraphicsScene
+    GraphicsScene o-- GraphicNode
+    VectorPath o-- PathCommand
+    VectorPath --> PaintStyle
+    VectorPath --> Transform
+    RasterImage --> Transform
+    GraphicText --> Transform
+    GraphicsCompiler --> PlacementContext
+    GraphicsCompiler --> ImageResolver
+```
+
+### 3.4 差分コンパイル コンテキスト
 
 ```mermaid
 classDiagram
@@ -452,7 +571,7 @@ classDiagram
     CompilationCache --> CacheConfig
 ```
 
-### 3.4 アセットランタイム コンテキスト
+### 3.5 アセットランタイム コンテキスト
 
 ```mermaid
 classDiagram
@@ -479,6 +598,16 @@ classDiagram
         +List~OverlayLayer~ layers
         +resolve(LogicalAssetId) AssetHandle
     }
+    class HostFontCatalog {
+        <<Entity>>
+        +CatalogVersion version
+        +Map~String, FontSnapshot~ entries
+        +refresh(PlatformFontScanner) void
+    }
+    class PlatformFontScanner {
+        <<Service>>
+        +scan() List~DiscoveredFont~
+    }
     class PackageSnapshot {
         <<ValueObject>>
         +String name
@@ -500,12 +629,15 @@ classDiagram
     AssetBundle --> BundleManifest
     AssetBundle --> AssetIndex
     OverlaySet --> AssetBundle
+    OverlaySet --> HostFontCatalog
     AssetIndex o-- PackageSnapshot
     AssetIndex o-- ClassSnapshot
     AssetIndex o-- FontSnapshot
+    HostFontCatalog o-- FontSnapshot
+    HostFontCatalog --> PlatformFontScanner
 ```
 
-### 3.5 PDF 生成 コンテキスト
+### 3.6 PDF 生成 コンテキスト
 
 ```mermaid
 classDiagram
@@ -571,7 +703,7 @@ classDiagram
     PdfDocument o-- EmbeddedImage
 ```
 
-### 3.6 フォント管理 コンテキスト
+### 3.7 フォント管理 コンテキスト
 
 ```mermaid
 classDiagram
@@ -586,8 +718,9 @@ classDiagram
         +FontMetrics metrics
         +GlyphStore glyphs
     }
-    class FontCatalog {
-        <<Entity>>
+    class HostFontCatalog {
+        <<Overlay>>
+        +CatalogVersion version
         +Map~String, FontDescriptor~ byPostScriptName
         +Map~String, FontDescriptor~ byFamilyStyle
     }
@@ -629,13 +762,13 @@ classDiagram
     FontMetrics o-- GlyphMetric
     LoadedFont <|-- OpenTypeFont
     LoadedFont <|-- TfmFont
-    FontManager --> FontCatalog
+    FontManager --> HostFontCatalog
     FontManager --> FontResolverCache
     FontManager ..> LoadedFont : produces
     GlyphSubsetter ..> LoadedFont : reads
 ```
 
-### 3.7 開発者ツール コンテキスト
+### 3.8 開発者ツール コンテキスト
 
 ```mermaid
 classDiagram
@@ -764,6 +897,7 @@ stateDiagram-v2
 | スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタの有効範囲 | ScopeStack |
 | レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
 | コンパイルセッション (CompilationSession) | 1 回のコンパイルパスで共有される可変 TeX 状態の集約。カテゴリコード、レジスタ、ラベル、実行ポリシーを保持する | DocumentState, ExecutionPolicy |
+| パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / bundle roots / cache dir / output roots / private temp root を保持する実行ポリシー | ExecutionPolicy |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 
 ### 5.2 タイプセッティング コンテキスト
@@ -779,7 +913,16 @@ stateDiagram-v2
 | 相互参照 (Cross Reference) | `\label`/`\ref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
 | 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
 
-### 5.3 差分コンパイル コンテキスト
+### 5.3 グラフィック描画 コンテキスト
+
+| 用語 | 定義 | 関連概念 |
+|---|---|---|
+| グラフィックシーン (GraphicsScene) | `tikz` / `graphicx` の結果を PDF 非依存のベクター・ラスタ・テキスト要素へ正規化した描画単位 | GraphicsBox, GraphicNode |
+| GraphicsBox | 組版結果に埋め込める寸法付きの描画ボックス | GraphicsScene, PlacementContext |
+| VectorPath | 線・矩形・曲線などのベクター描画要素 | PathCommand, PaintStyle |
+| RasterImage | PNG/JPEG/PDF 画像などのラスタ/外部画像要素 | ImageResolver, Transform |
+
+### 5.4 差分コンパイル コンテキスト
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
@@ -789,15 +932,16 @@ stateDiagram-v2
 | 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
 
-### 5.4 アセットランタイム コンテキスト
+### 5.5 アセットランタイム コンテキスト
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | Ferritex Asset Bundle | 実行時に参照するクラス・パッケージ・フォント資産の不変スナップショット | AssetIndex, OverlaySet |
 | Asset Index | 論理名から資産ハンドルを高速解決する索引構造 | AssetBundle |
-| オーバーレイ (Overlay) | 公式バンドルの上に project-local 資産を重ねる解決レイヤー | OverlaySet |
+| オーバーレイ (Overlay) | 公式バンドルの上に project-local 資産と host-local font catalog を重ねる解決レイヤー | OverlaySet |
+| Host Font Catalog | platform font discovery API から収集したホストフォント索引。overlay の一種として解決面に参加する | PlatformFontScanner, FontSnapshot |
 
-### 5.5 PDF 生成 コンテキスト
+### 5.6 PDF 生成 コンテキスト
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
@@ -806,11 +950,12 @@ stateDiagram-v2
 | 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
 | SyncTeX データ | ソース位置と PDF 位置の双方向マッピング | SourceLocation |
 
-### 5.6 フォント管理 コンテキスト
+### 5.7 フォント管理 コンテキスト
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | フォントメトリクス (FontMetrics) | 文字幅・高さ・深さ・カーニング・リガチャ情報の集合 | GlyphMetric |
+| Host Font Catalog | platform font discovery API に基づき永続化されたホストフォント索引。`fontspec` 解決時に hot path で再走査しない | HostFontCatalog, FontResolverCache |
 | OpenType フォント | OTF/TTF 形式のモダンフォント。GPOS/GSUB テーブルで高度な組版を制御 | fontspec |
 | TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 | Computer Modern |
 | グリフサブセット化 | 使用グリフのみを抽出してフォントデータを縮小する処理 | PDF 埋め込み |
@@ -857,9 +1002,9 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: 全コンテキスト横断
-- **判断内容**: パッケージ互換を独立サブドメインとせず、各サブドメインの拡張ポイントとして実現する
+- **判断内容**: パッケージ互換を独立サブドメインとせず、各サブドメインの拡張ポイントとして実現する。`graphicx` / `tikz` はグラフィック描画コンテキストへ束ねる
 - **根拠**:
-  - 観測事実: 個別パッケージの振る舞いは異なるサブドメインに属する（amsmath → 数式組版、hyperref → PDF リンク、tikz → グラフィック描画）
+  - 観測事実: 個別パッケージの振る舞いは異なるサブドメインに属する（amsmath → 数式組版、hyperref → PDF リンク、graphicx / tikz → グラフィック描画）
   - 代替案: 「パッケージ互換」を独立した境界づけられたコンテキストとする
   - 分離証人: 独立コンテキストモデルでは、amsmath の数式環境を処理するために「パッケージ互換コンテキスト」がタイプセッティングの内部（MathList, MathAtom）を知る必要があり、密結合が生じる。拡張ポイントモデルではこの問題が発生しない
 - **等価性への影響**: 理論等価（機能は同一。モジュール構造が異なる）
@@ -869,19 +1014,19 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: アセットランタイム / パーサー/マクロエンジン / フォント管理
-- **判断内容**: クラス・パッケージ・フォント資産は、Ferritex Asset Bundle とそのオーバーレイからのみ解決し、TeX Live / kpathsea は実行時依存にしない
+- **判断内容**: クラス・パッケージ・フォント資産は、Ferritex Asset Bundle とそのオーバーレイからのみ解決し、TeX Live / kpathsea は実行時依存にしない。Host Font Catalog は第三の資産源ではなく host-local overlay として扱う
 - **根拠**:
   - 観測事実: 要件は pdfLaTeX 比 100 倍の高速化を求め、単一バイナリ + バンドルでの起動を要求する
   - 代替案: 実行時に `TEXMF` ツリーを走査し、kpathsea 互換の探索を行う
   - 分離証人: クリーンマシンでのコールドスタートコンパイル。Asset Bundle モデルでは memory-mapped index 1回 + ハッシュ探索でクラス/パッケージ/フォントを解決できるが、実行時探索モデルではディレクトリ走査・`ls-R` 解析・OS フォント探索が必要になる
 - **等価性への影響**: 観測的非等価（展開・配備方式は変わるが、文書処理機能の目標は同一）
-- **語彙への影響**: 「Ferritex Asset Bundle」「Asset Index」を導入
+- **語彙への影響**: 「Ferritex Asset Bundle」「Asset Index」「Host Font Catalog」を導入
 
 ### 6.6 CompilationSession を可変 TeX 状態の集約境界とする
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング
-- **判断内容**: カテゴリコード、スコープ、レジスタ、カウンタ、ラベル、`.aux` 書き込み、コマンド/環境レジストリ、実行ポリシーを `CompilationSession` に集約する
+- **判断内容**: カテゴリコード、スコープ、レジスタ、カウンタ、ラベル、`.aux` 書き込み、参照安定性、コマンド/環境レジストリ、実行ポリシーを `CompilationSession` に集約する。タイプセッティングは同じ `DocumentState` を共有参照する
 - **根拠**:
   - 観測事実: `\section` によるカウンタ更新、`\label` の登録、`\ref` の解決、パッケージ読み込みは同一パスの逐次状態に依存する
   - 代替案: それぞれを独立サービスとして保持し、暗黙の共有状態またはグローバル状態で同期する
@@ -893,7 +1038,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
-- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する
+- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。`--output-dir` は明示的 `outputRoots` へ変換し、private temp root は Ferritex が管理する専用ディレクトリに限定する
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれる
   - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
@@ -914,14 +1059,15 @@ stateDiagram-v2
 | BR-5 | 差分コンパイルの出力はフルコンパイルと同一でなければならない | REQ-FUNC-030 | 差分コンパイル |
 | BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
 | BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。すべての実行要求は `ExecutionPolicy` を経由する | REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン |
-| BR-8 | ファイル読み書きはプロジェクトディレクトリ、Asset Bundle、キャッシュディレクトリに制限される | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
+| BR-8 | ファイル読み書きはプロジェクトディレクトリ、Asset Bundle、キャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
-| BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイと Ferritex Asset Bundle から解決し、実行時の `TEXMF` 全走査を行わない | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
+| BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、host-local Font Catalog overlay、Ferritex Asset Bundle から解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
 | BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationSession` の `DocumentState` に対して行われる | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 | パーサー/マクロエンジン / タイプセッティング |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.1 | 2026-03-12 | グラフィック描画コンテキスト、host-local overlay、共有 DocumentState、output roots/private temp root を反映 | Codex |
 | 0.1.0 | 2026-03-11 | 初版作成 | Claude Opus 4.6 |

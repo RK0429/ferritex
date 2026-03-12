@@ -5,8 +5,8 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.0           |
-| 最終更新日 | 2026-03-11      |
+| バージョン | 0.1.1           |
+| 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
@@ -38,7 +38,7 @@
 **スコープ内**:
 
 - LaTeX 文書をそのまま処理できるレベルの TeX/LaTeX 互換性
-- 主要パッケージ（amsmath, hyperref, tikz 等）のサポート
+- 主要パッケージ（amsmath, graphicx, hyperref, tikz 等）のサポート
 - PDF 直接出力
 - OpenType / TFM フォントサポート
 - Ferritex Asset Bundle によるクラス・パッケージ・フォント資産の事前インデックス化
@@ -63,7 +63,7 @@
 | -------- | ---------------------------------------- |
 | 実装言語     | Rust                                     |
 | 出力形式     | PDF 直接出力のみ                               |
-| パッケージ互換性 | 主要パッケージ（amsmath, hyperref, tikz 等）の動作が必須 |
+| パッケージ互換性 | 主要パッケージ（amsmath, graphicx, hyperref, tikz 等）の動作が必須 |
 | 実行時資産供給  | Ferritex Asset Bundle を使用し、TeX Live / kpathsea を実行時依存にしない |
 | プラットフォーム | Linux / macOS / Windows                  |
 
@@ -102,6 +102,8 @@
 | CTAN             | Comprehensive TeX Archive Network。TeX 関連パッケージのリポジトリ    |
 | Ferritex Asset Bundle | Ferritex が実行時に参照するクラス・パッケージ・フォント資産のスナップショット。事前インデックス化され memory-mapped に読み込まれる |
 | Asset Index      | Ferritex Asset Bundle 内の資産を論理名から O(1) 近傍で引ける索引構造        |
+| Host Font Catalog | platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集したホストフォント索引。Ferritex では host-local overlay として扱う |
+| グラフィックシーン | tikz/graphicx の描画結果を PDF 非依存のベクター・ラスタ・テキスト要素へ正規化した中間表現 |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
 
@@ -340,6 +342,7 @@
 - **処理**:
   - 画像フォーマットの判別と読み込み
   - スケーリング・クリッピングの適用
+  - `graphicx` の指定をグラフィックシーン上のラスタ画像ノードへ正規化
   - PDF 内への画像オブジェクト埋め込み
 - **出力**: 画像を含むページコンテンツストリーム
 - **例外**: サポート外形式・破損ファイルの場合はエラーを報告し、プレースホルダーボックスを配置
@@ -381,13 +384,13 @@
 - **入力**: フォント名、ファミリ名、スタイル指定、ファイル名
 - **処理**:
   - Ferritex Asset Bundle の Asset Index から TeX フォント資産（TFM, map, OpenType snapshot）を解決
-  - fontspec 用のシステムフォントは永続化されたローカル Font Catalog から解決し、コンパイルごとのフルスキャンを禁止
+  - fontspec 用のホストフォントは、platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集した Host Font Catalog を host-local overlay として解決し、コンパイルごとのフルスキャンを禁止
   - フォントマップファイル、PostScript 名、family/style の対応付けを行う
 - **出力**: フォント資産ハンドル（bundle asset id またはキャッシュ済みファイルハンドル）
 - **例外**: フォント未発見時にエラーを報告し、明示的なフォールバックチェーンが設定されている場合のみ代替フォントを使用
 - **受け入れ基準**:
   - Given Ferritex Asset Bundle のみが導入された環境, When `cmr10` を解決, Then Asset Index から対応する TFM 資産が返される
-  - Given ローカル Font Catalog に `Noto Serif` が登録済み, When `\setmainfont{Noto Serif}` を解決, Then OS ディレクトリ全走査なしで対象フォントが選択される
+  - Given Host Font Catalog に `Noto Serif` が登録済み, When `\setmainfont{Noto Serif}` を解決, Then OS ディレクトリ全走査なしで対象フォントが選択される
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -455,6 +458,7 @@
   - tikz の描画コマンド（`\draw`, `\fill`, `\node` 等）のパース・実行
   - 座標計算とパス構築
   - 変換（回転、拡大縮小、平行移動）、スタイル継承、クリッピング、矢印指定の適用
+  - 描画結果を PDF 直結ではなくグラフィックシーンへ正規化し、画像埋め込みと共通の描画パイプラインへ受け渡す
   - PDF グラフィックオペレータへの変換
 - **出力**: ベクター図形を含む PDF コンテンツストリーム
 - **受け入れ基準**:
@@ -765,7 +769,7 @@
 - **説明**: コンパイルの動作を制御する各種 CLI オプションを提供する
 - **入力**: CLI フラグ・引数
 - **処理**: 以下のオプションをサポート
-  - `--output-dir <dir>`: 出力先ディレクトリ指定
+  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加する
   - `--jobname <name>`: ジョブ名（出力ファイル名）の指定
   - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）
   - `--no-cache`: キャッシュを無効化しフルコンパイル
@@ -818,7 +822,7 @@
 - **処理**:
   - バンドルマニフェストとバージョンの検証
   - Asset Index を memory-mapped に読み込み、クラス・パッケージ・フォントの解決 API を提供
-  - プロジェクトローカルオーバーレイとの優先順位付き合成
+  - プロジェクトローカルオーバーレイおよび Host Font Catalog overlay との優先順位付き合成
 - **出力**: アセット解決ハンドル
 - **例外**: バージョン不一致または破損時は診断を表示し、互換バンドルがなければ起動を失敗させる
 - **受け入れ基準**:
@@ -845,14 +849,17 @@
 #### REQ-FUNC-048: ファイルアクセスサンドボックス
 
 - **説明**: コンパイル中のすべてのファイル読み書きをパスアクセスポリシーで制御する
-- **入力**: パス要求（read/write/create）、プロジェクトルート、Asset Bundle ルート、キャッシュディレクトリ
+- **入力**: パス要求（read/write/create）、アクセス目的（tex-input / tex-output / engine-output / engine-temp）、プロジェクトルート、Asset Bundle ルート、キャッシュディレクトリ、明示的 output root
 - **処理**:
   - パス正規化とシンボリックリンク解決
-  - 許可領域（プロジェクト、Asset Bundle、キャッシュ、システム一時領域）の判定
+  - 許可領域（プロジェクト、Asset Bundle、キャッシュ、明示的 output root）の判定
+  - Ferritex 自身が確保した private temp dir をキャッシュ配下または明示的 output root 配下に作成し、`engine-temp` 用にのみ許可
+  - システム一時領域全体は許可 root として公開しない
   - 拒否時の診断生成と、許可時のファイルハンドル発行
 - **出力**: 許可されたファイルハンドルまたは拒否診断
 - **受け入れ基準**:
   - Given プロジェクト内の `chap1.tex` を `\input` する文書, When コンパイル, Then 読み込みが許可される
+  - Given `--output-dir ../dist` を指定してコンパイル, When PDF / `.aux` / `.log` を生成, Then 正規化済み output root 配下への書き込みのみが許可される
   - Given `../../outside.txt` への `\openout` を試みる文書, When コンパイル, Then 書き込みが拒否され診断が表示される
 - **優先度**: Must
 - **出典**: REQ-NF-006 を機能要件へ具体化
@@ -906,8 +913,8 @@
 
 #### REQ-NF-006: ファイルアクセス制御
 
-- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、プロジェクトディレクトリ、Ferritex Asset Bundle、キャッシュディレクトリに制限する
-- **定量基準**: 許可領域（プロジェクト、Asset Bundle、キャッシュ）外への読み書きが発生する経路がゼロ
+- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、プロジェクトディレクトリ、Ferritex Asset Bundle、キャッシュディレクトリ、明示的 output root に制限する。システム一時領域は Ferritex が確保した private temp dir のみ許可する
+- **定量基準**: 許可領域（プロジェクト、Asset Bundle、キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
 - **優先度**: Must
 - **出典**: エージェント推測（pdfLaTeX の `openout_any = p` を発展させ、runtime bundle 設計へ適用）
 
@@ -964,4 +971,5 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.1 | 2026-03-12 | フォント資産源を host-local overlay として明確化し、グラフィックシーン/出力 root/private temp root の方針を追記 | Codex |
 | 0.1.0 | 2026-03-11 | 初版作成 | Claude Opus 4.6 |
