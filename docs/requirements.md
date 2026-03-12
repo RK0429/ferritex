@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.8           |
+| バージョン | 0.1.9           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -113,11 +113,13 @@
 | Job Context | `Compilation Job` 内の現在パスを識別する jobname・主入力・現在パス番号の組。same-job readback 判定に用いる |
 | Bbl Snapshot | `.bbl` から取り込んだ引用・参考文献情報の正規化スナップショット |
 | Definition Provenance | マクロ・ラベル・参考文献エントリの定義元を示すファイル名・行番号・列番号・由来種別の組。定義ジャンプと診断に用いる |
-| Navigation State | hyperref とセクショニングが蓄積する PDF ナビゲーション用状態。PDF metadata draft、しおり候補、named destination を保持する |
+| Navigation State | hyperref とセクショニングが蓄積する PDF ナビゲーション用状態。PDF metadata draft、しおり候補、named destination、既定リンク装飾設定を保持する |
+| Link Annotation Plan | 配置済みリンク 1 件分の PDF 注釈化計画。リンク矩形、リンク先、装飾設定を保持し、PDF 生成段階で Annotation に射影される |
+| Link Style | hyperref の `colorlinks` や枠線設定から正規化したリンク装飾値。テキスト色と注釈境界線の描画規則を保持する |
 | Table Of Contents State | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 |
 | Index State | `\index` で収集した索引語とソートキー、対応ページを保持し、makeindex 互換整列へ渡す job-scope 状態 |
 | グラフィックシーン | tikz/graphicx の描画結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した中間表現 |
-| Page Render Plan | 1 ページ分の `PageBox` と `GraphicsScene` を束ねた PDF 射影入力 |
+| Page Render Plan | 1 ページ分の `PageBox`、リンク注釈計画、`GraphicsScene` を束ねた PDF 射影入力 |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
 
@@ -299,6 +301,7 @@
   - `.toc`, `.lof`, `.lot` ファイルの書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された current Job Context と同一の `jobname` と主入力を持つ readback 対象ファイルのみを正規化済み output root 配下から再読込）
   - セクション番号・ページ番号の収集結果を Table Of Contents State として保持し、目次・図表一覧ごとに整形
   - 索引エントリを Index State に収集し、makeindex 互換の順序でソート・整形
+  - Table Of Contents State / Index State を専用の組版サービスで box tree へ射影し、`\tableofcontents` / `\listoffigures` / `\listoftables` / `\printindex` の出力に再利用
 - **出力**: 目次・索引のボックスツリー
 - **受け入れ基準**:
   - Given 章・節構造を持つ文書, When コンパイル, Then 正しいセクション番号とページ番号を含む目次が生成される
@@ -310,12 +313,12 @@
 #### REQ-FUNC-013: PDF ページストリーム出力
 
 - **説明**: タイプセッティング結果を PDF コンテンツストリームに変換する
-- **入力**: ページ単位の Page Render Plan（ボックスツリーとグラフィックシーンの組）
+- **入力**: ページ単位の Page Render Plan（ボックスツリー、リンク注釈計画、グラフィックシーンの組）
 - **処理**:
   - テキスト描画オペレータ（`BT`, `ET`, `Tf`, `Tj`, `TJ`）の生成
   - グラフィック描画オペレータ（罫線、図形）の生成
   - カラー指定（RGB, CMYK, グレースケール）
-  - ページ単位の Page Render Plan を共通 PDF レンダリングパイプラインへ射影し、コンテンツストリームとリソース辞書へ一貫して変換
+  - ページ単位の Page Render Plan を共通 PDF レンダリングパイプラインへ射影し、コンテンツストリーム、リンク Annotation、リソース辞書へ一貫して変換
   - PDF オブジェクト構造（ページツリー、リソース辞書）の構築
 - **出力**: 有効な PDF ファイル
 - **受け入れ基準**:
@@ -344,6 +347,7 @@
 - **処理**:
   - 内部リンク（`\ref`, `\cite` のリンク化）のアノテーション生成
   - 外部リンク（`\href`, `\url`）のアノテーション生成
+  - 配置済みのリンク領域を Link Annotation Plan（矩形、内部 destination または外部 URI、Link Style）へ正規化
   - Navigation State に蓄積された named destination と PDF metadata draft を参照し、PDF アウトライン（しおり）のセクション構造を生成
 - **出力**: リンクアノテーションとアウトラインを含む PDF
 - **受け入れ基準**:
@@ -461,8 +465,9 @@
   - `\ref`, `\cite` の自動リンク化
   - 目次・しおりへのリンク付与
   - PDF メタデータ（`pdftitle`, `pdfauthor` 等）を Navigation State 内の metadata draft に反映
-  - セクション構造・named destination・リンク対象を Navigation State に蓄積し、PDF 生成段階へ受け渡す
-  - リンクの装飾（色枠、色付きテキスト）
+  - セクション構造・named destination・既定リンク装飾設定を Navigation State に蓄積し、PDF 生成段階へ受け渡す
+  - 各リンク出現箇所を内部 destination または外部 URI を持つ Link Annotation Plan に正規化する
+  - リンクの装飾（色枠、色付きテキスト）を Link Style として正規化する
 - **出力**: ハイパーリンクと PDF メタデータを含む PDF
 - **受け入れ基準**:
   - Given `\hypersetup{colorlinks=true}` と `\href{URL}{link}` を含む文書, When PDF 生成, Then クリック可能なリンクが色付きテキストとして出力される
@@ -870,6 +875,7 @@
   - `--shell-escape` 未指定時は実行要求を拒否し、診断を返す
   - `--shell-escape` 指定時のみサブプロセスを生成し、同一 Compilation Job あたり最大 1 プロセスまでの同時実行制限下で終了コード・標準出力・標準エラーを収集
   - デフォルト実行上限として、タイムアウト 30 秒、標準出力+標準エラーの合計捕捉量 4 MiB を適用し、超過時はプロセスを停止して診断を返す
+  - Ferritex が制御した外部ツールが readback 対象補助ファイルを生成した場合、生成パス・artifact kind・主入力・jobname・producer kind・コンテンツハッシュを trusted external artifact として Output Artifact Registry に記録する
   - 実行ログを記録し、失敗時は TeX 側へ診断を返す
 - **出力**: 実行結果または拒否診断
 - **受け入れ基準**:
@@ -1008,6 +1014,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.9 | 2026-03-12 | Link Annotation Plan / Link Style、TOC/索引の box tree 投影、外部ツール成果物の trusted artifact 登録責務を追記 | Codex |
 | 0.1.8 | 2026-03-12 | Navigation State / Table Of Contents State / Index State / Page Render Plan を用語化し、目次・hyperref・PDF 射影の責務を明確化 | Codex |
 | 0.1.7 | 2026-03-12 | 差分コンパイルの job 単位反復、共通 PDF レンダリングパイプライン、entry point 非依存の Runtime Options を明文化 | Codex |
 | 0.1.6 | 2026-03-12 | Compilation Job / Session を導入し、same-job readback の主入力照合と shell-escape のデフォルト実行上限を明文化 | Codex |

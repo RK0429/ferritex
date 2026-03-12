@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.8           |
+| バージョン | 0.1.9           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.8 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.9 |
 
 ## 1. サブドメイン分類
 
@@ -249,6 +249,7 @@ classDiagram
         +PdfMetadataDraft metadata
         +List~OutlineDraftEntry~ outlineEntries
         +Map~String, DestinationAnchor~ namedDestinations
+        +LinkStyle defaultLinkStyle
         +recordOutline(OutlineDraftEntry) void
     }
     class PdfMetadataDraft {
@@ -268,6 +269,18 @@ classDiagram
         <<ValueObject>>
         +String name
         +DefinitionProvenance provenance
+    }
+    class LinkStyle {
+        <<ValueObject>>
+        +bool colorLinks
+        +Color textColor
+        +BorderStyle border
+    }
+    class BorderStyle {
+        <<ValueObject>>
+        +Color color
+        +Dimen width
+        +DashPattern dash
     }
     class CommandRegistry {
         <<Entity>>
@@ -317,7 +330,20 @@ classDiagram
     }
     class ShellCommandGateway {
         <<Service>>
-        +execute(CommandRequest, ExecutionPolicy) CommandResult
+        +execute(CommandRequest, ExecutionPolicy, JobContext, OutputArtifactRegistry) CommandResult
+    }
+    class CommandResult {
+        <<ValueObject>>
+        +int exitCode
+        +bytes stdout
+        +bytes stderr
+        +List~ProducedArtifact~ producedArtifacts
+    }
+    class ProducedArtifact {
+        <<ValueObject>>
+        +FilePath path
+        +ArtifactKind kind
+        +ContentHash contentHash
     }
     class ExecutionPolicy {
         <<ValueObject>>
@@ -411,6 +437,8 @@ classDiagram
     NavigationState --> PdfMetadataDraft
     NavigationState o-- OutlineDraftEntry
     NavigationState o-- DestinationAnchor
+    NavigationState --> LinkStyle
+    LinkStyle --> BorderStyle
     TocEntry --> DefinitionProvenance
     IndexEntry --> DefinitionProvenance
     MacroDefinition --> DefinitionProvenance
@@ -436,6 +464,9 @@ classDiagram
     PackageExtension <|.. FontspecExtension
     HyperrefExtension ..> NavigationState : populates
     ShellCommandGateway --> ExecutionPolicy
+    ShellCommandGateway --> OutputArtifactRegistry : records trusted external artifacts
+    ShellCommandGateway --> CommandResult
+    CommandResult o-- ProducedArtifact
     ExecutionPolicy --> PathAccessPolicy
     OutputArtifactRegistry o-- OutputArtifactRecord
     OutputArtifactRegistry ..> JobContext : validates
@@ -475,6 +506,12 @@ classDiagram
         <<ValueObject>>
         +List~Node~ content
     }
+    class PageBox {
+        <<ValueObject>>
+        +List~Node~ content
+        +Size size
+        +List~LinkAnnotationPlan~ linkAnnotations
+    }
     class Glue {
         <<ValueObject>>
         +Dimen natural
@@ -501,9 +538,40 @@ classDiagram
         +Box superscript
         +Box subscript
     }
+    class LinkAnnotationPlan {
+        <<ValueObject>>
+        +Rect rect
+        +LinkTarget target
+        +LinkStyle style
+    }
+    class LinkTarget {
+        <<ValueObject>>
+        +LinkTargetKind kind
+        +String value
+    }
+    class LinkStyle {
+        <<ValueObject>>
+        +bool colorLinks
+        +Color textColor
+        +BorderStyle border
+    }
+    class BorderStyle {
+        <<ValueObject>>
+        +Color color
+        +Dimen width
+        +DashPattern dash
+    }
     class SectioningEngine {
         <<Service>>
         +typesetHeading(SectionCommand, DocumentState) HBox
+    }
+    class TocTypesetter {
+        <<Service>>
+        +typeset(TocKind, TableOfContentsState, DocumentState) VBox
+    }
+    class IndexTypesetter {
+        <<Service>>
+        +typeset(IndexState, DocumentState) VBox
     }
     class PageBuilder {
         <<Entity>>
@@ -616,6 +684,7 @@ classDiagram
         +PdfMetadataDraft metadata
         +List~OutlineDraftEntry~ outlineEntries
         +Map~String, DestinationAnchor~ namedDestinations
+        +LinkStyle defaultLinkStyle
         +recordOutline(OutlineDraftEntry) void
     }
     class PdfMetadataDraft {
@@ -659,17 +728,27 @@ classDiagram
     Node <|-- Box
     Node <|-- Glue
     Node <|-- Penalty
+    PageBox o-- Node
+    PageBox o-- LinkAnnotationPlan
+    LinkAnnotationPlan --> LinkTarget
+    LinkAnnotationPlan --> LinkStyle
+    LinkStyle --> BorderStyle
     Paragraph --> LineBreakParams
     Paragraph o-- Node
     PageBuilder o-- Node
     PageBuilder --> FloatQueue
     PageBuilder --> DocumentState
+    PageBuilder --> PageBox
     FloatQueue o-- FloatItem
     MathList o-- MathAtom
     MathAtom --> Box
     SectioningEngine --> DocumentState
     SectioningEngine --> TableOfContentsState
     SectioningEngine --> NavigationState
+    TocTypesetter --> TableOfContentsState
+    TocTypesetter --> DocumentState
+    IndexTypesetter --> IndexState
+    IndexTypesetter --> DocumentState
     DocumentState --> CounterStore
     DocumentState --> AuxState
     DocumentState --> TableOfContentsState
@@ -687,6 +766,7 @@ classDiagram
     NavigationState --> PdfMetadataDraft
     NavigationState o-- OutlineDraftEntry
     NavigationState o-- DestinationAnchor
+    NavigationState --> LinkStyle
     TocEntry --> DefinitionProvenance
     IndexEntry --> DefinitionProvenance
     LabelInfo --> DefinitionProvenance
@@ -957,7 +1037,7 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
-`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、`GraphicResourceEncoder` がラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` を `Annotation` へ変換する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
 
 ```mermaid
 classDiagram
@@ -978,10 +1058,41 @@ classDiagram
         +PageBox pageBox
         +GraphicsScene graphics
     }
+    class PageBox {
+        <<Upstream ValueObject>>
+        +List~Node~ content
+        +Size size
+        +List~LinkAnnotationPlan~ linkAnnotations
+    }
+    class LinkAnnotationPlan {
+        <<Upstream ValueObject>>
+        +Rect rect
+        +LinkTarget target
+        +LinkStyle style
+    }
+    class LinkTarget {
+        <<Upstream ValueObject>>
+        +LinkTargetKind kind
+        +String value
+    }
+    class LinkStyle {
+        <<Upstream ValueObject>>
+        +bool colorLinks
+        +Color textColor
+        +BorderStyle border
+    }
+    class BorderStyle {
+        <<Upstream ValueObject>>
+        +Color color
+        +Dimen width
+        +DashPattern dash
+    }
     class NavigationState {
         <<Upstream Entity>>
         +PdfMetadataDraft metadata
         +List~OutlineDraftEntry~ outlineEntries
+        +Map~String, DestinationAnchor~ namedDestinations
+        +LinkStyle defaultLinkStyle
     }
     class PdfMetadataDraft {
         <<Upstream ValueObject>>
@@ -995,6 +1106,11 @@ classDiagram
         +String title
         +String destination
         +int level
+    }
+    class DestinationAnchor {
+        <<Upstream ValueObject>>
+        +String name
+        +DefinitionProvenance provenance
     }
     class PdfMetadata {
         <<ValueObject>>
@@ -1023,7 +1139,8 @@ classDiagram
         <<ValueObject>>
         +AnnotKind kind
         +Rect rect
-        +String destination
+        +LinkTarget target
+        +BorderStyle border
     }
     class PdfOutline {
         <<ValueObject>>
@@ -1070,16 +1187,24 @@ classDiagram
     PdfRenderer --> GraphicResourceEncoder
     PdfRenderer --> NavigationState : consumes
     PdfRenderer ..> PageRenderPlan : projects
+    PdfRenderer ..> LinkAnnotationPlan : materializes
     PdfRenderer ..> PdfMetadataDraft : derives
     PdfRenderer ..> OutlineDraftEntry : derives
+    PdfRenderer ..> DestinationAnchor : resolves
     PageRenderPlan --> PageBox
     PageRenderPlan --> GraphicsScene
+    PageBox o-- LinkAnnotationPlan
+    LinkAnnotationPlan --> LinkTarget
+    LinkAnnotationPlan --> LinkStyle
+    LinkStyle --> BorderStyle
     PdfDocument o-- PdfPage
     PdfDocument --> PdfMetadata
     PdfDocument --> PdfOutline
     PdfDocument --> SyncTexData
     PdfPage --> ContentStream
     PdfPage o-- Annotation
+    Annotation --> LinkTarget
+    Annotation --> BorderStyle
     ContentStream o-- PdfOperator
     PdfOutline o-- OutlineEntry
     PdfDocument o-- EmbeddedFont
@@ -1088,6 +1213,8 @@ classDiagram
     GraphicResourceEncoder --> EmbeddedImage
     GraphicResourceEncoder --> EmbeddedPdfGraphic
     GraphicResourceEncoder ..> RasterImage : encodes
+    NavigationState o-- DestinationAnchor
+    NavigationState --> LinkStyle
     GraphicResourceEncoder ..> PdfGraphic : form XObject
 ```
 
@@ -1361,7 +1488,8 @@ stateDiagram-v2
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback 判定と出力命名の境界を与える | CompilationSession, OutputArtifactRegistry |
 | 目次状態 (TableOfContentsState) | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 | DocumentState, TocEntry |
 | 索引状態 (IndexState) | `\index` から収集した索引語・ソートキー・ページ番号を保持し、makeindex 互換整列へ渡す job-scope 状態 | DocumentState, IndexEntry |
-| ナビゲーション状態 (NavigationState) | hyperref とセクショニングが生成する PDF metadata draft、しおり候補、named destination を保持する job-scope 状態 | DocumentState, PdfMetadataDraft, OutlineDraftEntry |
+| ナビゲーション状態 (NavigationState) | hyperref とセクショニングが生成する PDF metadata draft、しおり候補、named destination、既定リンク装飾を保持する job-scope 状態 | DocumentState, PdfMetadataDraft, OutlineDraftEntry |
+| リンク装飾 (LinkStyle) | hyperref の `colorlinks` や枠線指定から正規化されたリンク描画規則。既定値として `NavigationState` に保持され、配置済みリンクへコピーされる | NavigationState, LinkAnnotationPlan |
 | 定義 provenance (DefinitionProvenance) | マクロ・ラベル・参考文献エントリの定義元を示す SourceLocation と由来種別の組 | MacroDefinition, LabelInfo, CitationInfo |
 | パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する静的ポリシー。実際の readback 可否は OutputArtifactRegistry と組み合わせて判定する | ExecutionPolicy, OutputArtifactRegistry |
 | 出力アーティファクトレジストリ (OutputArtifactRegistry) | Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルの provenance を保持し、current Job Context の `jobname` と主入力の双方に整合する trusted artifact のみを再読込可能にする台帳 | OutputArtifactRecord, JobContext, ExecutionPolicy |
@@ -1381,6 +1509,9 @@ stateDiagram-v2
 | 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table と参考文献エントリを保持し、`\cite` を解決する状態 | CitationTable, BblSnapshot |
 | 目次エントリ (TocEntry) | 章節・図表一覧の項目名、番号、ページ番号、階層を保持する値 | TableOfContentsState |
 | 索引エントリ (IndexEntry) | 索引語、ソートキー、対応ページ番号を保持する値 | IndexState |
+| ページボックス (PageBox) | 単一ページに配置済みのノード列とリンク注釈計画を保持するページ単位の box tree | PageBuilder, LinkAnnotationPlan |
+| 目次組版器 (TocTypesetter) | `TableOfContentsState` を `\tableofcontents` / `\listoffigures` / `\listoftables` 用の box tree へ射影するサービス | TableOfContentsState, DocumentState |
+| 索引組版器 (IndexTypesetter) | `IndexState` を `\printindex` 用の box tree へ射影するサービス | IndexState, DocumentState |
 | 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
 
 ### 5.3 グラフィック描画 コンテキスト
@@ -1420,8 +1551,11 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | コンテンツストリーム (ContentStream) | PDF ページの描画命令列 | PdfOperator |
-| ページレンダープラン (PageRenderPlan) | 単一ページ分の `PageBox` と `GraphicsScene` を束ねた PDF 射影入力 | PdfRenderer, PageBox, GraphicsScene |
-| PDF レンダラ (PdfRenderer) | `PageRenderPlan` と `NavigationState` を PDF 演算子列・リソース辞書・メタデータ・しおりへ射影し、`PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
+| ページレンダープラン (PageRenderPlan) | 単一ページ分の `PageBox` と `GraphicsScene` を束ねた PDF 射影入力。`PageBox` 内には配置済み `LinkAnnotationPlan` が含まれる | PdfRenderer, PageBox, GraphicsScene |
+| PDF レンダラ (PdfRenderer) | `PageRenderPlan` と `NavigationState` を PDF 演算子列・リンク Annotation・リソース辞書・メタデータ・しおりへ射影し、`PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
+| リンク注釈計画 (LinkAnnotationPlan) | 配置済みリンク 1 件分の PDF 注釈化計画。リンク矩形、リンク先、装飾設定を保持し、`PdfRenderer` が `Annotation` へ変換する | PageBox, LinkTarget, LinkStyle |
+| リンク先 (LinkTarget) | 内部 named destination または外部 URI を表すリンク解決先 | LinkAnnotationPlan, Annotation |
+| リンク装飾 (LinkStyle) | リンクテキスト色と PDF 注釈境界線の描画規則 | LinkAnnotationPlan, Annotation |
 | アノテーション (Annotation) | PDF 上のリンク・しおり等のインタラクティブ要素 | hyperref |
 | PDF メタデータ草案 (PdfMetadataDraft) | hyperref が収集した `pdftitle` / `pdfauthor` などの中間状態。`PdfRenderer` が `PdfMetadata` へ変換する | NavigationState |
 | アウトライン草案エントリ (OutlineDraftEntry) | セクショニングや hyperref から収集したしおり候補。`PdfRenderer` が PDF の `OutlineEntry` へ変換する | NavigationState |
@@ -1526,11 +1660,11 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
-- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。`ExecutionPolicy` はデフォルト上限として `commandTimeout = 30s`、`maxConcurrentProcesses = 1`、`maxCapturedOutputBytes = 4 MiB` を保持する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root の readback は `OutputArtifactRegistry` が current `JobContext` の `jobname` と主入力の双方、および正規化パス/生成パスを含む artifact provenance の双方で same job と確認した補助ファイルに限って許可する
+- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。`ExecutionPolicy` はデフォルト上限として `commandTimeout = 30s`、`maxConcurrentProcesses = 1`、`maxCapturedOutputBytes = 4 MiB` を保持する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root の readback は `OutputArtifactRegistry` が current `JobContext` の `jobname` と主入力の双方、および正規化パス/生成パスを含む artifact provenance の双方で same job と確認した補助ファイルに限って許可する。Ferritex が制御した外部ツールの生成物は `ShellCommandGateway` が trusted external artifact として同レジストリへ登録する
 - **根拠**:
-  - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれる
+  - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれ、REQ-FUNC-024 / 047 / 048 は Ferritex 制御外部ツール生成物の provenance 記録を要求する
   - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
-  - 分離証人: watch モードと CLI の双方で `\write18` を含む文書を処理するケース。Policy モデルでは両者に同一判定を適用できるが、入口ごとの分岐モデルでは実装漏れで片方だけ許可される不整合が起こり得る
+  - 分離証人: `bibtex` を起動して `.bbl` を生成するケース。Policy + registry 連携モデルでは shell-escape 判定と trusted external artifact 登録を単一の gateway で完結できるが、入口ごとの分岐モデルでは許可判定と provenance 登録の所有者が分裂する
 - **等価性への影響**: 理論等価（外部仕様は同一で、実装の一貫性が向上する）
 - **語彙への影響**: 「ExecutionPolicy」「PathAccessPolicy」「OutputArtifactRegistry」を導入
 
@@ -1574,13 +1708,13 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: PDF 生成 / グラフィック描画
-- **判断内容**: `PageRenderPlan` / `NavigationState` を `PdfDocument` へ落とす責務は `PdfRenderer` とし、外部ラスタ画像と外部 PDF の埋め込み形式決定は `GraphicResourceEncoder` に分離する
+- **判断内容**: `PageRenderPlan` / `NavigationState` を `PdfDocument` へ落とす責務は `PdfRenderer` とし、配置済みリンクを `LinkAnnotationPlan` として受け取って `Annotation` へ変換する。外部ラスタ画像と外部 PDF の埋め込み形式決定は `GraphicResourceEncoder` に分離する
 - **根拠**:
-  - 観測事実: REQ-FUNC-013 / 015 / 016 / 022 / 023 は、通常のボックス組版、hyperref のメタデータ/しおり、`graphicx` の画像埋め込み、tikz/pgf の描画結果が単一の PDF 出力面へ収束することを要求している
+  - 観測事実: REQ-FUNC-013 / 015 / 016 / 022 / 023 は、通常のボックス組版、hyperref のメタデータ/しおり/リンク装飾、`graphicx` の画像埋め込み、tikz/pgf の描画結果が単一の PDF 出力面へ収束することを要求している
   - 代替案: `PdfDocument` 自身の `render()` にすべての射影責務を押し込む
-  - 分離証人: `\includegraphics{diagram.pdf}` と `\hypersetup{pdftitle=...}` を含む文書のケース。分離モデルでは `PdfRenderer` が `PageRenderPlan` と `NavigationState` の両方から演算子列・メタデータ・しおりを統合し、`GraphicResourceEncoder` が imported PDF Form XObject を扱えるが、自己完結型 `PdfDocument` モデルでは外部グラフィック変換とナビゲーション情報の受け渡し責務がデータ構造へ混入する
+  - 分離証人: `\href{https://example.com}{link}` と `\hypersetup{colorlinks=true,pdftitle=...}` を含む文書のケース。分離モデルでは `PdfRenderer` が `PageRenderPlan` の `LinkAnnotationPlan` と `NavigationState` のメタデータ/しおりを統合し、`GraphicResourceEncoder` が imported PDF Form XObject を扱えるが、自己完結型 `PdfDocument` モデルではリンク矩形・装飾・外部グラフィック変換の責務がデータ構造へ混入する
 - **等価性への影響**: 理論等価（外部仕様は同一で、変換責務の境界が明確になる）
-- **語彙への影響**: 「PageRenderPlan」「PdfRenderer」「GraphicResourceEncoder」を導入
+- **語彙への影響**: 「PageRenderPlan」「LinkAnnotationPlan」「LinkStyle」「PdfRenderer」「GraphicResourceEncoder」を導入
 
 ### 6.12 実行ポリシーは RuntimeOptions と WorkspaceContext から構築する
 
@@ -1598,13 +1732,13 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング / PDF 生成
-- **判断内容**: `\tableofcontents` / `\listoffigures` / `\listoftables` / `\makeindex` / hyperref が pass 間で共有する状態は `DocumentState` 内の `TableOfContentsState` / `IndexState` / `NavigationState` として保持し、`SectioningEngine` / `HyperrefExtension` が更新し、`PdfRenderer` が消費する
+- **判断内容**: `\tableofcontents` / `\listoffigures` / `\listoftables` / `\makeindex` / hyperref が pass 間で共有する状態は `DocumentState` 内の `TableOfContentsState` / `IndexState` / `NavigationState` として保持する。`SectioningEngine` / `HyperrefExtension` がこれらを更新し、`TocTypesetter` / `IndexTypesetter` が box tree へ投影し、`PdfRenderer` が `NavigationState` と配置済みリンクを消費する
 - **根拠**:
-  - 観測事実: REQ-FUNC-012 / 015 / 022 は pass をまたぐ `.toc` / `.lof` / `.lot` / metadata / outline の保持を必要とする
+  - 観測事実: REQ-FUNC-012 / 015 / 022 は pass をまたぐ `.toc` / `.lof` / `.lot` / metadata / outline / link style の保持と、その後段の組版・PDF 射影を必要とする
   - 代替案: package 拡張内部または PDF 生成直前の一時構造として個別に保持する
-  - 分離証人: `\tableofcontents` と `\hypersetup{pdftitle=...}` を含む 2 パス文書。`DocumentState` 集約モデルでは前パス生成の目次エントリと metadata draft を同一所有者で保持できるが、一時構造モデルでは pass 境界をまたいだ所有者が不明確になる
+  - 分離証人: `\tableofcontents` と `\printindex` と `\hypersetup{colorlinks=true}` を含む 2 パス文書。`DocumentState` 集約モデルでは前パス生成の目次/索引エントリと既定リンク装飾を同一所有者で保持し、後段で `TocTypesetter` / `IndexTypesetter` / `PdfRenderer` へ明示的に受け渡せるが、一時構造モデルでは pass 境界をまたいだ所有者が不明確になる
 - **等価性への影響**: 理論等価（外部仕様は同一で、pass 跨ぎ状態の所有境界が明確になる）
-- **語彙への影響**: 「TableOfContentsState」「IndexState」「NavigationState」「PdfMetadataDraft」「OutlineDraftEntry」を導入
+- **語彙への影響**: 「TableOfContentsState」「IndexState」「NavigationState」「LinkStyle」「TocTypesetter」「IndexTypesetter」「PdfMetadataDraft」「OutlineDraftEntry」を導入
 
 ## 7. ビジネスルール一覧
 
@@ -1618,7 +1752,7 @@ stateDiagram-v2
 | BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
 | BR-5 | 差分コンパイルは再構築ノードと再利用ノードをマージした後もフルコンパイルと同一の出力でなければならず、参照不安定時は最大 3 パスまで反復する | REQ-FUNC-030 | 差分コンパイル |
 | BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
-| BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。compile / watch / LSP の各入口は指定を `RuntimeOptions` へ正規化したうえですべての実行要求を `ExecutionPolicy` へ通し、デフォルト上限は 30 秒、1 プロセス / `CompilationJob`、捕捉出力 4 MiB である | REQ-FUNC-043 / REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン / 開発者ツール |
+| BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。compile / watch / LSP の各入口は指定を `RuntimeOptions` へ正規化したうえですべての実行要求を `ExecutionPolicy` へ通し、デフォルト上限は 30 秒、1 プロセス / `CompilationJob`、捕捉出力 4 MiB である。Ferritex が制御した readback 対象補助ファイル生成物は `ShellCommandGateway` を通じて trusted external artifact として `OutputArtifactRegistry` に記録される | REQ-FUNC-043 / REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン / 開発者ツール |
 | BR-8 | ファイル読み書きは、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は OutputArtifactRegistry が current `JobContext` の `jobname` と主入力の双方、および artifact provenance から same job の trusted artifact と確認した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
@@ -1626,13 +1760,14 @@ stateDiagram-v2
 | BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationJob` が所有する job-scope の `DocumentState` / `OutputArtifactRegistry` に対して行われ、各 pass の `CompilationSession` から参照される | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 / REQ-FUNC-048 | パーサー/マクロエンジン / タイプセッティング |
 | BR-13 | `\cite` の解決と参考文献リスト組版は `BibliographyState` / `CitationTable` が担い、label 系の `CrossReferenceTable` とは責務を分離する | REQ-FUNC-024 | パーサー/マクロエンジン / タイプセッティング |
 | BR-14 | 定義ジャンプは `MacroDefinition` / `LabelInfo` / `CitationInfo` / `BibliographyEntry` の `DefinitionProvenance` を `SymbolIndex` に投影して解決する | REQ-FUNC-036 | パーサー/マクロエンジン / 開発者ツール |
-| BR-15 | 目次・図表一覧・索引のエントリは同一 `CompilationJob` が所有する `TableOfContentsState` / `IndexState` に蓄積され、pass をまたいで merge されたうえで組版に再利用される | REQ-FUNC-012 | パーサー/マクロエンジン / タイプセッティング |
-| BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination は `NavigationState` に集約され、`PdfRenderer` が `PdfMetadata` / `PdfOutline` / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
+| BR-15 | 目次・図表一覧・索引のエントリは同一 `CompilationJob` が所有する `TableOfContentsState` / `IndexState` に蓄積され、pass をまたいで merge されたうえで `TocTypesetter` / `IndexTypesetter` により box tree へ再投影される | REQ-FUNC-012 | パーサー/マクロエンジン / タイプセッティング |
+| BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に正規化される。`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.9 | 2026-03-12 | LinkAnnotationPlan / LinkStyle、TocTypesetter / IndexTypesetter、trusted external artifact 登録経路を追加 | Codex |
 | 0.1.8 | 2026-03-12 | TableOfContentsState / IndexState / NavigationState と PageRenderPlan を追加し、hyperref と PDF 射影の受け渡しを明示 | Codex |
 | 0.1.7 | 2026-03-12 | 差分コンパイル固定点反復の所有者、PDF 射影サービス、RuntimeOptions/AssetBundleRef/WorkspaceContext を反映 | Codex |
 | 0.1.6 | 2026-03-12 | CompilationJob を導入し、主入力を含む same-job provenance と shell-escape のデフォルト実行上限を反映 | Codex |
