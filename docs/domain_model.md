@@ -4,7 +4,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.13          |
+| バージョン | 0.1.14          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -74,7 +74,7 @@ graph LR
 
 ### 3.1 パーサー/マクロエンジン コンテキスト
 
-`CompilationJob` は最大 3 パスまでのコンパイル全体を表す集約であり、pass 間で共有される `DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を所有する。`CompilationSession` はその内部の 1 パスを表し、カテゴリコード・レジスタ・スコープなど pass-local な状態だけを保持する。パイプライン並列化を行う場合でも、各ステージが参照できるのは `CompilationSession` / `DocumentState` から導出した読み取り専用 snapshot のみであり、可変状態への commit は `CompilationJob` が所有する決定的 barrier で逐次に行う。
+`CompilationJob` は最大 3 パスまでのコンパイル全体を表す集約であり、pass 間で共有される `DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を所有する。`CompilationSession` はその内部の 1 パスを表し、カテゴリコード・レジスタ・スコープに加えて current-file 基準の解決、`\include` ガード、ネスト深度管理を担う `InputStack` / `IncludeState` などの pass-local 状態を保持する。パイプライン並列化を行う場合でも、各ステージが参照できるのは `CompilationSession` / `DocumentState` から導出した読み取り専用 snapshot のみであり、可変状態への commit は `CompilationJob` が所有する決定的 barrier で逐次に行う。
 
 ```mermaid
 classDiagram
@@ -90,6 +90,8 @@ classDiagram
     class CompilationSession {
         <<Entity>>
         +JobContext context
+        +InputStack inputs
+        +IncludeState includes
         +CatcodeTable catcodes
         +ScopeStack scopes
         +RegisterBank registers
@@ -98,7 +100,7 @@ classDiagram
     }
     class Lexer {
         <<Entity>>
-        +InputSource source
+        +InputStack sources
         +nextToken(CompilationSession) Token
     }
     class CatcodeTable {
@@ -328,6 +330,12 @@ classDiagram
         <<Service>>
         +resolve(LogicalPath, ResolutionContext) AssetHandle
     }
+    class ResolutionContext {
+        <<ValueObject>>
+        +FilePath currentDirectory
+        +int nestingDepth
+        +bool allowMissing
+    }
     class FileAccessRequest {
         <<ValueObject>>
         +FilePath requestedPath
@@ -398,9 +406,26 @@ classDiagram
     class InputSource {
         <<Entity>>
         +SandboxedFileHandle handle
+        +LogicalPath logicalPath
+        +FilePath baseDirectory
         +int line
         +int column
         +read() char
+    }
+    class InputStack {
+        <<Entity>>
+        +List~InputSource~ frames
+        +push(InputSource) void
+        +pop() InputSource
+        +depth() int
+        +currentResolutionContext() ResolutionContext
+    }
+    class IncludeState {
+        <<Entity>>
+        +Set~LogicalPath~ activeIncludes
+        +Map~LogicalPath, FilePath~ auxPaths
+        +shouldEnter(LogicalPath) bool
+        +resolveAuxPath(LogicalPath, JobContext) FilePath
     }
     class ConditionalEvaluator {
         <<Service>>
@@ -431,6 +456,8 @@ classDiagram
     CompilationSession --> CatcodeTable
     CompilationSession --> CompilationJob
     CompilationSession --> JobContext
+    CompilationSession --> InputStack
+    CompilationSession --> IncludeState
     CompilationSession --> ScopeStack
     CompilationSession --> RegisterBank
     CompilationSession --> CommandRegistry
@@ -462,7 +489,7 @@ classDiagram
     BibliographyEntry --> DefinitionProvenance
     DestinationAnchor --> DefinitionProvenance
     Lexer --> CompilationSession : reads
-    Lexer --> InputSource
+    Lexer --> InputStack : reads current frame
     Lexer ..> Token : produces
     MacroEngine --> CompilationSession
     MacroEngine ..> MacroDefinition : uses
@@ -479,6 +506,7 @@ classDiagram
     PackageExtension <|.. FontspecExtension
     HyperrefExtension ..> NavigationState : populates
     AssetResolver --> FileAccessGate : opens assets
+    AssetResolver ..> ResolutionContext : resolves current-file relative
     FileAccessGate --> ExecutionPolicy
     FileAccessGate --> OutputArtifactRegistry : validates readback
     FileAccessGate --> SandboxedFileHandle
@@ -489,6 +517,8 @@ classDiagram
     ShellCommandGateway --> OutputArtifactRegistry : records trusted external artifacts
     ShellCommandGateway --> CommandResult
     CommandResult o-- ProducedArtifact
+    InputStack o-- InputSource
+    InputStack --> ResolutionContext
     InputSource --> SandboxedFileHandle
     ExecutionPolicy --> PathAccessPolicy
     OutputArtifactRegistry o-- OutputArtifactRecord
@@ -499,7 +529,7 @@ classDiagram
 
 ### 3.2 タイプセッティング コンテキスト
 
-ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。
+ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。複数行 display math は `DisplayMathBlock` / `AmsmathLayoutEngine` が表し、`align` 系の行揃え、`\intertext`、式番号付けを `MathAlignmentRow` / `EquationTag` として保持する。フロート配置は `[htbp!]` を `PlacementSpec` へ正規化し、確定した配置結果を `FloatPlacement` として `PageBox` に残す。
 
 ```mermaid
 classDiagram
@@ -532,6 +562,7 @@ classDiagram
     class PageBox {
         <<ValueObject>>
         +List~PlacedNode~ content
+        +List~FloatPlacement~ floats
         +Size size
         +List~LinkAnnotationPlan~ linkAnnotations
         +List~PlacedDestination~ destinations
@@ -582,6 +613,38 @@ classDiagram
         +Box nucleus
         +Box superscript
         +Box subscript
+    }
+    class DisplayMathBlock {
+        <<Entity>>
+        +DisplayMathKind kind
+        +List~DisplayMathElement~ elements
+        +typeset(DocumentState) VBox
+    }
+    class DisplayMathElement {
+        <<ValueObject>>
+    }
+    class MathAlignmentRow {
+        <<ValueObject>>
+        +List~MathCell~ cells
+        +EquationTag tag
+    }
+    class MathCell {
+        <<ValueObject>>
+        +MathList content
+        +int alignmentColumn
+    }
+    class IntertextBlock {
+        <<ValueObject>>
+        +VBox content
+    }
+    class EquationTag {
+        <<ValueObject>>
+        +String renderedText
+        +bool suppressNumber
+    }
+    class AmsmathLayoutEngine {
+        <<Service>>
+        +layout(DisplayMathBlock, DocumentState) VBox
     }
     class LinkAnnotationPlan {
         <<ValueObject>>
@@ -661,6 +724,17 @@ classDiagram
         <<ValueObject>>
         +PlacementSpec spec
         +Box content
+    }
+    class PlacementSpec {
+        <<ValueObject>>
+        +List~FloatRegion~ priorityOrder
+        +bool force
+    }
+    class FloatPlacement {
+        <<ValueObject>>
+        +FloatItem item
+        +FloatRegion region
+        +Rect rect
     }
     class DocumentState {
         <<Shared Entity>>
@@ -799,6 +873,7 @@ classDiagram
     Node <|-- Glue
     Node <|-- Penalty
     PageBox o-- PlacedNode
+    PageBox o-- FloatPlacement
     PageBox o-- PlacedDestination
     PageBox o-- LinkAnnotationPlan
     PlacedNode --> Node
@@ -818,8 +893,20 @@ classDiagram
     FootnoteQueue o-- FootnoteItem
     FootnoteQueue --> FootnotePlacement
     FloatQueue o-- FloatItem
+    FloatItem --> PlacementSpec
+    FloatPlacement --> FloatItem
     MathList o-- MathAtom
     MathAtom --> Box
+    DisplayMathElement <|-- MathAlignmentRow
+    DisplayMathElement <|-- IntertextBlock
+    DisplayMathBlock o-- DisplayMathElement
+    MathAlignmentRow o-- MathCell
+    MathAlignmentRow --> EquationTag
+    MathCell --> MathList
+    IntertextBlock --> VBox
+    AmsmathLayoutEngine --> DisplayMathBlock
+    AmsmathLayoutEngine --> DocumentState
+    AmsmathLayoutEngine --> CounterStore
     SectioningEngine --> DocumentState
     SectioningEngine --> TableOfContentsState
     SectioningEngine --> NavigationState
@@ -1172,9 +1259,16 @@ classDiagram
     class PageBox {
         <<Upstream ValueObject>>
         +List~PlacedNode~ content
+        +List~FloatPlacement~ floats
         +Size size
         +List~LinkAnnotationPlan~ linkAnnotations
         +List~PlacedDestination~ destinations
+    }
+    class FloatPlacement {
+        <<Upstream ValueObject>>
+        +FloatItem item
+        +FloatRegion region
+        +Rect rect
     }
     class PlacedNode {
         <<Upstream ValueObject>>
@@ -1378,6 +1472,7 @@ classDiagram
     PageRenderPlan --> PageBox
     PageRenderPlan --> GraphicsScene
     PageBox o-- PlacedNode
+    PageBox o-- FloatPlacement
     PageBox o-- LinkAnnotationPlan
     PageBox o-- PlacedDestination
     PlacedNode --> Node
@@ -1737,7 +1832,10 @@ stateDiagram-v2
 | スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタの有効範囲 | ScopeStack |
 | レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
 | コンパイルジョブ (CompilationJob) | 1 回の compile/watch/LSP 再コンパイル要求を表す集約。最大 3 パスまでの `CompilationSession` を束ね、`DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を pass 間で保持する | CompilationSession, DocumentState, OutputArtifactRegistry |
-| コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリ、current Job Context を保持する | CompilationJob, JobContext |
+| コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリ、input stack、include 状態、current Job Context を保持する | CompilationJob, JobContext, InputStack, IncludeState |
+| 入力スタック (InputStack) | 現在処理中の TeX 入力ファイル列を保持し、current-file 基準の解決コンテキストとネスト深度を供給するスタック | CompilationSession, InputSource, ResolutionContext |
+| include 状態 (IncludeState) | `\include` のガード対象と分離された `.aux` 出力先を保持する pass-local 状態 | CompilationSession, JobContext |
+| 解決コンテキスト (ResolutionContext) | current directory・ネスト深度・optional load 可否から成る資産解決用コンテキスト | InputStack, AssetResolver |
 | コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`CompilationSession` / `DocumentState` の確定済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentState |
 | コミットバリア (CommitBarrier) | 並列ステージの結果を決定的順序で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可される | CompilationJob, CompilationSnapshot |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback 判定と出力命名の境界を与える | CompilationSession, OutputArtifactRegistry |
@@ -1760,8 +1858,13 @@ stateDiagram-v2
 | ペナルティ (Penalty) | 行/ページ分割の位置を制御する整数値。高いほど分割されにくい | 行分割, ページ分割 |
 | 行分割 (Line Breaking) | Knuth-Plass アルゴリズムにより段落の最適な改行位置を決定する処理 | Paragraph, LineBreakParams |
 | フロート (Float) | テキストの流れから独立して配置されるオブジェクト。配置指定子で制御 | FloatQueue, PageBuilder |
+| 配置指定子 (PlacementSpec) | `[htbp!]` を優先順位付き配置領域と force 指示へ正規化した値 | FloatItem, FloatQueue |
+| フロート配置 (FloatPlacement) | 実際に選ばれた配置領域とページ内矩形を持つフロート配置結果 | PageBox, FloatQueue |
 | 脚注キュー (FootnoteQueue) | ページ下部へ配置待ちの脚注を保持し、現在ページへ割り当てる脚注高さを予約するキュー | PageBuilder, FootnoteItem |
 | 脚注項目 (FootnoteItem) | 脚注マーカー、本文、由来ソース範囲を持つ脚注 1 件 | FootnoteQueue, FootnotePlacement |
+| ディスプレイ数式ブロック (DisplayMathBlock) | `align` / `gather` / `multline` / `split` など複数行 display math を表す集約。行揃え、`\intertext`、式番号付けを保持する | AmsmathLayoutEngine, MathAlignmentRow, EquationTag |
+| 数式整列行 (MathAlignmentRow) | `&` で区切られたセル列と行単位の式タグを持つ display math の 1 行 | DisplayMathBlock, MathCell, EquationTag |
+| 数式タグ (EquationTag) | 自動番号、`\tag`、`\notag` を正規化した式番号付け規則 | MathAlignmentRow, CounterStore |
 | ドキュメント状態 (DocumentState) | カウンタ、ラベル、参考文献、目次、索引、ナビゲーション状態など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable, BibliographyState, TableOfContentsState, IndexState, NavigationState |
 | 相互参照 (Cross Reference) | `\label`/`\ref`/`\pageref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
 | 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table と参考文献エントリを保持し、`\cite` を解決する状態 | CitationTable, BblSnapshot |
@@ -1771,7 +1874,7 @@ stateDiagram-v2
 | 配置済みノード (PlacedNode) | ページ上で確定した矩形と SourceSpan を伴うノード。PDF 射影と SyncTeX の共通入力 | PageBox, TextRun |
 | テキストラン (TextRun) | 配置済みグリフ列と text style を持つノード。`colorlinks=true` 時は LinkStyle から text color を受け取る | TextStyle, LinkStyle |
 | 配置済み destination (PlacedDestination) | named destination のページ内配置結果。内部リンク・しおり解決に使う | PageBox, NavigationState |
-| ページボックス (PageBox) | 単一ページに配置済みのノード列、destination、リンク注釈計画を保持するページ単位の box tree | PageBuilder, PlacedNode, LinkAnnotationPlan |
+| ページボックス (PageBox) | 単一ページに配置済みのノード列、確定済みフロート配置、destination、リンク注釈計画を保持するページ単位の box tree | PageBuilder, PlacedNode, FloatPlacement, LinkAnnotationPlan |
 | 目次組版器 (TocTypesetter) | `TableOfContentsState` を `\tableofcontents` / `\listoffigures` / `\listoftables` 用の box tree へ射影するサービス | TableOfContentsState, DocumentState |
 | 索引組版器 (IndexTypesetter) | `IndexState` を `\printindex` 用の box tree へ射影するサービス | IndexState, DocumentState |
 | 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
@@ -2123,6 +2226,42 @@ stateDiagram-v2
 - **等価性への影響**: 理論等価（外部仕様は同一で、脚注配置責務の所有者が明確になる）
 - **語彙への影響**: 「FootnoteQueue」「FootnoteItem」「FootnotePlacement」を導入
 
+### 6.23 amsmath の複数行 display math は DisplayMathBlock として表現する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: タイプセッティング / パーサー/マクロエンジン
+- **判断内容**: `align` / `gather` / `multline` / `alignat` / `split` などの複数行 display math は `DisplayMathBlock` を集約境界とし、各行の揃え位置は `MathAlignmentRow` / `MathCell`、`\intertext` は `IntertextBlock`、行ごとの自動番号・`\tag`・`\notag` は `EquationTag` で表現する。実際の組版と番号付け確定は `AmsmathLayoutEngine` が `DocumentState` / `CounterStore` を参照して行う
+- **根拠**:
+  - 観測事実: REQ-FUNC-009 / REQ-FUNC-021 は `align` 系の複数行数式、`\intertext`、`\tag` / `\notag` を Must として要求している
+  - 代替案: `MathList` / `MathAtom` の単層モデルだけを維持し、display math の行揃えと番号付けは実装詳細に委ねる
+  - 分離証人: 2 列揃えの `align` 環境の途中に `\intertext{...}` を挟み、末尾行だけ `\tag{A}` を付与するケース。`DisplayMathBlock` モデルでは行列構造とタグ方針を同じ aggregate 内で保持できるが、単層 `MathList` モデルでは行境界・整列列・番号付け規則が暗黙になり受け入れ基準を追跡しにくい
+- **等価性への影響**: 理論等価（外部仕様は同一で、amsmath の複数行 display math の責務境界が明確になる）
+- **語彙への影響**: 「DisplayMathBlock」「MathAlignmentRow」「MathCell」「IntertextBlock」「EquationTag」「AmsmathLayoutEngine」を導入
+
+### 6.24 ファイル入力コンテキストは InputStack / IncludeState で保持する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: パーサー/マクロエンジン
+- **判断内容**: `\input` / `\include` / `\InputIfFileExists` の current-file 基準解決、ネスト深度管理、`\include` のガードと分離 `.aux` 出力先は `CompilationSession` 配下の `InputStack` / `ResolutionContext` / `IncludeState` が所有する。`AssetResolver` は `ResolutionContext.currentDirectory` と `allowMissing` を受けて資産解決を行う
+- **根拠**:
+  - 観測事実: REQ-FUNC-005 は current-file 基準の相対パス解決、`\include` のガード処理、ファイルネスト深度管理を Must として要求している
+  - 代替案: 単一 `InputSource` と暗黙の current directory を仮定し、`\include` 状態は実装内部のローカル変数に留める
+  - 分離証人: `main.tex` から `chapters/a.tex` を `\input` し、その内部で `sections/b.tex` をさらに `\input` しつつ別の `\include{appendix}` が独立 `.aux` を必要とするケース。`InputStack` + `IncludeState` モデルでは current-file 基準解決、深さ制限、include ごとの `.aux` 分離を同じ session 境界で説明できるが、単一 `InputSource` モデルでは責務が散逸する
+- **等価性への影響**: 理論等価（外部仕様は同一で、ファイル入力処理の責務境界が明確になる）
+- **語彙への影響**: 「InputStack」「IncludeState」「ResolutionContext」を導入
+
+### 6.25 フロート配置の入出力は PlacementSpec / FloatPlacement として明示する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: タイプセッティング
+- **判断内容**: `[htbp!]` などのフロート指定子は `PlacementSpec.priorityOrder` と `force` へ正規化し、`FloatQueue` は選択した配置領域とページ内矩形を `FloatPlacement` として返す。`PageBox` は確定済みフロート配置を `floats` として保持する
+- **根拠**:
+  - 観測事実: REQ-FUNC-010 は指定子優先順位に従うフロート配置と「配置位置が確定したフロートボックス」を Must として要求している
+  - 代替案: `FloatItem` の生 box を `PageBuilder` の内部実装だけで処理し、指定子解釈と配置結果は暗黙にする
+  - 分離証人: `[tbp]` 指定の図が現ページ top に入らず、次善策として float page へ送られるケース。`PlacementSpec` / `FloatPlacement` モデルでは入力指定子の意味と選択結果を `PageBox` まで保持できるが、暗黙モデルでは top/bottom/page の判定根拠が図から追えない
+- **等価性への影響**: 理論等価（外部仕様は同一で、フロート配置アルゴリズムの入出力境界が明確になる）
+- **語彙への影響**: 「PlacementSpec」「FloatPlacement」を導入
+
 ## 7. ビジネスルール一覧
 
 要件定義書から抽出した主要なビジネスルール・不変条件の一覧。
@@ -2151,11 +2290,15 @@ stateDiagram-v2
 | BR-20 | PDF フォント埋め込みは `FontEmbeddingPlanner` が `TextRun` 群から使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して subset font と ToUnicode CMap を生成する | REQ-FUNC-014 / REQ-FUNC-017 | PDF 生成 / フォント管理 |
 | BR-21 | tikz/pgf の描画は `GraphicGroup` が継承スタイルと clip path を保持し、`VectorPath` が path ごとの矢印指定を保持したまま PDF 射影へ渡される | REQ-FUNC-023 | グラフィック描画 / PDF 生成 |
 | BR-22 | 脚注は `FootnoteQueue` に蓄積され、`PageBuilder` が現在ページ下部へ予約できる脚注だけを `FootnotePlacement` として確定し、残りを次ページへ繰り延べる | REQ-FUNC-008 | タイプセッティング |
+| BR-23 | amsmath の複数行 display math は `DisplayMathBlock` が保持し、各 `MathAlignmentRow` は `EquationTag` により自動番号/`\tag`/`\notag` を表現する。`AmsmathLayoutEngine` は `CounterStore` を参照して行揃えと番号付けを確定する | REQ-FUNC-009 / REQ-FUNC-021 | タイプセッティング / パーサー/マクロエンジン |
+| BR-24 | `\input` / `\include` / `\InputIfFileExists` は `InputStack` を push/pop し、current-file 基準の `ResolutionContext.currentDirectory` で解決される。`\include` の重複抑止と分離 `.aux` 出力先は `IncludeState` が管理する | REQ-FUNC-005 | パーサー/マクロエンジン |
+| BR-25 | フロート指定子は `PlacementSpec.priorityOrder` と `force` へ正規化され、`FloatQueue` は選択された配置領域とページ内矩形を `FloatPlacement` として返し `PageBox` に保持する | REQ-FUNC-010 | タイプセッティング |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.14 | 2026-03-12 | amsmath の複数行 display math、ファイル入力スタック/include 状態、フロート配置の入出力型を追加して REQ-FUNC-005/009/010/021 のトレーサビリティを補強 | Codex |
 | 0.1.13 | 2026-03-12 | フォント埋め込み計画器、tikz/pgf の階層 scope/clip/arrow、脚注キュー、preview view restore の必須化を反映 | Codex |
 | 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch set の依存グラフ同期、preview の最近傍ページ fallback を追加 | Codex |
 | 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch scheduler/queue、preview session/view state を追加 | Codex |
