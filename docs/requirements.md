@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.4           |
+| バージョン | 0.1.5           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -105,7 +105,9 @@
 | Host Font Catalog | platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集したホストフォント索引。Ferritex では host-local overlay として扱う |
 | Configured Overlay Root | 起動時設定で明示された読み取り専用の追加資産ディレクトリ。project root 外に置かれた `.tex` / `.sty` / クラス / フォント資産を allowlist として解決面へ追加する |
 | Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、jobname、生成者種別、生成パス、コンテンツハッシュを記録する台帳 |
+| Job Context | 1 回のコンパイル実行を識別する jobname・主入力・現在パス番号の組。same-job readback 判定に用いる |
 | Bbl Snapshot | `.bbl` から取り込んだ引用・参考文献情報の正規化スナップショット |
+| Definition Provenance | マクロ・ラベル・参考文献エントリの定義元を示すファイル名・行番号・列番号・由来種別の組。定義ジャンプと診断に用いる |
 | グラフィックシーン | tikz/graphicx の描画結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した中間表現 |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
@@ -580,12 +582,13 @@
 #### REQ-FUNC-030: 部分再コンパイル
 
 - **説明**: 変更影響範囲のみを再処理し、キャッシュ済みの結果とマージして出力する
-- **入力**: 変更検知結果、キャッシュ済み中間結果
+- **入力**: 変更検知結果、依存グラフ、キャッシュ済み中間結果
 - **処理**:
+  - 変更影響範囲と依存グラフから、再構築ノードと再利用ノードを分離した再コンパイルプランを構築
   - 変更対象範囲の再パース・再展開・再組版
   - ページ番号・相互参照の再計算（変更による連鎖的な番号ずれの検知）
   - 再処理結果とキャッシュ結果の統合
-  - 参照が安定するまでの反復（差分コンパイルでも最大3パス）
+  - 参照安定性を判定し、安定するまで反復（差分コンパイルでも最大3パス）
 - **出力**: 更新された PDF
 - **受け入れ基準**:
   - Given 100ページの文書の1段落を変更, When 差分コンパイル, Then フルコンパイル結果と同一の PDF が生成される
@@ -678,12 +681,15 @@
 - **説明**: `\label`, `\ref`, `\cite`, マクロ定義へのジャンプ機能を提供する
 - **入力**: カーソル位置（`textDocument/definition`）
 - **処理**:
+  - マクロ定義、ラベル、参考文献エントリの Definition Provenance をシンボル索引として保持する
   - `\ref{label}` → 対応する `\label{label}` の位置
-  - `\cite{key}` → 対応する参考文献エントリの位置
+  - `\cite{key}` → 対応する参考文献エントリの位置（`.bbl` スナップショット上の定義位置、または保持していれば元ソース位置）
   - `\command` → `\newcommand{\command}` の定義位置
 - **出力**: 定義位置の `Location`
 - **受け入れ基準**:
   - Given `\ref{fig:overview}` にカーソルを置いた状態, When 定義ジャンプを実行, Then `\label{fig:overview}` の位置にジャンプする
+  - Given `\newcommand{\foo}[1]{...}` が定義された文書で `\foo{bar}` にカーソルを置いた状態, When 定義ジャンプを実行, Then `\newcommand{\foo}` の位置にジャンプする
+  - Given `\cite{knuth1984}` と対応する `.bbl` エントリがある文書, When 定義ジャンプを実行, Then `knuth1984` の参考文献エントリ位置が返される
 - **優先度**: Should
 - **出典**: ユーザー明示
 
@@ -861,12 +867,12 @@
 #### REQ-FUNC-048: ファイルアクセスサンドボックス
 
 - **説明**: コンパイル中のすべてのファイル読み書きをパスアクセスポリシーで制御する
-- **入力**: パス要求（read/write/create）、アクセス目的（tex-input / tex-output / engine-output / engine-readback / engine-temp）、プロジェクトルート、設定済み overlay roots、Asset Bundle ルート、キャッシュディレクトリ、明示的 output root、current jobname、Output Artifact Registry
+- **入力**: パス要求（read/write/create）、アクセス目的（tex-input / tex-output / engine-output / engine-readback / engine-temp）、プロジェクトルート、設定済み overlay roots、Asset Bundle ルート、キャッシュディレクトリ、明示的 output root、current Job Context、Output Artifact Registry
 - **処理**:
   - パス正規化とシンボリックリンク解決
-  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current jobname の trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
+  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Job Context の jobname と整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
   - Ferritex 自身が確保した private temp dir をキャッシュ配下または明示的 output root 配下に作成し、`engine-temp` 用にのみ許可
-  - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・artifact kind・jobname・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する
+  - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・artifact kind・jobname・現在パス番号・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する
   - システム一時領域全体は許可 root として公開しない
   - 拒否時の診断生成と、許可時のファイルハンドル発行
 - **出力**: 許可されたファイルハンドルまたは拒否診断
@@ -875,6 +881,7 @@
   - Given 設定済み read-only overlay root にある `shared.sty` を読み込む文書, When コンパイル, Then 読み込みは許可されるが同 root への書き込みは拒否される
   - Given `--output-dir ../dist` を指定してコンパイル, When PDF / `.aux` / `.log` を生成, Then 正規化済み output root 配下への書き込みのみが許可される
   - Given `--output-dir ../dist` を指定して 2 パス以上のコンパイルを行う文書, When Ferritex が前パスで生成し Output Artifact Registry に記録した `../dist/main.aux` と `../dist/main.toc` を再読込, Then `engine-readback` として許可される
+  - Given 同じ output root 配下に `foo.aux` と `bar.aux` が存在する環境, When current Job Context の jobname が `foo` のコンパイルから `bar.aux` を `engine-readback` しようとする, Then same-job 不一致として拒否される
   - Given `--output-dir ../dist` 配下にユーザーが事前配置した未登録の `main.aux` がある文書, When コンパイル, Then `engine-readback` は拒否され provenance 不一致の診断が表示される
   - Given `../../outside.txt` への `\openout` を試みる文書, When コンパイル, Then 書き込みが拒否され診断が表示される
 - **優先度**: Must
@@ -987,6 +994,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.5 | 2026-03-12 | Definition Provenance と定義ジャンプ要件、差分コンパイルの再コンパイルプラン、same-job readback 用 Job Context を反映 | Codex |
 | 0.1.4 | 2026-03-12 | output root readback provenance、font 解決優先順位、citation/bibliography の責務分離を反映 | Codex |
 | 0.1.3 | 2026-03-12 | output root の補助ファイル readback、host-local font の再現性スコープ、LSP codeAction、PDF Form XObject 表現を追記 | Codex |
 | 0.1.2 | 2026-03-12 | overlay roots の許可境界を明確化し、PDF グラフィック表現とフォント解決面の整合性を修正 | Codex |
