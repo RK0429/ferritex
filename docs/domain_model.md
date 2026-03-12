@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.11          |
+| バージョン | 0.1.12          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.11 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.12 |
 
 ## 1. サブドメイン分類
 
@@ -74,7 +74,7 @@ graph LR
 
 ### 3.1 パーサー/マクロエンジン コンテキスト
 
-`CompilationJob` は最大 3 パスまでのコンパイル全体を表す集約であり、pass 間で共有される `DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を所有する。`CompilationSession` はその内部の 1 パスを表し、カテゴリコード・レジスタ・スコープなど pass-local な状態だけを保持する。
+`CompilationJob` は最大 3 パスまでのコンパイル全体を表す集約であり、pass 間で共有される `DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を所有する。`CompilationSession` はその内部の 1 パスを表し、カテゴリコード・レジスタ・スコープなど pass-local な状態だけを保持する。パイプライン並列化を行う場合でも、各ステージが参照できるのは `CompilationSession` / `DocumentState` から導出した読み取り専用 snapshot のみであり、可変状態への commit は `CompilationJob` が所有する決定的 barrier で逐次に行う。
 
 ```mermaid
 classDiagram
@@ -1417,7 +1417,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、preview 配信は `PreviewSession` ごとの閲覧位置を保持する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSession` ごとの閲覧位置を保持し、新しい PDF のページ数に合わせて最近傍の有効ページへ clamp する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1456,6 +1456,7 @@ classDiagram
         <<Entity>>
         +Set~FilePath~ watchedPaths
         +Duration debounce
+        +replaceWatchedPaths(Set~FilePath~) void
         +start() void
         +stop() void
     }
@@ -1474,6 +1475,7 @@ classDiagram
         <<Service>>
         +bool compileInFlight
         +enqueue(FileChangeEvent) void
+        +syncWatchSet(DependencyGraph) void
         +onCompileFinished() void
     }
     class PreviewServer {
@@ -1491,17 +1493,20 @@ classDiagram
         +Connection connection
         +PreviewViewState viewState
         +updateView(PreviewViewState) void
+        +restoreView(PreviewUpdate) PreviewViewState
     }
     class PreviewViewState {
         <<ValueObject>>
         +int pageNumber
         +float viewportOffsetY
         +float zoom
+        +clampToPageCount(int) PreviewViewState
     }
     class PreviewUpdate {
         <<ValueObject>>
         +bytes pdf
         +bool retainView
+        +int pageCount
     }
     class RuntimeOptions {
         <<ValueObject>>
@@ -1575,6 +1580,8 @@ classDiagram
     DefinitionProvider --> SymbolIndex
     FileWatcher ..> FileChangeEvent : emits
     FileWatcher --> RecompileScheduler : notifies
+    RecompileScheduler --> FileWatcher : refreshes watch set
+    RecompileScheduler ..> DependencyGraph : projects watched paths
     RecompileScheduler --> PendingChangeQueue
     RecompileScheduler ..> CliRunner : triggers compile
     PreviewServer ..> CliRunner : receives PDF
@@ -1657,6 +1664,8 @@ stateDiagram-v2
 | レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
 | コンパイルジョブ (CompilationJob) | 1 回の compile/watch/LSP 再コンパイル要求を表す集約。最大 3 パスまでの `CompilationSession` を束ね、`DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を pass 間で保持する | CompilationSession, DocumentState, OutputArtifactRegistry |
 | コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリ、current Job Context を保持する | CompilationJob, JobContext |
+| コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`CompilationSession` / `DocumentState` の確定済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentState |
+| コミットバリア (CommitBarrier) | 並列ステージの結果を決定的順序で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可される | CompilationJob, CompilationSnapshot |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback 判定と出力命名の境界を与える | CompilationSession, OutputArtifactRegistry |
 | ファイルアクセスゲート (FileAccessGate) | `\input` / `\openin` / `\openout` / engine-temp / engine-readback などの I/O 要求を `ExecutionPolicy` と `OutputArtifactRegistry` に照らして許可/拒否する共通ゲート | FileAccessRequest, SandboxedFileHandle |
 | 目次状態 (TableOfContentsState) | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 | DocumentState, TocEntry |
@@ -1758,10 +1767,10 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, CompilationSession |
-| 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら再コンパイルを逐次実行する調停役 | FileWatcher, PendingChangeQueue |
+| 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら再コンパイルを逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph |
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
 | プレビューセッション (PreviewSession) | 接続 1 件分の preview 状態。閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewServer, PreviewViewState |
-| プレビュー表示状態 (PreviewViewState) | 現在ページ、ページ内オフセット、ズーム倍率など、プレビュー更新後も維持すべき閲覧位置 | PreviewSession |
+| プレビュー表示状態 (PreviewViewState) | 現在ページ、ページ内オフセット、ズーム倍率など、プレビュー更新後も維持すべき閲覧位置。新 PDF のページ数に対して最近傍の有効ページへ clamp できる | PreviewSession |
 | RuntimeOptions | compile / watch / LSP の入口固有指定を正規化した共通実行オプション。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
 | AssetBundleRef | Asset Bundle の参照値。ファイルパスまたは組み込み識別子を区別して保持する | RuntimeOptions, CompileOptions, WatchOptions |
 | WorkspaceContext | プロジェクトルート、overlay roots、キャッシュ位置、利用可能な bundle 探索範囲/組み込み識別子をまとめた実行文脈 | ExecutionPolicyFactory |
@@ -1772,13 +1781,13 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: 全コンテキスト横断
-- **判断内容**: パイプライン並列化（ステージ間バッファリング・スレッドプール管理）はドメインモデルに含めず、インフラストラクチャ層の関心事とする
+- **判断内容**: パイプライン並列化（ステージ間バッファリング・スレッドプール管理）はドメインモデルに含めず、インフラストラクチャ層の関心事とする。ただし `REQ-FUNC-031` の並列安全性を満たすため、各ステージは `CompilationSession` / `DocumentState` から導出した読み取り専用 `CompilationSnapshot` のみを観測し、可変状態の反映は `CompilationJob` 配下の `CommitBarrier` で逐次化する
 - **根拠**:
-  - 観測事実: BR-6「並列処理の出力はシングルスレッド実行と同一」— ドメインロジックは実行モデルに依存しない
+  - 観測事実: BR-6「並列処理の出力はシングルスレッド実行と同一」および REQ-FUNC-031「並列安全なレジスタ・マクロ状態管理」— ドメインロジックは実行モデルに依存しないが、状態可視性の契約は必要
   - 代替案: `PipelineOrchestrator` をドメインモデルに含める
-  - 分離証人: 逐次実行でも並列実行でも全ビジネスルール（行分割・ページ分割・参照解決等）の帰結は同一。パイプラインの存在でのみ表現可能なビジネスルールが存在しない
+  - 分離証人: 組版ステージと PDF 射影ステージが同じマクロ・レジスタ状態を参照するケース。snapshot/barrier 契約付きモデルでは両者が同一の確定済み状態を観測し、commit 順序も一意になるが、契約なしモデルでは途中更新の可視性が実装依存になり逐次実行との差分を説明できない
 - **等価性への影響**: 理論等価（ドメインの振る舞いは変化しない）
-- **語彙への影響**: なし
+- **語彙への影響**: 「CompilationSnapshot」「CommitBarrier」を導入
 
 ### 6.2 依存グラフとコンパイルキャッシュの独立永続化
 
@@ -1976,11 +1985,11 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール / 差分コンパイル
-- **判断内容**: watch 実行中の変更イベントは `FileWatcher` が発火し、`RecompileScheduler` が `PendingChangeQueue` を介して追加変更を coalesce しながら逐次的に差分コンパイルを起動する。コンパイル中の変更は即時実行せず、完了後に 1 回以上の再トリガーとして処理する
+- **判断内容**: watch 実行中の変更イベントは `FileWatcher` が発火し、`RecompileScheduler` が `PendingChangeQueue` を介して追加変更を coalesce しながら逐次的に差分コンパイルを起動する。コンパイル中の変更は即時実行せず、完了後に 1 回以上の再トリガーとして処理する。各コンパイル完了後は最新の `DependencyGraph` から watch 対象集合を再計算し、`FileWatcher` へ反映する
 - **根拠**:
-  - 観測事実: REQ-FUNC-039 はコンパイル中の追加変更をキューイングし、現在のコンパイル完了後に再コンパイルすることを Must として要求する
+  - 観測事実: REQ-FUNC-039 はコンパイル中の追加変更をキューイングし、現在のコンパイル完了後に再コンパイルすることを Must として要求し、REQ-FUNC-038 は `\input` / `\include` 先の自動監視を Must として要求する
   - 代替案: `FileWatcher` または `CliRunner` が個別に再入制御を持つ
-  - 分離証人: 保存を短時間に 3 回連続で行うケース。`RecompileScheduler` モデルでは変更を 1 つの保留集合に統合してコンパイル完了後に再実行できるが、呼び出し元分散モデルでは重複コンパイルやイベント取りこぼしの責務が曖昧になる
+  - 分離証人: watch 中の再コンパイルで新たに `\input{appendix}` が解決された後に `appendix.tex` を編集するケース。`RecompileScheduler` が `DependencyGraph` から watch set を再同期するモデルでは変更を捕捉できるが、初期 watch set 固定モデルでは新規依存ファイルのイベントを取りこぼす
 - **等価性への影響**: 理論等価（外部仕様は同一で、watch 再入制御の所有者が明確になる）
 - **語彙への影響**: 「RecompileScheduler」「PendingChangeQueue」「FileChangeEvent」を導入
 
@@ -1988,11 +1997,11 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール
-- **判断内容**: `PreviewServer` は生の接続一覧ではなく `PreviewSession` を保持し、各セッションが `PreviewViewState` として現在ページ・ページ内オフセット・ズーム倍率を持つ。PDF 更新時は `PreviewUpdate.retainView` に従って閲覧位置を再適用する
+- **判断内容**: `PreviewServer` は生の接続一覧ではなく `PreviewSession` を保持し、各セッションが `PreviewViewState` として現在ページ・ページ内オフセット・ズーム倍率を持つ。PDF 更新時は `PreviewUpdate.retainView` に従って閲覧位置を再適用し、保持ページが新 PDF に存在しない場合は `PreviewUpdate.pageCount` を用いて最近傍の有効ページへ clamp する
 - **根拠**:
-  - 観測事実: REQ-FUNC-040 はホットリロード後も閲覧ページ位置が維持されることを要求している
+  - 観測事実: REQ-FUNC-040 はホットリロード後も閲覧ページ位置が維持されること、および保持ページが消滅した場合は最近傍の有効ページへフォールバックすることを要求している
   - 代替案: preview クライアントが暗黙に位置復元すると仮定し、サーバー側モデルでは raw PDF 配信だけを表現する
-  - 分離証人: 20 ページ目を閲覧中に再コンパイルが発生するケース。`PreviewSession` モデルでは接続ごとに保持された view state を再適用できるが、raw 配信モデルでは「どの位置を維持するか」の所有者が不明になる
+  - 分離証人: 20 ページ目を閲覧中に再コンパイル後の PDF が 15 ページへ短縮されるケース。`PreviewSession` + `PreviewViewState.clampToPageCount` モデルでは 15 ページ目へ決定的にフォールバックできるが、raw 配信モデルでは fallback 先が実装依存になり位置維持要件を満たせない
 - **等価性への影響**: 理論等価（外部仕様は同一で、preview view restore の責務境界が明確になる）
 - **語彙への影響**: 「PreviewSession」「PreviewViewState」「PreviewUpdate」を導入
 
@@ -2007,7 +2016,7 @@ stateDiagram-v2
 | BR-3 | ラベル/ページ相互参照は同一 `CompilationJob` 内で最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
 | BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
 | BR-5 | 差分コンパイルは再構築ノードと再利用ノードをマージした後もフルコンパイルと同一の出力でなければならず、参照不安定時は最大 3 パスまで反復する | REQ-FUNC-030 | 差分コンパイル |
-| BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
+| BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならず、並列ステージは読み取り専用 `CompilationSnapshot` のみを参照し、マクロ・レジスタ・文書状態への commit は `CommitBarrier` で逐次化される | REQ-FUNC-031 | インフラストラクチャ層 |
 | BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。compile / watch / LSP の各入口は指定を `RuntimeOptions` へ正規化したうえですべての実行要求を `ExecutionPolicy` へ通し、デフォルト上限は 30 秒、1 プロセス / `CompilationJob`、捕捉出力 4 MiB である。Ferritex が制御した readback 対象補助ファイル生成物は `ShellCommandGateway` を通じて trusted external artifact として `OutputArtifactRegistry` に記録される | REQ-FUNC-043 / REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン / 開発者ツール |
 | BR-8 | ファイル読み書きはすべて `FileAccessGate` を経由し、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は OutputArtifactRegistry が current `JobContext` の `jobname` と主入力の双方、および artifact provenance から same job の trusted artifact と確認した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
@@ -2019,13 +2028,14 @@ stateDiagram-v2
 | BR-15 | 目次・図表一覧・索引のエントリは同一 `CompilationJob` が所有する `TableOfContentsState` / `IndexState` に蓄積され、pass をまたいで merge されたうえで `TocTypesetter` / `IndexTypesetter` により box tree へ再投影される | REQ-FUNC-012 | パーサー/マクロエンジン / タイプセッティング |
 | BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に、named destination は `PlacedDestination` に正規化される。`LinkStyle.textColor` は必要に応じて `TextRun.style.fillColor` へコピーされ、`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / text color / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
 | BR-17 | SyncTeX は `PageBox` に含まれる `PlacedNode` の `SourceSpan` と配置矩形から `SyncTexBuilder` が `SyncTraceFragment` 群を生成し、forward search では SourceLocation に交差する fragment 群を、inverse search では `PdfPosition` を含む fragment に対応する `SourceSpan` を返す | REQ-FUNC-041 | タイプセッティング / PDF 生成 |
-| BR-18 | watch 実行中の追加変更は `RecompileScheduler` が `PendingChangeQueue` へ集約し、コンパイル中に並列実行せず、現在のコンパイル完了後に coalesce 済み変更集合で再コンパイルする | REQ-FUNC-039 | 開発者ツール / 差分コンパイル |
-| BR-19 | PDF プレビュー配信は `PreviewSession` ごとに `PreviewViewState` を保持し、PDF 更新時は可能な限り同じページ位置とズームを再適用する | REQ-FUNC-040 | 開発者ツール |
+| BR-18 | watch 実行中の追加変更は `RecompileScheduler` が `PendingChangeQueue` へ集約し、コンパイル中に並列実行せず、現在のコンパイル完了後に coalesce 済み変更集合で再コンパイルする。各コンパイル完了後は最新 `DependencyGraph` から `FileWatcher.watchedPaths` を再同期する | REQ-FUNC-038 / REQ-FUNC-039 | 開発者ツール / 差分コンパイル |
+| BR-19 | PDF プレビュー配信は `PreviewSession` ごとに `PreviewViewState` を保持し、PDF 更新時は可能な限り同じページ位置とズームを再適用する。保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする | REQ-FUNC-040 | 開発者ツール |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch set の依存グラフ同期、preview の最近傍ページ fallback を追加 | Codex |
 | 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch scheduler/queue、preview session/view state を追加 | Codex |
 | 0.1.10 | 2026-03-12 | SourceSpan / PlacedNode / PlacedDestination / SyncTexBuilder、colorlinks の text-side style、FileAccessGate を追加 | Codex |
 | 0.1.9 | 2026-03-12 | LinkAnnotationPlan / LinkStyle、TocTypesetter / IndexTypesetter、trusted external artifact 登録経路を追加 | Codex |

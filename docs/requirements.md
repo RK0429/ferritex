@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.11          |
+| バージョン | 0.1.12          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -109,6 +109,8 @@
 | Asset Bundle Reference | Ferritex Asset Bundle を参照するための値。ファイルパスまたは組み込みバンドル識別子で表す |
 | Compilation Job | 1 回の `compile` / `watch` / LSP 再コンパイル要求に対応する単位。最大 3 パスまでの `Compilation Session` を束ね、参照状態と出力 artifact provenance を pass 間で保持する |
 | Compilation Session | `Compilation Job` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリを保持する |
+| Compilation Snapshot | 並列ステージ境界で共有する読み取り専用のコンパイル状態スナップショット。マクロ・レジスタ・文書状態の確定済み部分を含み、並列タスクから破壊的更新しない |
+| Commit Barrier | 並列ステージの結果を決定的な順序で `Compilation Job` へ反映する同期点。可変状態の commit はここでのみ行う |
 | Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、主入力、jobname、生成パス番号、生成者種別、生成パス、コンテンツハッシュを記録する台帳 |
 | Job Context | `Compilation Job` 内の現在パスを識別する jobname・主入力・現在パス番号の組。same-job readback 判定に用いる |
 | Bbl Snapshot | `.bbl` から取り込んだ引用・参考文献情報の正規化スナップショット |
@@ -635,11 +637,13 @@
   - ストリーミング処理: 前段の出力を後段がインクリメンタルに消費
   - ステージ間バッファリング（生産者-消費者パターン）
   - 並列安全なレジスタ・マクロ状態管理
+  - 並列ステージが参照するマクロ・レジスタ・文書状態は `Compilation Snapshot` として読み取り専用で受け渡し、可変状態への反映は `Commit Barrier` で逐次化する
   - スレッドプール管理（CPU コア数に基づく自動設定）
 - **出力**: 並列処理による高速化されたコンパイル結果
 - **受け入れ基準**:
   - Given 4コア以上の CPU 環境, When 100ページ文書をコンパイル, Then シングルスレッド実行と同一の出力が得られ処理時間が短縮される
   - Given 1コアの環境, When コンパイル, Then シングルスレッドにフォールバックし正常に動作する
+  - Given 並列実行中に複数ステージが同じマクロ・レジスタ状態を参照, When 片方のステージが処理を完了, Then 他方のステージは同一 `Compilation Snapshot` を観測し、可変状態への反映は `Commit Barrier` 通過後にのみ行われる
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -741,10 +745,12 @@
 - **処理**:
   - OS ネイティブのファイル監視 API（`inotify`, `FSEvents`, `ReadDirectoryChangesW`）を使用
   - `\input`, `\include` 先の依存ファイルも自動で監視対象に追加
+  - 各再コンパイル完了後に最新の依存グラフから監視対象集合を再同期し、新たに解決された `\input`, `\include`, `\usepackage` 先を次回監視へ反映する
   - デバウンス処理（短時間の連続変更をまとめて1回のトリガー、デフォルト 100ms）
 - **出力**: 変更イベント（変更されたファイルパスのリスト）
 - **受け入れ基準**:
   - Given `\include{chap1}` を含む文書を監視中, When `chap1.tex` を変更, Then 変更イベントが発火する
+  - Given watch 実行中の再コンパイルで `\input{appendix}` が新たに解決された文書, When その後 `appendix.tex` を変更, Then 追加設定なしで変更イベントが発火する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -777,6 +783,7 @@
 - **出力**: プレビューア上での更新された PDF 表示
 - **受け入れ基準**:
   - Given プレビューアが接続中, When 再コンパイル完了, Then 1秒以内にプレビューが更新され閲覧ページ位置が維持される
+  - Given 再コンパイル前に 20 ページ目を閲覧中で、再コンパイル後の PDF が 15 ページに短縮された場合, When プレビューが更新, Then 最近傍の有効ページである 15 ページ目へフォールバックしズーム倍率を維持する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -1030,6 +1037,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch 対象集合の依存グラフ同期、preview の最近傍ページ fallback を追記 | Codex |
 | 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch 再トリガーの scheduler/queue、preview の view state を追記 | Codex |
 | 0.1.10 | 2026-03-12 | SyncTeX の source trace / placed destination、colorlinks の text-side style、共通 File Access Gate を追記 | Codex |
 | 0.1.9 | 2026-03-12 | Link Annotation Plan / Link Style、TOC/索引の box tree 投影、外部ツール成果物の trusted artifact 登録責務を追記 | Codex |
