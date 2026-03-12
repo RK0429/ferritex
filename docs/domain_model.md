@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.3           |
+| バージョン | 0.1.4           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.3 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.4 |
 
 ## 1. サブドメイン分類
 
@@ -84,6 +84,7 @@ classDiagram
         +RegisterBank registers
         +CommandRegistry commands
         +EnvironmentRegistry environments
+        +OutputArtifactRegistry outputArtifacts
         +ExecutionPolicy policy
     }
     class Lexer {
@@ -139,10 +140,11 @@ classDiagram
         <<Entity>>
         +CounterStore counters
         +CrossReferenceTable references
+        +BibliographyState bibliography
         +AuxState aux
         +int passCount
         +registerLabel(String, LabelInfo) void
-        +resolve(String) ResolvedRef
+        +resolveLabel(String) ResolvedRef
     }
     class CounterStore {
         <<Entity>>
@@ -166,6 +168,31 @@ classDiagram
         +String key
         +String value
         +int pageNumber
+    }
+    class BibliographyState {
+        <<Entity>>
+        +CitationTable citations
+        +BblSnapshot bbl
+        +resolveCitation(String) CitationInfo
+    }
+    class CitationTable {
+        <<Entity>>
+        +Map~String, CitationInfo~ entries
+    }
+    class CitationInfo {
+        <<ValueObject>>
+        +String key
+        +String label
+        +String formattedText
+    }
+    class BblSnapshot {
+        <<ValueObject>>
+        +List~BibliographyEntry~ entries
+    }
+    class BibliographyEntry {
+        <<ValueObject>>
+        +String key
+        +String renderedBlock
     }
     class CommandRegistry {
         <<Entity>>
@@ -233,6 +260,21 @@ classDiagram
         +Set~String~ outputReadbackExtensions
         +FilePath privateTempRoot
     }
+    class OutputArtifactRegistry {
+        <<Entity>>
+        +Map~FilePath, OutputArtifactRecord~ records
+        +record(OutputArtifactRecord) void
+        +allowReadback(FilePath, String, ArtifactKind) bool
+    }
+    class OutputArtifactRecord {
+        <<ValueObject>>
+        +FilePath path
+        +ArtifactKind kind
+        +String jobname
+        +ArtifactProducerKind producer
+        +ContentHash contentHash
+        +int producedPass
+    }
     class InputSource {
         <<Entity>>
         +FilePath path
@@ -263,11 +305,17 @@ classDiagram
     CompilationSession --> RegisterBank
     CompilationSession --> CommandRegistry
     CompilationSession --> EnvironmentRegistry
+    CompilationSession --> OutputArtifactRegistry
     CompilationSession --> ExecutionPolicy
     DocumentState --> CounterStore
     DocumentState --> CrossReferenceTable
+    DocumentState --> BibliographyState
     DocumentState --> AuxState
     CrossReferenceTable o-- LabelInfo
+    BibliographyState --> CitationTable
+    BibliographyState --> BblSnapshot
+    CitationTable o-- CitationInfo
+    BblSnapshot o-- BibliographyEntry
     Lexer --> CompilationSession : reads
     Lexer --> InputSource
     Lexer ..> Token : produces
@@ -286,6 +334,7 @@ classDiagram
     PackageExtension <|.. FontspecExtension
     ShellCommandGateway --> ExecutionPolicy
     ExecutionPolicy --> PathAccessPolicy
+    OutputArtifactRegistry o-- OutputArtifactRecord
     Token --> SourceLocation
 ```
 
@@ -375,10 +424,11 @@ classDiagram
         <<Shared Entity>>
         +CounterStore counters
         +CrossReferenceTable references
+        +BibliographyState bibliography
         +AuxState aux
         +int passCount
         +registerLabel(String, LabelInfo) void
-        +resolve(String) ResolvedRef
+        +resolveLabel(String) ResolvedRef
     }
     class AuxState {
         <<Entity>>
@@ -396,6 +446,31 @@ classDiagram
         +String key
         +String value
         +int pageNumber
+    }
+    class BibliographyState {
+        <<Entity>>
+        +CitationTable citations
+        +BblSnapshot bbl
+        +resolveCitation(String) CitationInfo
+    }
+    class CitationTable {
+        <<Entity>>
+        +Map~String, CitationInfo~ entries
+    }
+    class CitationInfo {
+        <<ValueObject>>
+        +String key
+        +String label
+        +String formattedText
+    }
+    class BblSnapshot {
+        <<ValueObject>>
+        +List~BibliographyEntry~ entries
+    }
+    class BibliographyEntry {
+        <<ValueObject>>
+        +String key
+        +String renderedBlock
     }
     class CounterStore {
         <<Entity>>
@@ -421,7 +496,12 @@ classDiagram
     DocumentState --> CounterStore
     DocumentState --> AuxState
     DocumentState --> CrossReferenceTable
+    DocumentState --> BibliographyState
     CrossReferenceTable o-- LabelInfo
+    BibliographyState --> CitationTable
+    BibliographyState --> BblSnapshot
+    CitationTable o-- CitationInfo
+    BblSnapshot o-- BibliographyEntry
 ```
 
 ### 3.3 グラフィック描画 コンテキスト
@@ -611,6 +691,12 @@ classDiagram
         +List~OverlayLayer~ layers
         +resolve(LogicalAssetId) AssetHandle
     }
+    class OverlayLayer {
+        <<ValueObject>>
+        +OverlayKind kind
+        +int precedence
+        +bool fallbackOnly
+    }
     class HostFontCatalog {
         <<Entity>>
         +CatalogVersion version
@@ -643,6 +729,7 @@ classDiagram
     AssetBundle --> AssetIndex
     OverlaySet --> AssetBundle
     OverlaySet --> HostFontCatalog
+    OverlaySet o-- OverlayLayer
     AssetIndex o-- PackageSnapshot
     AssetIndex o-- ClassSnapshot
     AssetIndex o-- FontSnapshot
@@ -744,7 +831,7 @@ classDiagram
         +GlyphStore glyphs
     }
     class HostFontCatalog {
-        <<Overlay>>
+        <<FallbackOverlay>>
         +CatalogVersion version
         +Map~String, FontDescriptor~ byPostScriptName
         +Map~String, FontDescriptor~ byFamilyStyle
@@ -932,8 +1019,9 @@ stateDiagram-v2
 | マクロ定義 (MacroDefinition) | `\def` 等で定義されたパターンと置換テキストの組 | マクロ展開, スコープ |
 | スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタの有効範囲 | ScopeStack |
 | レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
-| コンパイルセッション (CompilationSession) | 1 回のコンパイルパスで共有される可変 TeX 状態の集約。カテゴリコード、レジスタ、ラベル、実行ポリシーを保持する | DocumentState, ExecutionPolicy |
-| パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する実行ポリシー | ExecutionPolicy |
+| コンパイルセッション (CompilationSession) | 1 回のコンパイルパスで共有される可変 TeX 状態の集約。カテゴリコード、レジスタ、ラベル、参考文献状態、出力アーティファクト provenance、実行ポリシーを保持する | DocumentState, OutputArtifactRegistry, ExecutionPolicy |
+| パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する静的ポリシー。実際の readback 可否は OutputArtifactRegistry と組み合わせて判定する | ExecutionPolicy, OutputArtifactRegistry |
+| 出力アーティファクトレジストリ (OutputArtifactRegistry) | Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルの provenance を保持し、trusted artifact のみを再読込可能にする台帳 | OutputArtifactRecord, ExecutionPolicy |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 
 ### 5.2 タイプセッティング コンテキスト
@@ -945,8 +1033,9 @@ stateDiagram-v2
 | ペナルティ (Penalty) | 行/ページ分割の位置を制御する整数値。高いほど分割されにくい | 行分割, ページ分割 |
 | 行分割 (Line Breaking) | Knuth-Plass アルゴリズムにより段落の最適な改行位置を決定する処理 | Paragraph, LineBreakParams |
 | フロート (Float) | テキストの流れから独立して配置されるオブジェクト。配置指定子で制御 | FloatQueue, PageBuilder |
-| ドキュメント状態 (DocumentState) | カウンタ、ラベル、参照安定性など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable |
-| 相互参照 (Cross Reference) | `\label`/`\ref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
+| ドキュメント状態 (DocumentState) | カウンタ、ラベル、参考文献状態、参照安定性など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable, BibliographyState |
+| 相互参照 (Cross Reference) | `\label`/`\ref`/`\pageref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
+| 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table と参考文献エントリを保持し、`\cite` を解決する状態 | CitationTable, BblSnapshot |
 | 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
 
 ### 5.3 グラフィック描画 コンテキスト
@@ -976,7 +1065,7 @@ stateDiagram-v2
 |---|---|---|
 | Ferritex Asset Bundle | 実行時に参照するクラス・パッケージ・フォント資産の不変スナップショット | AssetIndex, OverlaySet |
 | Asset Index | 論理名から資産ハンドルを高速解決する索引構造 | AssetBundle |
-| オーバーレイ (Overlay) | 公式バンドルの上に project-local 資産、設定済み read-only overlay roots、host-local font catalog を重ねる解決レイヤー | OverlaySet |
+| オーバーレイ (Overlay) | project-local 資産、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local font catalog fallback を優先順位付きで束ねる解決レイヤー | OverlaySet, OverlayLayer |
 | Host Font Catalog | platform font discovery API から収集したホストフォント索引。overlay の一種として解決面に参加する | PlatformFontScanner, FontSnapshot |
 
 ### 5.6 PDF 生成 コンテキスト
@@ -994,7 +1083,7 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | フォントメトリクス (FontMetrics) | 文字幅・高さ・深さ・カーニング・リガチャ情報の集合 | GlyphMetric |
-| Host Font Catalog | platform font discovery API に基づき永続化されたホストフォント索引。`fontspec` 解決時に hot path で再走査しないが、host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外 | HostFontCatalog, FontResolverCache |
+| Host Font Catalog | platform font discovery API に基づき永続化されたホストフォント索引。`fontspec` 解決時に hot path で再走査しない fallback overlay であり、project/configured overlay と Asset Bundle に一致候補がない場合にのみ参照する。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外 | HostFontCatalog, FontResolverCache |
 | OpenType フォント | OTF/TTF 形式のモダンフォント。GPOS/GSUB テーブルで高度な組版を制御 | fontspec |
 | TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 | Computer Modern |
 | グリフサブセット化 | 使用グリフのみを抽出してフォントデータを縮小する処理 | PDF 埋め込み |
@@ -1053,7 +1142,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: アセットランタイム / パーサー/マクロエンジン / フォント管理
-- **判断内容**: クラス・パッケージ・フォント資産は、Ferritex Asset Bundle とそのオーバーレイからのみ解決し、TeX Live / kpathsea は実行時依存にしない。オーバーレイは project-local 資産、設定済み read-only overlay roots、Host Font Catalog で構成し、Host Font Catalog は第三の資産源ではなく host-local overlay として扱う。ただし host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする
+- **判断内容**: クラス・パッケージ・フォント資産は、project-local 資産、設定済み read-only overlay roots、Ferritex Asset Bundle、Host Font Catalog fallback の順で解決し、TeX Live / kpathsea は実行時依存にしない。Host Font Catalog は第三の資産源ではなく fallback overlay として扱い、前段に一致候補がない場合または明示的 host-local 解決時にのみ参照する。ただし host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする
 - **根拠**:
   - 観測事実: 要件は pdfLaTeX 比 100 倍の高速化を求め、単一バイナリ + バンドルでの起動を要求する
   - 代替案: 実行時に `TEXMF` ツリーを走査し、kpathsea 互換の探索を行う
@@ -1065,25 +1154,37 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング
-- **判断内容**: カテゴリコード、スコープ、レジスタ、カウンタ、ラベル、`.aux` 書き込み、参照安定性、コマンド/環境レジストリ、実行ポリシーを `CompilationSession` に集約する。タイプセッティングは同じ `DocumentState` を共有参照する
+- **判断内容**: カテゴリコード、スコープ、レジスタ、カウンタ、ラベル、参考文献状態、`.aux` 書き込み、参照安定性、コマンド/環境レジストリ、実行ポリシーを `CompilationSession` に集約する。タイプセッティングは同じ `DocumentState` を共有参照する
 - **根拠**:
   - 観測事実: `\section` によるカウンタ更新、`\label` の登録、`\ref` の解決、パッケージ読み込みは同一パスの逐次状態に依存する
   - 代替案: それぞれを独立サービスとして保持し、暗黙の共有状態またはグローバル状態で同期する
   - 分離証人: `\section{A}\label{sec:a}` のケース。集約モデルでは同一セッション内で最新カウンタ値とラベル登録を原子的に扱えるが、分散サービスモデルでは「カウンタ更新後にどの値をラベルへ固定するか」が隠れた結合になる
 - **等価性への影響**: 理論等価（外部仕様は同一だが、整合性の表現力が向上する）
-- **語彙への影響**: 「CompilationSession」「DocumentState」を導入
+- **語彙への影響**: 「CompilationSession」「DocumentState」「BibliographyState」を導入
 
 ### 6.7 実行制御を CLI フラグではなく ExecutionPolicy として表現する
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
-- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root は Ferritex 自身が生成した補助ファイルの readback に限って再読込を許可する
+- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root の readback は `OutputArtifactRegistry` が same job の trusted artifact と確認した補助ファイルに限って許可する
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれる
   - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
   - 分離証人: watch モードと CLI の双方で `\write18` を含む文書を処理するケース。Policy モデルでは両者に同一判定を適用できるが、入口ごとの分岐モデルでは実装漏れで片方だけ許可される不整合が起こり得る
 - **等価性への影響**: 理論等価（外部仕様は同一で、実装の一貫性が向上する）
-- **語彙への影響**: 「ExecutionPolicy」「PathAccessPolicy」を導入
+- **語彙への影響**: 「ExecutionPolicy」「PathAccessPolicy」「OutputArtifactRegistry」を導入
+
+### 6.8 引用解決を label 系相互参照から分離する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング
+- **判断内容**: `\label`/`\ref`/`\pageref` は `CrossReferenceTable` で扱い、`.bbl` 由来の `\cite` 解決と参考文献リスト組版は `BibliographyState` / `CitationTable` で扱う。両者は同じ `DocumentState` に属するが責務は分離する
+- **根拠**:
+  - 観測事実: ラベル参照は `.aux` ベースの文書内参照であり、引用解決は `.bbl` ベースの外部ツール連携を伴う
+  - 代替案: すべての参照を単一の `CrossReferenceTable` に集約する
+  - 分離証人: `\ref{sec:intro}` と `\cite{knuth1984}` が同居する文書。分離モデルでは `.aux` と `.bbl` の更新条件を独立に扱えるが、単一テーブルモデルでは未解決原因と更新契機が混線する
+- **等価性への影響**: 理論等価（外部仕様は同一で、責務境界の明瞭さが向上する）
+- **語彙への影響**: 「CitationTable」「BblSnapshot」を導入
 
 ## 7. ビジネスルール一覧
 
@@ -1093,21 +1194,23 @@ stateDiagram-v2
 |---|---|---|---|
 | BR-1 | カテゴリコードは `\catcode` により動的に変更可能。字句解析は現在のカテゴリコードテーブルを常に参照する | REQ-FUNC-001 | パーサー/マクロエンジン |
 | BR-2 | マクロ展開の再帰深度は上限あり（デフォルト 1000）。超過時はエラー | REQ-FUNC-002 | パーサー/マクロエンジン |
-| BR-3 | 相互参照は最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
+| BR-3 | ラベル/ページ相互参照は最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
 | BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
 | BR-5 | 差分コンパイルの出力はフルコンパイルと同一でなければならない | REQ-FUNC-030 | 差分コンパイル |
 | BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
 | BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。すべての実行要求は `ExecutionPolicy` を経由する | REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン |
-| BR-8 | ファイル読み書きは、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は Ferritex 自身が生成した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
+| BR-8 | ファイル読み書きは、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は OutputArtifactRegistry が same job の trusted artifact と確認した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
-| BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、設定済み read-only overlay roots、host-local Font Catalog overlay、Ferritex Asset Bundle から解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 / REQ-NF-008 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
+| BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local Font Catalog fallback の順で解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 / REQ-NF-008 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
 | BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationSession` の `DocumentState` に対して行われる | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 | パーサー/マクロエンジン / タイプセッティング |
+| BR-13 | `\cite` の解決と参考文献リスト組版は `BibliographyState` / `CitationTable` が担い、label 系の `CrossReferenceTable` とは責務を分離する | REQ-FUNC-024 | パーサー/マクロエンジン / タイプセッティング |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.4 | 2026-03-12 | readback provenance、font fallback 優先順位、BibliographyState/CitationTable を反映 | Codex |
 | 0.1.3 | 2026-03-12 | output root の補助ファイル readback、host-local font の再現性境界、EmbeddedPdfGraphic、LSP codeAction/hover を反映 | Codex |
 | 0.1.2 | 2026-03-12 | overlayRoots、PdfGraphic、FontManager→OverlaySet を追加し、資産解決とアクセス境界の整合性を修正 | Codex |
 | 0.1.1 | 2026-03-12 | グラフィック描画コンテキスト、host-local overlay、共有 DocumentState、output roots/private temp root を反映 | Codex |

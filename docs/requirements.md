@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.3           |
+| バージョン | 0.1.4           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -104,6 +104,8 @@
 | Asset Index      | Ferritex Asset Bundle 内の資産を論理名から O(1) 近傍で引ける索引構造        |
 | Host Font Catalog | platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集したホストフォント索引。Ferritex では host-local overlay として扱う |
 | Configured Overlay Root | 起動時設定で明示された読み取り専用の追加資産ディレクトリ。project root 外に置かれた `.tex` / `.sty` / クラス / フォント資産を allowlist として解決面へ追加する |
+| Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、jobname、生成者種別、生成パス、コンテンツハッシュを記録する台帳 |
+| Bbl Snapshot | `.bbl` から取り込んだ引用・参考文献情報の正規化スナップショット |
 | グラフィックシーン | tikz/graphicx の描画結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した中間表現 |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
@@ -263,26 +265,27 @@
 
 #### REQ-FUNC-011: 相互参照解決
 
-- **説明**: `\label`, `\ref`, `\pageref`, `\cite` 等の相互参照を解決する
+- **説明**: `\label`, `\ref`, `\pageref` 等の文書内相互参照を解決する
 - **入力**: 相互参照コマンドを含む文書
 - **処理**:
-  - `.aux` ファイルへのラベル情報書き出し・読み込み（`--output-dir` 指定時は正規化済み output root 配下から再読込）
+  - `.aux` ファイルへのラベル情報書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された同一 jobname の readback 対象 `.aux` のみを正規化済み output root 配下から再読込）
   - マルチパス処理（参照解決が安定するまで繰り返し、最大3パス）
   - 未解決参照の検出・警告
-- **出力**: 解決済みの参照テキスト
+- **出力**: 解決済みのラベル・ページ参照テキスト
 - **例外**: 未定義ラベル参照時に `??` を出力し警告を表示
 - **受け入れ基準**:
   - Given `\label` と `\ref` を含む文書, When コンパイルを実行, Then 最大3パスで全参照が解決される
   - Given 未定義の `\ref{unknown}`, When コンパイルを実行, Then `??` が出力され警告が表示される
 - **優先度**: Must
 - **出典**: ユーザー明示
+- **関連要件**: REQ-FUNC-024
 
 #### REQ-FUNC-012: 目次・索引生成
 
 - **説明**: `\tableofcontents`, `\listoffigures`, `\listoftables`, `\makeindex` 等を処理する
 - **入力**: 目次・索引生成コマンドを含む文書
 - **処理**:
-  - `.toc`, `.lof`, `.lot` ファイルの書き出し・読み込み（`--output-dir` 指定時は正規化済み output root 配下から再読込）
+  - `.toc`, `.lof`, `.lot` ファイルの書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された同一 jobname の readback 対象ファイルのみを正規化済み output root 配下から再読込）
   - セクション番号・ページ番号の収集と整形
   - 索引エントリの収集・ソート・整形（`makeindex` 互換）
 - **出力**: 目次・索引のボックスツリー
@@ -386,14 +389,15 @@
 - **説明**: 指定されたフォント名またはフォント識別子から、組版に使用するフォント資産を高速に解決する
 - **入力**: フォント名、ファミリ名、スタイル指定、ファイル名
 - **処理**:
-  - OverlaySet を通じて Ferritex Asset Bundle、project-local / configured read-only overlay roots、Host Font Catalog overlay を単一の解決面として扱う
+  - OverlaySet を通じて project-local / configured read-only overlay roots、Ferritex Asset Bundle、Host Font Catalog overlay fallback を単一の解決面として扱う
   - Asset Index から TeX フォント資産（TFM, map, OpenType snapshot）を解決し、host-local overlay ではコンパイルごとのフルスキャンを禁止する
   - フォントマップファイル、PostScript 名、family/style の対応付けを行う
-  - Host Font Catalog overlay は利便性モードとし、host-local font を直接解決した結果は REQ-NF-008 のバイト同一保証対象外とする。クロスプラットフォーム再現性が必要な場合は Asset Bundle または project-local / configured read-only overlay roots に固定する
+  - Host Font Catalog overlay は利便性のための fallback モードとし、project-local / configured read-only overlay roots と Asset Bundle に一致候補がない場合、または明示的に host-local 解決を要求した場合にのみ参照する。host-local font を直接解決した結果は REQ-NF-008 のバイト同一保証対象外とする
 - **出力**: フォント資産ハンドル（bundle asset id、overlay asset handle、またはキャッシュ済みファイルハンドル）
 - **例外**: フォント未発見時にエラーを報告し、明示的なフォールバックチェーンが設定されている場合のみ代替フォントを使用
 - **受け入れ基準**:
   - Given Ferritex Asset Bundle のみが導入された環境, When `cmr10` を解決, Then Asset Index から対応する TFM 資産が返される
+  - Given Asset Bundle と Host Font Catalog の両方に同名フォントが存在する環境, When 通常のフォント解決を実行, Then project-local / configured read-only overlay roots または Asset Bundle 側の候補が host-local 候補より優先される
   - Given Host Font Catalog に `Noto Serif` が登録済み, When `\setmainfont{Noto Serif}` を解決, Then OS ディレクトリ全走査なしで対象フォントが選択される
 - **優先度**: Must
 - **出典**: ユーザー明示
@@ -476,13 +480,15 @@
 - **説明**: 参考文献処理のための外部ツール（`bibtex`, `biber`）との連携を行う
 - **入力**: `\bibliography`, `\addbibresource` 等を含む文書
 - **処理**:
-  - `.bbl` ファイルの読み込み
-  - `\cite` コマンドの参照解決
+  - `.bbl` ファイルを読み込み、Bbl Snapshot と Citation Table を構築する
+  - `\cite` コマンドの参照解決は Citation Table を用いて行い、`REQ-FUNC-011` のラベル/ページ参照とは責務を分離する
   - 参考文献リストの組版
+  - `REQ-FUNC-047` 経由で Ferritex が制御した外部ツールが `.bbl` を output root 配下へ生成した場合は、Output Artifact Registry に trusted external artifact として登録する
   - 外部ツール実行の案内（`bibtex` / `biber` の実行が必要な場合の通知）
-- **出力**: 参考文献が組版された出力
+- **出力**: 引用テキストと参考文献リストが組版された出力
 - **受け入れ基準**:
   - Given bibtex で生成された `.bbl` ファイルがある文書, When コンパイル, Then 参考文献リストが正しく組版される
+  - Given `\cite{knuth1984}` と対応する `.bbl` エントリがある文書, When コンパイル, Then `\cite` は Citation Table から解決される
 - **優先度**: Should
 - **出典**: ユーザー明示
 
@@ -774,7 +780,7 @@
 - **説明**: コンパイルの動作を制御する各種 CLI オプションを提供する
 - **入力**: CLI フラグ・引数
 - **処理**: 以下のオプションをサポート
-  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加し、Ferritex 自身が生成した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等の readback を許可する
+  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加し、Ferritex または Ferritex が制御した外部ツール実行で生成され Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等の readback を許可する
   - `--jobname <name>`: ジョブ名（出力ファイル名）の指定
   - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）
   - `--no-cache`: キャッシュを無効化しフルコンパイル
@@ -827,11 +833,12 @@
 - **処理**:
   - バンドルマニフェストとバージョンの検証
   - Asset Index を memory-mapped に読み込み、クラス・パッケージ・フォントの解決 API を提供
-  - プロジェクトローカルオーバーレイ、設定済み read-only overlay roots、および Host Font Catalog overlay との優先順位付き合成
+  - プロジェクトローカルオーバーレイ、設定済み read-only overlay roots、Ferritex Asset Bundle、Host Font Catalog overlay fallback の順で優先順位付き合成
 - **出力**: アセット解決ハンドル
 - **例外**: バージョン不一致または破損時は診断を表示し、互換バンドルがなければ起動を失敗させる
 - **受け入れ基準**:
   - Given 公式 Ferritex Asset Bundle のみが存在する環境, When `ferritex compile main.tex` を実行, Then TeX Live 非導入でも標準的な LaTeX 文書がコンパイルできる
+  - Given Asset Bundle と Host Font Catalog の両方に同名フォント資産が存在する環境, When 通常の解決 API を呼び出す, Then Asset Bundle 側の資産が優先される
   - Given バンドルが破損している環境, When 読み込み, Then 破損診断が表示されコンパイルは開始されない
 - **優先度**: Must
 - **出典**: ユーザー明示（高速化方針として TeX ランタイムの実行時依存を排除）
@@ -854,11 +861,12 @@
 #### REQ-FUNC-048: ファイルアクセスサンドボックス
 
 - **説明**: コンパイル中のすべてのファイル読み書きをパスアクセスポリシーで制御する
-- **入力**: パス要求（read/write/create）、アクセス目的（tex-input / tex-output / engine-output / engine-readback / engine-temp）、プロジェクトルート、設定済み overlay roots、Asset Bundle ルート、キャッシュディレクトリ、明示的 output root
+- **入力**: パス要求（read/write/create）、アクセス目的（tex-input / tex-output / engine-output / engine-readback / engine-temp）、プロジェクトルート、設定済み overlay roots、Asset Bundle ルート、キャッシュディレクトリ、明示的 output root、current jobname、Output Artifact Registry
 - **処理**:
   - パス正規化とシンボリックリンク解決
-  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Ferritex 自身が output root 配下へ生成した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
+  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current jobname の trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
   - Ferritex 自身が確保した private temp dir をキャッシュ配下または明示的 output root 配下に作成し、`engine-temp` 用にのみ許可
+  - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・artifact kind・jobname・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する
   - システム一時領域全体は許可 root として公開しない
   - 拒否時の診断生成と、許可時のファイルハンドル発行
 - **出力**: 許可されたファイルハンドルまたは拒否診断
@@ -866,7 +874,8 @@
   - Given プロジェクト内の `chap1.tex` を `\input` する文書, When コンパイル, Then 読み込みが許可される
   - Given 設定済み read-only overlay root にある `shared.sty` を読み込む文書, When コンパイル, Then 読み込みは許可されるが同 root への書き込みは拒否される
   - Given `--output-dir ../dist` を指定してコンパイル, When PDF / `.aux` / `.log` を生成, Then 正規化済み output root 配下への書き込みのみが許可される
-  - Given `--output-dir ../dist` を指定して 2 パス以上のコンパイルを行う文書, When Ferritex が前パスで生成した `../dist/main.aux` と `../dist/main.toc` を再読込, Then `engine-readback` として許可される
+  - Given `--output-dir ../dist` を指定して 2 パス以上のコンパイルを行う文書, When Ferritex が前パスで生成し Output Artifact Registry に記録した `../dist/main.aux` と `../dist/main.toc` を再読込, Then `engine-readback` として許可される
+  - Given `--output-dir ../dist` 配下にユーザーが事前配置した未登録の `main.aux` がある文書, When コンパイル, Then `engine-readback` は拒否され provenance 不一致の診断が表示される
   - Given `../../outside.txt` への `\openout` を試みる文書, When コンパイル, Then 書き込みが拒否され診断が表示される
 - **優先度**: Must
 - **出典**: REQ-NF-006 を機能要件へ具体化
@@ -920,8 +929,8 @@
 
 #### REQ-NF-006: ファイルアクセス制御
 
-- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Ferritex 自身が生成した補助ファイルの readback に限って読み取りを許可する。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
-- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、Ferritex 自身が生成した output root 配下の補助ファイル。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
+- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Output Artifact Registry により current jobname の trusted artifact と確認された補助ファイルの readback に限って読み取りを許可する。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
+- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、Output Artifact Registry に記録された output root 配下の trusted artifact。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
 - **優先度**: Must
 - **出典**: エージェント推測（pdfLaTeX の `openout_any = p` を発展させ、runtime bundle 設計へ適用）
 
@@ -978,6 +987,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.4 | 2026-03-12 | output root readback provenance、font 解決優先順位、citation/bibliography の責務分離を反映 | Codex |
 | 0.1.3 | 2026-03-12 | output root の補助ファイル readback、host-local font の再現性スコープ、LSP codeAction、PDF Form XObject 表現を追記 | Codex |
 | 0.1.2 | 2026-03-12 | overlay roots の許可境界を明確化し、PDF グラフィック表現とフォント解決面の整合性を修正 | Codex |
 | 0.1.1 | 2026-03-12 | フォント資産源を host-local overlay として明確化し、グラフィックシーン/出力 root/private temp root の方針を追記 | Codex |
