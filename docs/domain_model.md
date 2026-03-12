@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.5           |
+| バージョン | 0.1.7           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.5 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.6 |
 
 ## 1. サブドメイン分類
 
@@ -74,19 +74,27 @@ graph LR
 
 ### 3.1 パーサー/マクロエンジン コンテキスト
 
+`CompilationJob` は最大 3 パスまでのコンパイル全体を表す集約であり、pass 間で共有される `DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を所有する。`CompilationSession` はその内部の 1 パスを表し、カテゴリコード・レジスタ・スコープなど pass-local な状態だけを保持する。
+
 ```mermaid
 classDiagram
+    class CompilationJob {
+        <<Entity>>
+        +String jobname
+        +FilePath primaryInput
+        +DocumentState documentState
+        +OutputArtifactRegistry outputArtifacts
+        +ExecutionPolicy policy
+        +beginPass(int) CompilationSession
+    }
     class CompilationSession {
         <<Entity>>
+        +JobContext context
         +CatcodeTable catcodes
-        +DocumentState documentState
-        +JobContext job
         +ScopeStack scopes
         +RegisterBank registers
         +CommandRegistry commands
         +EnvironmentRegistry environments
-        +OutputArtifactRegistry outputArtifacts
-        +ExecutionPolicy policy
     }
     class Lexer {
         <<Entity>>
@@ -260,6 +268,8 @@ classDiagram
         +bool shellEscapeEnabled
         +PathAccessPolicy pathPolicy
         +Duration commandTimeout
+        +usize maxConcurrentProcesses
+        +usize maxCapturedOutputBytes
     }
     class PathAccessPolicy {
         <<ValueObject>>
@@ -281,6 +291,7 @@ classDiagram
         <<ValueObject>>
         +FilePath normalizedPath
         +FilePath producedPath
+        +FilePath primaryInput
         +ArtifactKind kind
         +String jobname
         +ArtifactProducerKind producer
@@ -316,15 +327,17 @@ classDiagram
 
     Token <|-- ControlSequenceToken
     Token <|-- CharacterToken
+    CompilationJob o-- CompilationSession
+    CompilationJob --> DocumentState
+    CompilationJob --> OutputArtifactRegistry
+    CompilationJob --> ExecutionPolicy
     CompilationSession --> CatcodeTable
-    CompilationSession --> DocumentState
+    CompilationSession --> CompilationJob
     CompilationSession --> JobContext
     CompilationSession --> ScopeStack
     CompilationSession --> RegisterBank
     CompilationSession --> CommandRegistry
     CompilationSession --> EnvironmentRegistry
-    CompilationSession --> OutputArtifactRegistry
-    CompilationSession --> ExecutionPolicy
     DocumentState --> CounterStore
     DocumentState --> CrossReferenceTable
     DocumentState --> BibliographyState
@@ -364,7 +377,7 @@ classDiagram
 
 ### 3.2 タイプセッティング コンテキスト
 
-ここで参照する `DocumentState` は、3.1 の `CompilationSession.documentState` と同一の共有エンティティである。
+ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。
 
 ```mermaid
 classDiagram
@@ -643,7 +656,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。
 
 ```mermaid
 classDiagram
@@ -681,8 +694,8 @@ classDiagram
     }
     class IncrementalCompilationCoordinator {
         <<Service>>
-        +plan(RecompilationScope, DependencyGraph, CompilationCache) CompilationMergePlan
-        +execute(CompilationMergePlan, CompilationSession) IncrementalCompilationResult
+        +plan(CompilationJob, RecompilationScope, DependencyGraph, CompilationCache) CompilationMergePlan
+        +runToFixedPoint(CompilationJob, CompilationMergePlan) IncrementalCompilationResult
     }
     class CompilationMergePlan {
         <<ValueObject>>
@@ -723,6 +736,7 @@ classDiagram
     ChangeDetector ..> FileChange : input
     ChangeDetector ..> RecompilationScope : output
     IncrementalCompilationCoordinator ..> RecompilationScope : consumes
+    IncrementalCompilationCoordinator ..> CompilationJob : drives passes
     IncrementalCompilationCoordinator ..> DependencyGraph : reads
     IncrementalCompilationCoordinator --> CompilationMergePlan
     IncrementalCompilationCoordinator --> IncrementalCompilationResult
@@ -806,6 +820,8 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
+`PdfRenderer` がページ単位の `PageBox` と `GraphicsScene` を PDF 演算子列へ射影し、`GraphicResourceEncoder` がラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+
 ```mermaid
 classDiagram
     class PdfDocument {
@@ -814,6 +830,11 @@ classDiagram
         +List~PdfPage~ pages
         +PdfOutline outline
         +render() bytes
+    }
+    class PdfRenderer {
+        <<Service>>
+        +buildDocument(List~PageBox~, SyncTexData) PdfDocument
+        +projectPage(PageBox, GraphicsScene) PdfPage
     }
     class PdfPage {
         <<ValueObject>>
@@ -861,12 +882,21 @@ classDiagram
         +Rect mediaBox
         +bytes formXObjectData
     }
+    class GraphicResourceEncoder {
+        <<Service>>
+        +embedRaster(RasterImage) EmbeddedImage
+        +embedPdfGraphic(PdfGraphic) EmbeddedPdfGraphic
+    }
     class SyncTexData {
         <<ValueObject>>
         +Map~SourceLocation, PdfPosition~ forwardMap
         +Map~PdfPosition, SourceLocation~ inverseMap
     }
 
+    PdfRenderer --> PdfDocument
+    PdfRenderer --> GraphicResourceEncoder
+    PdfRenderer ..> PageBox : projects
+    PdfRenderer ..> GraphicsScene : projects
     PdfDocument o-- PdfPage
     PdfDocument --> PdfOutline
     PdfDocument --> SyncTexData
@@ -876,6 +906,10 @@ classDiagram
     PdfDocument o-- EmbeddedFont
     PdfDocument o-- EmbeddedImage
     PdfDocument o-- EmbeddedPdfGraphic
+    GraphicResourceEncoder --> EmbeddedImage
+    GraphicResourceEncoder --> EmbeddedPdfGraphic
+    GraphicResourceEncoder ..> RasterImage : encodes
+    GraphicResourceEncoder ..> PdfGraphic : form XObject
 ```
 
 ### 3.7 フォント管理 コンテキスト
@@ -950,7 +984,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。
+`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -998,6 +1032,32 @@ classDiagram
         +List~Connection~ clients
         +deliverPdf(bytes) void
     }
+    class RuntimeOptions {
+        <<ValueObject>>
+        +EntryPointKind entryPoint
+        +FilePath input
+        +FilePath outputDir
+        +String jobname
+        +int jobs
+        +bool noCache
+        +AssetBundleRef assetBundle
+        +InteractionMode interaction
+        +bool synctex
+        +bool shellEscape
+    }
+    class AssetBundleRef {
+        <<ValueObject>>
+        +BundleRefKind kind
+        +String value
+    }
+    class WorkspaceContext {
+        <<ValueObject>>
+        +FilePath projectRoot
+        +List~FilePath~ overlayRoots
+        +FilePath cacheDir
+        +List~FilePath~ bundleSearchRoots
+        +Set~String~ builtinBundleIds
+    }
     class CliRunner {
         <<Service>>
         +compile(CompileOptions) ExitCode
@@ -1006,7 +1066,7 @@ classDiagram
     }
     class ExecutionPolicyFactory {
         <<Service>>
-        +build(CompileOptions, WorkspaceContext) ExecutionPolicy
+        +build(RuntimeOptions, WorkspaceContext) ExecutionPolicy
     }
     class CompileOptions {
         <<ValueObject>>
@@ -1015,10 +1075,23 @@ classDiagram
         +String jobname
         +int jobs
         +bool noCache
-        +FilePath assetBundle
+        +AssetBundleRef assetBundle
         +InteractionMode interaction
         +bool synctex
         +bool shellEscape
+    }
+    class WatchOptions {
+        <<ValueObject>>
+        +FilePath input
+        +FilePath outputDir
+        +String jobname
+        +int jobs
+        +bool noCache
+        +AssetBundleRef assetBundle
+        +InteractionMode interaction
+        +bool synctex
+        +bool shellEscape
+        +Duration debounce
     }
 
     LspServer --> DiagnosticProvider
@@ -1026,16 +1099,25 @@ classDiagram
     LspServer --> DefinitionProvider
     LspServer --> HoverProvider
     LspServer --> CodeActionProvider
+    LspServer --> ExecutionPolicyFactory
+    LspServer --> RuntimeOptions : normalizes
     DefinitionProvider --> SymbolIndex
     FileWatcher ..> CliRunner : triggers
     PreviewServer ..> CliRunner : receives PDF
     CliRunner --> CompileOptions
+    CliRunner --> WatchOptions
+    CliRunner --> RuntimeOptions : normalizes
     CliRunner --> ExecutionPolicyFactory
+    ExecutionPolicyFactory --> RuntimeOptions
+    ExecutionPolicyFactory --> WorkspaceContext
+    RuntimeOptions --> AssetBundleRef
+    CompileOptions --> AssetBundleRef
+    WatchOptions --> AssetBundleRef
 ```
 
 ## 4. 状態遷移図
 
-### 4.1 コンパイルジョブ
+### 4.1 コンパイルジョブ (CompilationJob)
 
 ```mermaid
 stateDiagram-v2
@@ -1095,11 +1177,12 @@ stateDiagram-v2
 | マクロ定義 (MacroDefinition) | `\def` 等で定義されたパターンと置換テキストの組。Definition Provenance を持ち、定義ジャンプの起点になる | マクロ展開, スコープ |
 | スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタの有効範囲 | ScopeStack |
 | レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
-| コンパイルセッション (CompilationSession) | 1 回のコンパイルパスで共有される可変 TeX 状態の集約。カテゴリコード、レジスタ、ラベル、参考文献状態、current Job Context、出力アーティファクト provenance、実行ポリシーを保持する | DocumentState, JobContext, OutputArtifactRegistry, ExecutionPolicy |
-| ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。same-job readback 判定と出力命名の境界を与える | CompilationSession, OutputArtifactRegistry |
+| コンパイルジョブ (CompilationJob) | 1 回の compile/watch/LSP 再コンパイル要求を表す集約。最大 3 パスまでの `CompilationSession` を束ね、`DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を pass 間で保持する | CompilationSession, DocumentState, OutputArtifactRegistry |
+| コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリ、current Job Context を保持する | CompilationJob, JobContext |
+| ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback 判定と出力命名の境界を与える | CompilationSession, OutputArtifactRegistry |
 | 定義 provenance (DefinitionProvenance) | マクロ・ラベル・参考文献エントリの定義元を示す SourceLocation と由来種別の組 | MacroDefinition, LabelInfo, CitationInfo |
 | パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する静的ポリシー。実際の readback 可否は OutputArtifactRegistry と組み合わせて判定する | ExecutionPolicy, OutputArtifactRegistry |
-| 出力アーティファクトレジストリ (OutputArtifactRegistry) | Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルの provenance を保持し、current Job Context と整合する trusted artifact のみを再読込可能にする台帳 | OutputArtifactRecord, JobContext, ExecutionPolicy |
+| 出力アーティファクトレジストリ (OutputArtifactRegistry) | Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルの provenance を保持し、current Job Context の `jobname` と主入力の双方に整合する trusted artifact のみを再読込可能にする台帳 | OutputArtifactRecord, JobContext, ExecutionPolicy |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 
 ### 5.2 タイプセッティング コンテキスト
@@ -1136,7 +1219,7 @@ stateDiagram-v2
 | コンテンツハッシュ (ContentHash) | ファイル/ノード内容のハッシュ値。変更検知に使用 | ChangeDetector |
 | 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
 | コンパイルマージプラン (CompilationMergePlan) | 再構築ノードと再利用ノードの境界、および参照安定化の要否を表す計画 | IncrementalCompilationCoordinator |
-| 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache |
+| 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
 
 ### 5.5 アセットランタイム コンテキスト
@@ -1153,6 +1236,7 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | コンテンツストリーム (ContentStream) | PDF ページの描画命令列 | PdfOperator |
+| PDF レンダラ (PdfRenderer) | `PageBox` と `GraphicsScene` を PDF 演算子列・リソース辞書へ射影し、`PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
 | アノテーション (Annotation) | PDF 上のリンク・しおり等のインタラクティブ要素 | hyperref |
 | 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
 | 埋め込み PDF グラフィック (EmbeddedPdfGraphic) | 外部 PDF ページを Form XObject 化して PDF 内へ再利用可能にした描画資産 | PdfGraphic |
@@ -1173,6 +1257,9 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, CompilationSession |
+| RuntimeOptions | compile / watch / LSP の入口固有指定を正規化した共通実行オプション。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
+| AssetBundleRef | Asset Bundle の参照値。ファイルパスまたは組み込み識別子を区別して保持する | RuntimeOptions, CompileOptions, WatchOptions |
+| WorkspaceContext | プロジェクトルート、overlay roots、キャッシュ位置、利用可能な bundle 探索範囲/組み込み識別子をまとめた実行文脈 | ExecutionPolicyFactory |
 
 ## 6. 判断記録
 
@@ -1236,23 +1323,23 @@ stateDiagram-v2
 - **等価性への影響**: 観測的非等価（展開・配備方式は変わるが、文書処理機能の目標は同一）
 - **語彙への影響**: 「Ferritex Asset Bundle」「Asset Index」「Host Font Catalog」を導入
 
-### 6.6 CompilationSession を可変 TeX 状態の集約境界とする
+### 6.6 CompilationJob と CompilationSession を分離して pass 境界を表現する
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング
-- **判断内容**: カテゴリコード、スコープ、レジスタ、カウンタ、ラベル、参考文献状態、`.aux` 書き込み、参照安定性、current Job Context、コマンド/環境レジストリ、実行ポリシーを `CompilationSession` に集約する。タイプセッティングは同じ `DocumentState` を共有参照する
+- **判断内容**: 最大 3 パスまでのコンパイル全体は `CompilationJob` が表現し、`DocumentState`・`OutputArtifactRegistry`・`ExecutionPolicy` を pass 間で保持する。各 pass は新しい `CompilationSession` として開始し、カテゴリコード、スコープ、レジスタ、コマンド/環境レジストリ、current Job Context など pass-local な可変状態だけを持つ。タイプセッティングは `CompilationJob` が所有する同じ `DocumentState` を共有参照する
 - **根拠**:
-  - 観測事実: `\section` によるカウンタ更新、`\label` の登録、`\ref` の解決、パッケージ読み込みは同一パスの逐次状態に依存する
-  - 代替案: それぞれを独立サービスとして保持し、暗黙の共有状態またはグローバル状態で同期する
-  - 分離証人: `\section{A}\label{sec:a}` のケース。集約モデルでは同一セッション内で最新カウンタ値とラベル登録を原子的に扱えるが、分散サービスモデルでは「カウンタ更新後にどの値をラベルへ固定するか」が隠れた結合になる
-- **等価性への影響**: 理論等価（外部仕様は同一だが、整合性の表現力が向上する）
-- **語彙への影響**: 「CompilationSession」「DocumentState」「BibliographyState」を導入
+  - 観測事実: `\section` によるカウンタ更新、`\label` の登録、`\ref` の再解決、`.aux` / `.toc` の readback は pass をまたいで持ち越される一方、カテゴリコードやグループスコープは各 pass で再初期化される
+  - 代替案: すべての状態を単一 `CompilationSession` に閉じ込める、または逆に pass 間共有状態を暗黙のグローバルへ逃がす
+  - 分離証人: `\tableofcontents` を含む文書の 2 パスコンパイル。`CompilationJob` モデルでは前パス生成の `.toc` provenance と参照状態を維持したまま、新しい `CompilationSession` で catcode / scope を初期化できるが、単一セッションモデルでは pass 境界が曖昧になり、グローバル逃がしモデルでは所有者が消える
+- **等価性への影響**: 理論等価（外部仕様は同一だが、pass 境界と所有境界の表現力が向上する）
+- **語彙への影響**: 「CompilationJob」「CompilationSession」「DocumentState」「BibliographyState」を導入
 
 ### 6.7 実行制御を CLI フラグではなく ExecutionPolicy として表現する
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
-- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root の readback は `OutputArtifactRegistry` が current `JobContext` と、正規化パス/生成パスを含む artifact provenance の双方で same job と確認した補助ファイルに限って許可する
+- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。`ExecutionPolicy` はデフォルト上限として `commandTimeout = 30s`、`maxConcurrentProcesses = 1`、`maxCapturedOutputBytes = 4 MiB` を保持する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root の readback は `OutputArtifactRegistry` が current `JobContext` の `jobname` と主入力の双方、および正規化パス/生成パスを含む artifact provenance の双方で same job と確認した補助ファイルに限って許可する
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれる
   - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
@@ -1296,6 +1383,30 @@ stateDiagram-v2
 - **等価性への影響**: 理論等価（外部仕様は同一で、コア制約の表現力が向上する）
 - **語彙への影響**: 「IncrementalCompilationCoordinator」「CompilationMergePlan」を導入
 
+### 6.11 PDF 射影責務を PdfRenderer / GraphicResourceEncoder として明示する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: PDF 生成 / グラフィック描画
+- **判断内容**: `PageBox` / `GraphicsScene` を `PdfDocument` へ落とす責務は `PdfRenderer` とし、外部ラスタ画像と外部 PDF の埋め込み形式決定は `GraphicResourceEncoder` に分離する
+- **根拠**:
+  - 観測事実: REQ-FUNC-013 / 016 / 023 は、通常のボックス組版、`graphicx` の画像埋め込み、tikz/pgf の描画結果が単一の PDF 出力面へ収束することを要求している
+  - 代替案: `PdfDocument` 自身の `render()` にすべての射影責務を押し込む
+  - 分離証人: `\includegraphics{diagram.pdf}` と tikz 図形が同一ページに共存するケース。分離モデルでは `PdfRenderer` が演算子列の統合を担い、`GraphicResourceEncoder` が imported PDF Form XObject を扱えるが、自己完結型 `PdfDocument` モデルでは外部グラフィックの変換責務がデータ構造へ混入する
+- **等価性への影響**: 理論等価（外部仕様は同一で、変換責務の境界が明確になる）
+- **語彙への影響**: 「PdfRenderer」「GraphicResourceEncoder」を導入
+
+### 6.12 実行ポリシーは RuntimeOptions と WorkspaceContext から構築する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: 開発者ツール / パーサー/マクロエンジン
+- **判断内容**: CLI 固有の `CompileOptions` を直接 `ExecutionPolicyFactory` に渡さず、compile / watch / LSP から得た指定を `RuntimeOptions` へ正規化してから `WorkspaceContext` と合わせて `ExecutionPolicy` を構築する。Asset Bundle 指定は `AssetBundleRef` としてファイルパスと組み込み識別子の両方を表現する
+- **根拠**:
+  - 観測事実: 同じコンパイル機能が CLI、watch、LSP から呼ばれ、REQ-FUNC-046 は Asset Bundle をパスまたは組み込み識別子で受ける
+  - 代替案: `CompileOptions` を共通入力として流用し、watch/LSP は暗黙変換で吸収する
+  - 分離証人: ワークスペース既定の組み込み bundle を使う LSP 再コンパイルと、明示的な `--asset-bundle /path/to/bundle` を使う CLI コンパイルのケース。`RuntimeOptions` + `AssetBundleRef` モデルでは両者を同じ `ExecutionPolicyFactory` で扱えるが、`CompileOptions(FilePath)` 前提モデルでは LSP 側の表現が崩れる
+- **等価性への影響**: 理論等価（外部仕様は同一で、入口非依存性と表現力が向上する）
+- **語彙への影響**: 「RuntimeOptions」「AssetBundleRef」「WorkspaceContext」を導入
+
 ## 7. ビジネスルール一覧
 
 要件定義書から抽出した主要なビジネスルール・不変条件の一覧。
@@ -1304,16 +1415,16 @@ stateDiagram-v2
 |---|---|---|---|
 | BR-1 | カテゴリコードは `\catcode` により動的に変更可能。字句解析は現在のカテゴリコードテーブルを常に参照する | REQ-FUNC-001 | パーサー/マクロエンジン |
 | BR-2 | マクロ展開の再帰深度は上限あり（デフォルト 1000）。超過時はエラー | REQ-FUNC-002 | パーサー/マクロエンジン |
-| BR-3 | ラベル/ページ相互参照は最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
+| BR-3 | ラベル/ページ相互参照は同一 `CompilationJob` 内で最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
 | BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
 | BR-5 | 差分コンパイルは再構築ノードと再利用ノードをマージした後もフルコンパイルと同一の出力でなければならず、参照不安定時は最大 3 パスまで反復する | REQ-FUNC-030 | 差分コンパイル |
 | BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
-| BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。すべての実行要求は `ExecutionPolicy` を経由する | REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン |
-| BR-8 | ファイル読み書きは、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は OutputArtifactRegistry が current `JobContext` と artifact provenance から same job の trusted artifact と確認した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
+| BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。compile / watch / LSP の各入口は指定を `RuntimeOptions` へ正規化したうえですべての実行要求を `ExecutionPolicy` へ通し、デフォルト上限は 30 秒、1 プロセス / `CompilationJob`、捕捉出力 4 MiB である | REQ-FUNC-043 / REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン / 開発者ツール |
+| BR-8 | ファイル読み書きは、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は OutputArtifactRegistry が current `JobContext` の `jobname` と主入力の双方、および artifact provenance から same job の trusted artifact と確認した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
 | BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local Font Catalog fallback の順で解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 / REQ-NF-008 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
-| BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationSession` の `DocumentState` に対して行われる | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 | パーサー/マクロエンジン / タイプセッティング |
+| BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationJob` が所有する job-scope の `DocumentState` / `OutputArtifactRegistry` に対して行われ、各 pass の `CompilationSession` から参照される | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 / REQ-FUNC-048 | パーサー/マクロエンジン / タイプセッティング |
 | BR-13 | `\cite` の解決と参考文献リスト組版は `BibliographyState` / `CitationTable` が担い、label 系の `CrossReferenceTable` とは責務を分離する | REQ-FUNC-024 | パーサー/マクロエンジン / タイプセッティング |
 | BR-14 | 定義ジャンプは `MacroDefinition` / `LabelInfo` / `CitationInfo` / `BibliographyEntry` の `DefinitionProvenance` を `SymbolIndex` に投影して解決する | REQ-FUNC-036 | パーサー/マクロエンジン / 開発者ツール |
 
@@ -1321,6 +1432,8 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.7 | 2026-03-12 | 差分コンパイル固定点反復の所有者、PDF 射影サービス、RuntimeOptions/AssetBundleRef/WorkspaceContext を反映 | Codex |
+| 0.1.6 | 2026-03-12 | CompilationJob を導入し、主入力を含む same-job provenance と shell-escape のデフォルト実行上限を反映 | Codex |
 | 0.1.5 | 2026-03-12 | DefinitionProvenance/SymbolIndex、差分コンパイル統合、same-job readback 用 JobContext を反映 | Codex |
 | 0.1.4 | 2026-03-12 | readback provenance、font fallback 優先順位、BibliographyState/CitationTable を反映 | Codex |
 | 0.1.3 | 2026-03-12 | output root の補助ファイル readback、host-local font の再現性境界、EmbeddedPdfGraphic、LSP codeAction/hover を反映 | Codex |

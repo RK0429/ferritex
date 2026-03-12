@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.5           |
+| バージョン | 0.1.7           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -104,8 +104,13 @@
 | Asset Index      | Ferritex Asset Bundle 内の資産を論理名から O(1) 近傍で引ける索引構造        |
 | Host Font Catalog | platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集したホストフォント索引。Ferritex では host-local overlay として扱う |
 | Configured Overlay Root | 起動時設定で明示された読み取り専用の追加資産ディレクトリ。project root 外に置かれた `.tex` / `.sty` / クラス / フォント資産を allowlist として解決面へ追加する |
-| Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、jobname、生成者種別、生成パス、コンテンツハッシュを記録する台帳 |
-| Job Context | 1 回のコンパイル実行を識別する jobname・主入力・現在パス番号の組。same-job readback 判定に用いる |
+| Execution Policy | `compile` / `watch` / `lsp` など全 entry point で共有される実行制約の集合。shell-escape 可否、パス許可境界、タイムアウト、出力上限を含む |
+| Runtime Options | CLI / watch / LSP など入口固有の指定を正規化した共通実行オプション。入力ファイル、jobname、asset bundle 参照、output dir などを保持する |
+| Asset Bundle Reference | Ferritex Asset Bundle を参照するための値。ファイルパスまたは組み込みバンドル識別子で表す |
+| Compilation Job | 1 回の `compile` / `watch` / LSP 再コンパイル要求に対応する単位。最大 3 パスまでの `Compilation Session` を束ね、参照状態と出力 artifact provenance を pass 間で保持する |
+| Compilation Session | `Compilation Job` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリを保持する |
+| Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、主入力、jobname、生成パス番号、生成者種別、生成パス、コンテンツハッシュを記録する台帳 |
+| Job Context | `Compilation Job` 内の現在パスを識別する jobname・主入力・現在パス番号の組。same-job readback 判定に用いる |
 | Bbl Snapshot | `.bbl` から取り込んだ引用・参考文献情報の正規化スナップショット |
 | Definition Provenance | マクロ・ラベル・参考文献エントリの定義元を示すファイル名・行番号・列番号・由来種別の組。定義ジャンプと診断に用いる |
 | グラフィックシーン | tikz/graphicx の描画結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した中間表現 |
@@ -270,8 +275,8 @@
 - **説明**: `\label`, `\ref`, `\pageref` 等の文書内相互参照を解決する
 - **入力**: 相互参照コマンドを含む文書
 - **処理**:
-  - `.aux` ファイルへのラベル情報書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された同一 jobname の readback 対象 `.aux` のみを正規化済み output root 配下から再読込）
-  - マルチパス処理（参照解決が安定するまで繰り返し、最大3パス）
+  - `.aux` ファイルへのラベル情報書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された current Job Context と同一の `jobname` と主入力を持つ readback 対象 `.aux` のみを正規化済み output root 配下から再読込）
+  - マルチパス処理（同一 Compilation Job 内で pass ごとに新しい Compilation Session を作成し、job-scope の参照状態と Output Artifact Registry を引き継ぎながら、参照解決が安定するまで繰り返し、最大3パス）
   - 未解決参照の検出・警告
 - **出力**: 解決済みのラベル・ページ参照テキスト
 - **例外**: 未定義ラベル参照時に `??` を出力し警告を表示
@@ -287,7 +292,7 @@
 - **説明**: `\tableofcontents`, `\listoffigures`, `\listoftables`, `\makeindex` 等を処理する
 - **入力**: 目次・索引生成コマンドを含む文書
 - **処理**:
-  - `.toc`, `.lof`, `.lot` ファイルの書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された同一 jobname の readback 対象ファイルのみを正規化済み output root 配下から再読込）
+  - `.toc`, `.lof`, `.lot` ファイルの書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された current Job Context と同一の `jobname` と主入力を持つ readback 対象ファイルのみを正規化済み output root 配下から再読込）
   - セクション番号・ページ番号の収集と整形
   - 索引エントリの収集・ソート・整形（`makeindex` 互換）
 - **出力**: 目次・索引のボックスツリー
@@ -306,6 +311,7 @@
   - テキスト描画オペレータ（`BT`, `ET`, `Tf`, `Tj`, `TJ`）の生成
   - グラフィック描画オペレータ（罫線、図形）の生成
   - カラー指定（RGB, CMYK, グレースケール）
+  - ページ単位のボックスツリーとグラフィックシーンを共通 PDF レンダリングパイプラインへ射影し、コンテンツストリームとリソース辞書へ一貫して変換
   - PDF オブジェクト構造（ページツリー、リソース辞書）の構築
 - **出力**: 有効な PDF ファイル
 - **受け入れ基準**:
@@ -582,13 +588,14 @@
 #### REQ-FUNC-030: 部分再コンパイル
 
 - **説明**: 変更影響範囲のみを再処理し、キャッシュ済みの結果とマージして出力する
-- **入力**: 変更検知結果、依存グラフ、キャッシュ済み中間結果
+- **入力**: 変更検知結果、依存グラフ、キャッシュ済み中間結果、current Compilation Job
 - **処理**:
   - 変更影響範囲と依存グラフから、再構築ノードと再利用ノードを分離した再コンパイルプランを構築
+  - 差分コンパイル統括コンポーネントが `Compilation Job` を所有単位として再コンパイルプランを実行し、各反復で新しい `Compilation Session` を生成する
   - 変更対象範囲の再パース・再展開・再組版
   - ページ番号・相互参照の再計算（変更による連鎖的な番号ずれの検知）
   - 再処理結果とキャッシュ結果の統合
-  - 参照安定性を判定し、安定するまで反復（差分コンパイルでも最大3パス）
+  - 同一 Compilation Job 内で参照安定性を判定し、pass ごとに新しい Compilation Session を作り直しながら、安定するまで反復（差分コンパイルでも最大3パス）
 - **出力**: 更新された PDF
 - **受け入れ基準**:
   - Given 100ページの文書の1段落を変更, When 差分コンパイル, Then フルコンパイル結果と同一の PDF が生成される
@@ -786,14 +793,15 @@
 - **説明**: コンパイルの動作を制御する各種 CLI オプションを提供する
 - **入力**: CLI フラグ・引数
 - **処理**: 以下のオプションをサポート
-  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加し、Ferritex または Ferritex が制御した外部ツール実行で生成され Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等の readback を許可する
+  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加し、Ferritex または Ferritex が制御した外部ツール実行で生成され Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等のうち、current Job Context の `jobname` と主入力に整合するものだけ readback を許可する
   - `--jobname <name>`: ジョブ名（出力ファイル名）の指定
   - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）
   - `--no-cache`: キャッシュを無効化しフルコンパイル
-  - `--asset-bundle <path>`: 使用する Ferritex Asset Bundle の指定
+  - `--asset-bundle <ref>`: 使用する Ferritex Asset Bundle の指定。`<ref>` はファイルパスまたは組み込みバンドル識別子
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`）
   - `--synctex`: SyncTeX データの生成有無
   - `--shell-escape` / `--no-shell-escape`: 外部コマンド実行の許可
+  - compile / watch / LSP の各入口で受け取った指定は共通の `Runtime Options` に正規化され、それを基に同一の `Execution Policy` を構築する
 - **出力**: 指定オプションに従ったコンパイル動作
 - **受け入れ基準**:
   - Given `--output-dir build` を指定, When コンパイル, Then `build/` ディレクトリに PDF が生成される
@@ -855,12 +863,15 @@
 - **入力**: コマンド文字列、コンパイルオプション、実行ポリシー
 - **処理**:
   - `--shell-escape` 未指定時は実行要求を拒否し、診断を返す
-  - `--shell-escape` 指定時のみサブプロセスを生成し、終了コード・標準出力・標準エラーを収集
-  - タイムアウトと実行ログを適用し、失敗時は TeX 側へ診断を返す
+  - `--shell-escape` 指定時のみサブプロセスを生成し、同一 Compilation Job あたり最大 1 プロセスまでの同時実行制限下で終了コード・標準出力・標準エラーを収集
+  - デフォルト実行上限として、タイムアウト 30 秒、標準出力+標準エラーの合計捕捉量 4 MiB を適用し、超過時はプロセスを停止して診断を返す
+  - 実行ログを記録し、失敗時は TeX 側へ診断を返す
 - **出力**: 実行結果または拒否診断
 - **受け入れ基準**:
   - Given `\write18{echo ok}` を含む文書, When `--shell-escape` なしでコンパイル, Then コマンドは実行されず拒否診断が表示される
   - Given 同じ文書, When `--shell-escape` 付きでコンパイル, Then コマンドが実行され終了コードと出力が取得される
+  - Given 同一 Compilation Job で 2 件の外部コマンド要求が連続して発生, When `--shell-escape` 付きでコンパイル, Then 同時実行数は 1 を超えず、後続コマンドは先行コマンド完了後に開始される
+  - Given 4 MiB を超える標準出力を生成するコマンド, When `--shell-escape` 付きでコンパイル, Then プロセスは停止され出力上限超過の診断が表示される
 - **優先度**: Must
 - **出典**: REQ-NF-005 を機能要件へ具体化
 
@@ -870,9 +881,9 @@
 - **入力**: パス要求（read/write/create）、アクセス目的（tex-input / tex-output / engine-output / engine-readback / engine-temp）、プロジェクトルート、設定済み overlay roots、Asset Bundle ルート、キャッシュディレクトリ、明示的 output root、current Job Context、Output Artifact Registry
 - **処理**:
   - パス正規化とシンボリックリンク解決
-  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Job Context の jobname と整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
+  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Job Context の `jobname` と主入力の双方に整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
   - Ferritex 自身が確保した private temp dir をキャッシュ配下または明示的 output root 配下に作成し、`engine-temp` 用にのみ許可
-  - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・artifact kind・jobname・現在パス番号・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する
+  - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・主入力・artifact kind・jobname・現在パス番号・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する
   - システム一時領域全体は許可 root として公開しない
   - 拒否時の診断生成と、許可時のファイルハンドル発行
 - **出力**: 許可されたファイルハンドルまたは拒否診断
@@ -882,6 +893,7 @@
   - Given `--output-dir ../dist` を指定してコンパイル, When PDF / `.aux` / `.log` を生成, Then 正規化済み output root 配下への書き込みのみが許可される
   - Given `--output-dir ../dist` を指定して 2 パス以上のコンパイルを行う文書, When Ferritex が前パスで生成し Output Artifact Registry に記録した `../dist/main.aux` と `../dist/main.toc` を再読込, Then `engine-readback` として許可される
   - Given 同じ output root 配下に `foo.aux` と `bar.aux` が存在する環境, When current Job Context の jobname が `foo` のコンパイルから `bar.aux` を `engine-readback` しようとする, Then same-job 不一致として拒否される
+  - Given `thesis.tex` と `article.tex` を同じ `--jobname shared` と同じ output root で順にコンパイルする環境, When `thesis.tex` の current Job Context から `article.tex` が生成した `shared.aux` を `engine-readback` しようとする, Then 主入力不一致として拒否される
   - Given `--output-dir ../dist` 配下にユーザーが事前配置した未登録の `main.aux` がある文書, When コンパイル, Then `engine-readback` は拒否され provenance 不一致の診断が表示される
   - Given `../../outside.txt` への `\openout` を試みる文書, When コンパイル, Then 書き込みが拒否され診断が表示される
 - **優先度**: Must
@@ -929,15 +941,15 @@
 
 #### REQ-NF-005: 外部コマンド実行制御
 
-- **説明**: `\write18`（shell escape）による外部コマンド実行はデフォルトで無効とし、明示的なオプション指定時のみ有効にする
-- **定量基準**: `--shell-escape` フラグなしの状態で外部コマンドが実行される経路がゼロ
+- **説明**: `\write18`（shell escape）による外部コマンド実行はデフォルトで無効とし、明示的なオプション指定時のみ有効にする。有効時も `ExecutionPolicy` のデフォルト上限（タイムアウト 30 秒、同時実行 1 プロセス / Compilation Job、捕捉出力 4 MiB）を適用する
+- **定量基準**: `--shell-escape` フラグなしの状態で外部コマンドが実行される経路がゼロであり、`--shell-escape` 有効時もデフォルト上限（30 秒、1 プロセス / Compilation Job、4 MiB）を超える実行は必ず拒否または停止される
 - **優先度**: Must
 - **出典**: エージェント推測（TeX のセキュリティモデルとして標準的な対策）
 
 #### REQ-NF-006: ファイルアクセス制御
 
-- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Output Artifact Registry により current jobname の trusted artifact と確認された補助ファイルの readback に限って読み取りを許可する。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
-- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、Output Artifact Registry に記録された output root 配下の trusted artifact。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
+- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Output Artifact Registry により current `JobContext` の `jobname` と主入力の双方に整合する trusted artifact と確認された補助ファイルの readback に限って読み取りを許可する。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
+- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、Output Artifact Registry に記録され current `JobContext` と `jobname` / 主入力の双方が一致する output root 配下の trusted artifact。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
 - **優先度**: Must
 - **出典**: エージェント推測（pdfLaTeX の `openout_any = p` を発展させ、runtime bundle 設計へ適用）
 
@@ -986,14 +998,13 @@
 | 4   | 差分コンパイルの正確性保証。マクロ展開の副作用（カウンタ変更等）が差分コンパイルの正確性に影響する可能性がある。どの程度の正確性を保証するか                                | REQ-FUNC-030 | 開発者  |
 | 5   | PDF 配信のプロトコル選択。WebSocket と HTTP のどちらを採用するか、または両方をサポートするか                                              | REQ-FUNC-040 | 開発者  |
 | 6   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
-| 7   | `--shell-escape` 有効時のデフォルト実行上限。タイムアウト、最大同時プロセス数、出力バイト数上限の初期値を決める必要がある                                    | REQ-FUNC-047 | 開発者  |
-
-
 ## 変更履歴
 
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.7 | 2026-03-12 | 差分コンパイルの job 単位反復、共通 PDF レンダリングパイプライン、entry point 非依存の Runtime Options を明文化 | Codex |
+| 0.1.6 | 2026-03-12 | Compilation Job / Session を導入し、same-job readback の主入力照合と shell-escape のデフォルト実行上限を明文化 | Codex |
 | 0.1.5 | 2026-03-12 | Definition Provenance と定義ジャンプ要件、差分コンパイルの再コンパイルプラン、same-job readback 用 Job Context を反映 | Codex |
 | 0.1.4 | 2026-03-12 | output root readback provenance、font 解決優先順位、citation/bibliography の責務分離を反映 | Codex |
 | 0.1.3 | 2026-03-12 | output root の補助ファイル readback、host-local font の再現性スコープ、LSP codeAction、PDF Form XObject 表現を追記 | Codex |
