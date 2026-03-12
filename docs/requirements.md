@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.9           |
+| バージョン | 0.1.11          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -116,10 +116,19 @@
 | Navigation State | hyperref とセクショニングが蓄積する PDF ナビゲーション用状態。PDF metadata draft、しおり候補、named destination、既定リンク装飾設定を保持する |
 | Link Annotation Plan | 配置済みリンク 1 件分の PDF 注釈化計画。リンク矩形、リンク先、装飾設定を保持し、PDF 生成段階で Annotation に射影される |
 | Link Style | hyperref の `colorlinks` や枠線設定から正規化したリンク装飾値。テキスト色と注釈境界線の描画規則を保持する |
+| Source Span | 組版済みノードに対応付くソース範囲。開始/終了の SourceLocation を持ち、SyncTeX と診断の由来追跡に用いる |
+| Placed Node | `PageBox` 内で確定した配置矩形と Source Span を伴う組版ノード。PDF 射影と SyncTeX の共通入力 |
+| Placed Destination | internal named destination の配置済みアンカー。destination 名とページ内矩形を持ち、内部リンク・しおり解決に用いる |
 | Table Of Contents State | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 |
 | Index State | `\index` で収集した索引語とソートキー、対応ページを保持し、makeindex 互換整列へ渡す job-scope 状態 |
+| File Access Gate | `\input` / `\include` / `\openin` / `\openout` / engine-temp / engine-readback を単一の Execution Policy で裁く共通ゲート |
 | グラフィックシーン | tikz/graphicx の描画結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した中間表現 |
-| Page Render Plan | 1 ページ分の `PageBox`、リンク注釈計画、`GraphicsScene` を束ねた PDF 射影入力 |
+| SyncTeX Trace Fragment | 1 つの Source Span と 1 つのページ内矩形を対応付ける SyncTeX の最小断片。1 つの Source Span に複数 fragment が対応してよい |
+| Pending Change Queue | watch 実行中にコンパイル中の追加変更を集約する待ち行列。連続変更を coalesce し、コンパイル完了後の再トリガーに使う |
+| Recompile Scheduler | `FileWatcher` からの変更イベントと Pending Change Queue を受け取り、同時実行を避けながら差分コンパイルを順序制御する調停役 |
+| Preview Session | プレビュー接続 1 件分の状態。接続と直近の閲覧位置を束ね、PDF 更新時の view restore に使う |
+| Preview View State | プレビューアの現在ページ、ページ内オフセット、ズーム倍率など、更新後も保持すべき閲覧位置情報 |
+| Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
 
@@ -313,11 +322,12 @@
 #### REQ-FUNC-013: PDF ページストリーム出力
 
 - **説明**: タイプセッティング結果を PDF コンテンツストリームに変換する
-- **入力**: ページ単位の Page Render Plan（ボックスツリー、リンク注釈計画、グラフィックシーンの組）
+- **入力**: ページ単位の Page Render Plan（配置済みノードと source trace、placed destination、リンク注釈計画、グラフィックシーンの組）
 - **処理**:
   - テキスト描画オペレータ（`BT`, `ET`, `Tf`, `Tj`, `TJ`）の生成
   - グラフィック描画オペレータ（罫線、図形）の生成
   - カラー指定（RGB, CMYK, グレースケール）
+  - 配置済みノードの矩形と placed destination を使って、内部リンク destination と SyncTeX の座標解決に必要なページ座標系を確定
   - ページ単位の Page Render Plan を共通 PDF レンダリングパイプラインへ射影し、コンテンツストリーム、リンク Annotation、リソース辞書へ一貫して変換
   - PDF オブジェクト構造（ページツリー、リソース辞書）の構築
 - **出力**: 有効な PDF ファイル
@@ -345,10 +355,10 @@
 - **説明**: PDF 内リンクとアウトライン（しおり）を生成する
 - **入力**: hyperref コマンド・セクション構造
 - **処理**:
-  - 内部リンク（`\ref`, `\cite` のリンク化）のアノテーション生成
+  - 内部リンク（`\ref`, `\cite` のリンク化）のアノテーション生成と、placed destination に基づく named destination 解決
   - 外部リンク（`\href`, `\url`）のアノテーション生成
   - 配置済みのリンク領域を Link Annotation Plan（矩形、内部 destination または外部 URI、Link Style）へ正規化
-  - Navigation State に蓄積された named destination と PDF metadata draft を参照し、PDF アウトライン（しおり）のセクション構造を生成
+  - Navigation State に蓄積された named destination と PDF metadata draft、および Page Render Plan が保持する placed destination を参照し、PDF アウトライン（しおり）のセクション構造を生成
 - **出力**: リンクアノテーションとアウトラインを含む PDF
 - **受け入れ基準**:
   - Given セクション構造を持つ文書, When PDF を生成, Then PDF ビューアのしおりパネルにセクション階層が表示される
@@ -467,7 +477,8 @@
   - PDF メタデータ（`pdftitle`, `pdfauthor` 等）を Navigation State 内の metadata draft に反映
   - セクション構造・named destination・既定リンク装飾設定を Navigation State に蓄積し、PDF 生成段階へ受け渡す
   - 各リンク出現箇所を内部 destination または外部 URI を持つ Link Annotation Plan に正規化する
-  - リンクの装飾（色枠、色付きテキスト）を Link Style として正規化する
+  - リンクの装飾（色枠、色付きテキスト）を Link Style として正規化し、annotation border と text-side paint へ分配する
+  - `colorlinks=true` の場合は Link Style の `textColor` をリンク文字列の text run style に反映し、content stream 側のテキスト着色として出力する
 - **出力**: ハイパーリンクと PDF メタデータを含む PDF
 - **受け入れ基準**:
   - Given `\hypersetup{colorlinks=true}` と `\href{URL}{link}` を含む文書, When PDF 生成, Then クリック可能なリンクが色付きテキストとして出力される
@@ -744,7 +755,8 @@
 - **処理**:
   - 変更検知（REQ-FUNC-028）の呼び出し
   - 部分再コンパイル（REQ-FUNC-030）の実行
-  - コンパイル中の新たな変更をキューイングし、完了後に再トリガー
+  - `Recompile Scheduler` がコンパイル中フラグを管理し、同時に複数の差分コンパイルを開始しない
+  - コンパイル中の新たな変更を `Pending Change Queue` にキューイングし、完了後に coalesce した変更集合で再トリガーする
 - **出力**: 更新された PDF
 - **受け入れ基準**:
   - Given ウォッチモード中にソースを編集, When 保存, Then 差分コンパイルが自動実行され更新された PDF が出力される
@@ -760,7 +772,8 @@
 - **処理**:
   - ローカルサーバー（WebSocket または HTTP）による PDF 配信
   - PDF 更新時のプレビューアへの通知（ホットリロード）
-  - 表示ページ位置の保持（更新時に閲覧位置がリセットされない）
+  - 接続ごとに `Preview Session` を保持し、`Preview View State` として現在ページ、ページ内オフセット、ズーム倍率を保存する
+  - PDF 更新時は保持済みの `Preview View State` を優先して再適用し、該当ページが消滅した場合のみ最近傍の有効ページへフォールバックする
 - **出力**: プレビューア上での更新された PDF 表示
 - **受け入れ基準**:
   - Given プレビューアが接続中, When 再コンパイル完了, Then 1秒以内にプレビューが更新され閲覧ページ位置が維持される
@@ -772,10 +785,12 @@
 - **説明**: ソース位置と PDF 位置の双方向ジャンプを実現する
 - **入力**: ソース位置（ファイル名:行:列）または PDF 位置（ページ:座標）
 - **処理**:
-  - コンパイル時に SyncTeX 互換データの生成
-  - ソース → PDF（フォワードサーチ）の座標計算
-  - PDF → ソース（インバースサーチ）の位置解決
-- **出力**: 対応する位置情報
+  - タイプセッティング時に placed node ごとの Source Span と配置矩形、および placed destination を記録する
+  - 1 つの Source Span が複数行・複数ページに分割された場合でも、各配置断片を `SyncTeX Trace Fragment` として保持する
+  - Page Render Plan 上の source trace から fragment ベースの SyncTeX 互換データを生成する
+  - ソース → PDF（フォワードサーチ）では SourceLocation に交差する fragment 群から候補位置を返す
+  - PDF → ソース（インバースサーチ）では指定座標を含む fragment から対応する Source Span を解決する
+- **出力**: 対応する PDF 位置群またはソース範囲
 - **受け入れ基準**:
   - Given SyncTeX データが生成された文書, When ソースの特定行を指定, Then 対応する PDF のページと座標が返される
 - **優先度**: Should
@@ -888,10 +903,11 @@
 
 #### REQ-FUNC-048: ファイルアクセスサンドボックス
 
-- **説明**: コンパイル中のすべてのファイル読み書きをパスアクセスポリシーで制御する
+- **説明**: コンパイル中のすべてのファイル読み書きを共通 File Access Gate とパスアクセスポリシーで制御する
 - **入力**: パス要求（read/write/create）、アクセス目的（tex-input / tex-output / engine-output / engine-readback / engine-temp）、プロジェクトルート、設定済み overlay roots、Asset Bundle ルート、キャッシュディレクトリ、明示的 output root、current Job Context、Output Artifact Registry
 - **処理**:
   - パス正規化とシンボリックリンク解決
+  - すべての `\input`, `\include`, `\openin`, `\openout`, asset read, engine-temp / engine-output / engine-readback 要求を共通 File Access Gate に集約する
   - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Job Context の `jobname` と主入力の双方に整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
   - Ferritex 自身が確保した private temp dir をキャッシュ配下または明示的 output root 配下に作成し、`engine-temp` 用にのみ許可
   - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・主入力・artifact kind・jobname・現在パス番号・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する
@@ -1014,6 +1030,8 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch 再トリガーの scheduler/queue、preview の view state を追記 | Codex |
+| 0.1.10 | 2026-03-12 | SyncTeX の source trace / placed destination、colorlinks の text-side style、共通 File Access Gate を追記 | Codex |
 | 0.1.9 | 2026-03-12 | Link Annotation Plan / Link Style、TOC/索引の box tree 投影、外部ツール成果物の trusted artifact 登録責務を追記 | Codex |
 | 0.1.8 | 2026-03-12 | Navigation State / Table Of Contents State / Index State / Page Render Plan を用語化し、目次・hyperref・PDF 射影の責務を明確化 | Codex |
 | 0.1.7 | 2026-03-12 | 差分コンパイルの job 単位反復、共通 PDF レンダリングパイプライン、entry point 非依存の Runtime Options を明文化 | Codex |

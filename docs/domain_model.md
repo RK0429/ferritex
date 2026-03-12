@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.9           |
+| バージョン | 0.1.11          |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.9 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.11 |
 
 ## 1. サブドメイン分類
 
@@ -328,6 +328,21 @@ classDiagram
         <<Service>>
         +resolve(LogicalPath, ResolutionContext) AssetHandle
     }
+    class FileAccessRequest {
+        <<ValueObject>>
+        +FilePath requestedPath
+        +AccessMode mode
+        +AccessPurpose purpose
+    }
+    class SandboxedFileHandle {
+        <<ValueObject>>
+        +FilePath normalizedPath
+        +AccessPurpose purpose
+    }
+    class FileAccessGate {
+        <<Service>>
+        +authorize(FileAccessRequest, ExecutionPolicy, JobContext, OutputArtifactRegistry) SandboxedFileHandle
+    }
     class ShellCommandGateway {
         <<Service>>
         +execute(CommandRequest, ExecutionPolicy, JobContext, OutputArtifactRegistry) CommandResult
@@ -382,7 +397,7 @@ classDiagram
     }
     class InputSource {
         <<Entity>>
-        +FilePath path
+        +SandboxedFileHandle handle
         +int line
         +int column
         +read() char
@@ -463,10 +478,18 @@ classDiagram
     PackageExtension <|.. TikzExtension
     PackageExtension <|.. FontspecExtension
     HyperrefExtension ..> NavigationState : populates
+    AssetResolver --> FileAccessGate : opens assets
+    FileAccessGate --> ExecutionPolicy
+    FileAccessGate --> OutputArtifactRegistry : validates readback
+    FileAccessGate --> SandboxedFileHandle
+    FileAccessGate ..> JobContext : scopes access
+    Lexer ..> FileAccessGate : requests tex-input
     ShellCommandGateway --> ExecutionPolicy
+    ShellCommandGateway --> FileAccessGate : uses output/temp handles
     ShellCommandGateway --> OutputArtifactRegistry : records trusted external artifacts
     ShellCommandGateway --> CommandResult
     CommandResult o-- ProducedArtifact
+    InputSource --> SandboxedFileHandle
     ExecutionPolicy --> PathAccessPolicy
     OutputArtifactRegistry o-- OutputArtifactRecord
     OutputArtifactRegistry ..> JobContext : validates
@@ -508,9 +531,10 @@ classDiagram
     }
     class PageBox {
         <<ValueObject>>
-        +List~Node~ content
+        +List~PlacedNode~ content
         +Size size
         +List~LinkAnnotationPlan~ linkAnnotations
+        +List~PlacedDestination~ destinations
     }
     class Glue {
         <<ValueObject>>
@@ -524,6 +548,27 @@ classDiagram
     }
     class Node {
         <<ValueObject>>
+    }
+    class TextRun {
+        <<ValueObject>>
+        +GlyphSequence glyphs
+        +TextStyle style
+    }
+    class TextStyle {
+        <<ValueObject>>
+        +FontSpec font
+        +Color fillColor
+    }
+    class PlacedNode {
+        <<ValueObject>>
+        +Node node
+        +Rect rect
+        +SourceSpan sourceSpan
+    }
+    class SourceSpan {
+        <<ValueObject>>
+        +SourceLocation start
+        +SourceLocation end
     }
     class MathList {
         <<Entity>>
@@ -548,6 +593,12 @@ classDiagram
         <<ValueObject>>
         +LinkTargetKind kind
         +String value
+    }
+    class PlacedDestination {
+        <<ValueObject>>
+        +String name
+        +Rect rect
+        +DefinitionProvenance provenance
     }
     class LinkStyle {
         <<ValueObject>>
@@ -726,13 +777,19 @@ classDiagram
     Box <|-- HBox
     Box <|-- VBox
     Node <|-- Box
+    Node <|-- TextRun
     Node <|-- Glue
     Node <|-- Penalty
-    PageBox o-- Node
+    PageBox o-- PlacedNode
+    PageBox o-- PlacedDestination
     PageBox o-- LinkAnnotationPlan
+    PlacedNode --> Node
+    PlacedNode --> SourceSpan
+    TextRun --> TextStyle
     LinkAnnotationPlan --> LinkTarget
     LinkAnnotationPlan --> LinkStyle
     LinkStyle --> BorderStyle
+    LinkStyle ..> TextStyle : colors linked text
     Paragraph --> LineBreakParams
     Paragraph o-- Node
     PageBuilder o-- Node
@@ -773,6 +830,8 @@ classDiagram
     CitationInfo --> DefinitionProvenance
     BibliographyEntry --> DefinitionProvenance
     DestinationAnchor --> DefinitionProvenance
+    PlacedDestination --> DefinitionProvenance
+    SourceSpan --> SourceLocation
     DefinitionProvenance --> SourceLocation
 ```
 
@@ -1037,7 +1096,7 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
-`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` を `Annotation` へ変換する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
 
 ```mermaid
 classDiagram
@@ -1050,7 +1109,7 @@ classDiagram
     }
     class PdfRenderer {
         <<Service>>
-        +buildDocument(List~PageRenderPlan~, NavigationState, SyncTexData) PdfDocument
+        +buildDocument(List~PageRenderPlan~, NavigationState) PdfDocument
         +projectPage(PageRenderPlan) PdfPage
     }
     class PageRenderPlan {
@@ -1060,9 +1119,34 @@ classDiagram
     }
     class PageBox {
         <<Upstream ValueObject>>
-        +List~Node~ content
+        +List~PlacedNode~ content
         +Size size
         +List~LinkAnnotationPlan~ linkAnnotations
+        +List~PlacedDestination~ destinations
+    }
+    class PlacedNode {
+        <<Upstream ValueObject>>
+        +Node node
+        +Rect rect
+        +SourceSpan sourceSpan
+    }
+    class Node {
+        <<Upstream ValueObject>>
+    }
+    class TextRun {
+        <<Upstream ValueObject>>
+        +GlyphSequence glyphs
+        +TextStyle style
+    }
+    class TextStyle {
+        <<Upstream ValueObject>>
+        +FontSpec font
+        +Color fillColor
+    }
+    class SourceSpan {
+        <<Upstream ValueObject>>
+        +SourceLocation start
+        +SourceLocation end
     }
     class LinkAnnotationPlan {
         <<Upstream ValueObject>>
@@ -1110,6 +1194,12 @@ classDiagram
     class DestinationAnchor {
         <<Upstream ValueObject>>
         +String name
+        +DefinitionProvenance provenance
+    }
+    class PlacedDestination {
+        <<Upstream ValueObject>>
+        +String name
+        +Rect rect
         +DefinitionProvenance provenance
     }
     class PdfMetadata {
@@ -1177,23 +1267,53 @@ classDiagram
         +embedRaster(RasterImage) EmbeddedImage
         +embedPdfGraphic(PdfGraphic) EmbeddedPdfGraphic
     }
+    class SyncTexBuilder {
+        <<Service>>
+        +build(List~PageRenderPlan~) SyncTexData
+    }
+    class PdfPosition {
+        <<ValueObject>>
+        +int pageNumber
+        +PdfPoint point
+    }
+    class PdfPoint {
+        <<ValueObject>>
+        +float x
+        +float y
+    }
+    class SyncTraceFragment {
+        <<ValueObject>>
+        +SourceSpan sourceSpan
+        +int pageNumber
+        +Rect rect
+    }
     class SyncTexData {
         <<ValueObject>>
-        +Map~SourceLocation, PdfPosition~ forwardMap
-        +Map~PdfPosition, SourceLocation~ inverseMap
+        +List~SyncTraceFragment~ fragments
+        +forwardSearch(SourceLocation) List~SyncTraceFragment~
+        +inverseSearch(PdfPosition) SourceSpan
     }
 
     PdfRenderer --> PdfDocument
     PdfRenderer --> GraphicResourceEncoder
+    PdfRenderer --> SyncTexBuilder
     PdfRenderer --> NavigationState : consumes
     PdfRenderer ..> PageRenderPlan : projects
     PdfRenderer ..> LinkAnnotationPlan : materializes
     PdfRenderer ..> PdfMetadataDraft : derives
     PdfRenderer ..> OutlineDraftEntry : derives
     PdfRenderer ..> DestinationAnchor : resolves
+    PdfRenderer ..> PlacedDestination : resolves named destinations
+    PdfRenderer ..> TextRun : emits text operators/colors
     PageRenderPlan --> PageBox
     PageRenderPlan --> GraphicsScene
+    PageBox o-- PlacedNode
     PageBox o-- LinkAnnotationPlan
+    PageBox o-- PlacedDestination
+    PlacedNode --> Node
+    PlacedNode --> SourceSpan
+    Node <|-- TextRun
+    TextRun --> TextStyle
     LinkAnnotationPlan --> LinkTarget
     LinkAnnotationPlan --> LinkStyle
     LinkStyle --> BorderStyle
@@ -1216,6 +1336,13 @@ classDiagram
     NavigationState o-- DestinationAnchor
     NavigationState --> LinkStyle
     GraphicResourceEncoder ..> PdfGraphic : form XObject
+    SyncTexBuilder ..> PageRenderPlan : traces
+    SyncTexBuilder ..> PlacedNode : consumes source spans
+    SyncTexBuilder --> SyncTexData
+    SyncTexData o-- SyncTraceFragment
+    SyncTexData ..> PdfPosition : inverse lookup
+    PdfPosition --> PdfPoint
+    SyncTraceFragment --> SourceSpan
 ```
 
 ### 3.7 フォント管理 コンテキスト
@@ -1290,7 +1417,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`DefinitionProvider` は暗黙の外部インデックスに依存せず、3.1/3.2 の `DefinitionProvenance` を投影した `SymbolIndex` を read model として利用する。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、preview 配信は `PreviewSession` ごとの閲覧位置を保持する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1332,11 +1459,49 @@ classDiagram
         +start() void
         +stop() void
     }
+    class FileChangeEvent {
+        <<ValueObject>>
+        +Set~FilePath~ paths
+        +Instant observedAt
+    }
+    class PendingChangeQueue {
+        <<Entity>>
+        +enqueue(FileChangeEvent) void
+        +drainCoalesced() FileChangeEvent
+        +isEmpty() bool
+    }
+    class RecompileScheduler {
+        <<Service>>
+        +bool compileInFlight
+        +enqueue(FileChangeEvent) void
+        +onCompileFinished() void
+    }
     class PreviewServer {
         <<Entity>>
         +int port
-        +List~Connection~ clients
-        +deliverPdf(bytes) void
+        +List~PreviewSession~ sessions
+        +publish(PreviewUpdate) void
+    }
+    class Connection {
+        <<ValueObject>>
+        +String clientId
+    }
+    class PreviewSession {
+        <<Entity>>
+        +Connection connection
+        +PreviewViewState viewState
+        +updateView(PreviewViewState) void
+    }
+    class PreviewViewState {
+        <<ValueObject>>
+        +int pageNumber
+        +float viewportOffsetY
+        +float zoom
+    }
+    class PreviewUpdate {
+        <<ValueObject>>
+        +bytes pdf
+        +bool retainView
     }
     class RuntimeOptions {
         <<ValueObject>>
@@ -1408,8 +1573,15 @@ classDiagram
     LspServer --> ExecutionPolicyFactory
     LspServer --> RuntimeOptions : normalizes
     DefinitionProvider --> SymbolIndex
-    FileWatcher ..> CliRunner : triggers
+    FileWatcher ..> FileChangeEvent : emits
+    FileWatcher --> RecompileScheduler : notifies
+    RecompileScheduler --> PendingChangeQueue
+    RecompileScheduler ..> CliRunner : triggers compile
     PreviewServer ..> CliRunner : receives PDF
+    PreviewServer o-- PreviewSession
+    PreviewServer ..> PreviewUpdate : publishes
+    PreviewSession --> Connection
+    PreviewSession --> PreviewViewState
     CliRunner --> CompileOptions
     CliRunner --> WatchOptions
     CliRunner --> RuntimeOptions : normalizes
@@ -1486,6 +1658,7 @@ stateDiagram-v2
 | コンパイルジョブ (CompilationJob) | 1 回の compile/watch/LSP 再コンパイル要求を表す集約。最大 3 パスまでの `CompilationSession` を束ね、`DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を pass 間で保持する | CompilationSession, DocumentState, OutputArtifactRegistry |
 | コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリ、current Job Context を保持する | CompilationJob, JobContext |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback 判定と出力命名の境界を与える | CompilationSession, OutputArtifactRegistry |
+| ファイルアクセスゲート (FileAccessGate) | `\input` / `\openin` / `\openout` / engine-temp / engine-readback などの I/O 要求を `ExecutionPolicy` と `OutputArtifactRegistry` に照らして許可/拒否する共通ゲート | FileAccessRequest, SandboxedFileHandle |
 | 目次状態 (TableOfContentsState) | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 | DocumentState, TocEntry |
 | 索引状態 (IndexState) | `\index` から収集した索引語・ソートキー・ページ番号を保持し、makeindex 互換整列へ渡す job-scope 状態 | DocumentState, IndexEntry |
 | ナビゲーション状態 (NavigationState) | hyperref とセクショニングが生成する PDF metadata draft、しおり候補、named destination、既定リンク装飾を保持する job-scope 状態 | DocumentState, PdfMetadataDraft, OutlineDraftEntry |
@@ -1509,7 +1682,11 @@ stateDiagram-v2
 | 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table と参考文献エントリを保持し、`\cite` を解決する状態 | CitationTable, BblSnapshot |
 | 目次エントリ (TocEntry) | 章節・図表一覧の項目名、番号、ページ番号、階層を保持する値 | TableOfContentsState |
 | 索引エントリ (IndexEntry) | 索引語、ソートキー、対応ページ番号を保持する値 | IndexState |
-| ページボックス (PageBox) | 単一ページに配置済みのノード列とリンク注釈計画を保持するページ単位の box tree | PageBuilder, LinkAnnotationPlan |
+| ソース範囲 (SourceSpan) | 組版結果 1 単位に対応付くソース開始/終了位置。SyncTeX と診断の由来追跡に使う | PlacedNode, SourceLocation |
+| 配置済みノード (PlacedNode) | ページ上で確定した矩形と SourceSpan を伴うノード。PDF 射影と SyncTeX の共通入力 | PageBox, TextRun |
+| テキストラン (TextRun) | 配置済みグリフ列と text style を持つノード。`colorlinks=true` 時は LinkStyle から text color を受け取る | TextStyle, LinkStyle |
+| 配置済み destination (PlacedDestination) | named destination のページ内配置結果。内部リンク・しおり解決に使う | PageBox, NavigationState |
+| ページボックス (PageBox) | 単一ページに配置済みのノード列、destination、リンク注釈計画を保持するページ単位の box tree | PageBuilder, PlacedNode, LinkAnnotationPlan |
 | 目次組版器 (TocTypesetter) | `TableOfContentsState` を `\tableofcontents` / `\listoffigures` / `\listoftables` 用の box tree へ射影するサービス | TableOfContentsState, DocumentState |
 | 索引組版器 (IndexTypesetter) | `IndexState` を `\printindex` 用の box tree へ射影するサービス | IndexState, DocumentState |
 | 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
@@ -1551,8 +1728,8 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | コンテンツストリーム (ContentStream) | PDF ページの描画命令列 | PdfOperator |
-| ページレンダープラン (PageRenderPlan) | 単一ページ分の `PageBox` と `GraphicsScene` を束ねた PDF 射影入力。`PageBox` 内には配置済み `LinkAnnotationPlan` が含まれる | PdfRenderer, PageBox, GraphicsScene |
-| PDF レンダラ (PdfRenderer) | `PageRenderPlan` と `NavigationState` を PDF 演算子列・リンク Annotation・リソース辞書・メタデータ・しおりへ射影し、`PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
+| ページレンダープラン (PageRenderPlan) | 単一ページ分の `PageBox` と `GraphicsScene` を束ねた PDF 射影入力。`PageBox` 内には配置済み `PlacedNode` / `PlacedDestination` / `LinkAnnotationPlan` が含まれる | PdfRenderer, PageBox, GraphicsScene |
+| PDF レンダラ (PdfRenderer) | `PageRenderPlan` と `NavigationState` を PDF 演算子列・リンク Annotation・リソース辞書・メタデータ・しおりへ射影し、`PlacedDestination` と `LinkStyle` を内部 destination / text color / annotation border へ変換して `PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
 | リンク注釈計画 (LinkAnnotationPlan) | 配置済みリンク 1 件分の PDF 注釈化計画。リンク矩形、リンク先、装飾設定を保持し、`PdfRenderer` が `Annotation` へ変換する | PageBox, LinkTarget, LinkStyle |
 | リンク先 (LinkTarget) | 内部 named destination または外部 URI を表すリンク解決先 | LinkAnnotationPlan, Annotation |
 | リンク装飾 (LinkStyle) | リンクテキスト色と PDF 注釈境界線の描画規則 | LinkAnnotationPlan, Annotation |
@@ -1561,7 +1738,10 @@ stateDiagram-v2
 | アウトライン草案エントリ (OutlineDraftEntry) | セクショニングや hyperref から収集したしおり候補。`PdfRenderer` が PDF の `OutlineEntry` へ変換する | NavigationState |
 | 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
 | 埋め込み PDF グラフィック (EmbeddedPdfGraphic) | 外部 PDF ページを Form XObject 化して PDF 内へ再利用可能にした描画資産 | PdfGraphic |
-| SyncTeX データ | ソース位置と PDF 位置の双方向マッピング | SourceLocation |
+| PDF 位置 (PdfPosition) | ページ番号とページ内座標の組。SyncTeX の逆引き入力になる | SyncTexData, PdfPoint |
+| SyncTeX trace fragment | 1 つの SourceSpan と 1 つのページ内矩形を対応付ける SyncTeX の最小断片。1 つの SourceSpan に複数存在しうる | SyncTexData, SyncTraceFragment |
+| SyncTeX ビルダ (SyncTexBuilder) | `PlacedNode` の SourceSpan と配置矩形から `SyncTexData` を導出するサービス | PageRenderPlan, SyncTexData |
+| SyncTeX データ | fragment 群を forward / inverse search 用に索引化した双方向マッピング | SyncTraceFragment, SyncTexBuilder |
 
 ### 5.7 フォント管理 コンテキスト
 
@@ -1578,6 +1758,10 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, CompilationSession |
+| 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら再コンパイルを逐次実行する調停役 | FileWatcher, PendingChangeQueue |
+| 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
+| プレビューセッション (PreviewSession) | 接続 1 件分の preview 状態。閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewServer, PreviewViewState |
+| プレビュー表示状態 (PreviewViewState) | 現在ページ、ページ内オフセット、ズーム倍率など、プレビュー更新後も維持すべき閲覧位置 | PreviewSession |
 | RuntimeOptions | compile / watch / LSP の入口固有指定を正規化した共通実行オプション。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
 | AssetBundleRef | Asset Bundle の参照値。ファイルパスまたは組み込み識別子を区別して保持する | RuntimeOptions, CompileOptions, WatchOptions |
 | WorkspaceContext | プロジェクトルート、overlay roots、キャッシュ位置、利用可能な bundle 探索範囲/組み込み識別子をまとめた実行文脈 | ExecutionPolicyFactory |
@@ -1740,6 +1924,78 @@ stateDiagram-v2
 - **等価性への影響**: 理論等価（外部仕様は同一で、pass 跨ぎ状態の所有境界が明確になる）
 - **語彙への影響**: 「TableOfContentsState」「IndexState」「NavigationState」「LinkStyle」「TocTypesetter」「IndexTypesetter」「PdfMetadataDraft」「OutlineDraftEntry」を導入
 
+### 6.14 SyncTeX と internal destination の source-to-layout trace を PageBox に保持する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: タイプセッティング / PDF 生成
+- **判断内容**: `PageBox` は単なる node 列ではなく、配置済み `PlacedNode` と `PlacedDestination` を保持する。`PlacedNode` は `SourceSpan` と配置矩形を持ち、`SyncTexBuilder` がそこから `SyncTexData` を生成する。`PdfRenderer` は `PlacedDestination` を named destination 解決に用いる
+- **根拠**:
+  - 観測事実: REQ-FUNC-041 はソース位置と PDF 位置の双方向対応付けを要求し、REQ-FUNC-015 / 022 は internal destination をページ上の配置結果に解決する必要がある
+  - 代替案: SyncTeX と destination 解決を非公開の外部インデックスまたは PDF 生成時の暗黙状態に依存させる
+  - 分離証人: `\section{Intro}\label{sec:intro}` と `\ref{sec:intro}` を含む文書。`PlacedNode` / `PlacedDestination` モデルでは見出しの source span と destination 座標を同じ page-scope 構造から得られるが、暗黙状態モデルでは SyncTeX と internal link 解決の入力が分裂する
+- **等価性への影響**: 理論等価（外部仕様は同一で、source-to-layout provenance の表現力が向上する）
+- **語彙への影響**: 「SourceSpan」「PlacedNode」「PlacedDestination」「SyncTexBuilder」を導入
+
+### 6.15 LinkStyle を text-side style と annotation border の両方へ射影する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: タイプセッティング / PDF 生成
+- **判断内容**: `LinkStyle` は annotation 用の境界線設定だけでなく、リンク文字列の `TextStyle.fillColor` へも射影される。`colorlinks=true` の場合、`PdfRenderer` は `TextRun` の text color として content stream に反映し、annotation には border 規則のみを残す
+- **根拠**:
+  - 観測事実: REQ-FUNC-022 は `colorlinks=true` で「色付きテキストとして出力」を要求しており、annotation だけでは満たせない
+  - 代替案: `LinkStyle` を PDF annotation 側の情報に限定し、テキスト着色は暗黙実装に委ねる
+  - 分離証人: `\hypersetup{colorlinks=true}\href{https://example.com}{link}` のケース。text-side 射影モデルでは `TextRun.style.fillColor` が content stream に現れるが、annotation-only モデルではクリック領域は表せてもリンク文字列の色は説明できない
+- **等価性への影響**: 理論等価（外部仕様は同一で、色付きリンクの責務境界が明確になる）
+- **語彙への影響**: 「TextRun」「TextStyle」を導入
+
+### 6.16 すべてのファイル I/O は FileAccessGate を経由させる
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: パーサー/マクロエンジン / アセットランタイム / 開発者ツール
+- **判断内容**: `\input` / `\include` / `\openin` / `\openout` / asset read / engine-temp / engine-readback を個別コンポーネントに散在させず、`FileAccessGate` が `ExecutionPolicy` / `OutputArtifactRegistry` / `JobContext` を受けて一元的に許可判定する
+- **根拠**:
+  - 観測事実: REQ-FUNC-048 は「コンパイル中のすべてのファイル読み書き」を同一ポリシーで制御することを要求し、外部コマンドだけでなく通常の TeX I/O も対象に含む
+  - 代替案: `Lexer` / `AssetResolver` / CLI 各入口が個別にパス判定を実装する
+  - 分離証人: `\input{chap1}` と `\openout\foo=../../outside.txt` が同じジョブ内にある文書。`FileAccessGate` モデルでは通常入力と危険書き込みの両方を同一の gate で判断できるが、呼び出し元分散モデルでは enforcement owner が複数に割れる
+- **等価性への影響**: 理論等価（外部仕様は同一で、sandbox enforcement の所有者が明確になる）
+- **語彙への影響**: 「FileAccessGate」「FileAccessRequest」「SandboxedFileHandle」を導入
+
+### 6.17 SyncTeX は fragment ベースで保持する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: タイプセッティング / PDF 生成
+- **判断内容**: `SyncTexData` は `SourceLocation -> PdfPosition` の単純写像ではなく、`SyncTraceFragment` の集合として保持する。forward search は SourceLocation に交差する fragment 群を返し、inverse search は `PdfPosition` を含む fragment から `SourceSpan` を返す
+- **根拠**:
+  - 観測事実: REQ-FUNC-041 は placed node ごとの `SourceSpan` と配置矩形を保持し、複数行・複数ページに分割された結果も扱える必要がある
+  - 代替案: `Map<SourceLocation, PdfPosition>` / `Map<PdfPosition, SourceLocation>` の点対点マップとして保持する
+  - 分離証人: 長いリンクテキストや見出しが改行をまたいで複数断片に分割されるケース。fragment モデルでは複数矩形を 1 つの source span に対応付けられるが、点対点マップでは情報が欠落する
+- **等価性への影響**: 理論等価（外部仕様は同一で、SyncTeX trace の表現力が向上する）
+- **語彙への影響**: 「SyncTraceFragment」「PdfPosition」「PdfPoint」を導入
+
+### 6.18 watch 再トリガーは RecompileScheduler が所有する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: 開発者ツール / 差分コンパイル
+- **判断内容**: watch 実行中の変更イベントは `FileWatcher` が発火し、`RecompileScheduler` が `PendingChangeQueue` を介して追加変更を coalesce しながら逐次的に差分コンパイルを起動する。コンパイル中の変更は即時実行せず、完了後に 1 回以上の再トリガーとして処理する
+- **根拠**:
+  - 観測事実: REQ-FUNC-039 はコンパイル中の追加変更をキューイングし、現在のコンパイル完了後に再コンパイルすることを Must として要求する
+  - 代替案: `FileWatcher` または `CliRunner` が個別に再入制御を持つ
+  - 分離証人: 保存を短時間に 3 回連続で行うケース。`RecompileScheduler` モデルでは変更を 1 つの保留集合に統合してコンパイル完了後に再実行できるが、呼び出し元分散モデルでは重複コンパイルやイベント取りこぼしの責務が曖昧になる
+- **等価性への影響**: 理論等価（外部仕様は同一で、watch 再入制御の所有者が明確になる）
+- **語彙への影響**: 「RecompileScheduler」「PendingChangeQueue」「FileChangeEvent」を導入
+
+### 6.19 preview の閲覧位置は PreviewSession が保持する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: 開発者ツール
+- **判断内容**: `PreviewServer` は生の接続一覧ではなく `PreviewSession` を保持し、各セッションが `PreviewViewState` として現在ページ・ページ内オフセット・ズーム倍率を持つ。PDF 更新時は `PreviewUpdate.retainView` に従って閲覧位置を再適用する
+- **根拠**:
+  - 観測事実: REQ-FUNC-040 はホットリロード後も閲覧ページ位置が維持されることを要求している
+  - 代替案: preview クライアントが暗黙に位置復元すると仮定し、サーバー側モデルでは raw PDF 配信だけを表現する
+  - 分離証人: 20 ページ目を閲覧中に再コンパイルが発生するケース。`PreviewSession` モデルでは接続ごとに保持された view state を再適用できるが、raw 配信モデルでは「どの位置を維持するか」の所有者が不明になる
+- **等価性への影響**: 理論等価（外部仕様は同一で、preview view restore の責務境界が明確になる）
+- **語彙への影響**: 「PreviewSession」「PreviewViewState」「PreviewUpdate」を導入
+
 ## 7. ビジネスルール一覧
 
 要件定義書から抽出した主要なビジネスルール・不変条件の一覧。
@@ -1753,7 +2009,7 @@ stateDiagram-v2
 | BR-5 | 差分コンパイルは再構築ノードと再利用ノードをマージした後もフルコンパイルと同一の出力でなければならず、参照不安定時は最大 3 パスまで反復する | REQ-FUNC-030 | 差分コンパイル |
 | BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならない | REQ-FUNC-031 | インフラストラクチャ層 |
 | BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。compile / watch / LSP の各入口は指定を `RuntimeOptions` へ正規化したうえですべての実行要求を `ExecutionPolicy` へ通し、デフォルト上限は 30 秒、1 プロセス / `CompilationJob`、捕捉出力 4 MiB である。Ferritex が制御した readback 対象補助ファイル生成物は `ShellCommandGateway` を通じて trusted external artifact として `OutputArtifactRegistry` に記録される | REQ-FUNC-043 / REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン / 開発者ツール |
-| BR-8 | ファイル読み書きは、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は OutputArtifactRegistry が current `JobContext` の `jobname` と主入力の双方、および artifact provenance から same job の trusted artifact と確認した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
+| BR-8 | ファイル読み書きはすべて `FileAccessGate` を経由し、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は OutputArtifactRegistry が current `JobContext` の `jobname` と主入力の双方、および artifact provenance から same job の trusted artifact と確認した `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能であり、書き込みはキャッシュディレクトリ、明示的 output root に制限される。private temp root は engine-temp 用にのみ使用する | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
 | BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local Font Catalog fallback の順で解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 / REQ-NF-008 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
@@ -1761,12 +2017,17 @@ stateDiagram-v2
 | BR-13 | `\cite` の解決と参考文献リスト組版は `BibliographyState` / `CitationTable` が担い、label 系の `CrossReferenceTable` とは責務を分離する | REQ-FUNC-024 | パーサー/マクロエンジン / タイプセッティング |
 | BR-14 | 定義ジャンプは `MacroDefinition` / `LabelInfo` / `CitationInfo` / `BibliographyEntry` の `DefinitionProvenance` を `SymbolIndex` に投影して解決する | REQ-FUNC-036 | パーサー/マクロエンジン / 開発者ツール |
 | BR-15 | 目次・図表一覧・索引のエントリは同一 `CompilationJob` が所有する `TableOfContentsState` / `IndexState` に蓄積され、pass をまたいで merge されたうえで `TocTypesetter` / `IndexTypesetter` により box tree へ再投影される | REQ-FUNC-012 | パーサー/マクロエンジン / タイプセッティング |
-| BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に正規化される。`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
+| BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に、named destination は `PlacedDestination` に正規化される。`LinkStyle.textColor` は必要に応じて `TextRun.style.fillColor` へコピーされ、`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / text color / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
+| BR-17 | SyncTeX は `PageBox` に含まれる `PlacedNode` の `SourceSpan` と配置矩形から `SyncTexBuilder` が `SyncTraceFragment` 群を生成し、forward search では SourceLocation に交差する fragment 群を、inverse search では `PdfPosition` を含む fragment に対応する `SourceSpan` を返す | REQ-FUNC-041 | タイプセッティング / PDF 生成 |
+| BR-18 | watch 実行中の追加変更は `RecompileScheduler` が `PendingChangeQueue` へ集約し、コンパイル中に並列実行せず、現在のコンパイル完了後に coalesce 済み変更集合で再コンパイルする | REQ-FUNC-039 | 開発者ツール / 差分コンパイル |
+| BR-19 | PDF プレビュー配信は `PreviewSession` ごとに `PreviewViewState` を保持し、PDF 更新時は可能な限り同じページ位置とズームを再適用する | REQ-FUNC-040 | 開発者ツール |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch scheduler/queue、preview session/view state を追加 | Codex |
+| 0.1.10 | 2026-03-12 | SourceSpan / PlacedNode / PlacedDestination / SyncTexBuilder、colorlinks の text-side style、FileAccessGate を追加 | Codex |
 | 0.1.9 | 2026-03-12 | LinkAnnotationPlan / LinkStyle、TocTypesetter / IndexTypesetter、trusted external artifact 登録経路を追加 | Codex |
 | 0.1.8 | 2026-03-12 | TableOfContentsState / IndexState / NavigationState と PageRenderPlan を追加し、hyperref と PDF 射影の受け渡しを明示 | Codex |
 | 0.1.7 | 2026-03-12 | 差分コンパイル固定点反復の所有者、PDF 射影サービス、RuntimeOptions/AssetBundleRef/WorkspaceContext を反映 | Codex |
