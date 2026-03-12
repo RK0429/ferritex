@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.7           |
+| バージョン | 0.1.8           |
 | 最終更新日 | 2026-03-12      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.6 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.8 |
 
 ## 1. サブドメイン分類
 
@@ -152,6 +152,9 @@ classDiagram
         +CrossReferenceTable references
         +BibliographyState bibliography
         +AuxState aux
+        +TableOfContentsState toc
+        +IndexState index
+        +NavigationState navigation
         +int passCount
         +registerLabel(String, LabelInfo) void
         +resolveLabel(String) ResolvedRef
@@ -172,6 +175,34 @@ classDiagram
         <<Entity>>
         +List~AuxWrite~ pendingWrites
         +mergePreviousPass(AuxSnapshot) void
+    }
+    class TableOfContentsState {
+        <<Entity>>
+        +Map~TocKind, List~TocEntry~~ entries
+        +record(TocEntry) void
+        +mergePreviousPass(Map~TocKind, List~TocEntry~~) void
+    }
+    class TocEntry {
+        <<ValueObject>>
+        +TocKind kind
+        +String title
+        +String number
+        +int pageNumber
+        +int level
+        +DefinitionProvenance provenance
+    }
+    class IndexState {
+        <<Entity>>
+        +List~IndexEntry~ entries
+        +record(IndexEntry) void
+        +sortMakeindexCompatible() List~IndexEntry~
+    }
+    class IndexEntry {
+        <<ValueObject>>
+        +String term
+        +String sortKey
+        +List~int~ pageNumbers
+        +DefinitionProvenance provenance
     }
     class CrossReferenceTable {
         <<Entity>>
@@ -211,6 +242,31 @@ classDiagram
         <<ValueObject>>
         +String key
         +String renderedBlock
+        +DefinitionProvenance provenance
+    }
+    class NavigationState {
+        <<Entity>>
+        +PdfMetadataDraft metadata
+        +List~OutlineDraftEntry~ outlineEntries
+        +Map~String, DestinationAnchor~ namedDestinations
+        +recordOutline(OutlineDraftEntry) void
+    }
+    class PdfMetadataDraft {
+        <<ValueObject>>
+        +String title
+        +String author
+        +String subject
+        +List~String~ keywords
+    }
+    class OutlineDraftEntry {
+        <<ValueObject>>
+        +String title
+        +String destination
+        +int level
+    }
+    class DestinationAnchor {
+        <<ValueObject>>
+        +String name
         +DefinitionProvenance provenance
     }
     class CommandRegistry {
@@ -339,18 +395,29 @@ classDiagram
     CompilationSession --> CommandRegistry
     CompilationSession --> EnvironmentRegistry
     DocumentState --> CounterStore
+    DocumentState --> TableOfContentsState
+    DocumentState --> IndexState
+    DocumentState --> NavigationState
     DocumentState --> CrossReferenceTable
     DocumentState --> BibliographyState
     DocumentState --> AuxState
+    TableOfContentsState o-- TocEntry
+    IndexState o-- IndexEntry
     CrossReferenceTable o-- LabelInfo
     BibliographyState --> CitationTable
     BibliographyState --> BblSnapshot
     CitationTable o-- CitationInfo
     BblSnapshot o-- BibliographyEntry
+    NavigationState --> PdfMetadataDraft
+    NavigationState o-- OutlineDraftEntry
+    NavigationState o-- DestinationAnchor
+    TocEntry --> DefinitionProvenance
+    IndexEntry --> DefinitionProvenance
     MacroDefinition --> DefinitionProvenance
     LabelInfo --> DefinitionProvenance
     CitationInfo --> DefinitionProvenance
     BibliographyEntry --> DefinitionProvenance
+    DestinationAnchor --> DefinitionProvenance
     Lexer --> CompilationSession : reads
     Lexer --> InputSource
     Lexer ..> Token : produces
@@ -367,6 +434,7 @@ classDiagram
     PackageExtension <|.. HyperrefExtension
     PackageExtension <|.. TikzExtension
     PackageExtension <|.. FontspecExtension
+    HyperrefExtension ..> NavigationState : populates
     ShellCommandGateway --> ExecutionPolicy
     ExecutionPolicy --> PathAccessPolicy
     OutputArtifactRegistry o-- OutputArtifactRecord
@@ -463,6 +531,9 @@ classDiagram
         +CrossReferenceTable references
         +BibliographyState bibliography
         +AuxState aux
+        +TableOfContentsState toc
+        +IndexState index
+        +NavigationState navigation
         +int passCount
         +registerLabel(String, LabelInfo) void
         +resolveLabel(String) ResolvedRef
@@ -471,6 +542,34 @@ classDiagram
         <<Entity>>
         +List~AuxWrite~ pendingWrites
         +mergePreviousPass(AuxSnapshot) void
+    }
+    class TableOfContentsState {
+        <<Entity>>
+        +Map~TocKind, List~TocEntry~~ entries
+        +record(TocEntry) void
+        +mergePreviousPass(Map~TocKind, List~TocEntry~~) void
+    }
+    class TocEntry {
+        <<ValueObject>>
+        +TocKind kind
+        +String title
+        +String number
+        +int pageNumber
+        +int level
+        +DefinitionProvenance provenance
+    }
+    class IndexState {
+        <<Entity>>
+        +List~IndexEntry~ entries
+        +record(IndexEntry) void
+        +sortMakeindexCompatible() List~IndexEntry~
+    }
+    class IndexEntry {
+        <<ValueObject>>
+        +String term
+        +String sortKey
+        +List~int~ pageNumbers
+        +DefinitionProvenance provenance
     }
     class CrossReferenceTable {
         <<Entity>>
@@ -512,6 +611,31 @@ classDiagram
         +String renderedBlock
         +DefinitionProvenance provenance
     }
+    class NavigationState {
+        <<Entity>>
+        +PdfMetadataDraft metadata
+        +List~OutlineDraftEntry~ outlineEntries
+        +Map~String, DestinationAnchor~ namedDestinations
+        +recordOutline(OutlineDraftEntry) void
+    }
+    class PdfMetadataDraft {
+        <<ValueObject>>
+        +String title
+        +String author
+        +String subject
+        +List~String~ keywords
+    }
+    class OutlineDraftEntry {
+        <<ValueObject>>
+        +String title
+        +String destination
+        +int level
+    }
+    class DestinationAnchor {
+        <<ValueObject>>
+        +String name
+        +DefinitionProvenance provenance
+    }
     class DefinitionProvenance {
         <<ValueObject>>
         +SourceLocation location
@@ -544,18 +668,31 @@ classDiagram
     MathList o-- MathAtom
     MathAtom --> Box
     SectioningEngine --> DocumentState
+    SectioningEngine --> TableOfContentsState
+    SectioningEngine --> NavigationState
     DocumentState --> CounterStore
     DocumentState --> AuxState
+    DocumentState --> TableOfContentsState
+    DocumentState --> IndexState
+    DocumentState --> NavigationState
     DocumentState --> CrossReferenceTable
     DocumentState --> BibliographyState
+    TableOfContentsState o-- TocEntry
+    IndexState o-- IndexEntry
     CrossReferenceTable o-- LabelInfo
     BibliographyState --> CitationTable
     BibliographyState --> BblSnapshot
     CitationTable o-- CitationInfo
     BblSnapshot o-- BibliographyEntry
+    NavigationState --> PdfMetadataDraft
+    NavigationState o-- OutlineDraftEntry
+    NavigationState o-- DestinationAnchor
+    TocEntry --> DefinitionProvenance
+    IndexEntry --> DefinitionProvenance
     LabelInfo --> DefinitionProvenance
     CitationInfo --> DefinitionProvenance
     BibliographyEntry --> DefinitionProvenance
+    DestinationAnchor --> DefinitionProvenance
     DefinitionProvenance --> SourceLocation
 ```
 
@@ -820,7 +957,7 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
-`PdfRenderer` がページ単位の `PageBox` と `GraphicsScene` を PDF 演算子列へ射影し、`GraphicResourceEncoder` がラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、`GraphicResourceEncoder` がラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
 
 ```mermaid
 classDiagram
@@ -833,8 +970,38 @@ classDiagram
     }
     class PdfRenderer {
         <<Service>>
-        +buildDocument(List~PageBox~, SyncTexData) PdfDocument
-        +projectPage(PageBox, GraphicsScene) PdfPage
+        +buildDocument(List~PageRenderPlan~, NavigationState, SyncTexData) PdfDocument
+        +projectPage(PageRenderPlan) PdfPage
+    }
+    class PageRenderPlan {
+        <<ValueObject>>
+        +PageBox pageBox
+        +GraphicsScene graphics
+    }
+    class NavigationState {
+        <<Upstream Entity>>
+        +PdfMetadataDraft metadata
+        +List~OutlineDraftEntry~ outlineEntries
+    }
+    class PdfMetadataDraft {
+        <<Upstream ValueObject>>
+        +String title
+        +String author
+        +String subject
+        +List~String~ keywords
+    }
+    class OutlineDraftEntry {
+        <<Upstream ValueObject>>
+        +String title
+        +String destination
+        +int level
+    }
+    class PdfMetadata {
+        <<ValueObject>>
+        +String title
+        +String author
+        +String subject
+        +List~String~ keywords
     }
     class PdfPage {
         <<ValueObject>>
@@ -861,6 +1028,12 @@ classDiagram
     class PdfOutline {
         <<ValueObject>>
         +List~OutlineEntry~ entries
+    }
+    class OutlineEntry {
+        <<ValueObject>>
+        +String title
+        +String destination
+        +int level
     }
     class EmbeddedFont {
         <<ValueObject>>
@@ -895,14 +1068,20 @@ classDiagram
 
     PdfRenderer --> PdfDocument
     PdfRenderer --> GraphicResourceEncoder
-    PdfRenderer ..> PageBox : projects
-    PdfRenderer ..> GraphicsScene : projects
+    PdfRenderer --> NavigationState : consumes
+    PdfRenderer ..> PageRenderPlan : projects
+    PdfRenderer ..> PdfMetadataDraft : derives
+    PdfRenderer ..> OutlineDraftEntry : derives
+    PageRenderPlan --> PageBox
+    PageRenderPlan --> GraphicsScene
     PdfDocument o-- PdfPage
+    PdfDocument --> PdfMetadata
     PdfDocument --> PdfOutline
     PdfDocument --> SyncTexData
     PdfPage --> ContentStream
     PdfPage o-- Annotation
     ContentStream o-- PdfOperator
+    PdfOutline o-- OutlineEntry
     PdfDocument o-- EmbeddedFont
     PdfDocument o-- EmbeddedImage
     PdfDocument o-- EmbeddedPdfGraphic
@@ -1180,6 +1359,9 @@ stateDiagram-v2
 | コンパイルジョブ (CompilationJob) | 1 回の compile/watch/LSP 再コンパイル要求を表す集約。最大 3 パスまでの `CompilationSession` を束ね、`DocumentState` / `OutputArtifactRegistry` / `ExecutionPolicy` を pass 間で保持する | CompilationSession, DocumentState, OutputArtifactRegistry |
 | コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリ、current Job Context を保持する | CompilationJob, JobContext |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback 判定と出力命名の境界を与える | CompilationSession, OutputArtifactRegistry |
+| 目次状態 (TableOfContentsState) | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 | DocumentState, TocEntry |
+| 索引状態 (IndexState) | `\index` から収集した索引語・ソートキー・ページ番号を保持し、makeindex 互換整列へ渡す job-scope 状態 | DocumentState, IndexEntry |
+| ナビゲーション状態 (NavigationState) | hyperref とセクショニングが生成する PDF metadata draft、しおり候補、named destination を保持する job-scope 状態 | DocumentState, PdfMetadataDraft, OutlineDraftEntry |
 | 定義 provenance (DefinitionProvenance) | マクロ・ラベル・参考文献エントリの定義元を示す SourceLocation と由来種別の組 | MacroDefinition, LabelInfo, CitationInfo |
 | パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する静的ポリシー。実際の readback 可否は OutputArtifactRegistry と組み合わせて判定する | ExecutionPolicy, OutputArtifactRegistry |
 | 出力アーティファクトレジストリ (OutputArtifactRegistry) | Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルの provenance を保持し、current Job Context の `jobname` と主入力の双方に整合する trusted artifact のみを再読込可能にする台帳 | OutputArtifactRecord, JobContext, ExecutionPolicy |
@@ -1194,9 +1376,11 @@ stateDiagram-v2
 | ペナルティ (Penalty) | 行/ページ分割の位置を制御する整数値。高いほど分割されにくい | 行分割, ページ分割 |
 | 行分割 (Line Breaking) | Knuth-Plass アルゴリズムにより段落の最適な改行位置を決定する処理 | Paragraph, LineBreakParams |
 | フロート (Float) | テキストの流れから独立して配置されるオブジェクト。配置指定子で制御 | FloatQueue, PageBuilder |
-| ドキュメント状態 (DocumentState) | カウンタ、ラベル、参考文献状態、参照安定性など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable, BibliographyState |
+| ドキュメント状態 (DocumentState) | カウンタ、ラベル、参考文献、目次、索引、ナビゲーション状態など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable, BibliographyState, TableOfContentsState, IndexState, NavigationState |
 | 相互参照 (Cross Reference) | `\label`/`\ref`/`\pageref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
 | 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table と参考文献エントリを保持し、`\cite` を解決する状態 | CitationTable, BblSnapshot |
+| 目次エントリ (TocEntry) | 章節・図表一覧の項目名、番号、ページ番号、階層を保持する値 | TableOfContentsState |
+| 索引エントリ (IndexEntry) | 索引語、ソートキー、対応ページ番号を保持する値 | IndexState |
 | 数式リスト (MathList) | 数式アトム（Ord, Op, Bin, Rel 等）の列。スタイルに応じて組版 | MathAtom |
 
 ### 5.3 グラフィック描画 コンテキスト
@@ -1236,8 +1420,11 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | コンテンツストリーム (ContentStream) | PDF ページの描画命令列 | PdfOperator |
-| PDF レンダラ (PdfRenderer) | `PageBox` と `GraphicsScene` を PDF 演算子列・リソース辞書へ射影し、`PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
+| ページレンダープラン (PageRenderPlan) | 単一ページ分の `PageBox` と `GraphicsScene` を束ねた PDF 射影入力 | PdfRenderer, PageBox, GraphicsScene |
+| PDF レンダラ (PdfRenderer) | `PageRenderPlan` と `NavigationState` を PDF 演算子列・リソース辞書・メタデータ・しおりへ射影し、`PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
 | アノテーション (Annotation) | PDF 上のリンク・しおり等のインタラクティブ要素 | hyperref |
+| PDF メタデータ草案 (PdfMetadataDraft) | hyperref が収集した `pdftitle` / `pdfauthor` などの中間状態。`PdfRenderer` が `PdfMetadata` へ変換する | NavigationState |
+| アウトライン草案エントリ (OutlineDraftEntry) | セクショニングや hyperref から収集したしおり候補。`PdfRenderer` が PDF の `OutlineEntry` へ変換する | NavigationState |
 | 埋め込みフォント (EmbeddedFont) | 使用グリフのみをサブセット化して PDF に埋め込んだフォントデータ | GlyphSubsetter |
 | 埋め込み PDF グラフィック (EmbeddedPdfGraphic) | 外部 PDF ページを Form XObject 化して PDF 内へ再利用可能にした描画資産 | PdfGraphic |
 | SyncTeX データ | ソース位置と PDF 位置の双方向マッピング | SourceLocation |
@@ -1387,13 +1574,13 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: PDF 生成 / グラフィック描画
-- **判断内容**: `PageBox` / `GraphicsScene` を `PdfDocument` へ落とす責務は `PdfRenderer` とし、外部ラスタ画像と外部 PDF の埋め込み形式決定は `GraphicResourceEncoder` に分離する
+- **判断内容**: `PageRenderPlan` / `NavigationState` を `PdfDocument` へ落とす責務は `PdfRenderer` とし、外部ラスタ画像と外部 PDF の埋め込み形式決定は `GraphicResourceEncoder` に分離する
 - **根拠**:
-  - 観測事実: REQ-FUNC-013 / 016 / 023 は、通常のボックス組版、`graphicx` の画像埋め込み、tikz/pgf の描画結果が単一の PDF 出力面へ収束することを要求している
+  - 観測事実: REQ-FUNC-013 / 015 / 016 / 022 / 023 は、通常のボックス組版、hyperref のメタデータ/しおり、`graphicx` の画像埋め込み、tikz/pgf の描画結果が単一の PDF 出力面へ収束することを要求している
   - 代替案: `PdfDocument` 自身の `render()` にすべての射影責務を押し込む
-  - 分離証人: `\includegraphics{diagram.pdf}` と tikz 図形が同一ページに共存するケース。分離モデルでは `PdfRenderer` が演算子列の統合を担い、`GraphicResourceEncoder` が imported PDF Form XObject を扱えるが、自己完結型 `PdfDocument` モデルでは外部グラフィックの変換責務がデータ構造へ混入する
+  - 分離証人: `\includegraphics{diagram.pdf}` と `\hypersetup{pdftitle=...}` を含む文書のケース。分離モデルでは `PdfRenderer` が `PageRenderPlan` と `NavigationState` の両方から演算子列・メタデータ・しおりを統合し、`GraphicResourceEncoder` が imported PDF Form XObject を扱えるが、自己完結型 `PdfDocument` モデルでは外部グラフィック変換とナビゲーション情報の受け渡し責務がデータ構造へ混入する
 - **等価性への影響**: 理論等価（外部仕様は同一で、変換責務の境界が明確になる）
-- **語彙への影響**: 「PdfRenderer」「GraphicResourceEncoder」を導入
+- **語彙への影響**: 「PageRenderPlan」「PdfRenderer」「GraphicResourceEncoder」を導入
 
 ### 6.12 実行ポリシーは RuntimeOptions と WorkspaceContext から構築する
 
@@ -1406,6 +1593,18 @@ stateDiagram-v2
   - 分離証人: ワークスペース既定の組み込み bundle を使う LSP 再コンパイルと、明示的な `--asset-bundle /path/to/bundle` を使う CLI コンパイルのケース。`RuntimeOptions` + `AssetBundleRef` モデルでは両者を同じ `ExecutionPolicyFactory` で扱えるが、`CompileOptions(FilePath)` 前提モデルでは LSP 側の表現が崩れる
 - **等価性への影響**: 理論等価（外部仕様は同一で、入口非依存性と表現力が向上する）
 - **語彙への影響**: 「RuntimeOptions」「AssetBundleRef」「WorkspaceContext」を導入
+
+### 6.13 目次・索引・ナビゲーション状態を DocumentState に集約する
+
+- **日付**: 2026-03-12
+- **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング / PDF 生成
+- **判断内容**: `\tableofcontents` / `\listoffigures` / `\listoftables` / `\makeindex` / hyperref が pass 間で共有する状態は `DocumentState` 内の `TableOfContentsState` / `IndexState` / `NavigationState` として保持し、`SectioningEngine` / `HyperrefExtension` が更新し、`PdfRenderer` が消費する
+- **根拠**:
+  - 観測事実: REQ-FUNC-012 / 015 / 022 は pass をまたぐ `.toc` / `.lof` / `.lot` / metadata / outline の保持を必要とする
+  - 代替案: package 拡張内部または PDF 生成直前の一時構造として個別に保持する
+  - 分離証人: `\tableofcontents` と `\hypersetup{pdftitle=...}` を含む 2 パス文書。`DocumentState` 集約モデルでは前パス生成の目次エントリと metadata draft を同一所有者で保持できるが、一時構造モデルでは pass 境界をまたいだ所有者が不明確になる
+- **等価性への影響**: 理論等価（外部仕様は同一で、pass 跨ぎ状態の所有境界が明確になる）
+- **語彙への影響**: 「TableOfContentsState」「IndexState」「NavigationState」「PdfMetadataDraft」「OutlineDraftEntry」を導入
 
 ## 7. ビジネスルール一覧
 
@@ -1427,11 +1626,14 @@ stateDiagram-v2
 | BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationJob` が所有する job-scope の `DocumentState` / `OutputArtifactRegistry` に対して行われ、各 pass の `CompilationSession` から参照される | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 / REQ-FUNC-048 | パーサー/マクロエンジン / タイプセッティング |
 | BR-13 | `\cite` の解決と参考文献リスト組版は `BibliographyState` / `CitationTable` が担い、label 系の `CrossReferenceTable` とは責務を分離する | REQ-FUNC-024 | パーサー/マクロエンジン / タイプセッティング |
 | BR-14 | 定義ジャンプは `MacroDefinition` / `LabelInfo` / `CitationInfo` / `BibliographyEntry` の `DefinitionProvenance` を `SymbolIndex` に投影して解決する | REQ-FUNC-036 | パーサー/マクロエンジン / 開発者ツール |
+| BR-15 | 目次・図表一覧・索引のエントリは同一 `CompilationJob` が所有する `TableOfContentsState` / `IndexState` に蓄積され、pass をまたいで merge されたうえで組版に再利用される | REQ-FUNC-012 | パーサー/マクロエンジン / タイプセッティング |
+| BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination は `NavigationState` に集約され、`PdfRenderer` が `PdfMetadata` / `PdfOutline` / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.8 | 2026-03-12 | TableOfContentsState / IndexState / NavigationState と PageRenderPlan を追加し、hyperref と PDF 射影の受け渡しを明示 | Codex |
 | 0.1.7 | 2026-03-12 | 差分コンパイル固定点反復の所有者、PDF 射影サービス、RuntimeOptions/AssetBundleRef/WorkspaceContext を反映 | Codex |
 | 0.1.6 | 2026-03-12 | CompilationJob を導入し、主入力を含む same-job provenance と shell-escape のデフォルト実行上限を反映 | Codex |
 | 0.1.5 | 2026-03-12 | DefinitionProvenance/SymbolIndex、差分コンパイル統合、same-job readback 用 JobContext を反映 | Codex |
