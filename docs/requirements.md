@@ -5,8 +5,8 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.14          |
-| 最終更新日 | 2026-03-12      |
+| バージョン | 0.1.16          |
+| 最終更新日 | 2026-03-15      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
@@ -107,14 +107,14 @@
 | Host Font Catalog | platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集したホストフォント索引。Ferritex では host-local overlay として扱う |
 | Configured Overlay Root | 起動時設定で明示された読み取り専用の追加資産ディレクトリ。project root 外に置かれた `.tex` / `.sty` / クラス / フォント資産を allowlist として解決面へ追加する |
 | Execution Policy | `compile` / `watch` / `lsp` など全 entry point で共有される実行制約の集合。shell-escape 可否、パス許可境界、タイムアウト、出力上限を含む |
-| Runtime Options | CLI / watch / LSP など入口固有の指定を正規化した共通実行オプション。入力ファイル、jobname、asset bundle 参照、output dir などを保持する |
+| Runtime Options | compile / watch / LSP の入口固有指定を正規化した共通実行記述。`primaryInput`、`artifactRoot`、`jobIdentity`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` を保持し `ExecutionPolicy` 構築に使う |
 | Asset Bundle Reference | Ferritex Asset Bundle を参照するための値。ファイルパスまたは組み込みバンドル識別子で表す |
 | Compilation Job | 1 回の `compile` / `watch` / LSP 再コンパイル要求に対応する単位。最大 3 パスまでの `Compilation Session` を束ね、参照状態と出力 artifact provenance を pass 間で保持する |
 | Compilation Session | `Compilation Job` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリを保持する |
 | Compilation Snapshot | 並列ステージ境界で共有する読み取り専用のコンパイル状態スナップショット。マクロ・レジスタ・文書状態の確定済み部分を含み、並列タスクから破壊的更新しない |
 | Commit Barrier | 並列ステージの結果を決定的な順序で `Compilation Job` へ反映する同期点。可変状態の commit はここでのみ行う |
-| Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、主入力、jobname、生成パス番号、生成者種別、生成パス、コンテンツハッシュを記録する台帳 |
-| Job Context | `Compilation Job` 内の現在パスを識別する jobname・主入力・現在パス番号の組。same-job readback 判定に用いる |
+| Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、主入力、jobname、生成パス番号、生成者種別、生成パス、コンテンツハッシュを記録する台帳。trusted readback の same-job 判定キーは主入力と jobname であり、生成パス番号は監査属性として保持する |
+| Job Context | `Compilation Job` 内の現在パスを識別する jobname・主入力・現在パス番号の組。same-job readback の一致判定は jobname と主入力で行い、現在パス番号は出力命名・順序・診断のために使う |
 | Bbl Snapshot | `.bbl` から取り込んだ引用・参考文献情報の正規化スナップショット |
 | Definition Provenance | マクロ・ラベル・参考文献エントリの定義元を示すファイル名・行番号・列番号・由来種別の組。定義ジャンプと診断に用いる |
 | Navigation State | hyperref とセクショニングが蓄積する PDF ナビゲーション用状態。PDF metadata draft、しおり候補、named destination、既定リンク装飾設定を保持する |
@@ -130,12 +130,18 @@
 | SyncTeX Trace Fragment | 1 つの Source Span と 1 つのページ内矩形を対応付ける SyncTeX の最小断片。1 つの Source Span に複数 fragment が対応してよい |
 | Pending Change Queue | watch 実行中にコンパイル中の追加変更を集約する待ち行列。連続変更を coalesce し、コンパイル完了後の再トリガーに使う |
 | Recompile Scheduler | `FileWatcher` からの変更イベントと Pending Change Queue を受け取り、同時実行を避けながら差分コンパイルを順序制御する調停役 |
-| Preview Session | プレビュー接続 1 件分の状態。接続と直近の閲覧位置を束ね、PDF 更新時の view restore に使う |
+| Preview Session | sessionId ごとの preview 状態。閲覧位置を保持し、`Preview Transport` から受ける view-state 更新を反映する |
 | Preview View State | プレビューアの現在ページ、ページ内オフセット、ズーム倍率など、更新後も保持すべき閲覧位置情報 |
+| Preview Session Service | `Preview Session` を管理し、`Execution Policy` に照らして許可された publish だけを `Preview Transport` へ委譲する調停役 |
+| Preview Transport | loopback のみへ bind し、`GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で更新通知と view-state 更新を扱う preview 配信契約 |
 | Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
 | Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
-| Live Analysis Snapshot | `Open Document Buffer` と最新のコンパイル由来状態（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
-| FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、4 コア以上の CPU、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
+| Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
+| Live Analysis Snapshot | `Open Document Buffer` と Stable Compile State（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
+| Citation Table | `.bbl` 由来の citation key と citation 表示文字列 / provenance を対応付ける索引。`\cite` 解決に使い、provenance は本文側 citation 表示の trace に使う |
+| Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
+| FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
+| FTX-CORPUS-TIKZ-001 | tikz/pgf 適合度を判定する固定回帰コーパス。基本図形、nested scope の style 継承、transform、clip、arrow、text node を含み、pdfLaTeX を参照出力とする |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
 
@@ -168,10 +174,12 @@
   - ネストされたマクロの再帰的展開
   - `\expandafter`, `\noexpand` 等の展開制御プリミティブ
   - グルーピング（`{}`, `\begingroup`/`\endgroup`）によるスコープ管理
+  - `ScopeStack` が group frame ごとの local macro / register / catcode 差分を保持し、group 終了時に frame 入口値へ巻き戻す
 - **出力**: 展開済みトークンストリーム
 - **例外**: 無限再帰検出時にエラーを報告し展開を中断（再帰深度上限: 設定可能、デフォルト 1000）
 - **受け入れ基準**:
   - Given `\def\foo#1#2{#2#1}` が定義された文書, When `\foo{A}{B}` を展開, Then `BA` が得られる
+  - Given `\def\foo{outer}{\begingroup\def\foo{inner}\foo\endgroup\foo}` を展開, When group を抜ける, Then 内側では `inner`、外側では `outer` が得られる
   - Given 再帰深度が上限を超えるマクロ, When 展開を実行, Then エラーメッセージと該当マクロのスタックトレースが出力される
 - **優先度**: Must
 - **出典**: ユーザー明示
@@ -196,9 +204,11 @@
   - `\newcount`, `\countdef` 等によるレジスタ割り当て
   - `\the`, 代入、算術演算（`\advance`, `\multiply`, `\divide`）
   - e-TeX 拡張レジスタ（32768 個）のサポート
+  - local 代入は current group frame に記録し、group 終了時に frame 入口値へ復元する。`\global` 指定だけが session-root へ反映される
 - **出力**: レジスタ値の更新・読み出し結果
 - **受け入れ基準**:
   - Given e-TeX 拡張レジスタを使用する文書, When レジスタ 256〜32767 番にアクセス, Then 正常に読み書きできる
+  - Given `\count0=1 {\count0=2} \the\count0` を含む文書, When group を抜ける, Then `\count0` は `1` に戻る
 - **優先度**: Must
 - **出典**: ユーザー確認済み（LaTeX 互換に e-TeX 拡張が事実上必須）
 
@@ -297,7 +307,7 @@
 - **説明**: `\label`, `\ref`, `\pageref` 等の文書内相互参照を解決する
 - **入力**: 相互参照コマンドを含む文書
 - **処理**:
-  - `.aux` ファイルへのラベル情報書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された current Job Context と同一の `jobname` と主入力を持つ readback 対象 `.aux` のみを正規化済み output root 配下から再読込）
+  - `.aux` ファイルへのラベル情報書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された current Compilation Job の `jobname` と主入力に整合する readback 対象 `.aux` のみを正規化済み output root 配下から再読込し、生成パス番号は監査属性として扱う）
   - マルチパス処理（同一 Compilation Job 内で pass ごとに新しい Compilation Session を作成し、job-scope の参照状態と Output Artifact Registry を引き継ぎながら、参照解決が安定するまで繰り返し、最大3パス）
   - 未解決参照の検出・警告
 - **出力**: 解決済みのラベル・ページ参照テキスト
@@ -314,7 +324,7 @@
 - **説明**: `\tableofcontents`, `\listoffigures`, `\listoftables`, `\makeindex` 等を処理する
 - **入力**: 目次・索引生成コマンドを含む文書
 - **処理**:
-  - `.toc`, `.lof`, `.lot` ファイルの書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された current Job Context と同一の `jobname` と主入力を持つ readback 対象ファイルのみを正規化済み output root 配下から再読込）
+  - `.toc`, `.lof`, `.lot` ファイルの書き出し・読み込み（`--output-dir` 指定時は、Output Artifact Registry に記録された current Compilation Job の `jobname` と主入力に整合する readback 対象ファイルのみを正規化済み output root 配下から再読込し、生成パス番号は監査属性として扱う）
   - セクション番号・ページ番号の収集結果を Table Of Contents State として保持し、目次・図表一覧ごとに整形
   - 索引エントリを Index State に収集し、makeindex 互換の順序でソート・整形
   - Table Of Contents State / Index State を専用の組版サービスで box tree へ射影し、`\tableofcontents` / `\listoffigures` / `\listoftables` / `\printindex` の出力に再利用
@@ -337,9 +347,10 @@
   - 配置済みノードの矩形と placed destination を使って、内部リンク destination と SyncTeX の座標解決に必要なページ座標系を確定
   - ページ単位の Page Render Plan を共通 PDF レンダリングパイプラインへ射影し、コンテンツストリーム、リンク Annotation、リソース辞書へ一貫して変換
   - PDF オブジェクト構造（ページツリー、リソース辞書）の構築
-- **出力**: 有効な PDF ファイル
+- **出力**: ISO 32000 準拠の妥当な PDF ファイル
 - **受け入れ基準**:
-  - Given 100ページの文書, When PDF 生成を実行, Then PDF/A バリデータで構造エラーがゼロ
+  - Given 100ページの文書, When PDF 生成を実行, Then PDF 構造バリデータで syntax / xref / object structure error がゼロ
+- **補足**: PDF/A 適合は本要件の判定対象外とし、必要になった時点で別要件として定義する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -506,8 +517,8 @@
   - PDF グラフィックオペレータへの変換
 - **出力**: ベクター図形を含む PDF コンテンツストリーム
 - **受け入れ基準**:
-  - Given 基本的な `tikzpicture`（線、矩形、円、テキストノード）を含む文書, When コンパイル, Then pdfLaTeX と同等の図形が出力される
-  - Given 変換・スタイル・クリッピング・矢印を含む `tikzpicture`, When コンパイル, Then 要素の幾何関係と描画順が pdfLaTeX と一致する
+  - Given `FTX-CORPUS-TIKZ-001` の basic-shapes ケース, When コンパイル, Then 線、矩形、円、テキストノードの幾何関係が pdfLaTeX と一致する
+  - Given `FTX-CORPUS-TIKZ-001` の nested-style / transform / clip / arrow ケース, When コンパイル, Then 継承 style、クリッピング境界、描画順、矢印形状が pdfLaTeX と一致する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -518,7 +529,8 @@
 - **処理**:
   - `.bbl` ファイルを読み込み、Bbl Snapshot と Citation Table を構築する
   - `\cite` コマンドの参照解決は Citation Table を用いて行い、`REQ-FUNC-011` のラベル/ページ参照とは責務を分離する
-  - 参考文献リストの組版
+  - `BibliographyState` は `.bbl` 取り込み、Citation Table 構築、`BibliographyEntry` provenance 管理、参考文献リストの組版データ生成を担う
+  - `CrossReferenceTable` は `\label` / `\ref` / `\pageref` のみを扱い、citation 系は扱わない
   - `REQ-FUNC-047` 経由で Ferritex が制御した外部ツールが `.bbl` を output root 配下へ生成した場合は、Output Artifact Registry に trusted external artifact として登録する
   - 外部ツール実行の案内（`bibtex` / `biber` の実行が必要な場合の通知）
 - **出力**: 引用テキストと参考文献リストが組版された出力
@@ -686,7 +698,7 @@
 - **入力**: 編集中の TeX ソースと最新の `Open Document Buffer`（`textDocument/didOpen`, `textDocument/didChange`）
 - **処理**:
   - `textDocument/didOpen` / `textDocument/didChange` を `Open Document Buffer` へ反映する
-  - `Open Document Buffer` を優先して `Live Analysis Snapshot` を構築する
+  - `Open Document Buffer` と最新の成功した `CommitBarrier` 完了時点で確定した `Stable Compile State` から `Live Analysis Snapshot` を構築し、それを唯一の解析入力として使う
   - インクリメンタルなパース・マクロ展開によるエラー検出
   - エラー位置（行・列）の特定
   - エラーの重大度分類（Error, Warning, Information, Hint）
@@ -705,7 +717,7 @@
 - **説明**: TeX/LaTeX のコマンド・環境名・ラベル・参考文献キーの補完候補を提供する
 - **入力**: カーソル位置のコンテキストと最新の `Open Document Buffer`（`textDocument/completion`）
 - **処理**:
-  - `Open Document Buffer` と最新のコンパイル由来状態から `Live Analysis Snapshot` を構築する
+  - `Open Document Buffer` と最新の成功した `CommitBarrier` 完了時点で確定した `Stable Compile State` から `Live Analysis Snapshot` を構築し、それを唯一の解析入力として使う
   - `\` 入力後にコマンド名候補を提示（使用中パッケージのコマンドを含む）
   - `\begin{` 入力後に環境名候補を提示
   - `\ref{` 入力後に定義済みラベル一覧を提示
@@ -724,10 +736,10 @@
 - **説明**: `\label`, `\ref`, `\cite`, マクロ定義へのジャンプ機能を提供する
 - **入力**: カーソル位置と最新の `Open Document Buffer`（`textDocument/definition`）
 - **処理**:
-  - `Open Document Buffer` を優先して現在カーソル位置のシンボルを解決する
-  - マクロ定義、ラベル、参考文献エントリの Definition Provenance をシンボル索引として保持する
+  - `Open Document Buffer` と最新の成功した `CommitBarrier` 完了時点で確定した `Stable Compile State` から `Live Analysis Snapshot` を構築し、それを唯一の解析入力として使う
+  - マクロ定義、ラベル、参考文献エントリの Definition Provenance を `Live Analysis Snapshot` から再構築したシンボル索引として保持する
   - `\ref{label}` → 対応する `\label{label}` の位置
-  - `\cite{key}` → 対応する参考文献エントリの位置（`.bbl` スナップショット上の定義位置、または保持していれば元ソース位置）
+  - `\cite{key}` → 対応する参考文献エントリの位置（`BibliographyEntry.provenance` があれば元ソース位置、なければ `.bbl` スナップショット上の定義位置）
   - `\command` → `\newcommand{\command}` の定義位置
 - **出力**: 定義位置の `Location`
 - **受け入れ基準**:
@@ -742,7 +754,7 @@
 - **説明**: コマンドにカーソルを合わせた際にドキュメント情報を表示する
 - **入力**: カーソル位置と最新の `Open Document Buffer`（`textDocument/hover`）
 - **処理**:
-  - `Open Document Buffer` と有効なクラス/パッケージ状態から `Live Analysis Snapshot` を構築する
+  - `Open Document Buffer` と最新の成功した `CommitBarrier` 完了時点で確定した `Stable Compile State` から `Live Analysis Snapshot` を構築し、それを唯一の解析入力として使う
   - コマンド名に基づくドキュメントの検索と表示
 - **出力**: ホバー情報（Markdown 形式）
 - **受け入れ基準**:
@@ -790,13 +802,13 @@
 - **説明**: コンパイル結果の PDF をプレビューアに配信する
 - **入力**: 生成された PDF ファイル
 - **処理**:
-  - ローカルサーバー（WebSocket または HTTP）による PDF 配信
-  - PDF 更新時のプレビューアへの通知（ホットリロード）
-  - 接続ごとに `Preview Session` を保持し、`Preview View State` として現在ページ、ページ内オフセット、ズーム倍率を保存する
+  - `Preview Session Service` が `Execution Policy` に照らして publish 可否を判定し、許可された場合だけ `Preview Transport` を loopback に bind した `GET /preview/{sessionId}/document` で active job の最新 PDF を配信する
+  - 同じ session に対して `Preview Session Service` が `Preview Transport` の `WS /preview/{sessionId}/events` を介して PDF 更新通知、document revision、page count、view-state 更新を交換する
+  - sessionId ごとに `Preview Session` を保持し、`Preview View State` として現在ページ、ページ内オフセット、ズーム倍率を保存する
   - PDF 更新時は保持済みの `Preview View State` を優先して再適用し、該当ページが消滅した場合のみ最近傍の有効ページへフォールバックする
 - **出力**: プレビューア上での更新された PDF 表示
 - **受け入れ基準**:
-  - Given プレビューアが接続中, When 再コンパイル完了, Then 1秒以内にプレビューが更新され閲覧ページ位置が維持される
+  - Given loopback 上の preview session が確立済みで `GET /preview/{sessionId}/document` と `WS /preview/{sessionId}/events` に接続したプレビューア, When 再コンパイル完了, Then 1秒以内に document revision 通知が届き閲覧ページ位置が維持される
   - Given 再コンパイル前に 20 ページ目を閲覧中で、再コンパイル後の PDF が 15 ページに短縮された場合, When プレビューが更新, Then 最近傍の有効ページである 15 ページ目へフォールバックしズーム倍率を維持する
 - **優先度**: Must
 - **出典**: ユーザー明示
@@ -839,7 +851,7 @@
 - **説明**: コンパイルの動作を制御する各種 CLI オプションを提供する
 - **入力**: CLI フラグ・引数
 - **処理**: 以下のオプションをサポート
-  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加し、Ferritex または Ferritex が制御した外部ツール実行で生成され Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等のうち、current Job Context の `jobname` と主入力に整合するものだけ readback を許可する
+  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加し、Ferritex または Ferritex が制御した外部ツール実行で生成され Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等のうち、current Compilation Job の `jobname` と主入力に整合するものだけ readback を許可する。現在パス番号と生成パス番号は監査用に保持するが一致条件には含めない
   - `--jobname <name>`: ジョブ名（出力ファイル名）の指定
   - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）
   - `--no-cache`: キャッシュを無効化しフルコンパイル
@@ -847,7 +859,7 @@
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`）
   - `--synctex`: SyncTeX データの生成有無
   - `--shell-escape` / `--no-shell-escape`: 外部コマンド実行の許可
-  - compile / watch / LSP の各入口で受け取った指定は共通の `Runtime Options` に正規化され、それを基に同一の `Execution Policy` を構築する
+  - compile / watch / LSP の各入口で受け取った指定は `primaryInput`, `artifactRoot`, `jobIdentity`, `parallelism`, `reuseCache`, `assetBundleRef`, `interactionMode`, `synctex`, `shellEscapeAllowed` から成る共通の `Runtime Options` に正規化され、それを基に同一の `Execution Policy` を構築する
 - **出力**: 指定オプションに従ったコンパイル動作
 - **受け入れ基準**:
   - Given `--output-dir build` を指定, When コンパイル, Then `build/` ディレクトリに PDF が生成される
@@ -930,9 +942,9 @@
 - **処理**:
   - パス正規化とシンボリックリンク解決
   - すべての `\input`, `\include`, `\openin`, `\openout`, asset read, engine-temp / engine-output / engine-readback 要求を共通 File Access Gate に集約する
-  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Job Context の `jobname` と主入力の双方に整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。書き込みはキャッシュ、明示的 output root、private temp root に限定する
+  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Compilation Job の `jobname` と主入力の双方に整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。現在パス番号と生成パス番号は監査・診断属性として保持するが same-job 一致条件には含めない。書き込みはキャッシュ、明示的 output root、private temp root に限定する
   - Ferritex 自身が確保した private temp dir をキャッシュ配下または明示的 output root 配下に作成し、`engine-temp` 用にのみ許可
-  - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・主入力・artifact kind・jobname・現在パス番号・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する
+  - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・主入力・artifact kind・jobname・生成パス番号・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する。生成パス番号は監査属性であり、trusted readback の一致判定は主入力と jobname で行う
   - システム一時領域全体は許可 root として公開しない
   - 拒否時の診断生成と、許可時のファイルハンドル発行
 - **出力**: 許可されたファイルハンドルまたは拒否診断
@@ -940,7 +952,7 @@
   - Given プロジェクト内の `chap1.tex` を `\input` する文書, When コンパイル, Then 読み込みが許可される
   - Given 設定済み read-only overlay root にある `shared.sty` を読み込む文書, When コンパイル, Then 読み込みは許可されるが同 root への書き込みは拒否される
   - Given `--output-dir ../dist` を指定してコンパイル, When PDF / `.aux` / `.log` を生成, Then 正規化済み output root 配下への書き込みのみが許可される
-  - Given `--output-dir ../dist` を指定して 2 パス以上のコンパイルを行う文書, When Ferritex が前パスで生成し Output Artifact Registry に記録した `../dist/main.aux` と `../dist/main.toc` を再読込, Then `engine-readback` として許可される
+  - Given `--output-dir ../dist` を指定して 2 パス以上のコンパイルを行う文書, When Ferritex が前パスで生成し Output Artifact Registry に記録した `../dist/main.aux` と `../dist/main.toc` を後続パスから再読込, Then `producedPass` と current pass number が異なっていても `engine-readback` として許可される
   - Given 同じ output root 配下に `foo.aux` と `bar.aux` が存在する環境, When current Job Context の jobname が `foo` のコンパイルから `bar.aux` を `engine-readback` しようとする, Then same-job 不一致として拒否される
   - Given `thesis.tex` と `article.tex` を同じ `--jobname shared` と同じ output root で順にコンパイルする環境, When `thesis.tex` の current Job Context から `article.tex` が生成した `shared.aux` を `engine-readback` しようとする, Then 主入力不一致として拒否される
   - Given `--output-dir ../dist` 配下にユーザーが事前配置した未登録の `main.aux` がある文書, When コンパイル, Then `engine-readback` は拒否され provenance 不一致の診断が表示される
@@ -997,8 +1009,8 @@
 
 #### REQ-NF-006: ファイルアクセス制御
 
-- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Output Artifact Registry により current `JobContext` の `jobname` と主入力の双方に整合する trusted artifact と確認された補助ファイルの readback に限って読み取りを許可する。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
-- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、Output Artifact Registry に記録され current `JobContext` と `jobname` / 主入力の双方が一致する output root 配下の trusted artifact。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
+- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Output Artifact Registry により current `Compilation Job` の `jobname` と主入力の双方に整合する trusted artifact と確認された補助ファイルの readback に限って読み取りを許可する。現在パス番号と生成パス番号は監査属性として保持するが same-job 一致条件には含めない。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
+- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、Output Artifact Registry に記録され current `Compilation Job` の `jobname` / 主入力の双方が一致する output root 配下の trusted artifact。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
 - **優先度**: Must
 - **出典**: エージェント推測（pdfLaTeX の `openout_any = p` を発展させ、runtime bundle 設計へ適用）
 
@@ -1041,17 +1053,16 @@
 
 | #   | 内容                                                                                                    | 関連要件         | 確認相手 |
 | --- | ----------------------------------------------------------------------------------------------------- | ------------ | ---- |
-| 1   | `FTX-BENCH-001` における pdfLaTeX 比 100 倍の目標達成可能性。TeX のマクロ展開は本質的に逐次的であり、並列化の限界があるため、プロトタイプでの実測が必要                                | REQ-NF-001   | 開発者  |
-| 2   | tikz/pgf の適合度を判定する回帰テストコーパス。Must 要件としたため、どのライブラリ・描画パターンを代表ケースとして固定するかを定義する必要がある                       | REQ-FUNC-023 | 開発者  |
-| 3   | e-TeX 以外の拡張プリミティブ（pdfTeX 拡張、XeTeX 拡張）のサポート範囲。一部の LaTeX パッケージは pdfTeX 拡張プリミティブ（`\pdfliteral` 等）に依存している | REQ-FUNC-026 | 開発者  |
-| 4   | 差分コンパイルの正確性保証。マクロ展開の副作用（カウンタ変更等）が差分コンパイルの正確性に影響する可能性がある。どの程度の正確性を保証するか                                | REQ-FUNC-030 | 開発者  |
-| 5   | PDF 配信のプロトコル選択。WebSocket と HTTP のどちらを採用するか、または両方をサポートするか                                              | REQ-FUNC-040 | 開発者  |
-| 6   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
+| 1   | e-TeX 以外の拡張プリミティブ（pdfTeX 拡張、XeTeX 拡張）のサポート範囲。一部の LaTeX パッケージは pdfTeX 拡張プリミティブ（`\pdfliteral` 等）に依存している | REQ-FUNC-026 | 開発者  |
+| 2   | 差分コンパイルの正確性保証。マクロ展開の副作用（カウンタ変更等）が差分コンパイルの正確性に影響する可能性がある。どの程度の正確性を保証するか                                | REQ-FUNC-030 | 開発者  |
+| 3   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
 ## 変更履歴
 
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.16 | 2026-03-15 | same-job readback の判定キーを主入力 + jobname に固定し、pass number を監査属性へ切り分け。メタ情報を最新版へ同期 | Codex |
+| 0.1.15 | 2026-03-15 | preview transport 契約、PDF 妥当性判定、tikz 回帰コーパス、group-scope 巻き戻し、bibliography / runtime options の責務境界を明確化 | Codex |
 | 0.1.14 | 2026-03-12 | LSP 要件に Open Document Buffer / Live Analysis Snapshot を導入し、completion の受け入れ基準と hover capability 条件を整合化 | Codex |
 | 0.1.13 | 2026-03-12 | 性能要件の共通 benchmark profile `FTX-BENCH-001` を導入し、絶対速度/相対速度/差分速度の判定条件を統一 | Codex |
 | 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch 対象集合の依存グラフ同期、preview の最近傍ページ fallback を追記 | Codex |

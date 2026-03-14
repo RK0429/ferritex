@@ -6,7 +6,7 @@
 
 ## コンテキスト
 
-Ferritex は `DependencyGraph` と `CompilationCache` を永続化して `REQ-NF-002` の差分コンパイル速度を支える必要がある。一方、trusted artifact 判定に使う `OutputArtifactRegistry` は current `JobContext` に結び付くため、cache と同じ寿命で永続化すると `REQ-NF-006` の same-job 制約を曖昧にする。
+Ferritex は `DependencyGraph` と `CompilationCache` を永続化して `REQ-NF-002` の差分コンパイル速度を支える必要がある。一方、trusted artifact 判定に使う `OutputArtifactRegistry` は active job に結び付くため、cache と同じ寿命で永続化すると `REQ-NF-006` の same-job 制約を曖昧にする。trusted readback の一致判定キーは主入力と jobname であり、current pass number は current job の運用属性、`producedPass` は artifact provenance の監査属性として扱う。trusted readback 判定の authority は active job の in-memory `OutputArtifactRegistry` だけとし、append-only manifest は監査専用に限定する必要がある。
 
 ## 検討した選択肢
 
@@ -30,7 +30,7 @@ Ferritex は `DependencyGraph` と `CompilationCache` を永続化して `REQ-NF
 
 ### 選択肢 C: 独立ストア群
 
-`DependencyGraphStore`、`CacheMetadataStore`、`BlobCacheStore` を分離し、必要に応じて同じ SQLite 技術を使っても論理的に独立させる。`OutputArtifactRegistry` は active job の in-memory state とし、監査用にのみ append-only manifest を残す。
+`DependencyGraphStore`、`CacheMetadataStore`、`BlobCacheStore` を分離し、必要に応じて同じ SQLite 技術を使っても論理的に独立させる。`OutputArtifactRegistry` は active job の in-memory state とし、監査用にのみ append-only manifest を残す。registry record には normalized path、primary input、jobname、pass number、producer kind、generation path、content hash を保持するが、trusted readback の same-job 判定は primary input と jobname だけで行う。current pass number は registry record ではなく active `JobContext` 側の運用属性として扱う。
 
 - 利点:
   - dependency graph と cache の破損を障害分離できる
@@ -48,7 +48,8 @@ Ferritex は `DependencyGraph` と `CompilationCache` を永続化して `REQ-NF
 
 - `DependencyGraph` は `CompilationCache` と独立永続化した方が、cache 破損時のフォールバック要件を満たしやすい
 - cache metadata と大きな compiled artifact は分離した方が再利用効率と GC 制御に優れる
-- trusted artifact は active `JobContext` にのみ有効とし、job 完了または process restart で無効化するのが same-job 制約に合う
+- trusted artifact は active job にのみ有効とし、same-job 判定を主入力 + jobname に固定したうえで job 完了または process restart で無効化するのが制約に合う
+- append-only manifest は監査には有用だが、trusted 判定の根拠にすると same-job 制約と authority が混線する
 - 単一ユーザー・単一ノード前提では SQLite 系ストアの運用コストが低い
 
 ## 帰結

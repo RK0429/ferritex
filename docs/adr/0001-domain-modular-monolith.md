@@ -25,7 +25,7 @@ Ferritex は `REQ-NF-001` のフルコンパイル 1.0 秒未満、`REQ-NF-002` 
 
 ### 選択肢 B: ドメイン境界を持つモジュラーモノリス
 
-単一プロセスを維持しつつ、トップレベルは `ferritex-cli` / `ferritex-application` / `ferritex-core` / `ferritex-infra` のレイヤ crate に分ける。ドメイン境界はまず `ferritex-core` 内の module として表現し、安定した narrow interface を持つものだけ独立 crate に昇格させる。接続は ports and adapters とする。
+単一プロセスを維持しつつ、トップレベルは `ferritex-cli` / `ferritex-application` / `ferritex-core` / `ferritex-infra` のレイヤ crate に分ける。ドメイン境界はまず `ferritex-core` 内の module として表現し、安定した narrow interface を持つものだけ独立 crate に昇格させる。`kernel` は数値/寸法演算、stable ID、source span などの基底型だけを置く shared base module とし、package/class/bibliography semantics や I/O を入れない。接続は ports and adapters とする。
 
 - 利点:
 - IPC なしで低遅延を維持できる
@@ -57,6 +57,7 @@ LSP、preview、compile、cache を別プロセスまたは別サービスに分
 - 単一バイナリ配布と 3 OS 対応を維持しやすい
 - ドメインモデルに明確な境界が既に存在するため、技術レイヤ分割より自然である
 - 将来、一部を別 crate / 別 process に抽出する余地を残しつつ、現時点では最小の複雑性で済む
+- crate 昇格条件と依存方向を CI で検査すれば、境界規律を実装段階でも維持できる
 
 ## 帰結
 
@@ -75,3 +76,9 @@ LSP、preview、compile、cache を別プロセスまたは別サービスに分
 
 - 実装が境界を破って `ferritex-core` に OS / network 依存を持ち込むと設計が崩れる
 - `DocumentState` を共有万能モデルにするとモジュール分割が形骸化する
+
+### 追加規律
+
+- crate 昇格は stable API、独立 compile の利点、OS 依存や外部ライブラリ依存の局所化が揃った場合だけ許可する
+- `kernel` は catch-all shared module にせず、基底型だけを置く
+- CI は `ferritex-core` から `ferritex-application` / `ferritex-infra` への依存 0、循環依存 0 を強制する
