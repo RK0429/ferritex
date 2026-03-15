@@ -2023,6 +2023,8 @@ stateDiagram-v2
 | 定義 provenance (DefinitionProvenance) | マクロ・ラベル・参考文献エントリの定義元を示す SourceLocation と由来種別の組。`CitationInfo.traceProvenance` のような trace 用参照にも使う | MacroDefinition, LabelInfo, BibliographyEntry, CitationInfo(trace) |
 | パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する静的ポリシー。実際の readback 可否は OutputArtifactRegistry と組み合わせて判定する | ExecutionPolicy, OutputArtifactRegistry |
 | 出力アーティファクトレジストリ (OutputArtifactRegistry) | Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルの provenance を保持し、current Compilation Job の `jobname` と主入力の双方に整合する trusted artifact のみを再読込可能にする active-job 限定 in-memory 台帳。`producedPass` は監査属性であり、same-job の一致条件には含めない。job 完了または process restart で無効化し、append-only manifest は監査専用とする | OutputArtifactRecord, JobContext, ExecutionPolicy |
+| アーティファクト種別 (ArtifactKind) | Output Artifact Registry が記録する補助ファイル種別。`.aux`、`.toc`、`.lof`、`.lot`、`.bbl`、`.synctex` など trusted readback 対象の論理分類を表す | OutputArtifactRecord, OutputArtifactRegistry |
+| アーティファクト生成者種別 (ArtifactProducerKind) | Output Artifact Registry が記録する生成主体種別。Ferritex 本体か、Ferritex が制御した外部ツールかを区別する | OutputArtifactRecord, ShellCommandGateway |
 | プレビューターゲット (PreviewTarget) | preview session / revision が紐づく対象文書の識別子。workspace root、primaryInput、jobname の組 | PreviewSession, PreviewRevision |
 | プレビュー公開ポリシー (PreviewPublicationPolicy) | `ExecutionPolicy` に内包される preview 配信専用の制約。loopback bind 限定、active job の最新 PDF のみ publish、session target 一致、target 変更または process restart 時の session 再発行規約を保持する | ExecutionPolicy, PreviewSessionService |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
@@ -2087,6 +2089,8 @@ stateDiagram-v2
 | 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
 | 文書パーティション計画 (DocumentPartitionPlan) | 章またはセクション単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画 | DocumentPartitionPlanner, DocumentWorkUnit |
 | 文書ワークユニット (DocumentWorkUnit) | 1 つの章またはセクションに対応する入力ファイル、パーティション種別、輸入/輸出する参照、独立組版可否を表す単位 | DocumentPartitionPlan, PaginationMergeCoordinator |
+| パーティション種別 (PartitionKind) | 文書パーティションの種別。`chapter` / `section` など、`DocumentPartitionPlanner` が work unit を分類するための論理タグ | DocumentWorkUnit, DocumentPartitionPlan |
+| パーティション識別子 (partitionId) | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`CommitBarrier` の total order を決定するキーの 1 つ | DocumentWorkUnit, CommitBarrier |
 | ページ統合調停役 (PaginationMergeCoordinator) | 各文書パーティションの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | DocumentLayoutFragment, PaginationMergeResult |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
 
@@ -2108,7 +2112,6 @@ stateDiagram-v2
 | PDF レンダラ (PdfRenderer) | `PageRenderPlan` と `NavigationState` を PDF 演算子列・リンク Annotation・リソース辞書・メタデータ・しおりへ射影し、`PlacedDestination` と `LinkStyle` を内部 destination / text color / annotation border へ変換して `PdfDocument` を構築するサービス | GraphicResourceEncoder, PdfPage |
 | リンク注釈計画 (LinkAnnotationPlan) | 配置済みリンク 1 件分の PDF 注釈化計画。リンク矩形、リンク先、装飾設定を保持し、`PdfRenderer` が `Annotation` へ変換する | PageBox, LinkTarget, LinkStyle |
 | リンク先 (LinkTarget) | 内部 named destination または外部 URI を表すリンク解決先 | LinkAnnotationPlan, Annotation |
-| リンク装飾 (LinkStyle) | リンクテキスト色と PDF 注釈境界線の描画規則 | LinkAnnotationPlan, Annotation |
 | アノテーション (Annotation) | PDF 上のリンク・しおり等のインタラクティブ要素 | hyperref |
 | フォントサブセット計画 (FontSubsetPlan) | 1 フォントについて PDF に埋め込む使用グリフ集合と ToUnicode CMap 生成要否を保持する計画 | FontEmbeddingPlanner, EmbeddedFont |
 | フォント埋め込み計画器 (FontEmbeddingPlanner) | `TextRun` 群から使用グリフを集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` を構築するサービス | FontSubsetPlan, EmbeddedFont |
@@ -2129,7 +2132,6 @@ stateDiagram-v2
 | フォント指定 (FontSpec) | `fontspec` と `TextStyle` から正規化されるフォント要求。family、weight/style、OpenType feature、fallback chain を 1 つの値にまとめる | FontFeatureSet, FontFallbackChain |
 | フォント feature 集合 (FontFeatureSet) | `Ligatures`, `Numbers`, `Script`, `Language` などの OpenType feature 指定を正規化した値 | FontSpec |
 | フォント fallback chain (FontFallbackChain) | 第 1 候補が解決できない場合に試す追加フォントファミリ列 | FontSpec, FontFamilyRef |
-| Host Font Catalog | platform font discovery API に基づき永続化されたホストフォント索引。`fontspec` 解決時に hot path で再走査しない fallback overlay であり、project/configured overlay と Asset Bundle に一致候補がない場合にのみ参照する。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外 | HostFontCatalog, FontResolverCache |
 | OpenType フォント | OTF/TTF 形式のモダンフォント。GPOS/GSUB テーブルで高度な組版を制御 | fontspec |
 | TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 | Computer Modern |
 | グリフサブセット化 | 使用グリフのみを抽出してフォントデータを縮小する処理 | PDF 埋め込み |

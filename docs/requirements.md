@@ -109,6 +109,8 @@
 | Execution Policy | `compile` / `watch` / `lsp` など全 entry point で共有される実行制約の集合。shell-escape 可否、パス許可境界、タイムアウト、出力上限に加え、preview 配信専用の `Preview Publication Policy` を含む |
 | Runtime Options | compile / watch / LSP の入口固有指定を正規化した共通実行記述。`primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` を保持し `ExecutionPolicy` 構築に使う |
 | Asset Bundle Reference | Ferritex Asset Bundle を参照するための値。ファイルパスまたは組み込みバンドル識別子で表す |
+| Artifact Kind | Output Artifact Registry が記録する補助ファイル種別。`.aux`、`.toc`、`.lof`、`.lot`、`.bbl`、`.synctex` など trusted readback 対象の論理分類を表す |
+| Artifact Producer Kind | Output Artifact Registry が記録する生成主体種別。Ferritex 本体が生成した成果物か、Ferritex が制御した外部ツールが生成した成果物かを区別する |
 | Compilation Job | 1 回の `compile` / `watch` / LSP 再コンパイル要求に対応する単位。最大 3 パスまでの `Compilation Session` を束ね、参照状態と出力 artifact provenance を pass 間で保持する |
 | Compilation Session | `Compilation Job` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリを保持する |
 | Compilation Snapshot | 並列ステージ境界で共有する読み取り専用のコンパイル状態スナップショット。マクロ・レジスタ・文書状態の確定済み部分を含み、並列タスクから破壊的更新しない |
@@ -141,10 +143,20 @@
 | Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
 | Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
 | Live Analysis Snapshot | `Open Document Buffer` と Stable Compile State（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
+| Partition Kind | 文書パーティションの種別。`chapter` / `section` など、`DocumentPartitionPlanner` が work unit を分類するための論理タグ |
+| Partition ID | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`Commit Barrier` の total order の一部として使う |
 | Citation Table | `.bbl` 由来の citation key と citation 表示文字列 / provenance を対応付ける索引。`\cite` 解決に使い、provenance は本文側 citation 表示の trace に使う |
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
+| FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
+| FTX-CORPUS-COMPAT-001 | pdfLaTeX 互換性を判定する versioned 回帰コーパス。article/report/book/letter の基準文書に加え、hyperref、フォント埋め込み、画像埋め込み、外部 PDF 埋め込み、参考文献、目次/しおりを含む 100 文書で構成し、`FTX-ASSET-BUNDLE-001` を前提に評価する |
+| FTX-CORPUS-COMPAT-001/layout-core | `FTX-CORPUS-COMPAT-001` のうち article/report/book/letter の baseline 文書群を束ねる stable subset ID。レイアウト互換の基準ケースに使う |
+| FTX-CORPUS-COMPAT-001/layout-core/article | `FTX-CORPUS-COMPAT-001/layout-core` に含まれる article baseline 文書の stable case ID |
+| FTX-CORPUS-COMPAT-001/navigation-features | `FTX-CORPUS-COMPAT-001` のうち hyperlink、named destination、しおり、PDF metadata を含む stable subset ID |
+| FTX-CORPUS-COMPAT-001/embedded-assets | `FTX-CORPUS-COMPAT-001` のうち埋め込みフォント、画像埋め込み、外部 PDF 埋め込みを含む stable subset ID |
 | FTX-CORPUS-TIKZ-001 | tikz/pgf 適合度を判定する固定回帰コーパス。基本図形、nested scope の style 継承、transform、clip、arrow、text node を含み、pdfLaTeX を参照出力とする |
+| FTX-CORPUS-TIKZ-001/basic-shapes | `FTX-CORPUS-TIKZ-001` の基本図形ケースを束ねる stable subset ID |
+| FTX-CORPUS-TIKZ-001/nested-style-transform-clip-arrow | `FTX-CORPUS-TIKZ-001` の style 継承、transform、clip、arrow を束ねる stable subset ID |
 | MoSCoW           | 優先度分類法。Must / Should / Could / Won't の4段階              |
 
 
@@ -462,10 +474,11 @@
   - 環境定義（`\newenvironment`, `\renewenvironment`）
   - セクショニングコマンド（`\chapter`, `\section`, `\subsection` 等）
   - リスト環境（`itemize`, `enumerate`, `description`）
-  - クロスリファレンス機構（`\label`, `\ref`, `\cite`）
+  - クロスリファレンス機構（`\label`, `\ref`, `\pageref`）
+  - citation 系参照は `REQ-FUNC-024` の `Citation Table` / `BibliographyState` に委譲する
 - **出力**: LaTeX カーネル機構が正しく処理された中間表現
 - **受け入れ基準**:
-  - Given `\documentclass{article}` で始まる標準的な論文と公式 Asset Bundle, When コンパイル, Then TeX Live 非導入環境でも pdfLaTeX と同等のレイアウトで PDF が生成される
+  - Given `FTX-CORPUS-COMPAT-001/layout-core/article` と `FTX-ASSET-BUNDLE-001`, When コンパイル, Then TeX Live 非導入環境でも pdfLaTeX と同等のレイアウトで PDF が生成される
   - Given 複数の `\usepackage` が互いに依存する文書, When パッケージ読み込み, Then 依存順序が正しく解決される
 - **優先度**: Must
 - **出典**: ユーザー明示
@@ -520,8 +533,8 @@
   - PDF グラフィックオペレータへの変換
 - **出力**: ベクター図形を含む PDF コンテンツストリーム
 - **受け入れ基準**:
-  - Given `FTX-CORPUS-TIKZ-001` の basic-shapes ケース, When コンパイル, Then 線、矩形、円、テキストノードの幾何関係が pdfLaTeX と一致する
-  - Given `FTX-CORPUS-TIKZ-001` の nested-style / transform / clip / arrow ケース, When コンパイル, Then 継承 style、クリッピング境界、描画順、矢印形状が pdfLaTeX と一致する
+  - Given `FTX-CORPUS-TIKZ-001/basic-shapes`, When コンパイル, Then 線、矩形、円、テキストノードの幾何関係が pdfLaTeX と一致する
+  - Given `FTX-CORPUS-TIKZ-001/nested-style-transform-clip-arrow`, When コンパイル, Then 継承 style、クリッピング境界、描画順、矢印形状が pdfLaTeX と一致する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -919,7 +932,7 @@
 - **出力**: アセット解決ハンドル
 - **例外**: バージョン不一致または破損時は診断を表示し、互換バンドルがなければ起動を失敗させる
 - **受け入れ基準**:
-  - Given 公式 Ferritex Asset Bundle のみが存在する環境, When `ferritex compile main.tex` を実行, Then TeX Live 非導入でも標準的な LaTeX 文書がコンパイルできる
+  - Given `FTX-ASSET-BUNDLE-001` のみが存在する環境, When `ferritex compile main.tex` を実行, Then TeX Live 非導入でも `FTX-CORPUS-COMPAT-001/layout-core` の baseline 文書群がコンパイルできる
   - Given Asset Bundle と Host Font Catalog の両方に同名フォント資産が存在する環境, When 通常の解決 API を呼び出す, Then Asset Bundle 側の資産が優先される
   - Given バンドルが破損している環境, When 読み込み, Then 破損診断が表示されコンパイルは開始されない
 - **優先度**: Must
@@ -988,15 +1001,15 @@
 - **定量基準**: `FTX-BENCH-001` を一度フルコンパイルしてキャッシュと依存グラフを構築した状態で、本文 1 段落だけを変更した差分コンパイル完了時間の中央値が 100ms 未満である
 - **計測方法**: `FTX-BENCH-001` を同一マシンでフルコンパイル済みの状態から、本文 1 段落の変更を適用して 5 回計測し中央値を採用する
 - **優先度**: Must
-- **出典**: エージェント推測（差分コンパイルの目標速度として、リアルタイムプレビューに必要なレイテンシから導出）
+- **出典**: ユーザー確認済み（2026-03-16）
 
 #### REQ-NF-003: メモリ使用量
 
 - **説明**: コンパイル時のメモリ使用量を合理的な範囲に抑える
-- **定量基準**: 100ページ文書のコンパイル時ピークメモリ使用量 < 1GB
-- **計測方法**: RSS（Resident Set Size）で計測
+- **定量基準**: `FTX-BENCH-001` のコンパイル時ピークメモリ使用量 < 1GB
+- **計測方法**: `FTX-BENCH-001` を対象に RSS（Resident Set Size）で計測する
 - **優先度**: Should
-- **出典**: エージェント推測（一般的な開発環境のメモリ搭載量から導出）
+- **出典**: ユーザー確認済み（2026-03-16）
 
 #### REQ-NF-004: LSP 応答速度
 
@@ -1028,9 +1041,12 @@
 
 #### REQ-NF-007: pdfLaTeX 出力互換性
 
-- **説明**: 標準的な LaTeX 文書に対して、pdfLaTeX と視覚的に同等の PDF を生成する
-- **定量基準**: テストスイート（標準的な論文テンプレート100件）に対して、pdfLaTeX 出力との差異がページレイアウト（行分割位置・ページ分割位置）ベースで 95% 以上一致
-- **計測方法**: テストスイートの各文書を両エンジンでコンパイルし、行分割位置・ページ分割位置を比較
+- **説明**: `FTX-CORPUS-COMPAT-001` に対して、pdfLaTeX とレイアウト・リンク・埋め込み資産を含めて互換な PDF を生成する
+- **定量基準**:
+  - `FTX-CORPUS-COMPAT-001` の全 100 文書を文書単位で集計し、各文書について「全ページの行分割位置差分率 <= 5% かつ全ページのページ分割位置が一致」を満たす文書数が 95 文書以上である。ここで行分割位置差分率は、各ページごとに `|Ferritex の改行位置集合 △ pdfLaTeX の改行位置集合| / max(1, |pdfLaTeX の改行位置集合|)` を計算し、その文書内ページ平均を取った値とする
+  - `FTX-CORPUS-COMPAT-001/navigation-features` の全文書で、正規化した PDF manifest 上の annotation 数、named destination 数、outline 階層、主要 metadata key（`Title`, `Author`）が 100% 一致する
+  - `FTX-CORPUS-COMPAT-001/embedded-assets` の全文書で、埋め込みフォント集合、画像・外部 PDF の resource inventory、参照先ページ数が 100% 一致する
+- **計測方法**: `FTX-CORPUS-COMPAT-001` の各文書を `FTX-ASSET-BUNDLE-001` 前提で両エンジンから生成し、レイアウト差分はページごとの改行位置集合の対称差から算出した差分率と、ページ分割位置一致を文書単位で集計する。PDF 機能差分は `FTX-CORPUS-COMPAT-001/navigation-features` と `FTX-CORPUS-COMPAT-001/embedded-assets` に対して annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数を正規化した manifest と埋め込み検証で比較する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
