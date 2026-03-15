@@ -25,7 +25,7 @@ Ferritex は `REQ-NF-001` のフルコンパイル 1.0 秒未満、`REQ-NF-002` 
 
 ### 選択肢 B: ドメイン境界を持つモジュラーモノリス
 
-単一プロセスを維持しつつ、トップレベルは `ferritex-cli` / `ferritex-application` / `ferritex-core` / `ferritex-infra` のレイヤ crate に分ける。ドメイン境界はまず `ferritex-core` 内の module として表現し、安定した narrow interface を持つものだけ独立 crate に昇格させる。`kernel` は数値/寸法演算、stable ID、source span などの基底型だけを置く shared base module とし、package/class/bibliography semantics や I/O を入れない。接続は ports and adapters とする。
+単一プロセスを維持しつつ、runtime path を構成するトップレベルのレイヤ crate は `ferritex-cli` / `ferritex-application` / `ferritex-core` / `ferritex-infra` に分ける。repo 直下には benchmark / compatibility harness 用の `ferritex-bench` を追加してよいが、これは runtime layer crate には含めない。ドメイン境界はまず `ferritex-core` 内の module として表現し、安定した narrow interface を持つものだけ独立 crate に昇格させる。`kernel` は数値/寸法演算、stable ID、source span などの基底型だけを置く shared base module とし、package/class/bibliography semantics や I/O を入れない。接続は ports and adapters とする。
 
 - 利点:
 - IPC なしで低遅延を維持できる

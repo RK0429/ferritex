@@ -113,7 +113,7 @@
 | Compilation Session | `Compilation Job` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリを保持する |
 | Compilation Snapshot | 並列ステージ境界で共有する読み取り専用のコンパイル状態スナップショット。マクロ・レジスタ・文書状態の確定済み部分を含み、並列タスクから破壊的更新しない |
 | Commit Barrier | 並列ステージの結果を決定的な順序で `Compilation Job` へ反映する同期点。可変状態の commit はここでのみ行う |
-| Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、主入力、jobname、生成パス番号、生成者種別、生成パス、コンテンツハッシュを記録する active-job 限定の in-memory 台帳。trusted readback の same-job 判定キーは主入力と jobname であり、生成パス番号は監査属性として保持する。job 完了または process restart 時に無効化し、append-only manifest は監査専用とする |
+| Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、主入力、artifact kind、jobname、生成パス番号、生成者種別、生成パス、コンテンツハッシュを記録する active-job 限定の in-memory 台帳。trusted readback の same-job 判定キーは主入力と jobname であり、生成パス番号は監査属性として保持する。job 完了または process restart 時に無効化し、append-only manifest は監査専用とする |
 | Job Context | `Compilation Job` 内の現在パスを識別する jobname・主入力・現在パス番号の組。same-job readback の一致判定は jobname と主入力で行い、現在パス番号は出力命名・順序・診断のために使う |
 | Bbl Snapshot | `.bbl` から取り込んだ引用・参考文献情報の正規化スナップショット |
 | Definition Provenance | マクロ・ラベル・参考文献エントリの定義元を示すファイル名・行番号・列番号・由来種別の組。定義ジャンプと診断に用いる |
@@ -667,17 +667,18 @@
 - **優先度**: Must
 - **出典**: ユーザー明示
 
-#### REQ-FUNC-032: チャプター単位並列化
+#### REQ-FUNC-032: 文書パーティション単位並列化
 
-- **説明**: 独立した章・セクションを並列に処理する
-- **入力**: マルチファイル構成の文書
+- **説明**: 独立した章またはセクション単位の文書パーティションを並列に処理する
+- **入力**: 章またはセクションで分割可能なマルチファイル構成の文書
 - **処理**:
-  - 章間の独立性判定（相互参照の依存解析）
-  - 独立チャプターの並列組版
+  - 章・セクション間の独立性判定（相互参照の依存解析）
+  - 独立パーティションの並列組版
   - 結果のマージとページ番号の統合
-- **出力**: 並列処理されたチャプターが統合された出力
+- **出力**: 並列処理された文書パーティションが統合された出力
 - **受け入れ基準**:
-  - Given 10章から成る文書, When コンパイル, Then 独立した章が並列に処理され、シングルスレッドと同一の出力が得られる
+  - Given 10章から成る `book` 文書, When コンパイル, Then 独立した章が並列に処理され、シングルスレッドと同一の出力が得られる
+  - Given chapter を持たない `article` 文書で独立した section 群がある場合, When コンパイル, Then 安全な section 単位だけが並列に処理され、シングルスレッドと同一の出力が得られる
 - **優先度**: Should
 - **出典**: ユーザー明示
 - **関連要件**: REQ-FUNC-031
@@ -895,12 +896,13 @@
 - **入力**: `ferritex lsp`
 - **処理**:
   - 標準入出力（stdio）を介した LSP プロトコル通信の開始
-  - `initialize` ハンドシェイクでサポート対象のサーバーケイパビリティを通知し、optional provider の capability は有効時のみ advertise する
+  - `initialize` ハンドシェイクで必須 capability（`textDocumentSync`, `completionProvider`, `codeActionProvider`）を通知し、optional provider の capability（`definitionProvider`, `hoverProvider` など）は provider 有効時のみ advertise する
   - プロジェクトルートの自動検出
 - **出力**: LSP プロトコルに準拠したリクエスト/レスポンス
 - **受け入れ基準**:
-  - Given `ferritex lsp` を起動, When エディタから `initialize` リクエストを受信, Then ケイパビリティ（diagnostics, completion, definition, codeAction）を含む応答が返される
-  - Given hover provider が有効なビルド, When `initialize` リクエストを受信, Then `hover` capability を含む応答が返される
+  - Given `ferritex lsp` を起動, When エディタから `initialize` リクエストを受信, Then 必須 capability（`textDocumentSync`, `completionProvider`, `codeActionProvider`）を含む応答が返される
+  - Given definition provider が有効な build, When `initialize` リクエストを受信, Then `definitionProvider` を含む応答が返される
+  - Given hover provider が有効なビルド, When `initialize` リクエストを受信, Then `hoverProvider` を含む応答が返される
 - **優先度**: Must
 - **出典**: ユーザー明示
 

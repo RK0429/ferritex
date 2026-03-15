@@ -30,7 +30,7 @@ Ferritex は `DependencyGraph` と `CompilationCache` を永続化して `REQ-NF
 
 ### 選択肢 C: 独立ストア群
 
-`DependencyGraphStore`、`CacheMetadataStore`、`BlobCacheStore` を分離し、必要に応じて同じ SQLite 技術を使っても論理的に独立させる。`OutputArtifactRegistry` は active job の in-memory state とし、監査用にのみ append-only manifest を残す。registry record には normalized path、primary input、jobname、pass number、producer kind、generation path、content hash を保持するが、trusted readback の same-job 判定は primary input と jobname だけで行う。current pass number は registry record ではなく active `JobContext` 側の運用属性として扱う。
+`DependencyGraphStore`、`CacheMetadataStore`、`BlobCacheStore` を分離し、必要に応じて同じ SQLite 技術を使っても論理的に独立させる。`OutputArtifactRegistry` は active job の in-memory state とし、監査用にのみ append-only manifest を残す。registry record には normalized path、primary input、artifact kind、jobname、produced pass、artifact producer kind、produced path、content hash を保持するが、trusted readback の same-job 判定は primary input と jobname だけで行う。current pass number は registry record ではなく active `JobContext` 側の運用属性として扱う。
 
 - 利点:
   - dependency graph と cache の破損を障害分離できる
