@@ -4,8 +4,8 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| バージョン | 0.1.4 |
-| 最終更新日 | 2026-03-16 |
+| バージョン | 0.1.5 |
+| 最終更新日 | 2026-03-17 |
 | ステータス | 提案 |
 | 入力 | [requirements.md](requirements.md) v0.1.19, [domain_model.md](domain_model.md) v0.1.20 |
 
@@ -224,7 +224,7 @@ graph LR
 | --- | --- | --- |
 | Parser & Macro Engine | 字句解析、マクロ展開、条件分岐 (`REQ-FUNC-003`)、レジスタ管理 (`REQ-FUNC-004`)、エラー回復 (`REQ-FUNC-006`)、パッケージ読み込み、job/pass 状態管理、および `FTX-ASSET-BUNDLE-001` / `FTX-CORPUS-COMPAT-001` が要求する package-facing pdfTeX 拡張の互換層 | `CompilationSession`, `DocumentStateDelta`, `GraphicsCommandStream`, `DependencyEvents` |
 | Bibliography Integration | `.bbl` 読み込み、`BblSnapshot` / `CitationTable` / `BibliographyEntry` 構築、citation provenance の供給 | `BibliographyState`, `CitationTable`, `BibliographyEntry` |
-| Typesetting Engine | 行分割、ページ分割、display math、フロート、脚注、目次/索引、参考文献リストのレイアウト | `PageBox`, `FloatPlacement`, `LayoutFragment` |
+| Typesetting Engine | 行分割、ページ分割、display math、フロート、脚注、目次/索引、参考文献リストのレイアウト | `PageBox`, `FloatPlacement`, `DocumentLayoutFragment`（差分コンパイルのパーティション統合用） |
 | Incremental Compilation | 依存グラフ、変更検知 (`REQ-FUNC-028`)、影響範囲判定、`DocumentPartitionPlanner` による stable `partitionId` と `PartitionLocator` 発行、再利用/再構築統合、固定点反復、文書パーティション統合 | `RecompilationScope`, `CompilationMergePlan`, `PaginationMergeResult`, `CompilationSnapshot` |
 | Graphics Rendering | `graphicx` / `tikz` を PDF 非依存プリミティブへ正規化 | `GraphicsScene`, `GraphicResourceSet` |
 | Font Management | `FontSpec` 正規化、フォント解決、TFM/OpenType 読み込み (`REQ-FUNC-018`)、メトリクス・グリフ供給 | `ResolvedFont`, `FontMetrics`, `FontEmbeddingPlan` |
@@ -341,63 +341,63 @@ runtime path のトップレベル crate はレイヤ境界として使い、`fe
 
 ## 10. 適合度関数
 
-## 適合度関数: フルコンパイル性能
+### 10.1 フルコンパイル性能
 
 - **計測対象**: `FTX-BENCH-001` のフルコンパイル時間
 - **閾値**: 中央値 1.0 秒未満
 - **計測方法**: 専用 perf runner で 1 回ウォームアップ後 5 回計測し中央値を記録する
 - **違反時のアクション**: main ブランチへのマージを止め、遅延の大きい commit を bisect する
 
-## 適合度関数: 差分コンパイル性能
+### 10.2 差分コンパイル性能
 
 - **計測対象**: 本文 1 段落変更時の差分コンパイル時間
 - **閾値**: 中央値 100ms 未満
 - **計測方法**: 依存グラフと cache を事前生成した状態で 5 回計測する
 - **違反時のアクション**: affected node 数、cache hit 率、passes used を記録し regression として追跡する
 
-## 適合度関数: 相対速度
+### 10.3 相対速度
 
 - **計測対象**: `FTX-BENCH-001` に対する pdfLaTeX 比の速度倍率
 - **閾値**: フルコンパイルで pdfLaTeX 比 100x 以上
 - **計測方法**: 同一マシン、同一入力、同一 benchmark profile で pdfLaTeX baseline と比較する
 - **違反時のアクション**: 絶対速度だけでなく baseline 側の変動も記録し、成功基準との差を追跡する
 
-## 適合度関数: メモリ使用量
+### 10.4 メモリ使用量
 
 - **計測対象**: `FTX-BENCH-001` のフルコンパイルと `LiveAnalysisSnapshot` 構築を含むピーク RSS
 - **閾値**: peak RSS < 1 GiB
 - **計測方法**: CI とローカル perf runner で `peak_rss_mb`, `compilation_snapshot_bytes`, `live_analysis_snapshot_bytes` を採取する
 - **違反時のアクション**: main ブランチへのマージを止め、snapshot 粒度と cache retention を見直す
 
-## 適合度関数: エラーメッセージ品質
+### 10.5 エラーメッセージ品質
 
 - **計測対象**: compile / watch / lsp / preview の診断・拒否メッセージ・セッションエラー応答
 - **閾値**: ソース診断ではファイル名・行番号・要約・文脈 snippet を 100% 付与し、修正候補を出せるケースでは suggestion を付与する。preview session 応答ではエラー種別・対象 sessionId・回復手順を 100% 付与する
 - **計測方法**: golden diagnostics テストでソース診断の `file`, `line`, `message`, `context`, `suggestion?` を検証し、preview session テストで `error_type`, `session_id`, `recovery` を検証する
 - **違反時のアクション**: build を失敗させ、ソース診断では `DefinitionProvenance` / `SourceSpan` の欠落箇所を、session 応答では `PreviewSessionService` のエラー応答を修正する
 
-## 適合度関数: LSP 応答性
+### 10.6 LSP 応答性
 
 - **計測対象**: diagnostics / completion / definition の各処理時間
 - **閾値**: diagnostics < 500ms、completion < 100ms、definition < 200ms
 - **計測方法**: replayable LSP trace を CI と手元ベンチで実行する
 - **違反時のアクション**: snapshot 構築コストと provider コストを分離計測し、どちらがボトルネックか判定する
 
-## 適合度関数: プレビュー更新遅延
+### 10.7 プレビュー更新遅延
 
 - **計測対象**: watch モードでの再コンパイル完了から preview client への document revision 通知到達までの遅延
 - **閾値**: 中央値 1.0 秒以内
 - **計測方法**: `FTX-BENCH-001` を watch モードで loopback preview session を確立した状態から本文 1 段落変更を適用し、再コンパイル完了時点から `WS /preview/{sessionId}/events` 上で revision 通知を受信するまでの時間を 5 回計測し中央値を記録する
 - **違反時のアクション**: publish 判定時間と transport 配信時間を分離計測し、ボトルネックを特定する
 
-## 適合度関数: 再現性
+### 10.8 再現性
 
 - **計測対象**: 3 OS での PDF 出力一致
 - **閾値**: Host Font Catalog overlay 無効時、メタデータ差分を除きバイト同一
 - **計測方法**: CI matrix で同一入力を処理し、正規化後の PDF ハッシュを比較する
 - **違反時のアクション**: Asset Bundle / font resolution / metadata injection の差分を切り分ける
 
-## 適合度関数: pdfLaTeX 互換性 (`REQ-NF-007`)
+### 10.9 pdfLaTeX 互換性 (`REQ-NF-007`)
 
 - **計測対象**: `FTX-ASSET-BUNDLE-001` 前提で `FTX-CORPUS-COMPAT-001` に対する pdfLaTeX とのレイアウト互換、および `FTX-CORPUS-COMPAT-001/navigation-features` / `FTX-CORPUS-COMPAT-001/embedded-assets` に対する PDF 機能互換
 - **スコープ**: 互換対象の engine surface は `FTX-ASSET-BUNDLE-001` と `FTX-CORPUS-COMPAT-001` が要求する e-TeX および package-facing pdfTeX 拡張プリミティブに限定し、XeTeX 固有プリミティブは v1 の対象外とする
@@ -405,14 +405,14 @@ runtime path のトップレベル crate はレイヤ境界として使い、`fe
 - **計測方法**: `ferritex-bench` で `FTX-CORPUS-COMPAT-001` を `FTX-ASSET-BUNDLE-001` 前提で実行し、レイアウト差分は文書単位で集計する。feature subset は annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数を正規化した manifest で比較する
 - **違反時のアクション**: どの subset / 文書で差が生じたかを `parser` / `typesetting` / `font` / `pdf` 単位で切り分ける
 
-## 適合度関数: アーキテクチャ境界
+### 10.10 アーキテクチャ境界
 
 - **計測対象**: crate 依存方向
 - **閾値**: `ferritex-core` から `ferritex-application` / `ferritex-infra` への依存 0、循環依存 0
 - **計測方法**: `cargo metadata` ベースのカスタム検査を CI で実行する
 - **違反時のアクション**: build を失敗させ、依存逆流を修正する
 
-## 適合度関数: セキュリティ境界
+### 10.11 セキュリティ境界
 
 - **計測対象**: 許可外ファイルアクセスと許可外外部コマンド実行
 - **閾値**: 拒否テスト 100% パス、未許可経路 0、明示許可時でも 30 秒 / 1 process / 4 MiB を超える外部実行 0
