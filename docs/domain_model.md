@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.19          |
-| 最終更新日 | 2026-03-15      |
+| バージョン | 0.1.20          |
+| 最終更新日 | 2026-03-16      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.17 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.18 |
 
 ## 1. サブドメイン分類
 
@@ -1088,8 +1088,11 @@ classDiagram
         +addNode(DepNode) void
         +addEdge(NodeId, NodeId) void
         +affectedBy(Set~NodeId~) Set~NodeId~
-        +persist(StoragePath) void
-        +restore(StoragePath) DependencyGraph
+    }
+    class DependencyGraphStore {
+        <<Port>>
+        +load() DependencyGraph
+        +save(DependencyGraph) void
     }
     class DepNode {
         <<ValueObject>>
@@ -1145,6 +1148,7 @@ classDiagram
         +LogicalPath entryFile
         +PartitionKind kind
         +String partitionId
+        +PartitionLocator locator
         +Set~String~ importedRefs
         +Set~String~ exportedRefs
         +bool canTypesetInIsolation
@@ -1153,8 +1157,16 @@ classDiagram
         <<ValueObject>>
         +LogicalPath entryFile
         +PartitionKind kind
+        +String partitionId
+        +PartitionLocator locator
         +List~PageBox~ pages
         +Map~String, int~ localLabelPages
+    }
+    class PartitionLocator {
+        <<ValueObject>>
+        +LogicalPath entryFile
+        +SourceSpan headingSpan
+        +int ordinalWithinFile
     }
     class PaginationMergeCoordinator {
         <<Service>>
@@ -1187,6 +1199,7 @@ classDiagram
     }
 
     DependencyGraph o-- DepNode
+    DependencyGraphStore ..> DependencyGraph : loads / saves
     ChangeDetector ..> DependencyGraph : reads
     ChangeDetector ..> FileChange : input
     ChangeDetector ..> RecompilationScope : output
@@ -1197,8 +1210,10 @@ classDiagram
     DocumentPartitionPlanner ..> DocumentState : reads ref stability
     DocumentPartitionPlanner --> DocumentPartitionPlan
     DocumentPartitionPlan o-- DocumentWorkUnit
+    DocumentWorkUnit --> PartitionLocator
     PaginationMergeCoordinator ..> DocumentPartitionPlan : consumes
     PaginationMergeCoordinator ..> DocumentLayoutFragment : merges
+    DocumentLayoutFragment --> PartitionLocator
     PaginationMergeCoordinator ..> DocumentState : reconciles refs/pages
     PaginationMergeCoordinator --> PaginationMergeResult
     IncrementalCompilationCoordinator --> CompilationMergePlan
@@ -1663,7 +1678,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、`ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて loopback 上の HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、loopback 上の `POST /preview/session` bootstrap request と `ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1695,6 +1710,7 @@ classDiagram
         +EnvironmentRegistry environments
         +CrossReferenceTable references
         +BibliographyState bibliography
+        +PackageDocSnapshotCatalog packageDocs
     }
     class LiveAnalysisSnapshot {
         <<ValueObject>>
@@ -2028,7 +2044,7 @@ stateDiagram-v2
 | プレビューターゲット (PreviewTarget) | preview session / revision が紐づく対象文書の識別子。workspace root、primaryInput、jobname の組 | PreviewSession, PreviewRevision |
 | プレビュー公開ポリシー (PreviewPublicationPolicy) | `ExecutionPolicy` に内包される preview 配信専用の制約。loopback bind 限定、active job の最新 PDF のみ publish、session target 一致、target 変更または process restart 時の session 再発行規約を保持する | ExecutionPolicy, PreviewSessionService |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
-| プレビュー配信契約 (PreviewTransport) | loopback に bind し、session ごとの HTTP document endpoint と WebSocket events endpoint へ `PreviewTarget` 付き revision 通知を配信し、view-state 更新を受信する双方向 port | PreviewSession, PreviewRevision |
+| プレビュー配信契約 (PreviewTransport) | loopback に bind し、`PreviewSessionService` が `POST /preview/session` bootstrap 応答と session ごとの HTTP document endpoint / WebSocket events endpoint を公開するための双方向 port。`PreviewTarget` 付き revision 通知を配信し、view-state 更新を受信する | PreviewSession, PreviewRevision |
 
 ### 5.2 タイプセッティング コンテキスト
 
@@ -2081,16 +2097,18 @@ stateDiagram-v2
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
-| 依存グラフ (DependencyGraph) | ファイル・マクロ・ラベル間の依存関係を表す有向グラフ | DepNode, 変更検知 |
+| 依存グラフ (DependencyGraph) | ファイル・マクロ・ラベル間の依存関係を表す有向グラフ。永続化は `DependencyGraphStore` port が担う | DepNode, 変更検知 |
 | 依存ノード (DepNode) | 依存グラフの頂点。ファイル/マクロ/ラベルのいずれか | DependencyGraph |
 | コンテンツハッシュ (ContentHash) | ファイル/ノード内容のハッシュ値。変更検知に使用 | ChangeDetector |
 | 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
+| コンパイルキャッシュ (CompilationCache) | 差分再利用の論理集約。永続化は `CacheMetadataStore` と `BlobCacheStore` に分離され、`IncrementalCompilationCoordinator` からは一貫した cache 契約として見える | CacheEntry, IncrementalCompilationCoordinator |
 | コンパイルマージプラン (CompilationMergePlan) | 再構築ノードと再利用ノードの境界、および参照安定化の要否を表す計画 | IncrementalCompilationCoordinator |
 | 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
 | 文書パーティション計画 (DocumentPartitionPlan) | 章またはセクション単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画 | DocumentPartitionPlanner, DocumentWorkUnit |
-| 文書ワークユニット (DocumentWorkUnit) | 1 つの章またはセクションに対応する入力ファイル、パーティション種別、輸入/輸出する参照、独立組版可否を表す単位 | DocumentPartitionPlan, PaginationMergeCoordinator |
+| 文書ワークユニット (DocumentWorkUnit) | 1 つの章またはセクションに対応する入力ファイル、`partitionId`、`PartitionLocator`、輸入/輸出する参照、独立組版可否を表す単位 | DocumentPartitionPlan, PaginationMergeCoordinator |
 | パーティション種別 (PartitionKind) | 文書パーティションの種別。`chapter` / `section` など、`DocumentPartitionPlanner` が work unit を分類するための論理タグ | DocumentWorkUnit, DocumentPartitionPlan |
 | パーティション識別子 (partitionId) | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`CommitBarrier` の total order を決定するキーの 1 つ | DocumentWorkUnit, CommitBarrier |
+| パーティション位置 (PartitionLocator) | 同一ファイル内でも章/セクション境界を一意に特定する論理位置。`entryFile`、見出しの `SourceSpan`、出現順 ordinal を組にして表す | DocumentWorkUnit, DocumentLayoutFragment |
 | ページ統合調停役 (PaginationMergeCoordinator) | 各文書パーティションの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | DocumentLayoutFragment, PaginationMergeResult |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
 
@@ -2143,14 +2161,15 @@ stateDiagram-v2
 | シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, CompilationSession |
 | 補完索引 (CompletionIndex) | `LiveAnalysisSnapshot` から active な command/environment registry、未保存 buffer、label/citation 状態を LSP 補完向けに射影した read model | CompletionProvider, CompletionCandidate |
 | 補完候補 (CompletionCandidate) | コマンド、環境、ラベル、参考文献キーの補完項目。表示名、挿入文字列、由来情報を保持する | CompletionIndex |
-| hover 文書カタログ (HoverDocCatalog) | `LiveAnalysisSnapshot` から active な class/package snapshot の説明資産をコマンドごとに索引化した read model | HoverProvider, HoverDoc |
+| パッケージ説明スナップショット群 (PackageDocSnapshotCatalog) | active な class/package snapshot の説明資産を保持する `StableCompileState` 側の読み取りモデル | StableCompileState, HoverDocCatalog |
+| hover 文書カタログ (HoverDocCatalog) | `LiveAnalysisSnapshot.stableState.packageDocs` から active な class/package snapshot の説明資産をコマンドごとに索引化した read model | HoverProvider, HoverDoc |
 | hover 文書 (HoverDoc) | コマンドの構文、要約、使用例、由来パッケージを保持する説明データ | HoverDocCatalog |
 | オープンドキュメントバッファ (OpenDocumentBuffer) | エディタ上の未保存変更を含む最新テキスト。LSP 機能は保存済みファイルよりこれを優先して参照する | OpenDocumentStore, LiveAnalysisSnapshot |
 | オープンドキュメントストア (OpenDocumentStore) | 現在開かれているテキスト文書の buffer と version を保持する LSP セッション内ストア | LspServer, OpenDocumentBuffer |
 | ライブ解析スナップショット (LiveAnalysisSnapshot) | `OpenDocumentBuffer` と Stable Compile State を合成した LSP 共通入力。diagnostic/completion/definition/hover が同じ解析基盤を共有する | LiveAnalysisSnapshotFactory, CompletionIndex, SymbolIndex, HoverDocCatalog |
 | 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら再コンパイルを逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph |
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
-| プレビューセッション (PreviewSession) | sessionId ごとの preview 状態。`PreviewTarget` を owner として保持し、同一 target かつ同一 process の間だけ再利用される。閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewTransport, PreviewViewState |
+| プレビューセッション (PreviewSession) | sessionId ごとの preview 状態。`PreviewTarget` を owner として保持し、同一 target かつ同一 process の間だけ再利用される。`PreviewSessionService.openSession` から bootstrap され、閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewTransport, PreviewViewState |
 | プレビュー表示状態 (PreviewViewState) | 現在ページ、ページ内オフセット、ズーム倍率など、プレビュー更新後も維持すべき閲覧位置。新 PDF のページ数に対して最近傍の有効ページへ clamp できる | PreviewSession |
 | RuntimeOptions | compile / watch / LSP の入口固有指定を `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` へ正規化した共通実行オプション。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
 | AssetBundleRef | Asset Bundle の参照値。ファイルパスまたは組み込み識別子を区別して保持する | RuntimeOptions, CompileOptions, WatchOptions |
@@ -2178,7 +2197,7 @@ stateDiagram-v2
 - **根拠**:
   - 観測事実: BR-9「キャッシュ破損時はフルコンパイルにフォールバック」。依存グラフが失われると変更検知自体が不可能になり、フォールバックのコストが不必要に増大する
   - 代替案: `DependencyGraph` を `CompilationCache` の一部として同一ストレージに保存する
-  - 分離証人: キャッシュ破損＋依存グラフ健全のケース。独立永続化モデルでは依存グラフから変更範囲を特定し「変更範囲のみフルリビルド」が可能。同一ストレージモデルではグラフも失われるため全ファイルの再パースから開始する必要がある
+  - 分離証人: キャッシュ破損＋依存グラフ健全のケース。独立永続化モデルでは依存グラフから invalidation 範囲や watch-set refresh を再計算したうえで full compile へ移行できるが、同一ストレージモデルではグラフも失われるため復旧前に全ファイル再探索が必要になる
 - **等価性への影響**: 観測的等価（正常時の出力は同一。異常時の復旧効率が異なる）
 - **語彙への影響**: なし
 
@@ -2378,7 +2397,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール
-- **判断内容**: `PreviewTransport` は loopback 上の HTTP document endpoint と WebSocket events endpoint を公開する双方向 port とし、view-state 更新の受信と許可済み revision 通知の publish だけを担う。`PreviewSessionService` は `PreviewTarget` ごとに session を発行し、同一 process かつ同一 target の間だけ再利用し、target 変更または process restart 時は再発行する。publish 前には `ExecutionPolicy.previewPublication` に照らして active job の `PreviewTarget` と session owner の一致を判定し、`PreviewSession` が保持する閲覧位置を再適用してから `PreviewTransport` へ配信を委譲する。`PreviewRevision` は target 付き revision と pageCount を持ち、保持ページが新 PDF に存在しない場合は最近傍の有効ページへ clamp する
+- **判断内容**: `PreviewTransport` は loopback 上の `POST /preview/session` bootstrap endpoint、HTTP document endpoint、WebSocket events endpoint を公開する双方向 port とし、view-state 更新の受信と許可済み revision 通知の publish を担う。`PreviewSessionService` は `PreviewTarget` ごとに session を発行し、同一 process かつ同一 target の間だけ再利用し、target 変更または process restart 時は再発行する。client からの bootstrap request には `PreviewSessionService` が応答し、publish 前には `ExecutionPolicy.previewPublication` に照らして active job の `PreviewTarget` と session owner の一致を判定し、`PreviewSession` が保持する閲覧位置を再適用してから `PreviewTransport` へ配信を委譲する。旧 session は `410 Gone` 相当で拒否し、client に bootstrap の再実行を要求する。`PreviewRevision` は target 付き revision と pageCount を持ち、保持ページが新 PDF に存在しない場合は最近傍の有効ページへ clamp する
 - **根拠**:
   - 観測事実: REQ-FUNC-040 はホットリロード後も閲覧ページ位置が維持されること、および保持ページが消滅した場合は最近傍の有効ページへフォールバックすることを要求している
   - 代替案: preview クライアントが暗黙に位置復元すると仮定し、サーバー側モデルでは raw PDF 配信だけを表現する
@@ -2530,7 +2549,7 @@ stateDiagram-v2
 | BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に、named destination は `PlacedDestination` に正規化される。`LinkStyle.textColor` は必要に応じて `TextRun.style.fillColor` へコピーされ、`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / text color / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
 | BR-17 | SyncTeX は `PageBox` に含まれる `PlacedNode` の `SourceSpan` と配置矩形から `SyncTexBuilder` が `SyncTraceFragment` 群を生成し、forward search では SourceLocation に交差する fragment 群を、inverse search では `PdfPosition` を含む fragment に対応する `SourceSpan` を返す | REQ-FUNC-041 | タイプセッティング / PDF 生成 |
 | BR-18 | watch 実行中の追加変更は `RecompileScheduler` が `PendingChangeQueue` へ集約し、コンパイル中に並列実行せず、現在のコンパイル完了後に coalesce 済み変更集合で再コンパイルする。各コンパイル完了後は最新 `DependencyGraph` から `FileWatcher.watchedPaths` を再同期する | REQ-FUNC-038 / REQ-FUNC-039 | 開発者ツール / 差分コンパイル |
-| BR-19 | PDF プレビュー配信は `PreviewSessionService` が `PreviewTarget` ごとに session を発行・失効管理し、`ExecutionPolicy.previewPublication` に照らして active job の target と session owner が一致する場合だけ publish 可否を判定する。`PreviewTransport` は loopback 上の HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。`PreviewSession` は `PreviewViewState` を保持して PDF 更新時に保存済みの同じページ位置とズームを再適用し、保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする。target 変更または process restart 時は session を再発行する | REQ-FUNC-040 | 開発者ツール |
+| BR-19 | PDF プレビュー配信は `PreviewSessionService` が `PreviewTarget` ごとに session を発行・失効管理し、loopback `POST /preview/session` bootstrap request に応答して session を返す。`ExecutionPolicy.previewPublication` に照らして active job の target と session owner が一致する場合だけ publish 可否を判定する。`PreviewTransport` は session ごとの HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。`PreviewSession` は `PreviewViewState` を保持して PDF 更新時に保存済みの同じページ位置とズームを再適用し、保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする。target 変更または process restart 時の旧 session は `410 Gone` 相当で拒否する | REQ-FUNC-040 | 開発者ツール |
 | BR-20 | PDF フォント埋め込みは `FontEmbeddingPlanner` が `TextRun` 群から使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して subset font と ToUnicode CMap を生成する | REQ-FUNC-014 / REQ-FUNC-017 | PDF 生成 / フォント管理 |
 | BR-21 | tikz/pgf の描画は `GraphicGroup` が継承スタイルと clip path を保持し、`VectorPath` が path ごとの矢印指定を保持したまま PDF 射影へ渡される | REQ-FUNC-023 | グラフィック描画 / PDF 生成 |
 | BR-22 | 脚注は `FootnoteQueue` に蓄積され、`PageBuilder` が現在ページ下部へ予約できる脚注だけを `FootnotePlacement` として確定し、残りを次ページへ繰り延べる | REQ-FUNC-008 | タイプセッティング |
@@ -2538,15 +2557,16 @@ stateDiagram-v2
 | BR-24 | `\input` / `\include` / `\InputIfFileExists` は `InputStack` を push/pop し、current-file 基準の `ResolutionContext.currentDirectory` で解決される。`\include` の重複抑止と分離 `.aux` 出力先は `IncludeState` が管理する | REQ-FUNC-005 | パーサー/マクロエンジン |
 | BR-25 | フロート指定子は `PlacementSpec.priorityOrder` と `force` へ正規化され、`FloatQueue` は選択された配置領域とページ内矩形を `FloatPlacement` として返し `PageBox` に保持する | REQ-FUNC-010 | タイプセッティング |
 | BR-26 | LSP 補完は `CompletionIndex` が `LiveAnalysisSnapshot` から active な command/environment registry、未保存 buffer、label/citation 状態を再構築し、package-aware な command/environment 候補と `\ref` / `\cite` 候補だけを返す | REQ-FUNC-035 | パーサー/マクロエンジン / 開発者ツール |
-| BR-27 | LSP hover は `HoverDocCatalog` が `LiveAnalysisSnapshot` から active な class/package snapshot の説明資産をコマンド単位に索引化し、構文・要約・使用例を返す | REQ-FUNC-037 | パーサー/マクロエンジン / 開発者ツール |
+| BR-27 | LSP hover は `HoverDocCatalog` が `LiveAnalysisSnapshot.stableState.packageDocs` から active な class/package snapshot の説明資産をコマンド単位に索引化し、構文・要約・使用例を返す | REQ-FUNC-037 | パーサー/マクロエンジン / 開発者ツール |
 | BR-28 | `fontspec` によるフォント指定は `FontSpec` へ正規化され、OpenType feature は `FontFeatureSet`、代替フォント列は `FontFallbackChain` で保持される。`FontManager` / `FontResolverCache` はこの canonical form を解決キーとして扱う | REQ-FUNC-025 / REQ-FUNC-017 / REQ-FUNC-019 | パーサー/マクロエンジン / フォント管理 |
-| BR-29 | 章またはセクション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立パーティションだけを `DocumentWorkUnit` として抽出し、`PaginationMergeCoordinator` が各パーティションの組版結果を順序付きに統合して sequential compile と同じページ番号へ復元する | REQ-FUNC-032 | 差分コンパイル / タイプセッティング |
+| BR-29 | 章またはセクション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立パーティションだけを `partitionId` と `PartitionLocator` 付き `DocumentWorkUnit` として抽出し、`PaginationMergeCoordinator` が同じ組を持つ `DocumentLayoutFragment` を順序付きに統合して sequential compile と同じページ番号へ復元する | REQ-FUNC-032 | 差分コンパイル / タイプセッティング |
 | BR-30 | LSP の diagnostics/completion/definition/hover/codeAction は `OpenDocumentStore` 上の未保存 `OpenDocumentBuffer` を優先し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を共通入力として評価する。read path は active compile/watch job の完了を待たず、必要なら次回の background recompile だけを coalesce する | REQ-FUNC-034 / REQ-FUNC-035 / REQ-FUNC-036 / REQ-FUNC-037 | 開発者ツール / パーサー/マクロエンジン |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.20 | 2026-03-16 | preview bootstrap 契約、partition locator、cache fallback の復旧意味論、package doc snapshot、永続化 port の責務を明文化 | Codex |
 | 0.1.19 | 2026-03-15 | `RuntimeOptions.jobname` と `PreviewPublicationPolicy` / `PreviewTarget` を導入し、preview session の owner/lifecycle、active-job 限定の Output Artifact Registry 寿命、LSP 非ブロッキング read path を反映 | Codex |
 | 0.1.18 | 2026-03-15 | same-job readback の判定キーを jobname + 主入力へ固定し、LSP 入力境界を Stable Compile State 表現へ統一。メタ情報を最新版へ同期 | Codex |
 | 0.1.17 | 2026-03-15 | ScopeStack の group 巻き戻し責務、Stable Compile State、PreviewTransport/PreviewRevision、entry-point 非依存の RuntimeOptions を反映 | Codex |

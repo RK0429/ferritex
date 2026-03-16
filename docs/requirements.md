@@ -5,8 +5,8 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.17          |
-| 最終更新日 | 2026-03-15      |
+| バージョン | 0.1.18          |
+| 最終更新日 | 2026-03-16      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
@@ -134,17 +134,18 @@
 | Recompile Scheduler | `FileWatcher` からの変更イベントと Pending Change Queue を受け取り、同時実行を避けながら差分コンパイルを順序制御する調停役 |
 | Preview Publication Policy | preview 配信専用の制約。loopback bind 限定、active job の最新 PDF のみ publish、session owner 一致の必須化、process restart または preview target 変更時の session 再発行規約を保持する |
 | Preview Target | preview session / revision が紐づく対象文書の識別子。workspace root、primaryInput、jobname の組で表す |
-| Preview Session | sessionId ごとの preview 状態。`Preview Target` を owner として保持し、同一 target が維持される間だけ再利用される。閲覧位置を保持し、`Preview Transport` から受ける view-state 更新を反映する |
+| Preview Session | sessionId ごとの preview 状態。`Preview Target` を owner として保持し、同一 target かつ同一 process の間だけ再利用される。閲覧位置を保持し、`Preview Transport` から受ける view-state 更新を反映する |
 | Preview View State | プレビューアの現在ページ、ページ内オフセット、ズーム倍率など、更新後も保持すべき閲覧位置情報 |
 | Preview Revision | active job が生成した PDF の改訂。`Preview Target` に紐づく revision 番号と pageCount を保持する |
-| Preview Session Service | `Preview Session` の発行・再発行・失効を管理し、`Execution Policy.previewPublication` に照らして許可された publish だけを `Preview Transport` へ委譲する調停役 |
-| Preview Transport | loopback のみへ bind し、`GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で `Preview Revision` 更新通知と view-state 更新を扱う preview 配信契約 |
+| Preview Session Service | `Preview Session` の発行・再発行・失効を管理し、`POST /preview/session` から受けた `Preview Target` を同一 process / 同一 target の既存 session に解決する。`Execution Policy.previewPublication` に照らして許可された publish だけを `Preview Transport` へ委譲する調停役 |
+| Preview Transport | loopback のみへ bind し、session bootstrap / document / events endpoint を提供する preview 配信契約。`POST /preview/session` への `sessionId` / `documentUrl` / `eventsUrl` 応答内容は `Preview Session Service` が決定し、`GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で `Preview Revision` 更新通知と view-state 更新を扱う |
 | Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
 | Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
 | Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
 | Live Analysis Snapshot | `Open Document Buffer` と Stable Compile State（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
 | Partition Kind | 文書パーティションの種別。`chapter` / `section` など、`DocumentPartitionPlanner` が work unit を分類するための論理タグ |
 | Partition ID | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`Commit Barrier` の total order の一部として使う |
+| Partition Locator | 章/セクション境界を一意に示す論理位置。`entryFile`、見出しの source span、同一ファイル内での出現順を組にして表す |
 | Citation Table | `.bbl` 由来の citation key と citation 表示文字列 / provenance を対応付ける索引。`\cite` 解決に使い、provenance は本文側 citation 表示の trace に使う |
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
 | FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
@@ -255,7 +256,7 @@
 - **出力**: 診断メッセージとリカバリ後のトークンストリーム
 - **受け入れ基準**:
   - Given 複数のエラーを含む文書, When コンパイル, Then 最初のエラーだけでなく後続のエラーも可能な限り報告される
-- **優先度**: Should
+- **優先度**: Must
 - **出典**: ユーザー明示
 
 ### 3.2 タイプセッティングエンジン
@@ -346,7 +347,7 @@
 - **出力**: 目次・索引のボックスツリー
 - **受け入れ基準**:
   - Given 章・節構造を持つ文書, When コンパイル, Then 正しいセクション番号とページ番号を含む目次が生成される
-- **優先度**: Should
+- **優先度**: Must
 - **出典**: ユーザー明示
 
 ### 3.3 PDF 生成
@@ -395,7 +396,7 @@
 - **出力**: リンクアノテーションとアウトラインを含む PDF
 - **受け入れ基準**:
   - Given セクション構造を持つ文書, When PDF を生成, Then PDF ビューアのしおりパネルにセクション階層が表示される
-- **優先度**: Should
+- **優先度**: Must
 - **出典**: ユーザー明示
 - **関連要件**: REQ-FUNC-022
 
@@ -581,12 +582,14 @@
   - パッケージオプションの処理（`\DeclareOption`, `\ProcessOptions`）
   - `\RequirePackage` による依存パッケージの再帰的読み込み
   - パッケージ内で定義されるマクロ・環境をレジストリへ登録
+  - `FTX-ASSET-BUNDLE-001` および `FTX-CORPUS-COMPAT-001` が要求する e-TeX と package-facing pdfTeX 拡張プリミティブは互換層で吸収する
 - **出力**: パッケージ定義が適用された状態
-- **例外**: パッケージ未発見時にエラー報告。未対応プリミティブ使用時は警告を出力し、可能な範囲で処理を継続
+- **例外**: パッケージ未発見時にエラー報告。XeTeX 固有プリミティブや corpus / bundle 外の未対応 engine 拡張使用時は構造化警告を出力し、依存箇所は non-success として停止する
 - **受け入れ基準**:
   - Given `geometry`, `graphicx`, `xcolor` 等の標準パッケージが Asset Bundle に含まれる環境, When 読み込み, Then TeX Live 非導入環境でもエラーなく処理されパッケージの機能が利用可能
   - Given プロジェクト内に同名の `mystyle.sty` があり Bundle 内にも同名資産がある環境, When `\usepackage{mystyle}` を実行, Then プロジェクトローカル版が優先される
-  - Given Ferritex 未対応のプリミティブを含むパッケージ, When 読み込み, Then 未対応箇所を警告しつつ対応済み機能は正常に動作する
+  - Given `FTX-ASSET-BUNDLE-001` に含まれる標準パッケージが package-facing pdfTeX 拡張プリミティブを使用する場合, When 読み込み, Then 互換層がそのプリミティブを吸収し package 機能が利用可能
+  - Given XeTeX 固有プリミティブまたは corpus / bundle 外の未対応 engine 拡張を含むパッケージ, When 読み込み, Then 未対応プリミティブ名と停止理由を含む警告が返る
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -821,16 +824,17 @@
 - **説明**: コンパイル結果の PDF をプレビューアに配信する
 - **入力**: 生成された PDF ファイル
 - **処理**:
-  - preview client は `(workspaceRoot, primaryInput, jobname)` から成る `Preview Target` を指定して `Preview Session Service` に接続し、service は同一 process かつ同一 target の間だけ再利用可能な sessionId を払い出す。process restart または target 変更時は sessionId を再発行し、旧 sessionId を失効させる
+  - preview client は `(workspaceRoot, primaryInput, jobname)` から成る `Preview Target` を loopback 上の `POST /preview/session` へ送信し、`Preview Session Service` は同一 process かつ同一 target の既存 session があれば再利用し、なければ新しい `sessionId` と `documentUrl` / `eventsUrl` を返す。process restart または target 変更時は sessionId を再発行し、旧 sessionId を失効させる
   - `Preview Session Service` が `Execution Policy.previewPublication` に照らして publish 可否を判定し、active job の `Preview Target` と session owner が一致する場合だけ `Preview Transport` を loopback に bind した `GET /preview/{sessionId}/document` で最新 PDF を配信する
   - 同じ session に対して `Preview Session Service` が `Preview Transport` の `WS /preview/{sessionId}/events` を介して target 付き `Preview Revision`、page count、view-state 更新を交換する
   - sessionId ごとに `Preview Session` を保持し、`Preview Target` と `Preview View State` として現在ページ、ページ内オフセット、ズーム倍率を保存する
   - PDF 更新時は保持済みの `Preview View State` を優先して再適用し、該当ページが消滅した場合のみ最近傍の有効ページへフォールバックする
 - **出力**: プレビューア上での更新された PDF 表示
 - **受け入れ基準**:
+  - Given preview client が `POST /preview/session` に `(workspaceRoot, primaryInput, jobname)` を送る, When 同一 process かつ同一 target の session が存在する, Then 同じ `sessionId` と `documentUrl` / `eventsUrl` が返る
   - Given loopback 上で `(workspaceRoot, primaryInput, jobname)` に紐づく preview session が確立済みで `GET /preview/{sessionId}/document` と `WS /preview/{sessionId}/events` に接続したプレビューア, When 同じ target の再コンパイル完了, Then 1秒以内に target 付き document revision 通知が届き閲覧ページ位置が維持される
   - Given 再コンパイル前に 20 ページ目を閲覧中で、再コンパイル後の PDF が 15 ページに短縮された場合, When プレビューが更新, Then 最近傍の有効ページである 15 ページ目へフォールバックしズーム倍率を維持する
-  - Given process restart 後または別 `Preview Target` へ切り替え後の古い `sessionId`, When 旧 session へ接続または publish を試みる, Then 旧 session は無効として拒否され、新しい sessionId の再取得が要求される
+  - Given process restart 後または別 `Preview Target` へ切り替え後の古い `sessionId`, When 旧 session へ接続または publish を試みる, Then 旧 session は `410 Gone` 相当で拒否され、新しい `POST /preview/session` による sessionId 再取得が要求される
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -1041,7 +1045,7 @@
 
 #### REQ-NF-007: pdfLaTeX 出力互換性
 
-- **説明**: `FTX-CORPUS-COMPAT-001` に対して、pdfLaTeX とレイアウト・リンク・埋め込み資産を含めて互換な PDF を生成する
+- **説明**: `FTX-CORPUS-COMPAT-001` に対して、pdfLaTeX とレイアウト・リンク・埋め込み資産を含めて互換な PDF を生成する。互換対象の engine surface は `FTX-ASSET-BUNDLE-001` と `FTX-CORPUS-COMPAT-001` が要求する e-TeX および package-facing pdfTeX 拡張プリミティブに限定し、XeTeX 固有プリミティブは本要件の範囲外とする
 - **定量基準**:
   - `FTX-CORPUS-COMPAT-001` の全 100 文書を文書単位で集計し、各文書について「全ページの行分割位置差分率 <= 5% かつ全ページのページ分割位置が一致」を満たす文書数が 95 文書以上である。ここで行分割位置差分率は、各ページごとに `|Ferritex の改行位置集合 △ pdfLaTeX の改行位置集合| / max(1, |pdfLaTeX の改行位置集合|)` を計算し、その文書内ページ平均を取った値とする
   - `FTX-CORPUS-COMPAT-001/navigation-features` の全文書で、正規化した PDF manifest 上の annotation 数、named destination 数、outline 階層、主要 metadata key（`Title`, `Author`）が 100% 一致する
@@ -1069,9 +1073,9 @@
 
 #### REQ-NF-010: エラーメッセージ品質
 
-- **説明**: エラーメッセージにファイル名・行番号・コンテキスト情報を含め、原因特定を容易にする
-- **定量基準**: 全エラーメッセージにファイル名と行番号が含まれる。可能な場合は修正候補を提示する
-- **優先度**: Should
+- **説明**: エラーメッセージにファイル名・行番号・要約メッセージ・コンテキスト snippet を含め、原因特定を容易にする
+- **定量基準**: 全エラーメッセージにファイル名・行番号・要約メッセージ・コンテキスト snippet が含まれる。可能な場合は修正候補を提示する
+- **優先度**: Must
 - **出典**: エージェント推測（pdfLaTeX のエラーメッセージの分かりにくさへの改善として）
 
 ## 5. 未確定事項
@@ -1079,13 +1083,13 @@
 
 | #   | 内容                                                                                                    | 関連要件         | 確認相手 |
 | --- | ----------------------------------------------------------------------------------------------------- | ------------ | ---- |
-| 1   | e-TeX 以外の拡張プリミティブ（pdfTeX 拡張、XeTeX 拡張）のサポート範囲。一部の LaTeX パッケージは pdfTeX 拡張プリミティブ（`\pdfliteral` 等）に依存している | REQ-FUNC-026 | 開発者  |
-| 2   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
+| 1   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
 ## 変更履歴
 
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.18 | 2026-03-16 | preview session bootstrap API、partition locator、pdfLaTeX 互換範囲、エラーメッセージ品質の必須項目を明文化し、未確定事項を整理 | Codex |
 | 0.1.17 | 2026-03-15 | `Runtime Options.jobname` への語彙統一、preview session の owner/lifecycle/policy 追加、active-job 限定の Output Artifact Registry 寿命、LSP 非ブロッキング read path を反映 | Codex |
 | 0.1.16 | 2026-03-15 | same-job readback の判定キーを主入力 + jobname に固定し、pass number を監査属性へ切り分け。メタ情報を最新版へ同期 | Codex |
 | 0.1.15 | 2026-03-15 | preview transport 契約、PDF 妥当性判定、tikz 回帰コーパス、group-scope 巻き戻し、bibliography / runtime options の責務境界を明確化 | Codex |
