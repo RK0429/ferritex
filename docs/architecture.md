@@ -115,7 +115,7 @@ graph TB
         Frontends[Entry Frontends<br>CLI / Watch / LSP / Preview]
         App[Application Services<br>Job Orchestrator / Scheduler / Snapshot Factory]
         Policy[Security & Policy Gate<br>ExecutionPolicy / FileAccessGate]
-        Core[Compilation Core<br>Parser / Typesetting / Incremental / Graphics / PDF / Font]
+        Core[Compilation Core<br>Parser / Typesetting / Incremental / Graphics / PDF / Font / Asset]
     end
 
     User --> Frontends
@@ -215,6 +215,8 @@ graph LR
     PreviewSvc --> Transport : publishes if allowed
     Scheduler --> Tools
 ```
+
+補足: `Scheduler --> Tools` は `WorkspaceJobScheduler` が job 実行の一環として `ShellCommandGateway` の起動を統括することを示す。実際の外部コマンド実行はコンパイルパイプライン（Parser → Bibliography → `ShellCommandGateway`）を経由し、`ExecutionPolicy` による許可判定を受ける。
 
 ## 5. コンポーネント分割
 
