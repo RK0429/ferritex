@@ -247,7 +247,7 @@ graph LR
 | `CacheMaintenanceService` | dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損検知を `Incremental Compilation` へ通知する |
 | `ExecutionPolicyFactory` | 入口ごとの差を吸収し、共通 `ExecutionPolicy` と `previewPublication` の既定制約を生成する |
 
-Stable Compile State は、最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影を指す。worker-local な未 commit 状態、失敗 pass の部分結果、進行中 barrier の中間結果は LSP から観測しない。
+Stable Compile State は、最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影を指す。具体的には `CompilationSession` 由来の `CommandRegistry` / `EnvironmentRegistry` と、`DocumentState` 由来の `CrossReferenceTable` / `BibliographyState` に加え、同じパッケージ読み込みプロセスの副産物である `PackageDocSnapshotCatalog`（active な class/package snapshot の説明資産）を含む。worker-local な未 commit 状態、失敗 pass の部分結果、進行中 barrier の中間結果は LSP から観測しない。
 
 ### 5.3 Infrastructure Adapters
 
