@@ -6,7 +6,7 @@
 | --- | --- |
 | バージョン | 0.1.5 |
 | 最終更新日 | 2026-03-17 |
-| ステータス | 提案 |
+| ステータス | ドラフト |
 | 入力 | [requirements.md](requirements.md) v0.1.19, [domain_model.md](domain_model.md) v0.1.21 |
 
 ## 1. 設計方針
