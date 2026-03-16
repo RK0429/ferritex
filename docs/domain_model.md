@@ -4,8 +4,8 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.20          |
-| 最終更新日 | 2026-03-16      |
+| バージョン | 0.1.21          |
+| 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
@@ -452,6 +452,25 @@ classDiagram
         +SourceLocation location
         +DefinitionOriginKind originKind
     }
+    class DocumentStateDelta {
+        <<ValueObject>>
+        +Map~String, int~ counterDeltas
+        +List~LabelInfo~ labelUpdates
+        +List~CitationInfo~ citationUpdates
+        +List~TocEntry~ tocUpdates
+        +List~IndexEntry~ indexUpdates
+        +List~OutlineDraftEntry~ navigationUpdates
+        +List~AuxWrite~ auxWrites
+    }
+    class GraphicsCommandStream {
+        <<ValueObject>>
+        +List~GraphicsDirective~ directives
+        +List~AssetRef~ referencedAssets
+    }
+    class DependencyEvents {
+        <<ValueObject>>
+        +List~DependencyEvent~ events
+    }
 
     Token <|-- ControlSequenceToken
     Token <|-- CharacterToken
@@ -531,11 +550,14 @@ classDiagram
     OutputArtifactRegistry ..> JobContext : validates
     Token --> SourceLocation
     DefinitionProvenance --> SourceLocation
+    CompilationSession ..> DocumentStateDelta : produces per partition
+    CompilationSession ..> GraphicsCommandStream : emits to graphics
+    CompilationSession ..> DependencyEvents : emits to incremental
 ```
 
 ### 3.2 タイプセッティング コンテキスト
 
-ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。複数行 display math は `DisplayMathBlock` / `AmsmathLayoutEngine` が表し、`align` 系の行揃え、`\intertext`、式番号付けを `MathAlignmentRow` / `EquationTag` として保持する。フロート配置は `[htbp!]` を `PlacementSpec` へ正規化し、確定した配置結果を `FloatPlacement` として `PageBox` に残す。
+ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。タイプセッティングコンテキストでは読み取り専用の共有エンティティとして参照するため `<<Shared Entity>>` と表記する。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。複数行 display math は `DisplayMathBlock` / `AmsmathLayoutEngine` が表し、`align` 系の行揃え、`\intertext`、式番号付けを `MathAlignmentRow` / `EquationTag` として保持する。フロート配置は `[htbp!]` を `PlacementSpec` へ正規化し、確定した配置結果を `FloatPlacement` として `PageBox` に残す。
 
 ```mermaid
 classDiagram
@@ -1040,6 +1062,11 @@ classDiagram
         <<ValueObject>>
         +Matrix3 matrix
     }
+    class GraphicsCommandStream {
+        <<Upstream ValueObject>>
+        +List~GraphicsDirective~ directives
+        +List~AssetRef~ referencedAssets
+    }
     class GraphicsCompiler {
         <<Service>>
         +compile(GraphicsCommandStream, PlacementContext) GraphicsBox
@@ -1071,6 +1098,7 @@ classDiagram
     VectorPath --> Transform
     ExternalGraphic --> Transform
     GraphicText --> Transform
+    GraphicsCompiler --> GraphicsCommandStream : consumes
     GraphicsCompiler --> PlacementContext
     GraphicsCompiler --> GraphicAssetResolver
 ```
@@ -1197,8 +1225,13 @@ classDiagram
         +usize maxSizeBytes
         +EvictionPolicy policy
     }
+    class DependencyEvents {
+        <<Upstream ValueObject>>
+        +List~DependencyEvent~ events
+    }
 
     DependencyGraph o-- DepNode
+    DependencyGraph ..> DependencyEvents : consumes to build graph
     DependencyGraphStore ..> DependencyGraph : loads / saves
     ChangeDetector ..> DependencyGraph : reads
     ChangeDetector ..> FileChange : input
@@ -2043,6 +2076,9 @@ stateDiagram-v2
 | アーティファクト生成者種別 (ArtifactProducerKind) | Output Artifact Registry が記録する生成主体種別。Ferritex 本体か、Ferritex が制御した外部ツールかを区別する | OutputArtifactRecord, ShellCommandGateway |
 | プレビューターゲット (PreviewTarget) | preview session / revision が紐づく対象文書の識別子。workspace root、primaryInput、jobname の組 | PreviewSession, PreviewRevision |
 | プレビュー公開ポリシー (PreviewPublicationPolicy) | `ExecutionPolicy` に内包される preview 配信専用の制約。loopback bind 限定、active job の最新 PDF のみ publish、session target 一致、target 変更または process restart 時の session 再発行規約を保持する | ExecutionPolicy, PreviewSessionService |
+| 文書状態デルタ (DocumentStateDelta) | 1 つの文書パーティションまたは 1 つの commit barrier ステージが生成する `DocumentState` への変更セット。カウンタ差分、ラベル/citation/TOC/索引/ナビゲーション更新、aux 書き出しを含む。`CommitBarrier` が `(passNumber, stageOrder, partitionId)` の total order でデルタを適用する | CommitBarrier, DocumentState, DocumentPartitionPlan |
+| グラフィックコマンドストリーム (GraphicsCommandStream) | パーサーが tikz/graphicx コマンドを処理した際に生成する描画指示列。描画ディレクティブと参照先資産を保持し、`GraphicsCompiler` が `GraphicsBox` へ変換する | GraphicsCompiler, GraphicsScene |
+| 依存イベント列 (DependencyEvents) | パース中に発生するファイル読み込み・マクロ定義/使用・ラベル定義・参照使用などの依存追跡イベント列。`DependencyGraph` の構築・更新に使い、差分コンパイルの変更検知基盤を供給する | DependencyGraph, ChangeDetector |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 | プレビュー配信契約 (PreviewTransport) | loopback に bind し、`PreviewSessionService` が `POST /preview/session` bootstrap 応答と session ごとの HTTP document endpoint / WebSocket events endpoint を公開するための双方向 port。`PreviewTarget` 付き revision 通知を配信し、view-state 更新を受信する | PreviewSession, PreviewRevision |
 
@@ -2082,6 +2118,7 @@ stateDiagram-v2
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
+| グラフィックコマンドストリーム (GraphicsCommandStream) | パーサー/マクロエンジンから供給される描画指示列。`GraphicsCompiler` の入力として消費される | GraphicsCompiler, GraphicsBox |
 | グラフィックシーン (GraphicsScene) | `tikz` / `graphicx` の結果を PDF 非依存のベクター・PDF グラフィック・ラスタ・テキスト要素へ正規化した描画単位 | GraphicsBox, GraphicNode |
 | GraphicsBox | 組版結果に埋め込める寸法付きの描画ボックス | GraphicsScene, PlacementContext |
 | GraphicGroup | tikz/pgf の group/scope に対応する階層ノード。継承スタイルと clip path を子ノードへ適用する | GraphicsScene, GraphicStyle, ClipPath |
@@ -2097,6 +2134,7 @@ stateDiagram-v2
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
+| 依存イベント列 (DependencyEvents) | パーサー/マクロエンジンから供給される依存追跡イベント列。ファイル読み込み・マクロ定義/使用・ラベル/参照を記録し、`DependencyGraph` の構築に使う | DependencyGraph, ChangeDetector |
 | 依存グラフ (DependencyGraph) | ファイル・マクロ・ラベル間の依存関係を表す有向グラフ。永続化は `DependencyGraphStore` port が担う | DepNode, 変更検知 |
 | 依存ノード (DepNode) | 依存グラフの頂点。ファイル/マクロ/ラベルのいずれか | DependencyGraph |
 | コンテンツハッシュ (ContentHash) | ファイル/ノード内容のハッシュ値。変更検知に使用 | ChangeDetector |
