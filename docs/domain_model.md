@@ -9,7 +9,7 @@
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.18 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.19 |
 
 ## 1. サブドメイン分類
 
