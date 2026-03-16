@@ -438,7 +438,7 @@ classDiagram
         +evaluate(ConditionKind, TokenStream) Branch
     }
     class ErrorRecovery {
-        <<Service : REQ-FUNC-006>>
+        <<Service>>
         +recover(ParseError, TokenStream) TokenStream
     }
     class SourceLocation {

@@ -133,7 +133,7 @@ graph TB
 
 ### 4.3 レベル3: Ferritex Runtime の主要コンポーネント
 
-この図の矢印は runtime 上の協調関係または port 利用方向を表し、静的な compile-time 依存を表さない。compile-time 依存規律は 3.3 の `entry-adapters -> application -> domain` と「infrastructure は port 実装側」に従う。
+この図の矢印は runtime 上の協調関係または port 利用方向を表し、静的な compile-time 依存を表さない。compile-time 依存規律は 3.3 の `entry-adapters -> application -> domain` と「infrastructure は port 実装側」に従う。本図は主要コンポーネントを抽出したものであり、Application Services の全容（`LspCapabilityService`, `CacheMaintenanceService` 等）は §5.2 を参照。
 
 ```mermaid
 graph LR
