@@ -220,6 +220,8 @@ graph LR
 
 ### 5.1 Compilation Core
 
+以下の 9 コンポーネントは `domain_model.md` の 8 境界づけられたコンテキストに対応する。Bibliography Integration はパーサー/マクロエンジンコンテキストのサブ責務として切り出したもの、Kernel Runtime は特定コンテキストに属さない共有基底モジュールであり、それぞれ独立した境界づけられたコンテキストではない。
+
 | コンポーネント | 責務 | 主な公開契約 |
 | --- | --- | --- |
 | Parser & Macro Engine | 字句解析、マクロ展開、条件分岐 (`REQ-FUNC-003`)、レジスタ管理 (`REQ-FUNC-004`)、エラー回復 (`REQ-FUNC-006`)、パッケージ読み込み、job/pass 状態管理、および `FTX-ASSET-BUNDLE-001` / `FTX-CORPUS-COMPAT-001` が要求する package-facing pdfTeX 拡張の互換層 | `CompilationSession`, `DocumentStateDelta`, `GraphicsCommandStream`, `DependencyEvents` |
