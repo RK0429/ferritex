@@ -2021,9 +2021,9 @@ stateDiagram-v2
 | カテゴリコード (Catcode) | 各文字に割り当てる種別コード（0〜15）。字句解析の挙動を制御 | トークン, CatcodeTable |
 | マクロ定義 (MacroDefinition) | `\def` 等で定義されたパターンと置換テキストの組。Definition Provenance を持ち、定義ジャンプの起点になる | マクロ展開, スコープ |
 | スコープ (Scope) | `{}` や `\begingroup`/`\endgroup` で区切られたマクロ・レジスタ・catcode の有効範囲。`ScopeStack` は frame ごとの差分を保持し、終了時に入口値へ巻き戻す | ScopeStack |
-| レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 | RegisterBank |
+| レジスタ (Register) | count, dimen, skip, toks, box 等の型付き記憶領域。e-TeX 拡張で 32768 個 (`REQ-FUNC-004`) | RegisterBank |
 | コンパイルジョブ (CompilationJob) | 1 回の compile/watch/LSP 再コンパイル要求を表す集約。最大 3 パスまでの `CompilationSession` を束ね、`DocumentState` / active-job 限定の `OutputArtifactRegistry` / `ExecutionPolicy` を pass 間で保持する。job 完了時に registry を invalidate する | CompilationSession, DocumentState, OutputArtifactRegistry |
-| コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリ、input stack、include 状態、current Job Context を保持する | CompilationJob, JobContext, InputStack, IncludeState |
+| コンパイルセッション (CompilationSession) | `CompilationJob` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、条件分岐評価 (`REQ-FUNC-003`)、エラー回復 (`REQ-FUNC-006`)、コマンド/環境レジストリ、input stack、include 状態、current Job Context を保持する | CompilationJob, JobContext, InputStack, IncludeState |
 | 入力スタック (InputStack) | 現在処理中の TeX 入力ファイル列を保持し、current-file 基準の解決コンテキストとネスト深度を供給するスタック | CompilationSession, InputSource, ResolutionContext |
 | include 状態 (IncludeState) | `\include` のガード対象と分離された `.aux` 出力先を保持する pass-local 状態 | CompilationSession, JobContext |
 | 解決コンテキスト (ResolutionContext) | current directory・ネスト深度・optional load 可否から成る資産解決用コンテキスト | InputStack, AssetResolver |
@@ -2100,7 +2100,7 @@ stateDiagram-v2
 | 依存グラフ (DependencyGraph) | ファイル・マクロ・ラベル間の依存関係を表す有向グラフ。永続化は `DependencyGraphStore` port が担う | DepNode, 変更検知 |
 | 依存ノード (DepNode) | 依存グラフの頂点。ファイル/マクロ/ラベルのいずれか | DependencyGraph |
 | コンテンツハッシュ (ContentHash) | ファイル/ノード内容のハッシュ値。変更検知に使用 | ChangeDetector |
-| 再コンパイル範囲 (RecompilationScope) | 変更の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
+| 再コンパイル範囲 (RecompilationScope) | 変更検知 (`REQ-FUNC-028`) の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
 | コンパイルキャッシュ (CompilationCache) | 差分再利用の論理集約。永続化は `CacheMetadataStore` と `BlobCacheStore` に分離され、`IncrementalCompilationCoordinator` からは一貫した cache 契約として見える | CacheEntry, IncrementalCompilationCoordinator |
 | コンパイルマージプラン (CompilationMergePlan) | 再構築ノードと再利用ノードの境界、および参照安定化の要否を表す計画 | IncrementalCompilationCoordinator |
 | 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
@@ -2151,7 +2151,7 @@ stateDiagram-v2
 | フォント feature 集合 (FontFeatureSet) | `Ligatures`, `Numbers`, `Script`, `Language` などの OpenType feature 指定を正規化した値 | FontSpec |
 | フォント fallback chain (FontFallbackChain) | 第 1 候補が解決できない場合に試す追加フォントファミリ列 | FontSpec, FontFamilyRef |
 | OpenType フォント | OTF/TTF 形式のモダンフォント。GPOS/GSUB テーブルで高度な組版を制御 | fontspec |
-| TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 | Computer Modern |
+| TFM フォント | TeX 固有のフォントメトリクスバイナリ形式 (`REQ-FUNC-018`) | Computer Modern |
 | グリフサブセット化 | 使用グリフのみを抽出してフォントデータを縮小する処理 | PDF 埋め込み |
 
 ### 5.8 開発者ツール コンテキスト
@@ -2171,7 +2171,7 @@ stateDiagram-v2
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
 | プレビューセッション (PreviewSession) | sessionId ごとの preview 状態。`PreviewTarget` を owner として保持し、同一 target かつ同一 process の間だけ再利用される。`PreviewSessionService.openSession` から bootstrap され、閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewTransport, PreviewViewState |
 | プレビュー表示状態 (PreviewViewState) | 現在ページ、ページ内オフセット、ズーム倍率など、プレビュー更新後も維持すべき閲覧位置。新 PDF のページ数に対して最近傍の有効ページへ clamp できる | PreviewSession |
-| RuntimeOptions | compile / watch / LSP の入口固有指定を `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` へ正規化した共通実行オプション。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
+| RuntimeOptions | compile (`REQ-FUNC-042`) / watch (`REQ-FUNC-044`) / LSP (`REQ-FUNC-045`) の入口固有指定を `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` へ正規化した共通実行オプション。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
 | AssetBundleRef | Asset Bundle の参照値。ファイルパスまたは組み込み識別子を区別して保持する | RuntimeOptions, CompileOptions, WatchOptions |
 | WorkspaceContext | プロジェクトルート、overlay roots、キャッシュ位置、利用可能な bundle 探索範囲/組み込み識別子をまとめた実行文脈 | ExecutionPolicyFactory |
 
@@ -2255,7 +2255,7 @@ stateDiagram-v2
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
 - **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。`ExecutionPolicy` はデフォルト上限として `commandTimeout = 30s`、`maxConcurrentProcesses = 1`、`maxCapturedOutputBytes = 4 MiB` を保持し、preview 配信については `previewPublication` に loopback 限定、active-job 限定、session target 一致、target 変更または process restart 時の session 再発行規約を保持する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root の readback は、まず current `JobContext` の `jobname` と主入力で same-job を確認し、次に `OutputArtifactRegistry` に記録された正規化パス・生成パス・生成者・コンテンツハッシュなどの artifact provenance で個別 artifact を trusted と確認した補助ファイルに限って許可する。`producedPass` は監査属性であり、same-job の一致条件には含めない。Ferritex が制御した外部ツールの生成物は `ShellCommandGateway` が trusted external artifact として同レジストリへ登録し、registry は active job 完了時に invalidate される
 - **根拠**:
-  - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれ、REQ-FUNC-024 / 047 / 048 は Ferritex 制御外部ツール生成物の provenance 記録を要求する
+  - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれ、REQ-FUNC-024 / REQ-FUNC-047 / REQ-FUNC-048 は Ferritex 制御外部ツール生成物の provenance 記録を要求する
   - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
   - 分離証人: `bibtex` を起動して `.bbl` を生成するケース。Policy + registry 連携モデルでは shell-escape 判定と trusted external artifact 登録を単一の gateway で完結できるが、入口ごとの分岐モデルでは許可判定と provenance 登録の所有者が分裂する
 - **等価性への影響**: 理論等価（外部仕様は同一で、実装の一貫性が向上する）
@@ -2303,7 +2303,7 @@ stateDiagram-v2
 - **関連コンテキスト**: PDF 生成 / グラフィック描画
 - **判断内容**: `PageRenderPlan` / `NavigationState` を `PdfDocument` へ落とす責務は `PdfRenderer` とし、配置済みリンクを `LinkAnnotationPlan` として受け取って `Annotation` へ変換する。外部ラスタ画像と外部 PDF の埋め込み形式決定は `GraphicResourceEncoder` に分離する
 - **根拠**:
-  - 観測事実: REQ-FUNC-013 / 015 / 016 / 022 / 023 は、通常のボックス組版、hyperref のメタデータ/しおり/リンク装飾、`graphicx` の画像埋め込み、tikz/pgf の描画結果が単一の PDF 出力面へ収束することを要求している
+  - 観測事実: REQ-FUNC-013 / REQ-FUNC-015 / REQ-FUNC-016 / REQ-FUNC-022 / REQ-FUNC-023 は、通常のボックス組版、hyperref のメタデータ/しおり/リンク装飾、`graphicx` の画像埋め込み、tikz/pgf の描画結果が単一の PDF 出力面へ収束することを要求している
   - 代替案: `PdfDocument` 自身の `render()` にすべての射影責務を押し込む
   - 分離証人: `\href{https://example.com}{link}` と `\hypersetup{colorlinks=true,pdftitle=...}` を含む文書のケース。分離モデルでは `PdfRenderer` が `PageRenderPlan` の `LinkAnnotationPlan` と `NavigationState` のメタデータ/しおりを統合し、`GraphicResourceEncoder` が imported PDF Form XObject を扱えるが、自己完結型 `PdfDocument` モデルではリンク矩形・装飾・外部グラフィック変換の責務がデータ構造へ混入する
 - **等価性への影響**: 理論等価（外部仕様は同一で、変換責務の境界が明確になる）
@@ -2327,7 +2327,7 @@ stateDiagram-v2
 - **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング / PDF 生成
 - **判断内容**: `\tableofcontents` / `\listoffigures` / `\listoftables` / `\makeindex` / hyperref が pass 間で共有する状態は `DocumentState` 内の `TableOfContentsState` / `IndexState` / `NavigationState` として保持する。`SectioningEngine` / `HyperrefExtension` がこれらを更新し、`TocTypesetter` / `IndexTypesetter` が box tree へ投影し、`PdfRenderer` が `NavigationState` と配置済みリンクを消費する
 - **根拠**:
-  - 観測事実: REQ-FUNC-012 / 015 / 022 は pass をまたぐ `.toc` / `.lof` / `.lot` / metadata / outline / link style の保持と、その後段の組版・PDF 射影を必要とする
+  - 観測事実: REQ-FUNC-012 / REQ-FUNC-015 / REQ-FUNC-022 は pass をまたぐ `.toc` / `.lof` / `.lot` / metadata / outline / link style の保持と、その後段の組版・PDF 射影を必要とする
   - 代替案: package 拡張内部または PDF 生成直前の一時構造として個別に保持する
   - 分離証人: `\tableofcontents` と `\printindex` と `\hypersetup{colorlinks=true}` を含む 2 パス文書。`DocumentState` 集約モデルでは前パス生成の目次/索引エントリと既定リンク装飾を同一所有者で保持し、後段で `TocTypesetter` / `IndexTypesetter` / `PdfRenderer` へ明示的に受け渡せるが、一時構造モデルでは pass 境界をまたいだ所有者が不明確になる
 - **等価性への影響**: 理論等価（外部仕様は同一で、pass 跨ぎ状態の所有境界が明確になる）
@@ -2339,7 +2339,7 @@ stateDiagram-v2
 - **関連コンテキスト**: タイプセッティング / PDF 生成
 - **判断内容**: `PageBox` は単なる node 列ではなく、配置済み `PlacedNode` と `PlacedDestination` を保持する。`PlacedNode` は `SourceSpan` と配置矩形を持ち、`SyncTexBuilder` がそこから `SyncTexData` を生成する。`PdfRenderer` は `PlacedDestination` を named destination 解決に用いる
 - **根拠**:
-  - 観測事実: REQ-FUNC-041 はソース位置と PDF 位置の双方向対応付けを要求し、REQ-FUNC-015 / 022 は internal destination をページ上の配置結果に解決する必要がある
+  - 観測事実: REQ-FUNC-041 はソース位置と PDF 位置の双方向対応付けを要求し、REQ-FUNC-015 / REQ-FUNC-022 は internal destination をページ上の配置結果に解決する必要がある
   - 代替案: SyncTeX と destination 解決を非公開の外部インデックスまたは PDF 生成時の暗黙状態に依存させる
   - 分離証人: `\section{Intro}\label{sec:intro}` と `\ref{sec:intro}` を含む文書。`PlacedNode` / `PlacedDestination` モデルでは見出しの source span と destination 座標を同じ page-scope 構造から得られるが、暗黙状態モデルでは SyncTeX と internal link 解決の入力が分裂する
 - **等価性への影響**: 理論等価（外部仕様は同一で、source-to-layout provenance の表現力が向上する）
@@ -2495,7 +2495,7 @@ stateDiagram-v2
 - **関連コンテキスト**: パーサー/マクロエンジン / フォント管理
 - **判断内容**: `fontspec` の `\setmainfont` / `\setsansfont` / `\setmonofont` と `TextStyle` のフォント要求は、生の文字列オプションのまま保持せず `FontSpec` へ正規化する。OpenType feature は `FontFeatureSet`、代替フォント列は `FontFallbackChain` で表現し、`FontManager` / `FontResolverCache` はこの canonical form をキーに解決する
 - **根拠**:
-  - 観測事実: REQ-FUNC-025 はフォント名解決、OpenType feature 適用、fallback chain を Should として要求し、REQ-FUNC-017/019 は OpenType 読み込みとフォント解決を要求している
+  - 観測事実: REQ-FUNC-025 はフォント名解決、OpenType feature 適用、fallback chain を Should として要求し、REQ-FUNC-017 / REQ-FUNC-019 は OpenType 読み込みとフォント解決を要求している
   - 代替案: `fontspec` オプション文字列を各 call site で個別解釈し、キャッシュキーは family 名だけにする
   - 分離証人: `\setmainfont{Noto Serif}[Ligatures=TeX,Numbers=OldStyle]` と記号用 fallback font を併用するケース。`FontSpec` モデルなら feature と fallback の差が解決キーと描画責務に残るが、文字列ばらまきモデルでは feature 差分と fallback 順序がキャッシュ境界から失われやすい
 - **等価性への影響**: 理論等価（外部仕様は同一で、fontspec の責務境界が明確になる）
@@ -2519,7 +2519,7 @@ stateDiagram-v2
 - **関連コンテキスト**: 開発者ツール / パーサー/マクロエンジン
 - **判断内容**: `diagnostics` / `completion` / `definition` / `hover` / `codeAction` は、保存済みファイルを個別に再読込するのではなく、`OpenDocumentStore` が保持する `OpenDocumentBuffer` と最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State から `LiveAnalysisSnapshot` を構築し、それを共通入力として扱う。LSP の read path は active compile/watch job の完了を待たず、常に直近の Stable Compile State を読み取る
 - **根拠**:
-  - 観測事実: REQ-FUNC-034/035/036/037 は保存前の `didChange` 状態に対して一貫した診断・補完・定義ジャンプ・hover を返す必要がある
+  - 観測事実: REQ-FUNC-034 / REQ-FUNC-035 / REQ-FUNC-036 / REQ-FUNC-037 は保存前の `didChange` 状態に対して一貫した診断・補完・定義ジャンプ・hover を返す必要がある
   - 代替案: provider ごとに保存済みファイルと最新コンパイル結果を別々に参照する
   - 分離証人: 未保存の `\label{fig:new}` 追加直後に `\ref{fig:` 補完と hover を引き、同時に diagnostics を更新するケース。`LiveAnalysisSnapshot` モデルでは全 provider が同じ buffer version を観測できるが、個別参照モデルでは completion だけ新しい label を見えて diagnostics/hover が古い状態を返しうる
 - **等価性への影響**: 理論等価（外部仕様は同一で、LSP の一貫した入力境界が明確になる）
@@ -2571,8 +2571,8 @@ stateDiagram-v2
 | 0.1.18 | 2026-03-15 | same-job readback の判定キーを jobname + 主入力へ固定し、LSP 入力境界を Stable Compile State 表現へ統一。メタ情報を最新版へ同期 | Codex |
 | 0.1.17 | 2026-03-15 | ScopeStack の group 巻き戻し責務、Stable Compile State、PreviewTransport/PreviewRevision、entry-point 非依存の RuntimeOptions を反映 | Codex |
 | 0.1.16 | 2026-03-12 | LSP の OpenDocumentBuffer/LiveAnalysisSnapshot を追加し、章固定の partition モデルを章/セクション両対応の document partition へ一般化 | Codex |
-| 0.1.15 | 2026-03-12 | CompletionIndex/HoverDocCatalog、FontSpec/FontFeatureSet/FallbackChain、章単位並列化の partition/merge 責務を追加し REQ-FUNC-025/032/035/037 のトレーサビリティを補強 | Codex |
-| 0.1.14 | 2026-03-12 | amsmath の複数行 display math、ファイル入力スタック/include 状態、フロート配置の入出力型を追加して REQ-FUNC-005/009/010/021 のトレーサビリティを補強 | Codex |
+| 0.1.15 | 2026-03-12 | CompletionIndex/HoverDocCatalog、FontSpec/FontFeatureSet/FallbackChain、章単位並列化の partition/merge 責務を追加し REQ-FUNC-025 / REQ-FUNC-032 / REQ-FUNC-035 / REQ-FUNC-037 のトレーサビリティを補強 | Codex |
+| 0.1.14 | 2026-03-12 | amsmath の複数行 display math、ファイル入力スタック/include 状態、フロート配置の入出力型を追加して REQ-FUNC-005 / REQ-FUNC-009 / REQ-FUNC-010 / REQ-FUNC-021 のトレーサビリティを補強 | Codex |
 | 0.1.13 | 2026-03-12 | フォント埋め込み計画器、tikz/pgf の階層 scope/clip/arrow、脚注キュー、preview view restore の必須化を反映 | Codex |
 | 0.1.12 | 2026-03-12 | 並列実行の snapshot/barrier 契約、watch set の依存グラフ同期、preview の最近傍ページ fallback を追加 | Codex |
 | 0.1.11 | 2026-03-12 | SyncTeX の fragment-based trace、watch scheduler/queue、preview session/view state を追加 | Codex |
