@@ -25,12 +25,12 @@ Ferritex は `REQ-NF-001` のフルコンパイル 1.0 秒未満、`REQ-NF-002` 
 
 ### 選択肢 B: ドメイン境界を持つモジュラーモノリス
 
-単一プロセスを維持しつつ、runtime path を構成するトップレベルのレイヤ crate は `ferritex-cli` / `ferritex-application` / `ferritex-core` / `ferritex-infra` に分ける。repo 直下には benchmark / compatibility harness 用の `ferritex-bench` を追加してよいが、これは runtime layer crate には含めない。ドメイン境界はまず `ferritex-core` 内の module として表現し、安定した narrow interface を持つものだけ独立 crate に昇格させる。`kernel` は数値/寸法演算、stable ID、source span などの基底型だけを置く shared base module とし、package/class/bibliography semantics や I/O を入れない。接続は ports and adapters とする。
+単一プロセスを維持しつつ、runtime を構成するトップレベルのレイヤ crate は `ferritex-cli` / `ferritex-application` / `ferritex-core` / `ferritex-infra` に分ける。repo 直下には benchmark / compatibility harness 用の `ferritex-bench` を追加してよいが、これは runtime layer crate には含めない。ドメイン境界はまず `ferritex-core` 内の module として表現し、安定した narrow interface を持つものだけ独立 crate に昇格させる。`kernel` は数値/寸法演算、stable ID、source span などの基底型だけを置く shared base module とし、package/class/bibliography semantics や I/O を入れない。接続は ports and adapters とする。
 
 - 利点:
-- IPC なしで低遅延を維持できる
-- 単一バイナリ配布を維持できる
-- crate と module の役割を分けて、過剰な分割を避けつつドメイン境界で変更コストを抑えられる
+  - IPC なしで低遅延を維持できる
+  - 単一バイナリ配布を維持できる
+  - crate と module の役割を分けて、過剰な分割を避けつつドメイン境界で変更コストを抑えられる
 - 欠点:
   - 境界規律を CI で守る必要がある
   - コンテキスト分割の設計コストがかかる
@@ -58,6 +58,15 @@ LSP、preview、compile、cache を別プロセスまたは別サービスに分
 - ドメインモデルに明確な境界が既に存在するため、技術レイヤ分割より自然である
 - 将来、一部を別 crate / 別 process に抽出する余地を残しつつ、現時点では最小の複雑性で済む
 - crate 昇格条件と依存方向を CI で検査すれば、境界規律を実装段階でも維持できる
+
+## 要件トレーサビリティ
+
+| 要件 | この ADR で固定する点 |
+| --- | --- |
+| `REQ-NF-001` / `REQ-NF-002` | 単一プロセスで IPC オーバーヘッドを排除し、フルコンパイル・差分コンパイルの遅延バジェットをプロセス境界に消費しない |
+| `REQ-NF-004` | LSP が compile と同一プロセス内の core を共有し、IPC なしで低遅延応答を実現する |
+| `REQ-NF-008` | 単一バイナリ + 共通 core により 3 OS で同一のドメインロジックを実行し、クロスプラットフォーム再現性を維持する |
+| `REQ-NF-009` | モジュラーモノリスを単一バイナリとして配布し、外部プロセス依存を持たない |
 
 ## 帰結
 

@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.18          |
+| バージョン | 0.1.19          |
 | 最終更新日 | 2026-03-16      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -1009,9 +1009,9 @@
 
 #### REQ-NF-003: メモリ使用量
 
-- **説明**: コンパイル時のメモリ使用量を合理的な範囲に抑える
-- **定量基準**: `FTX-BENCH-001` のコンパイル時ピークメモリ使用量 < 1GB
-- **計測方法**: `FTX-BENCH-001` を対象に RSS（Resident Set Size）で計測する
+- **説明**: フルコンパイルと `LiveAnalysisSnapshot` 構築を含むピークメモリ使用量を合理的な範囲に抑える
+- **定量基準**: `FTX-BENCH-001` のフルコンパイルと `LiveAnalysisSnapshot` 構築を含むピークメモリ使用量 < 1GB
+- **計測方法**: `FTX-BENCH-001` を対象にフルコンパイルと `LiveAnalysisSnapshot` 構築を同時実行した状態で RSS（Resident Set Size）のピークを計測する
 - **優先度**: Should
 - **出典**: ユーザー確認済み（2026-03-16）
 
@@ -1073,8 +1073,10 @@
 
 #### REQ-NF-010: エラーメッセージ品質
 
-- **説明**: エラーメッセージにファイル名・行番号・要約メッセージ・コンテキスト snippet を含め、原因特定を容易にする
-- **定量基準**: 全エラーメッセージにファイル名・行番号・要約メッセージ・コンテキスト snippet が含まれる。可能な場合は修正候補を提示する
+- **説明**: compile / watch / lsp / preview の全入口で、ユーザーが原因を特定し回復できるエラー応答を返す
+- **定量基準**:
+  - ソース診断（compile / watch / lsp）: 全エラーメッセージにファイル名・行番号・要約メッセージ・コンテキスト snippet が含まれる。可能な場合は修正候補を提示する
+  - セッション応答（preview）: session 失効（`410 Gone` 相当）を含む全エラー応答にエラー種別・対象 sessionId・回復手順（`POST /preview/session` による再取得）が含まれる
 - **優先度**: Must
 - **出典**: エージェント推測（pdfLaTeX のエラーメッセージの分かりにくさへの改善として）
 
@@ -1089,6 +1091,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.19 | 2026-03-16 | REQ-NF-003 の計測スコープを compile + LiveAnalysisSnapshot に拡張し、REQ-NF-010 の対象を preview session エラーに拡大 | Claude Opus 4.6 |
 | 0.1.18 | 2026-03-16 | preview session bootstrap API、partition locator、pdfLaTeX 互換範囲、エラーメッセージ品質の必須項目を明文化し、未確定事項を整理 | Codex |
 | 0.1.17 | 2026-03-15 | `Runtime Options.jobname` への語彙統一、preview session の owner/lifecycle/policy 追加、active-job 限定の Output Artifact Registry 寿命、LSP 非ブロッキング read path を反映 | Codex |
 | 0.1.16 | 2026-03-15 | same-job readback の判定キーを主入力 + jobname に固定し、pass number を監査属性へ切り分け。メタ情報を最新版へ同期 | Codex |
