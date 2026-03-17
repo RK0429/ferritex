@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.27          |
+| バージョン | 0.1.28          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.25 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.10 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.26 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.11 |
 
 ## 1. サブドメイン分類
 
@@ -482,7 +482,7 @@ classDiagram
     CompilationJob --> OutputArtifactRegistry
     CompilationJob --> ExecutionPolicy
     CompilationSession --> CatcodeTable
-    CompilationSession --> CompilationJob  %% back-reference to owner
+    CompilationSession --> CompilationJob : owner
     CompilationSession --> JobContext
     CompilationSession --> InputStack
     CompilationSession --> IncludeState
@@ -568,6 +568,22 @@ classDiagram
     CompilationSnapshot --> CommandRegistry
     CompilationSnapshot --> EnvironmentRegistry
     CompilationSnapshot --> DocumentState
+    class StageOrder {
+        <<Enumeration>>
+        MACRO_SESSION_DELTA
+        DOCUMENT_REFERENCE_BIBLIOGRAPHY
+        LAYOUT_PAGE_NUMBER_MERGE
+        ARTIFACT_EMISSION_CACHE_METADATA
+    }
+    class CommitBarrier {
+        <<ValueObject>>
+        +int passNumber
+        +StageOrder stageOrder
+        +String partitionId
+        +applyInOrder(List~DocumentStateDelta~, CompilationJob) void
+    }
+    CommitBarrier --> StageOrder
+    CompilationJob --> CommitBarrier : owns
 ```
 
 ### 3.2 タイプセッティング コンテキスト
@@ -1120,7 +1136,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。`CacheMaintenanceService` は dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。`CacheMaintenanceService` は dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知する。通知を受けた `IncrementalCompilationCoordinator` は dependency graph を invalidation 範囲の特定と watch-set refresh の補助にのみ使用し、出力生成はフルコンパイルへ fallback させる（`RecompilationScope.requiresFullRecompile = true`）。実際のスレッド実行はインフラストラクチャ層へ委譲する。
 
 ```mermaid
 classDiagram
@@ -2139,7 +2155,8 @@ stateDiagram-v2
 | include 状態 (IncludeState) | `\include` のガード対象と分離された `.aux` 出力先を保持する pass-local 状態 | CompilationSession, JobContext |
 | 解決コンテキスト (ResolutionContext) | current directory・ネスト深度・optional load 可否から成る資産解決用コンテキスト | InputStack, AssetResolver |
 | コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`CompilationSession` / `DocumentState` の確定済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentState |
-| コミットバリア (CommitBarrier) | 並列ステージの結果を決定的順序で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可される | CompilationJob, CompilationSnapshot |
+| コミットバリア (CommitBarrier) | 並列ステージの結果を `(passNumber, StageOrder, partitionId)` の total order で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可される | CompilationJob, CompilationSnapshot, StageOrder |
+| ステージ順序 (StageOrder) | `CommitBarrier` が `DocumentStateDelta` を適用する順序を決定する列挙型。macro/session delta → document/reference/bibliography state → layout/page-number merge → artifact emission/cache metadata の 4 段階 | CommitBarrier, DocumentStateDelta |
 | Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない | LiveAnalysisSnapshot, CompilationJob |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback の一致判定キーである jobname / 主入力と、順序・診断用の現在パス番号を分離して扱う | CompilationSession, OutputArtifactRegistry |
 | ファイルアクセスゲート (FileAccessGate) | `\input` / `\openin` / `\openout` / engine-temp / engine-readback などの I/O 要求を `ExecutionPolicy` と `OutputArtifactRegistry` に照らして許可/拒否する共通ゲート | FileAccessRequest, SandboxedFileHandle |
@@ -2689,6 +2706,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.28 | 2026-03-17 | §3.1 に `StageOrder` 列挙型と `CommitBarrier` 値オブジェクトを追加、§3.1 の `%%` コメントをラベル付き矢印に変更、§3.4 に cache 破損時の fallback 動作を明示、§5.1 に `StageOrder` 用語を追加し `CommitBarrier` 定義を拡充 | Claude Opus 4.6 |
 | 0.1.27 | 2026-03-17 | §3.4 に CacheMaintenanceService を追加、§3.8 に WorkspaceJobScheduler と LspCapabilityService を追加、§5.4 / §5.8 の用語集にそれぞれ追記、§3.1 に CompilationSession → CompilationJob の back-reference コメントを追加 | Claude Opus 4.6 |
 | 0.1.26 | 2026-03-17 | §3.2 DocumentState の read-only 表記から registerLabel を除き Mermaid note を追加、§3.6 PageRenderPlan の間接保持注記に PlacedDestination / LinkAnnotationPlan を追記 | Claude Opus 4.6 |
 | 0.1.25 | 2026-03-17 | メタ情報に architecture.md への参照を追加、§3.1 に LinkStyle/BorderStyle 重複定義の意図注記を追加、§3.6 に PageRenderPlan の source trace 間接保持注記を追加 | Claude Opus 4.6 |
