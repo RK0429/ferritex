@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.22          |
+| バージョン | 0.1.23          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -1034,11 +1034,11 @@
 #### REQ-NF-004: LSP 応答速度
 
 - **説明**: LSP サーバーの各操作がエディタ操作を阻害しない速度で応答する。read path は最新の `Stable Compile State` と `Open Document Buffer` を使い、active compile/watch job の完了を待たない
-- **定量基準**:
+- **定量基準**（キャッシュと `Stable Compile State` が構築済みの warm 状態で計測する）:
   - 診断更新: < 500ms（編集後）
   - 補完候補提示: < 100ms
   - 定義ジャンプ: < 200ms
-- **計測方法**: versioned benchmark profile `FTX-LSP-BENCH-001` の LSP trace を 1 回ウォームアップ後に 5 回再生し中央値を採用する
+- **計測方法**: versioned benchmark profile `FTX-LSP-BENCH-001` の LSP trace を warm 状態（キャッシュと `Stable Compile State` が構築済み）から 1 回ウォームアップ後に 5 回再生し中央値を採用する
 - **優先度**: Must
 - **出典**: ユーザー明示（REQ-FUNC-034 の受け入れ基準から導出）
 
@@ -1110,6 +1110,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.23 | 2026-03-17 | REQ-NF-004 の定量基準に warm 状態前提を明記 | Claude Opus 4.6 |
 | 0.1.22 | 2026-03-17 | REQ-NF-004 の計測対象を専用 benchmark profile `FTX-LSP-BENCH-001` として定義し、用語集に追加 | Claude Opus 4.6 |
 | 0.1.21 | 2026-03-17 | REQ-FUNC-024 を .bbl 読み込み＋参考文献組版（Must）と外部ツール連携 REQ-FUNC-024a（Should）に分割し、REQ-NF-007（Must）との優先度整合性を解消 | Claude Opus 4.6 |
 | 0.1.20 | 2026-03-17 | REQ-NF-004 に計測方法を追加、REQ-FUNC-024 に処理境界を明記、REQ-NF-007 に参考文献互換指標を追加、FTX-CORPUS-COMPAT-001 に .bbl 同梱前提を明記 | Claude Opus 4.6 |
