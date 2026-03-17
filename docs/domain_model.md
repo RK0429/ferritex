@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.28          |
+| バージョン | 0.1.29          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.26 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.11 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.27 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.12 |
 
 ## 1. サブドメイン分類
 
@@ -77,7 +77,7 @@ graph LR
 
 `CompilationJob` は最大 3 パスまでのコンパイル全体を表す集約であり、pass 間で共有される `DocumentState` / active-job 限定の `OutputArtifactRegistry` / `ExecutionPolicy` を所有する。`CompilationSession` はその内部の 1 パスを表し、カテゴリコード・レジスタ・スコープに加えて current-file 基準の解決、`\include` ガード、ネスト深度管理を担う `InputStack` / `IncludeState` などの pass-local 状態を保持する。パイプライン並列化を行う場合でも、各ステージが参照できるのは `CompilationSession` / `DocumentState` から導出した読み取り専用 snapshot のみであり、可変状態への commit は `CompilationJob` が所有する決定的 barrier で逐次に行う。`OutputArtifactRegistry` は job 完了時に invalidate され、process restart をまたいで再利用しない。
 
-注記: `LinkStyle` / `BorderStyle` は §3.2 タイプセッティングコンテキストにも同名・同構造で定義されている。これはコンテキスト間の型独立性を示すための意図的な重複であり、各コンテキストが upstream の型に依存しないことを明確にしている。
+注記: §3.1 で定義される型のうち、§3.2 以降で参照される共有型（`DocumentState` 子要素群、`LinkStyle` / `BorderStyle`、`DefinitionProvenance` / `SourceLocation` 等）はフィールド定義を §3.1 にのみ記載し、他セクションでは stereotype と参照先セクション番号のみを記載する。
 
 ```mermaid
 classDiagram
@@ -588,7 +588,7 @@ classDiagram
 
 ### 3.2 タイプセッティング コンテキスト
 
-ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。タイプセッティングコンテキストでは読み取り専用の共有エンティティとして参照するため `<<Shared Entity (read-only)>>` と表記する。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。複数行 display math は `DisplayMathBlock` / `AmsmathLayoutEngine` が表し、`align` 系の行揃え、`\intertext`、式番号付けを `MathAlignmentRow` / `EquationTag` として保持する。フロート配置は `[htbp!]` を `PlacementSpec` へ正規化し、確定した配置結果を `FloatPlacement` として `PageBox` に残す。
+ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。タイプセッティングコンテキストでは読み取り専用の共有エンティティとして参照するため `<<Shared Entity (read-only) — §3.1>>` と表記する。`DocumentState` 子要素群、`LinkStyle` / `BorderStyle`、`DefinitionProvenance` / `SourceLocation` 等の共有型はフィールド定義を省略し、stereotype に正規の定義セクションを付記する（§3.1 注記参照）。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。複数行 display math は `DisplayMathBlock` / `AmsmathLayoutEngine` が表し、`align` 系の行揃え、`\intertext`、式番号付けを `MathAlignmentRow` / `EquationTag` として保持する。フロート配置は `[htbp!]` を `PlacementSpec` へ正規化し、確定した配置結果を `FloatPlacement` として `PageBox` に残す。
 
 ```mermaid
 classDiagram
@@ -723,16 +723,10 @@ classDiagram
         +DefinitionProvenance provenance
     }
     class LinkStyle {
-        <<ValueObject>>
-        +bool colorLinks
-        +Color textColor
-        +BorderStyle border
+        <<ValueObject — §3.1>>
     }
     class BorderStyle {
-        <<ValueObject>>
-        +Color color
-        +Dimen width
-        +DashPattern dash
+        <<ValueObject — §3.1>>
     }
     class SectioningEngine {
         <<Service>>
@@ -796,133 +790,65 @@ classDiagram
         +Rect rect
     }
     class DocumentState {
-        <<Shared Entity (read-only)>>
-        +CounterStore counters
-        +CrossReferenceTable references
-        +BibliographyState bibliography
-        +AuxState aux
-        +TableOfContentsState toc
-        +IndexState index
-        +NavigationState navigation
-        +int passCount
-        +resolveLabel(String) ResolvedRef
+        <<Shared Entity (read-only) — §3.1>>
     }
-    note for DocumentState "タイプセッティングコンテキストでは read-only。\nregisterLabel 等の書き込み操作は\nパーサー/マクロエンジンコンテキスト\n(§3.1) からのみ呼ばれる"
+    note for DocumentState "フィールド定義は §3.1 を参照。\nタイプセッティングコンテキストでは read-only"
     class AuxState {
-        <<Entity>>
-        +List~AuxWrite~ pendingWrites
-        +mergePreviousPass(AuxSnapshot) void
+        <<Entity — §3.1>>
     }
     class TableOfContentsState {
-        <<Entity>>
-        +Map~TocKind, List~TocEntry~~ entries
-        +record(TocEntry) void
-        +mergePreviousPass(Map~TocKind, List~TocEntry~~) void
+        <<Entity — §3.1>>
     }
     class TocEntry {
-        <<ValueObject>>
-        +TocKind kind
-        +String title
-        +String number
-        +int pageNumber
-        +int level
-        +DefinitionProvenance provenance
+        <<ValueObject — §3.1>>
     }
     class IndexState {
-        <<Entity>>
-        +List~IndexEntry~ entries
-        +record(IndexEntry) void
-        +sortMakeindexCompatible() List~IndexEntry~
+        <<Entity — §3.1>>
     }
     class IndexEntry {
-        <<ValueObject>>
-        +String term
-        +String sortKey
-        +List~int~ pageNumbers
-        +DefinitionProvenance provenance
+        <<ValueObject — §3.1>>
     }
     class CrossReferenceTable {
-        <<Entity>>
-        +Map~String, LabelInfo~ labels
-        +List~UnresolvedRef~ unresolved
-        +isStable() bool
+        <<Entity — §3.1>>
     }
     class LabelInfo {
-        <<ValueObject>>
-        +String key
-        +String value
-        +int pageNumber
-        +DefinitionProvenance provenance
+        <<ValueObject — §3.1>>
     }
     class BibliographyState {
-        <<Entity>>
-        +CitationTable citations
-        +BblSnapshot bbl
-        +resolveCitation(String) CitationInfo
+        <<Entity — §3.1>>
     }
     class CitationTable {
-        <<Entity>>
-        +Map~String, CitationInfo~ entries
+        <<Entity — §3.1>>
     }
     class CitationInfo {
-        <<ValueObject>>
-        +String key
-        +String label
-        +String formattedText
-        +DefinitionProvenance traceProvenance
+        <<ValueObject — §3.1>>
     }
     class BblSnapshot {
-        <<ValueObject>>
-        +List~BibliographyEntry~ entries
+        <<ValueObject — §3.1>>
     }
     class BibliographyEntry {
-        <<ValueObject>>
-        +String key
-        +String renderedBlock
-        +DefinitionProvenance provenance
+        <<ValueObject — §3.1>>
     }
     class NavigationState {
-        <<Entity>>
-        +PdfMetadataDraft metadata
-        +List~OutlineDraftEntry~ outlineEntries
-        +Map~String, DestinationAnchor~ namedDestinations
-        +LinkStyle defaultLinkStyle
-        +recordOutline(OutlineDraftEntry) void
+        <<Entity — §3.1>>
     }
     class PdfMetadataDraft {
-        <<ValueObject>>
-        +String title
-        +String author
-        +String subject
-        +List~String~ keywords
+        <<ValueObject — §3.1>>
     }
     class OutlineDraftEntry {
-        <<ValueObject>>
-        +String title
-        +String destination
-        +int level
+        <<ValueObject — §3.1>>
     }
     class DestinationAnchor {
-        <<ValueObject>>
-        +String name
-        +DefinitionProvenance provenance
+        <<ValueObject — §3.1>>
     }
     class DefinitionProvenance {
-        <<ValueObject>>
-        +SourceLocation location
-        +DefinitionOriginKind originKind
+        <<ValueObject — §3.1>>
     }
     class SourceLocation {
-        <<ValueObject>>
-        +FilePath file
-        +int line
-        +int column
+        <<ValueObject — §3.1>>
     }
     class CounterStore {
-        <<Entity>>
-        +step(String) int
-        +set(String, int) void
-        +get(String) int
+        <<Entity — §3.1>>
     }
 
     Box <|-- HBox
@@ -1014,7 +940,7 @@ classDiagram
         +GraphicsScene scene
     }
     class GraphicsScene {
-        <<Entity>>
+        <<ValueObject>>
         +List~GraphicNode~ nodes
         +Rect viewport
     }
@@ -1094,9 +1020,7 @@ classDiagram
         +Matrix3 matrix
     }
     class GraphicsCommandStream {
-        <<Upstream ValueObject>>
-        +List~GraphicsDirective~ directives
-        +List~AssetRef~ referencedAssets
+        <<Upstream ValueObject — §3.1>>
     }
     class GraphicsCompiler {
         <<Service>>
@@ -1257,8 +1181,7 @@ classDiagram
         +EvictionPolicy policy
     }
     class DependencyEvents {
-        <<Upstream ValueObject>>
-        +List~DependencyEvent~ events
+        <<Upstream ValueObject — §3.1>>
     }
 
     DependencyGraph o-- DepNode
@@ -1372,7 +1295,7 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
-`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`PageRenderPlan` は `pageBox` と `graphics` をフィールドとして持ち、requirements.md の用語定義にある「placed destination」「リンク注釈計画」「source trace」は `PageBox` 内の `PlacedDestination` / `LinkAnnotationPlan` / `PlacedNode.sourceSpan` を介して間接的に保持される。`FontEmbeddingPlanner` は `TextRun` 群からページ横断の使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` と `ToUnicode CMap` を構築する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`PageRenderPlan` は `pageBox` と `graphics` をフィールドとして持ち、requirements.md の用語定義にある「placed destination」「リンク注釈計画」「source trace」は `PageBox` 内の `PlacedDestination` / `LinkAnnotationPlan` / `PlacedNode.sourceSpan` を介して間接的に保持される。`FontEmbeddingPlanner` は `TextRun` 群からページ横断の使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` と `ToUnicode CMap` を構築する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。upstream 型（`<<Upstream ... — §X.Y>>` と表記）はフィールド定義を省略し、正規の定義セクションを参照する。
 
 ```mermaid
 classDiagram
@@ -1394,96 +1317,52 @@ classDiagram
         +GraphicsScene graphics
     }
     class PageBox {
-        <<Upstream ValueObject>>
-        +List~PlacedNode~ content
-        +List~FloatPlacement~ floats
-        +Size size
-        +List~LinkAnnotationPlan~ linkAnnotations
-        +List~PlacedDestination~ destinations
+        <<Upstream ValueObject — §3.2>>
     }
     class FloatPlacement {
-        <<Upstream ValueObject>>
-        +FloatItem item
-        +FloatRegion region
-        +Rect rect
+        <<Upstream ValueObject — §3.2>>
     }
     class PlacedNode {
-        <<Upstream ValueObject>>
-        +Node node
-        +Rect rect
-        +SourceSpan sourceSpan
+        <<Upstream ValueObject — §3.2>>
     }
     class Node {
-        <<Upstream ValueObject>>
+        <<Upstream ValueObject — §3.2>>
     }
     class TextRun {
-        <<Upstream ValueObject>>
-        +GlyphSequence glyphs
-        +TextStyle style
+        <<Upstream ValueObject — §3.2>>
     }
     class TextStyle {
-        <<Upstream ValueObject>>
-        +FontSpec font
-        +Color fillColor
+        <<Upstream ValueObject — §3.2>>
     }
     class SourceSpan {
-        <<Upstream ValueObject>>
-        +SourceLocation start
-        +SourceLocation end
+        <<Upstream ValueObject — §3.2>>
     }
     class LinkAnnotationPlan {
-        <<Upstream ValueObject>>
-        +Rect rect
-        +LinkTarget target
-        +LinkStyle style
+        <<Upstream ValueObject — §3.2>>
     }
     class LinkTarget {
-        <<Upstream ValueObject>>
-        +LinkTargetKind kind
-        +String value
+        <<Upstream ValueObject — §3.2>>
     }
     class LinkStyle {
-        <<Upstream ValueObject>>
-        +bool colorLinks
-        +Color textColor
-        +BorderStyle border
+        <<Upstream ValueObject — §3.1>>
     }
     class BorderStyle {
-        <<Upstream ValueObject>>
-        +Color color
-        +Dimen width
-        +DashPattern dash
+        <<Upstream ValueObject — §3.1>>
     }
     class NavigationState {
-        <<Upstream Entity>>
-        +PdfMetadataDraft metadata
-        +List~OutlineDraftEntry~ outlineEntries
-        +Map~String, DestinationAnchor~ namedDestinations
-        +LinkStyle defaultLinkStyle
+        <<Upstream Entity — §3.1>>
     }
     class PdfMetadataDraft {
-        <<Upstream ValueObject>>
-        +String title
-        +String author
-        +String subject
-        +List~String~ keywords
+        <<Upstream ValueObject — §3.1>>
     }
     class OutlineDraftEntry {
-        <<Upstream ValueObject>>
-        +String title
-        +String destination
-        +int level
+        <<Upstream ValueObject — §3.1>>
     }
     class DestinationAnchor {
-        <<Upstream ValueObject>>
-        +String name
-        +DefinitionProvenance provenance
+        <<Upstream ValueObject — §3.1>>
     }
     class PlacedDestination {
-        <<Upstream ValueObject>>
-        +String name
-        +Rect rect
-        +DefinitionProvenance provenance
+        <<Upstream ValueObject — §3.2>>
     }
     class PdfMetadata {
         <<ValueObject>>
@@ -1557,10 +1436,10 @@ classDiagram
         +embed(List~FontSubsetPlan~) List~EmbeddedFont~
     }
     class FontManager {
-        <<Upstream Service>>
+        <<Upstream Service — §3.7>>
     }
     class GlyphSubsetter {
-        <<Upstream Service>>
+        <<Upstream Service — §3.7>>
     }
     class GraphicResourceEncoder {
         <<Service>>
@@ -2706,6 +2585,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.29 | 2026-03-17 | §3.2 / §3.6 の共有型・upstream 型のフィールド定義を削除し、stereotype + 正規セクション参照形式に統一（§3.1 注記参照）。§3.3 `GraphicsScene` を `<<ValueObject>>` に変更。§3.3 / §3.4 の upstream 型にも参照先を付記 | Claude Opus 4.6 |
 | 0.1.28 | 2026-03-17 | §3.1 に `StageOrder` 列挙型と `CommitBarrier` 値オブジェクトを追加、§3.1 の `%%` コメントをラベル付き矢印に変更、§3.4 に cache 破損時の fallback 動作を明示、§5.1 に `StageOrder` 用語を追加し `CommitBarrier` 定義を拡充 | Claude Opus 4.6 |
 | 0.1.27 | 2026-03-17 | §3.4 に CacheMaintenanceService を追加、§3.8 に WorkspaceJobScheduler と LspCapabilityService を追加、§5.4 / §5.8 の用語集にそれぞれ追記、§3.1 に CompilationSession → CompilationJob の back-reference コメントを追加 | Claude Opus 4.6 |
 | 0.1.26 | 2026-03-17 | §3.2 DocumentState の read-only 表記から registerLabel を除き Mermaid note を追加、§3.6 PageRenderPlan の間接保持注記に PlacedDestination / LinkAnnotationPlan を追記 | Claude Opus 4.6 |
