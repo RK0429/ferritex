@@ -6,6 +6,7 @@
 | 日付 | 2026-03-15 |
 | 著者 | ferritex team |
 | 関連ADR | ADR-0001 |
+| 反映先 | [architecture.md](../architecture.md) §3.1 採用パターン（commit 順序）, §5.1 Compilation Core（CompilationSnapshot）, §11.4 性能設計 |
 
 ## コンテキスト
 

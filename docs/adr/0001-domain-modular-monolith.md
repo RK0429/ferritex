@@ -6,6 +6,7 @@
 | 日付 | 2026-03-15 |
 | 著者 | ferritex team |
 | 関連ADR | なし |
+| 反映先 | [architecture.md](../architecture.md) §1 設計方針, §3.1 採用パターン, §5.1 Compilation Core, §6 推奨クレート構成 |
 
 ## コンテキスト
 
