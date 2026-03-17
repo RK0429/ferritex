@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.32          |
+| バージョン | 0.1.33          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.31 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.18 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.32 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.19 |
 
 ## 1. サブドメイン分類
 
@@ -545,7 +545,7 @@ classDiagram
     PackageExtension <|.. HyperrefExtension
     PackageExtension <|.. TikzExtension
     PackageExtension <|.. FontspecExtension
-    HyperrefExtension ..> NavigationState : populates
+    HyperrefExtension ..> DocumentStateDelta : emits navigation delta
     AssetResolver --> FileAccessGate : opens assets
     AssetResolver ..> ResolutionContext : resolves current-file relative
     FileAccessGate --> ExecutionPolicy
@@ -571,16 +571,61 @@ classDiagram
     CompilationSession ..> DependencyEvents : emits to incremental
     class CompilationSnapshot {
         <<ValueObject>>
-        +RegisterBank confirmedRegisters
-        +CommandRegistry confirmedCommands
-        +EnvironmentRegistry confirmedEnvironments
-        +DocumentState confirmedDocumentState
+        +RegisterBankView confirmedRegisters
+        +CommandRegistryView confirmedCommands
+        +EnvironmentRegistryView confirmedEnvironments
+        +DocumentStateView confirmedDocumentState
+    }
+    class RegisterBankView {
+        <<ValueObject>>
+        +get(RegisterKind, int) RegisterValue
+    }
+    class CommandRegistryView {
+        <<ValueObject>>
+        +lookup(String) ExecutableCommand
+    }
+    class EnvironmentRegistryView {
+        <<ValueObject>>
+        +lookup(String) ExecutableEnvironment
+    }
+    class DocumentStateView {
+        <<ValueObject>>
+        +CounterStoreView counters
+        +CrossReferenceTableView references
+        +BibliographyStateView bibliography
+        +AuxStateView aux
+        +TableOfContentsStateView toc
+        +IndexStateView index
+        +NavigationStateView navigation
+    }
+    class CounterStoreView {
+        <<ValueObject>>
+    }
+    class AuxStateView {
+        <<ValueObject>>
+    }
+    class TableOfContentsStateView {
+        <<ValueObject>>
+    }
+    class IndexStateView {
+        <<ValueObject>>
+    }
+    class NavigationStateView {
+        <<ValueObject>>
+    }
+    class CrossReferenceTableView {
+        <<ValueObject>>
+    }
+    class BibliographyStateView {
+        <<ValueObject>>
     }
     CompilationJob ..> CompilationSnapshot : derives read-only projection
-    CompilationSnapshot --> RegisterBank
-    CompilationSnapshot --> CommandRegistry
-    CompilationSnapshot --> EnvironmentRegistry
-    CompilationSnapshot --> DocumentState
+    CompilationSnapshot --> RegisterBankView
+    CompilationSnapshot --> CommandRegistryView
+    CompilationSnapshot --> EnvironmentRegistryView
+    CompilationSnapshot --> DocumentStateView
+    note for CompilationSnapshot "内部フィールドは commit 完了時点で凍結した read-only view であり、mutable aggregate を直接共有しない"
+    note for DocumentStateView "DocumentState から commit 完了時に導出される frozen read-only projection。公開面は commit 済み sub-state view に限定する"
     class StageOrder {
         <<Enumeration>>
         MACRO_SESSION_DELTA
@@ -601,7 +646,7 @@ classDiagram
 
 ### 3.2 タイプセッティング コンテキスト
 
-ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。タイプセッティングコンテキストでは読み取り専用の共有エンティティとして参照するため `<<Shared Entity (read-only) — §3.1>>` と表記する。`DocumentState` 子要素群、`LinkStyle` / `BorderStyle`、`DefinitionProvenance` / `SourceLocation` 等の共有型はフィールド定義を省略し、stereotype に正規の定義セクションを付記する（§3.1 注記参照）。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。複数行 display math は `DisplayMathBlock` / `AmsmathLayoutEngine` が表し、`align` 系の行揃え、`\intertext`、式番号付けを `MathAlignmentRow` / `EquationTag` として保持する。フロート配置は `[htbp!]` を `PlacementSpec` へ正規化し、確定した配置結果を `FloatPlacement` として `PageBox` に残す。
+ここで参照する `DocumentState` は、3.1 の `CompilationJob.documentState` と同一の共有エンティティであり、各 pass の `CompilationSession` から参照される。タイプセッティングコンテキストでは読み取り専用の共有エンティティとして参照するため `<<Shared Entity (read-only) — §3.1>>` と表記する。sectioning、式番号、navigation の更新は typesetting stage 内で `DocumentState` を直接 mutate せず、`SectioningEngine` / `AmsmathLayoutEngine` が `DocumentStateDelta` を生成し、`CommitBarrier` が順序付きに commit する。`DocumentState` 子要素群、`LinkStyle` / `BorderStyle`、`DefinitionProvenance` / `SourceLocation` 等の共有型はフィールド定義を省略し、stereotype に正規の定義セクションを付記する（§3.1 注記参照）。`PageBuilder` は `FloatQueue` と `FootnoteQueue` を所有し、脚注本文の収集、ページ下部への予約、あふれた脚注の次ページ繰り延べを同じページ分割境界で決定する。複数行 display math は `DisplayMathBlock` / `AmsmathLayoutEngine` が表し、`align` 系の行揃え、`\intertext`、式番号付けを `MathAlignmentRow` / `EquationTag` として保持する。フロート配置は `[htbp!]` を `PlacementSpec` へ正規化し、確定した配置結果を `FloatPlacement` として `PageBox` に残す。
 
 ```mermaid
 classDiagram
@@ -905,9 +950,9 @@ classDiagram
     AmsmathLayoutEngine --> DisplayMathBlock
     AmsmathLayoutEngine --> DocumentState
     AmsmathLayoutEngine --> CounterStore
+    AmsmathLayoutEngine ..> DocumentStateDelta : emits counter delta
     SectioningEngine --> DocumentState
-    SectioningEngine --> TableOfContentsState
-    SectioningEngine --> NavigationState
+    SectioningEngine ..> DocumentStateDelta : emits TOC/navigation delta
     TocTypesetter --> TableOfContentsState
     TocTypesetter --> DocumentState
     IndexTypesetter --> IndexState
@@ -1073,7 +1118,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。ここでの `CompilationCache` は差分再利用の論理集約であり、metadata の永続化は `CacheMetadataStore`、blob payload の永続化は `BlobCacheStore` が担う。metadata publish は durable な blob write 成功後にのみ許可され、missing blob を指す entry は integrity check で invalidation される。`CacheMaintenanceService` は dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知する。通知を受けた `IncrementalCompilationCoordinator` は dependency graph を invalidation 範囲の特定と watch-set refresh の補助にのみ使用し、出力生成はフルコンパイルへ fallback させる（`RecompilationScope.requiresFullRecompile = true`）。実際のスレッド実行はインフラストラクチャ層へ委譲する。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentStateView` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の primary source は前 pass で確定した `DocumentStateView.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）であり、cold start または TOC 未確定時は `IncrementalCompilationCoordinator` が実行する sectioning pre-scan で検出した sectioning command の `SourceSpan` と `DependencyGraph` のファイル間依存を fallback source とする。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。ここでの `CompilationCache` は差分再利用の論理集約であり、metadata の永続化は `CacheMetadataStore`、blob payload の永続化は `BlobCacheStore` が担う。metadata publish は durable な blob write 成功後にのみ許可され、missing blob を指す entry は integrity check で invalidation される。`CacheMaintenanceService` は dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知する。通知を受けた `IncrementalCompilationCoordinator` は dependency graph を invalidation 範囲の特定と watch-set refresh の補助にのみ使用し、出力生成はフルコンパイルへ fallback させる（`RecompilationScope.requiresFullRecompile = true`）。実際のスレッド実行はインフラストラクチャ層へ委譲する。
 
 ```mermaid
 classDiagram
@@ -1132,7 +1177,7 @@ classDiagram
     }
     class DocumentPartitionPlanner {
         <<Service>>
-        +plan(DependencyGraph, DocumentState) DocumentPartitionPlan
+        +plan(DependencyGraph, DocumentStateView) DocumentPartitionPlan
     }
     class DocumentPartitionPlan {
         <<ValueObject>>
@@ -1218,10 +1263,11 @@ classDiagram
     IncrementalCompilationCoordinator ..> CompilationJob : drives passes
     IncrementalCompilationCoordinator ..> DependencyGraph : reads
     DocumentPartitionPlanner ..> DependencyGraph : analyzes partition deps
-    DocumentPartitionPlanner ..> DocumentState : reads ref stability
+    DocumentPartitionPlanner ..> DocumentStateView : reads stable TOC
     DocumentPartitionPlanner --> DocumentPartitionPlan
     DocumentPartitionPlan o-- DocumentWorkUnit
     DocumentWorkUnit --> PartitionLocator
+    note for DocumentPartitionPlanner "前 pass の確定済み TOC を primary source とし、TOC 未確定時は sectioning pre-scan が検出した sectioning command の SourceSpan と DependencyGraph を fallback source に使う"
     PaginationMergeCoordinator ..> DocumentPartitionPlan : consumes
     PaginationMergeCoordinator ..> DocumentLayoutFragment : merges
     DocumentLayoutFragment --> PartitionLocator
@@ -1690,10 +1736,10 @@ classDiagram
     }
     class StableCompileState {
         <<ValueObject>>
-        +CommandRegistry commands
-        +EnvironmentRegistry environments
-        +CrossReferenceTable references
-        +BibliographyState bibliography
+        +CommandRegistryView commands
+        +EnvironmentRegistryView environments
+        +CrossReferenceTableView references
+        +BibliographyStateView bibliography
         +PackageDocSnapshotCatalog packageDocs
     }
     class PackageDocSnapshotCatalog {
@@ -1948,7 +1994,12 @@ classDiagram
     LiveAnalysisSnapshotFactory --> LiveAnalysisSnapshot
     LiveAnalysisSnapshot --> OpenDocumentBuffer
     LiveAnalysisSnapshot --> StableCompileState
+    StableCompileState --> CommandRegistryView
+    StableCompileState --> EnvironmentRegistryView
+    StableCompileState --> CrossReferenceTableView
+    StableCompileState --> BibliographyStateView
     StableCompileState --> PackageDocSnapshotCatalog
+    note for StableCompileState "最新 commit 済み状態から導出される frozen read-only projection"
     PackageDocSnapshotCatalog o-- PackageDocEntry
     PackageDocEntry o-- CommandDoc
     CompletionProvider --> CompletionIndex
@@ -2068,10 +2119,11 @@ stateDiagram-v2
 | 入力スタック (InputStack) | 現在処理中の TeX 入力ファイル列を保持し、current-file 基準の解決コンテキストとネスト深度を供給するスタック | CompilationSession, InputSource, ResolutionContext |
 | include 状態 (IncludeState) | `\include` のガード対象と分離された `.aux` 出力先を保持する pass-local 状態 | CompilationSession, JobContext |
 | 解決コンテキスト (ResolutionContext) | current directory・ネスト深度・optional load 可否から成る資産解決用コンテキスト | InputStack, AssetResolver |
-| コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`CompilationSession` / `DocumentState` の確定済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentState |
+| コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`RegisterBankView` / `CommandRegistryView` / `EnvironmentRegistryView` / `DocumentStateView` として commit 済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentStateView |
+| ドキュメント状態ビュー (DocumentStateView) | `DocumentState` から commit 完了時に導出される frozen read-only projection。`CounterStoreView` / `CrossReferenceTableView` / `BibliographyStateView` / `AuxStateView` / `TableOfContentsStateView` / `IndexStateView` / `NavigationStateView` を公開面として持つ | CompilationSnapshot, DocumentPartitionPlanner, StableCompileState |
 | コミットバリア (CommitBarrier) | 並列ステージの結果を `(passNumber, StageOrder, partitionId)` の total order で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可され、authority key が衝突した場合は winner を選ばず affected pass を sequential path へフォールバックさせる | CompilationJob, CompilationSnapshot, StageOrder |
 | ステージ順序 (StageOrder) | `CommitBarrier` が `DocumentStateDelta` を適用する順序を決定する列挙型。macro/session delta → document/reference/bibliography state → layout/page-number merge → artifact emission/cache metadata の 4 段階 | CommitBarrier, DocumentStateDelta |
-| Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない | LiveAnalysisSnapshot, CompilationJob |
+| Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の frozen read-only projection。`CommandRegistryView` / `EnvironmentRegistryView` / `CrossReferenceTableView` / `BibliographyStateView` を保持し、worker-local な未 commit 状態や失敗 pass の部分結果を含まない | LiveAnalysisSnapshot, CompilationJob |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback の一致判定キーである jobname / 主入力と、順序・診断用の現在パス番号を分離して扱う | CompilationSession, OutputArtifactRegistry |
 | ファイルアクセスゲート (FileAccessGate) | `\input` / `\openin` / `\openout` / engine-temp / engine-readback などの I/O 要求を `ExecutionPolicy` と `OutputArtifactRegistry` に照らして許可/拒否する共通ゲート | FileAccessRequest, SandboxedFileHandle |
 | 目次状態 (TableOfContentsState) | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 | DocumentState, TocEntry |
@@ -2157,10 +2209,11 @@ stateDiagram-v2
 | blob キャッシュストア (BlobCacheStore) | content-addressed な blob payload の保存 port。staging + atomic promote で durable に保存し、unreferenced blob の GC を担当する | CompilationCache, CacheEntry |
 | コンパイルマージプラン (CompilationMergePlan) | 再構築ノードと再利用ノードの境界、および参照安定化の要否を表す計画 | IncrementalCompilationCoordinator |
 | 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
-| 文書パーティション計画 (DocumentPartitionPlan) | 章またはセクション単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画 | DocumentPartitionPlanner, DocumentWorkUnit |
+| セクショニング事前走査 (sectioning pre-scan) | current pass の source を軽量走査して `\chapter` / `\section` 等の sectioning command とその `SourceSpan` を抽出する前処理。`DocumentPartitionPlanner` が TOC 未確定時の fallback boundary source として使う | IncrementalCompilationCoordinator, DocumentPartitionPlanner |
+| 文書パーティション計画 (DocumentPartitionPlan) | 章またはセクション単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画。境界認識は前 pass の確定済み TOC を primary source とし、TOC 未確定時は sectioning pre-scan が検出した sectioning command の `SourceSpan` と `DependencyGraph` を fallback source とする | DocumentPartitionPlanner, DocumentWorkUnit |
 | 文書ワークユニット (DocumentWorkUnit) | 1 つの章またはセクションに対応する入力ファイル、`partitionId`、`PartitionLocator`、輸入/輸出する参照、独立組版可否を表す単位 | DocumentPartitionPlan, PaginationMergeCoordinator |
 | パーティション種別 (PartitionKind) | 文書パーティションの種別。`chapter` / `section` など、`DocumentPartitionPlanner` が work unit を分類するための論理タグ | DocumentWorkUnit, DocumentPartitionPlan |
-| パーティション識別子 (partitionId) | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`CommitBarrier` の total order を決定するキーの 1 つ | DocumentWorkUnit, CommitBarrier |
+| パーティション識別子 (partitionId) | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。前 pass の確定済み TOC が使える限り安定であり、TOC 未確定の初回 pass では fallback boundary source に基づく暫定値を使う。`CommitBarrier` の total order を決定するキーの 1 つ | DocumentWorkUnit, CommitBarrier |
 | パーティション位置 (PartitionLocator) | 同一ファイル内でも章/セクション境界を一意に特定する論理位置。`entryFile`、見出しの `SourceSpan`、出現順 ordinal を組にして表す | DocumentWorkUnit, DocumentLayoutFragment |
 | ページ統合調停役 (PaginationMergeCoordinator) | 各文書パーティションの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | DocumentLayoutFragment, PaginationMergeResult |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果への metadata handle。ソースハッシュと blob hash を保持し、payload 本体は `BlobCacheStore` から取得する | CompilationCache, CacheMetadataStore, BlobCacheStore |
@@ -2385,7 +2438,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: パーサー/マクロエンジン / タイプセッティング / PDF 生成
-- **判断内容**: `\tableofcontents` / `\listoffigures` / `\listoftables` / `\makeindex` / hyperref が pass 間で共有する状態は `DocumentState` 内の `TableOfContentsState` / `IndexState` / `NavigationState` として保持する。`SectioningEngine` / `HyperrefExtension` がこれらを更新し、`TocTypesetter` / `IndexTypesetter` が box tree へ投影し、`PdfRenderer` が `NavigationState` と配置済みリンクを消費する
+- **判断内容**: `\tableofcontents` / `\listoffigures` / `\listoftables` / `\makeindex` / hyperref が pass 間で共有する状態は `DocumentState` 内の `TableOfContentsState` / `IndexState` / `NavigationState` として保持する。`SectioningEngine` / `HyperrefExtension` はこれらに対する `DocumentStateDelta` を生成し、`CommitBarrier` が job-scope の `DocumentState` へ反映する。`TocTypesetter` / `IndexTypesetter` が box tree へ投影し、`PdfRenderer` が `NavigationState` と配置済みリンクを消費する
 - **根拠**:
   - 観測事実: REQ-FUNC-012 / REQ-FUNC-015 / REQ-FUNC-022 は pass をまたぐ `.toc` / `.lof` / `.lot` / metadata / outline / link style の保持と、その後段の組版・PDF 射影を必要とする
   - 代替案: package 拡張内部または PDF 生成直前の一時構造として個別に保持する
@@ -2565,7 +2618,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 差分コンパイル / タイプセッティング
-- **判断内容**: REQ-FUNC-032 の章・セクション単位並列化は、実行スケジューリング自体ではなく、`DependencyGraph` / `DocumentState` を用いた独立パーティション判定を `DocumentPartitionPlanner` が、各パーティションの組版結果から逐次ページ番号と参照整合性を復元する処理を `PaginationMergeCoordinator` が所有する
+- **判断内容**: REQ-FUNC-032 の章・セクション単位並列化は、実行スケジューリング自体ではなく、`DependencyGraph` / `DocumentStateView` を用いた独立パーティション判定を `DocumentPartitionPlanner` が、各パーティションの組版結果から逐次ページ番号と参照整合性を復元する処理を `PaginationMergeCoordinator` が所有する。セクション境界の primary source は前 pass で確定した TOC とし、cold start または TOC 未確定時は sectioning pre-scan が検出した sectioning command の `SourceSpan` と `DependencyGraph` のファイル間依存へ fallback する
 - **根拠**:
   - 観測事実: REQ-FUNC-032 は章間だけでなく、chapter を持たない文書クラスでは section 単位の独立性判定、並列組版、結果マージとページ番号統合も要求している
   - 代替案: インフラストラクチャ層の scheduler が heuristic に章だけを分割し、統合も単純連結に任せる
@@ -2609,7 +2662,7 @@ stateDiagram-v2
 | BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に、named destination は `PlacedDestination` に正規化される。`LinkStyle.textColor` は必要に応じて `TextRun.style.fillColor` へコピーされ、`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / text color / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
 | BR-17 | SyncTeX は `PageBox` に含まれる `PlacedNode` の `SourceSpan` と配置矩形から `SyncTexBuilder` が `SyncTraceFragment` 群を生成し、forward search では SourceLocation に交差する fragment 群を、inverse search では `PdfPosition` を含む fragment に対応する `SourceSpan` を返す | REQ-FUNC-041 | タイプセッティング / PDF 生成 |
 | BR-18 | watch 実行中の追加変更は `RecompileScheduler` が `PendingChangeQueue` へ集約し、コンパイル中に並列実行せず、現在のコンパイル完了後に coalesce 済み変更集合で再コンパイルする。各コンパイル完了後は最新 `DependencyGraph` から `FileWatcher.watchedPaths` を再同期する | REQ-FUNC-038 / REQ-FUNC-039 | 開発者ツール / 差分コンパイル |
-| BR-19 | PDF プレビュー配信は `PreviewSessionService` が `PreviewTarget` ごとに session を発行・失効管理し、上位 adapter から委譲された bootstrap request に対して session を返す。`ExecutionPolicy.previewPublication` に照らして active job の target と session owner が一致する場合だけ publish 可否を判定する。`PreviewTransport` は session ごとの HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。`PreviewSession` は `PreviewViewState` を保持して PDF 更新時に保存済みの同じページ位置とズームを再適用し、保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする。target 変更または process restart 時の旧 session は `410 Gone` 相当で拒否する | REQ-FUNC-040 | 開発者ツール |
+| BR-19 | PDF プレビュー配信は `PreviewSessionService` が `PreviewTarget` ごとに session を発行・失効管理し、上位 adapter から委譲された bootstrap request に対して session を返す。policy 判定は publish phase でのみ行い、`ExecutionPolicy.previewPublication` に照らして active job の target と session owner が一致する場合だけ publish 可否を判定する。`PreviewTransport` は session ごとの HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。`PreviewSession` は `PreviewViewState` を保持して PDF 更新時に保存済みの同じページ位置とズームを再適用し、保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする。target 変更または process restart 時の旧 session は `410 Gone` 相当で拒否する | REQ-FUNC-040 | 開発者ツール |
 | BR-20 | PDF フォント埋め込みは `FontEmbeddingPlanner` が `TextRun` 群から使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して subset font と ToUnicode CMap を生成する | REQ-FUNC-014 / REQ-FUNC-017 | PDF 生成 / フォント管理 |
 | BR-21 | tikz/pgf の描画は `GraphicGroup` が継承スタイルと clip path を保持し、`VectorPath` が path ごとの矢印指定を保持したまま PDF 射影へ渡される | REQ-FUNC-023 | グラフィック描画 / PDF 生成 |
 | BR-22 | 脚注は `FootnoteQueue` に蓄積され、`PageBuilder` が現在ページ下部へ予約できる脚注だけを `FootnotePlacement` として確定し、残りを次ページへ繰り延べる | REQ-FUNC-008 | タイプセッティング |
@@ -2619,13 +2672,14 @@ stateDiagram-v2
 | BR-26 | LSP 補完は `CompletionIndex` が `LiveAnalysisSnapshot` から active な command/environment registry、未保存 buffer、label/citation 状態を再構築し、package-aware な command/environment 候補と `\ref` / `\cite` 候補だけを返す | REQ-FUNC-035 | パーサー/マクロエンジン / 開発者ツール |
 | BR-27 | LSP hover は `HoverDocCatalog` が `LiveAnalysisSnapshot.stableState.packageDocs` から active な class/package snapshot の説明資産をコマンド単位に索引化し、構文・要約・使用例を返す | REQ-FUNC-037 | パーサー/マクロエンジン / 開発者ツール |
 | BR-28 | `fontspec` によるフォント指定は `FontSpec` へ正規化され、OpenType feature は `FontFeatureSet`、代替フォント列は `FontFallbackChain` で保持される。`FontManager` / `FontResolverCache` はこの canonical form を解決キーとして扱う | REQ-FUNC-025 / REQ-FUNC-017 / REQ-FUNC-019 | パーサー/マクロエンジン / フォント管理 |
-| BR-29 | 章またはセクション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立パーティションだけを `partitionId` と `PartitionLocator` 付き `DocumentWorkUnit` として抽出し、`PaginationMergeCoordinator` が同じ組を持つ `DocumentLayoutFragment` を順序付きに統合して sequential compile と同じページ番号へ復元する | REQ-FUNC-032 | 差分コンパイル / タイプセッティング |
+| BR-29 | 章またはセクション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentStateView` から独立パーティションだけを `partitionId` と `PartitionLocator` 付き `DocumentWorkUnit` として抽出し、`PaginationMergeCoordinator` が同じ組を持つ `DocumentLayoutFragment` を順序付きに統合して sequential compile と同じページ番号へ復元する。境界認識は前 pass の確定済み TOC を primary source とし、TOC 未確定時は sectioning pre-scan が検出した sectioning command の `SourceSpan` と `DependencyGraph` のファイル間依存へ fallback する | REQ-FUNC-032 | 差分コンパイル / タイプセッティング |
 | BR-30 | LSP の diagnostics/completion/definition/hover/codeAction は `OpenDocumentStore` 上の未保存 `OpenDocumentBuffer` を優先し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を共通入力として評価する。read path は active compile/watch job の完了を待たず、必要なら次回の background recompile だけを coalesce する | REQ-FUNC-034 / REQ-FUNC-035 / REQ-FUNC-036 / REQ-FUNC-037 | 開発者ツール / パーサー/マクロエンジン |
 
 ## 変更履歴
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.33 | 2026-03-17 | `CompilationSnapshot` / `StableCompileState` を frozen read-only view 契約で表現し、`DocumentStateDelta` を Hyperref/Typesetting 更新経路へ明示。`DocumentPartitionPlanner` の TOC primary / parser fallback 境界と `partitionId` の暫定性、preview bootstrap と publish の責務境界を文書全体で統一 | Codex |
 | 0.1.32 | 2026-03-17 | §3.1 / §5.1 に bibliography freshness metadata（`BibliographyInputFingerprint` / `BibliographyToolchain`）を追加し、toolchain 選択と sidecar 更新計画の owner を `Bibliography Integration`、`.bbl` 更新後の invalidation / 同一 job 内の追加 pass を `IncrementalCompilationCoordinator` へ固定。§3.4 の `CompilationCache` を論理集約へ整理し `CacheMetadataStore` / `BlobCacheStore` port と durability 順序を追記、§3.8 / §5.8 の `CompileJobService` caller 定義・`traceFontTasks` 正規化経路・preview transport/adapter 境界を統一し、§5.1 / BR-6 に `CommitBarrier` conflict fallback 規則、§6.7 / BR-8 に pre-generated `.bbl` readback 例外を追記 | Codex |
 | 0.1.31 | 2026-03-17 | §5.1 用語集に `StableId`（安定識別子）と `DimensionValue`（寸法値）の定義を追加し `architecture.md` §5.1 Kernel Runtime の公開契約との整合を確保 | Claude Opus 4.6 |
 | 0.1.30 | 2026-03-17 | §3.4 に `CacheMaintenanceService` のアプリケーション層配置理由を示す Mermaid note を追加、§3.8 の `RecompileScheduler` / `ExecutionPolicyFactory` / `LiveAnalysisSnapshotFactory` / `PreviewSessionService` のステレオタイプを `<<Service>>` から `<<Application Service>>` に修正し architecture.md §5.2 の分類と統一 | Claude Opus 4.6 |

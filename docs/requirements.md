@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.31          |
+| バージョン | 0.1.32          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -77,7 +77,7 @@
 | FTX-BENCH-001 の相対速度    | 1x               | pdfLaTeX 比 50x 以上（最低基準）、100x 以上（目標）|
 | LaTeX 互換性        | —                | 主要パッケージを含む標準的な論文がコンパイル可能 |
 
-※ 絶対速度と相対速度は同じ benchmark profile `FTX-BENCH-001` で判定し、詳細条件は `REQ-NF-001` / `REQ-NF-002` に定義する。相対速度 50x は最低基準（これを下回ると PoC として不成立）、100x は目標基準とする。
+※ 絶対速度と相対速度は同じ benchmark profile `FTX-BENCH-001` で判定し、詳細条件は `REQ-NF-001` / `REQ-NF-001a` に定義する。相対速度 50x は最低基準（これを下回ると PoC として不成立）、100x は目標基準とする。
 
 
 ## 2. 用語集
@@ -113,7 +113,7 @@
 | Artifact Producer Kind | Output Artifact Registry が記録する生成主体種別。Ferritex 本体が生成した成果物か、Ferritex が制御した外部ツールが生成した成果物かを区別する |
 | Compilation Job | 1 回の `compile` / `watch` / LSP 再コンパイル要求に対応する単位。最大 3 パスまでの `Compilation Session` を束ね、参照状態と出力 artifact provenance を pass 間で保持する |
 | Compilation Session | `Compilation Job` 内の 1 パスで共有される可変 TeX 状態。カテゴリコード、レジスタ、スコープ、コマンド/環境レジストリを保持する |
-| Compilation Snapshot | 並列ステージ境界で共有する読み取り専用のコンパイル状態スナップショット。マクロ・レジスタ・文書状態の確定済み部分を含み、並列タスクから破壊的更新しない |
+| Compilation Snapshot | 並列ステージ境界で共有する frozen read-only のコンパイル状態スナップショット。マクロ・レジスタ・文書状態の commit 済み部分だけを含み、並列タスクから破壊的更新しない |
 | Commit Barrier | 並列ステージの結果を決定的な順序で `Compilation Job` へ反映する同期点。可変状態の commit はここでのみ行う |
 | Output Artifact Registry | Ferritex または Ferritex が制御した外部ツール実行で生成された readback 対象補助ファイルの正規化パス、主入力、artifact kind、jobname、生成パス番号、生成者種別、生成パス、コンテンツハッシュを記録する active-job 限定の in-memory 台帳。trusted readback の same-job 判定キーは主入力と jobname であり、生成パス番号は監査属性として保持する。job 完了または process restart 時に無効化し、append-only manifest は監査専用とする |
 | Job Context | `Compilation Job` 内の現在パスを識別する jobname・主入力・現在パス番号の組。same-job readback の一致判定は jobname と主入力で行い、現在パス番号は出力命名・順序・診断のために使う |
@@ -141,7 +141,7 @@
 | Preview Transport | loopback のみへ bind し、session ごとの document / events endpoint を提供する preview 配信契約。session bootstrap は別責務とし、`Preview Session Service` が決定した `sessionId` / `documentUrl` / `eventsUrl` に基づいて `GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で `Preview Revision` 更新通知と view-state 更新を扱う |
 | Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
 | Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
-| Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
+| Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の frozen read-only projection。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
 | Live Analysis Snapshot | `Open Document Buffer` と Stable Compile State（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
 | Partition Kind | 文書パーティションの種別。`chapter` / `section` など、`DocumentPartitionPlanner` が work unit を分類するための論理タグ |
 | Partition ID | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`Commit Barrier` の total order の一部として使う |
@@ -1030,7 +1030,15 @@
 
 - **説明**: versioned benchmark profile `FTX-BENCH-001` をフルコンパイルで 1.0 秒未満に処理する
 - **定量基準**: `FTX-BENCH-001`（100 ページ、`amsmath` + `hyperref` + `graphicx`、4 コア以上の CPU、同一入力・同一マシンで pdfLaTeX baseline と比較）に対して、`--no-cache` 指定のフルコンパイル完了時間の中央値が 1.0 秒未満である
-- **計測方法**: `FTX-BENCH-001` の入力を同一マシンで 1 回ウォームアップ後に 5 回計測し中央値を採用する。相対速度比較も同一 profile・同一マシンで実施する
+- **計測方法**: `FTX-BENCH-001` の入力を同一マシンで 1 回ウォームアップ後に 5 回計測し中央値を採用する。pdfLaTeX baseline との相対速度比較条件は `REQ-NF-001a` に委譲する
+- **優先度**: Must
+- **出典**: ユーザー明示
+
+#### REQ-NF-001a: フルコンパイル相対速度
+
+- **説明**: versioned benchmark profile `FTX-BENCH-001` を、同一入力・同一マシン上の pdfLaTeX baseline より十分高速に処理する
+- **定量基準**: `FTX-BENCH-001` に対して、同一入力・同一マシンで測定した pdfLaTeX フルコンパイル時間中央値との比が 50x 以上である。50x を最低基準、100x を目標基準とする
+- **計測方法**: `FTX-BENCH-001` の入力を同一マシンで pdfLaTeX / Ferritex の双方について 1 回ウォームアップ後に 5 回ずつ計測し、中央値の比を採用する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -1124,13 +1132,14 @@
 | --- | ----------------------------------------------------------------------------------------------------- | ------------ | ---- |
 | 1   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
 | 2   | Ferritex Asset Bundle の初回セットアップ時の取得戦略。自動ダウンロード / 手動配置 / バイナリ同梱のいずれを採用するか。`cargo install ferritex` 後のユーザー体験に影響する | REQ-NF-009, REQ-FUNC-046 | 開発者  |
-| 3   | pdfLaTeX 比 100x の達成可能性。成功基準（§1.6）では 50x を最低基準、100x を目標基準とし、PoC で律速ステージの確認が必要。`architecture.md` §12 でもリスクとして識別済み | REQ-NF-001 | 開発者  |
+| 3   | pdfLaTeX 比 100x の達成可能性。成功基準（§1.6）では 50x を最低基準、100x を目標基準とし、PoC で律速ステージの確認が必要。`architecture.md` §12 でもリスクとして識別済み | REQ-NF-001a | 開発者  |
 
 ## 変更履歴
 
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.32 | 2026-03-17 | §1.6 の相対速度参照先を `REQ-NF-001a` へ分離し、非機能要件に pdfLaTeX baseline 比 50x/100x の相対速度要件を追加。未確定事項の関連要件も同期 | Codex |
 | 0.1.31 | 2026-03-17 | `REQ-FUNC-024` / `REQ-FUNC-024a` に bibliography freshness fingerprint・manual `.bbl` workflow・toolchain 選択・同一 `CompilationJob` 内の再実行境界を追加し、`REQ-NF-006` に pre-generated `.bbl` の read-only 例外を反映、`REQ-FUNC-040` と用語集に `no-store` 配信契約と preview bootstrap / transport 境界を反映、`REQ-FUNC-033` / `REQ-FUNC-043` に `FontTaskTrace` の `stderr` 出力契約と `Runtime Options.traceFontTasks` を追加し、`REQ-FUNC-044` に watch の option 継承境界、`REQ-FUNC-045` に LSP background compile の固定既定値、`REQ-FUNC-042` / `REQ-FUNC-048` に output root と既定値の明文化を追加 | Codex |
 | 0.1.30 | 2026-03-17 | `REQ-FUNC-024` の `.bbl` 古さ判定基準をコンテンツハッシュ比較として明確化 | Claude Opus 4.6 |
 | 0.1.29 | 2026-03-17 | `FTX-BENCH-001` のハードウェア条件に物理メモリ下限（8 GiB 以上）を追加し、計測結果の再現性を強化 | Claude Opus 4.6 |
