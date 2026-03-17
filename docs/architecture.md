@@ -4,10 +4,10 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| バージョン | 0.1.5 |
+| バージョン | 0.1.6 |
 | 最終更新日 | 2026-03-17 |
 | ステータス | ドラフト |
-| 入力 | [requirements.md](requirements.md) v0.1.19, [domain_model.md](domain_model.md) v0.1.21 |
+| 入力 | [requirements.md](requirements.md) v0.1.20, [domain_model.md](domain_model.md) v0.1.22 |
 
 ## 1. 設計方針
 
@@ -216,7 +216,7 @@ graph LR
     Scheduler --> Tools
 ```
 
-補足: `Scheduler --> Tools` は `WorkspaceJobScheduler` が job 実行の一環として `ShellCommandGateway` の起動を統括することを示す。実際の外部コマンド実行はコンパイルパイプライン（Parser → Bibliography → `ShellCommandGateway`）を経由し、`ExecutionPolicy` による許可判定を受ける。
+補足: `Scheduler --> Tools` の詳細は §7.1 ステップ 3〜5 を参照。実際の外部コマンド実行は `ExecutionPolicy` による許可判定を受ける。
 
 ## 5. コンポーネント分割
 
@@ -405,8 +405,8 @@ runtime path のトップレベル crate はレイヤ境界として使い、`fe
 
 - **計測対象**: `FTX-ASSET-BUNDLE-001` 前提で `FTX-CORPUS-COMPAT-001` に対する pdfLaTeX とのレイアウト互換、および `FTX-CORPUS-COMPAT-001/navigation-features` / `FTX-CORPUS-COMPAT-001/embedded-assets` に対する PDF 機能互換
 - **スコープ**: 互換対象の engine surface は `FTX-ASSET-BUNDLE-001` と `FTX-CORPUS-COMPAT-001` が要求する e-TeX および package-facing pdfTeX 拡張プリミティブに限定し、XeTeX 固有プリミティブは v1 の対象外とする
-- **閾値**: 文書単位で 95/100 文書以上が「全ページの行分割位置差分率 <= 5% かつページ分割位置一致」を満たす。行分割位置差分率はページごとに `|Ferritex の改行位置集合 △ pdfLaTeX の改行位置集合| / max(1, |pdfLaTeX の改行位置集合|)` を計算し、その文書内ページ平均を取る。feature subset は annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数まで 100% 一致する
-- **計測方法**: `ferritex-bench` で `FTX-CORPUS-COMPAT-001` を `FTX-ASSET-BUNDLE-001` 前提で実行し、レイアウト差分は文書単位で集計する。feature subset は annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数を正規化した manifest で比較する
+- **閾値**: 文書単位で 95/100 文書以上が「全ページの行分割位置差分率 <= 5% かつページ分割位置一致」を満たす。行分割位置差分率はページごとに `|Ferritex の改行位置集合 △ pdfLaTeX の改行位置集合| / max(1, |pdfLaTeX の改行位置集合|)` を計算し、その文書内ページ平均を取る。feature subset は annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数まで 100% 一致する。参考文献を含む文書では citation label・エントリ数・エントリ順序が 100% 一致する
+- **計測方法**: `ferritex-bench` で `FTX-CORPUS-COMPAT-001` を `FTX-ASSET-BUNDLE-001` 前提で実行し、レイアウト差分は文書単位で集計する。feature subset は annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数を正規化した manifest で比較する。参考文献互換性は citation label とエントリ順序を正規化後に比較する
 - **違反時のアクション**: どの subset / 文書で差が生じたかを `parser` / `typesetting` / `font` / `pdf` 単位で切り分ける
 
 ### 10.10 アーキテクチャ境界

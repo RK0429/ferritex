@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.21          |
+| バージョン | 0.1.22          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.19 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.20 |
 
 ## 1. サブドメイン分類
 
@@ -1105,7 +1105,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出し、`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
 
 ```mermaid
 classDiagram
@@ -1711,7 +1711,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、loopback 上の `POST /preview/session` bootstrap request と `ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。compile / watch / LSP の入口固有オプションは `RuntimeOptions` に正規化され、`ExecutionPolicyFactory` はそれと `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、loopback 上の `POST /preview/session` bootstrap request と `ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。session 失効・target 不一致・policy 拒否時は `SessionErrorResponse`（エラー種別・対象 sessionId・回復手順）を返す（`REQ-NF-010`）。compile / watch / LSP の入口は `CliAdapter` / `WatchAdapter` / `LspServer` として分離され、各入口のオプションを `RuntimeOptions` に正規化する。`WatchAdapter` は `RecompileScheduler` を起動し、`CliAdapter` と `RecompileScheduler` は共通の `CompileJobService` にコンパイルを委譲する。`ExecutionPolicyFactory` は `RuntimeOptions` と `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1848,6 +1848,13 @@ classDiagram
         <<Service>>
         +publish(PreviewSession, PreviewRevision) void
         +receiveViewUpdate(String, PreviewViewState) void
+        +respondError(String, SessionErrorResponse) void
+    }
+    class SessionErrorResponse {
+        <<ValueObject>>
+        +SessionErrorKind errorKind
+        +String sessionId
+        +String recoveryInstruction
     }
     class PreviewSessionService {
         <<Service>>
@@ -1902,11 +1909,16 @@ classDiagram
         +List~FilePath~ bundleSearchRoots
         +Set~String~ builtinBundleIds
     }
-    class CliRunner {
+    class CliAdapter {
         <<Service>>
         +compile(CompileOptions) ExitCode
+    }
+    class WatchAdapter {
+        <<Service>>
         +watch(WatchOptions) void
-        +lsp() void
+    }
+    class CompileJobService {
+        <<Application Service>>
     }
     class ExecutionPolicyFactory {
         <<Service>>
@@ -1971,20 +1983,26 @@ classDiagram
     RecompileScheduler --> FileWatcher : refreshes watch set
     RecompileScheduler ..> DependencyGraph : projects watched paths
     RecompileScheduler --> PendingChangeQueue
-    RecompileScheduler ..> CliRunner : triggers compile
-    CliRunner ..> PreviewSessionService : delegates preview publish
+    RecompileScheduler ..> CompileJobService : triggers compile
+    CompileJobService ..> PreviewSessionService : delegates preview publish
     PreviewSessionService ..> ExecutionPolicy : checks previewPublication
     PreviewSessionService --> PreviewTransport : publishes if allowed
     PreviewSessionService o-- PreviewSession : owns
+    PreviewSessionService ..> SessionErrorResponse : returns on error
     PreviewTransport --> PreviewSession : exchanges view-state for
     PreviewTransport ..> PreviewRevision : publishes
+    PreviewTransport ..> SessionErrorResponse : returns on session error
     PreviewSession --> PreviewViewState
     PreviewSession --> PreviewTarget
     PreviewRevision --> PreviewTarget
-    CliRunner --> CompileOptions
-    CliRunner --> WatchOptions
-    CliRunner --> RuntimeOptions : normalizes
-    CliRunner --> ExecutionPolicyFactory
+    CliAdapter --> CompileOptions
+    CliAdapter --> RuntimeOptions : normalizes
+    CliAdapter --> ExecutionPolicyFactory
+    CliAdapter ..> CompileJobService : delegates
+    WatchAdapter --> WatchOptions
+    WatchAdapter --> RuntimeOptions : normalizes
+    WatchAdapter --> ExecutionPolicyFactory
+    WatchAdapter --> RecompileScheduler : starts
     ExecutionPolicyFactory --> RuntimeOptions
     ExecutionPolicyFactory --> WorkspaceContext
     RuntimeOptions --> AssetBundleRef
@@ -2080,7 +2098,7 @@ stateDiagram-v2
 | グラフィックコマンドストリーム (GraphicsCommandStream) | パーサーが tikz/graphicx コマンドを処理した際に生成する描画指示列。描画ディレクティブと参照先資産を保持し、`GraphicsCompiler` が `GraphicsBox` へ変換する | GraphicsCompiler, GraphicsScene |
 | 依存イベント列 (DependencyEvents) | パース中に発生するファイル読み込み・マクロ定義/使用・ラベル定義・参照使用などの依存追跡イベント列。`DependencyGraph` の構築・更新に使い、差分コンパイルの変更検知基盤を供給する | DependencyGraph, ChangeDetector |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
-| プレビュー配信契約 (PreviewTransport) | loopback に bind し、`PreviewSessionService` が `POST /preview/session` bootstrap 応答と session ごとの HTTP document endpoint / WebSocket events endpoint を公開するための双方向 port。`PreviewTarget` 付き revision 通知を配信し、view-state 更新を受信する | PreviewSession, PreviewRevision |
+| プレビュー配信契約 (PreviewTransport) | loopback に bind し、`PreviewSessionService` が `POST /preview/session` bootstrap 応答と session ごとの HTTP document endpoint / WebSocket events endpoint を公開するための双方向 port。`PreviewTarget` 付き revision 通知を配信し、view-state 更新を受信する。session 失効時は `SessionErrorResponse` を返す | PreviewSession, PreviewRevision, SessionErrorResponse |
 
 ### 5.2 タイプセッティング コンテキスト
 
@@ -2205,7 +2223,11 @@ stateDiagram-v2
 | オープンドキュメントバッファ (OpenDocumentBuffer) | エディタ上の未保存変更を含む最新テキスト。LSP 機能は保存済みファイルよりこれを優先して参照する | OpenDocumentStore, LiveAnalysisSnapshot |
 | オープンドキュメントストア (OpenDocumentStore) | 現在開かれているテキスト文書の buffer と version を保持する LSP セッション内ストア | LspServer, OpenDocumentBuffer |
 | ライブ解析スナップショット (LiveAnalysisSnapshot) | `OpenDocumentBuffer` と Stable Compile State を合成した LSP 共通入力。diagnostic/completion/definition/hover が同じ解析基盤を共有する | LiveAnalysisSnapshotFactory, CompletionIndex, SymbolIndex, HoverDocCatalog |
-| 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら再コンパイルを逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph |
+| 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら `CompileJobService` への再コンパイル要求を逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph, CompileJobService |
+| CLI アダプタ (CliAdapter) | CLI からのコンパイル要求を `RuntimeOptions` に正規化し、`CompileJobService` に委譲する entry adapter | CompileOptions, RuntimeOptions, CompileJobService |
+| watch アダプタ (WatchAdapter) | watch モードの起動を `RuntimeOptions` に正規化し、`RecompileScheduler` を起動する entry adapter | WatchOptions, RuntimeOptions, RecompileScheduler |
+| コンパイルジョブサービス (CompileJobService) | `CliAdapter` と `RecompileScheduler` から正規化済みの `RuntimeOptions` を受け取り、共通のコンパイル use case を統合する application service。compile 完了後の `PreviewSessionService` への publish 委譲も担う | RuntimeOptions, ExecutionPolicy, PreviewSessionService |
+| セッションエラー応答 (SessionErrorResponse) | preview session の失効・target 不一致・policy 拒否時に返すエラー応答。エラー種別・対象 sessionId・回復手順（`POST /preview/session` による再取得）を含む（`REQ-NF-010`） | PreviewSessionService, PreviewTransport |
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
 | プレビューセッション (PreviewSession) | sessionId ごとの preview 状態。`PreviewTarget` を owner として保持し、同一 target かつ同一 process の間だけ再利用される。`PreviewSessionService.openSession` から bootstrap され、閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewTransport, PreviewViewState |
 | プレビュー表示状態 (PreviewViewState) | 現在ページ、ページ内オフセット、ズーム倍率など、プレビュー更新後も維持すべき閲覧位置。新 PDF のページ数に対して最近傍の有効ページへ clamp できる | PreviewSession |
@@ -2426,7 +2448,7 @@ stateDiagram-v2
 - **判断内容**: watch 実行中の変更イベントは `FileWatcher` が発火し、`RecompileScheduler` が `PendingChangeQueue` を介して追加変更を coalesce しながら逐次的に差分コンパイルを起動する。コンパイル中の変更は即時実行せず、完了後に 1 回以上の再トリガーとして処理する。各コンパイル完了後は最新の `DependencyGraph` から watch 対象集合を再計算し、`FileWatcher` へ反映する
 - **根拠**:
   - 観測事実: REQ-FUNC-039 はコンパイル中の追加変更をキューイングし、現在のコンパイル完了後に再コンパイルすることを Must として要求し、REQ-FUNC-038 は `\input` / `\include` 先の自動監視を Must として要求する
-  - 代替案: `FileWatcher` または `CliRunner` が個別に再入制御を持つ
+  - 代替案: `FileWatcher` または各 entry adapter が個別に再入制御を持つ
   - 分離証人: watch 中の再コンパイルで新たに `\input{appendix}` が解決された後に `appendix.tex` を編集するケース。`RecompileScheduler` が `DependencyGraph` から watch set を再同期するモデルでは変更を捕捉できるが、初期 watch set 固定モデルでは新規依存ファイルのイベントを取りこぼす
 - **等価性への影響**: 理論等価（外部仕様は同一で、watch 再入制御の所有者が明確になる）
 - **語彙への影響**: 「RecompileScheduler」「PendingChangeQueue」「FileChangeEvent」を導入

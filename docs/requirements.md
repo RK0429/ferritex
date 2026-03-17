@@ -5,8 +5,8 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.19          |
-| 最終更新日 | 2026-03-16      |
+| バージョン | 0.1.20          |
+| 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
@@ -150,7 +150,7 @@
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
 | FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
-| FTX-CORPUS-COMPAT-001 | pdfLaTeX 互換性を判定する versioned 回帰コーパス。article/report/book/letter の基準文書に加え、hyperref、フォント埋め込み、画像埋め込み、外部 PDF 埋め込み、参考文献、目次/しおりを含む 100 文書で構成し、`FTX-ASSET-BUNDLE-001` を前提に評価する |
+| FTX-CORPUS-COMPAT-001 | pdfLaTeX 互換性を判定する versioned 回帰コーパス。article/report/book/letter の基準文書に加え、hyperref、フォント埋め込み、画像埋め込み、外部 PDF 埋め込み、参考文献、目次/しおりを含む 100 文書で構成し、`FTX-ASSET-BUNDLE-001` を前提に評価する。参考文献を含む文書には事前生成済みの `.bbl` ファイルを同梱し、`bibtex` / `biber` の実行を前提としない |
 | FTX-CORPUS-COMPAT-001/layout-core | `FTX-CORPUS-COMPAT-001` のうち article/report/book/letter の baseline 文書群を束ねる stable subset ID。レイアウト互換の基準ケースに使う |
 | FTX-CORPUS-COMPAT-001/layout-core/article | `FTX-CORPUS-COMPAT-001/layout-core` に含まれる article baseline 文書の stable case ID |
 | FTX-CORPUS-COMPAT-001/navigation-features | `FTX-CORPUS-COMPAT-001` のうち hyperlink、named destination、しおり、PDF metadata を含む stable subset ID |
@@ -550,6 +550,7 @@
   - `CrossReferenceTable` は `\label` / `\ref` / `\pageref` のみを扱い、citation 系は扱わない
   - `REQ-FUNC-047` 経由で Ferritex が制御した外部ツールが `.bbl` を output root 配下へ生成した場合は、Output Artifact Registry に trusted external artifact として登録する
   - 外部ツール実行の案内（`bibtex` / `biber` の実行が必要な場合の通知）
+- **処理境界**: Ferritex は事前生成済みの `.bbl` ファイルの読み込みと参考文献リストの組版を常にサポートする。外部ツール（`bibtex` / `biber`）の自動実行は `--shell-escape` 有効時に `REQ-FUNC-047` 経由で行う任意機能であり、未生成または古い `.bbl` の検出時は外部ツールの手動実行を案内する診断を返す
 - **出力**: 引用テキストと参考文献リストが組版された出力
 - **受け入れ基準**:
   - Given bibtex で生成された `.bbl` ファイルがある文書, When コンパイル, Then 参考文献リストが正しく組版される
@@ -1022,6 +1023,7 @@
   - 診断更新: < 500ms（編集後）
   - 補完候補提示: < 100ms
   - 定義ジャンプ: < 200ms
+- **計測方法**: `FTX-BENCH-001` 相当の文書を LSP で開き、キャッシュと `Stable Compile State` が構築済みの warm 状態から、replayable LSP trace（診断・補完・定義ジャンプの各操作を含む）を 1 回ウォームアップ後に 5 回再生し中央値を採用する
 - **優先度**: Must
 - **出典**: ユーザー明示（REQ-FUNC-034 の受け入れ基準から導出）
 
@@ -1050,7 +1052,8 @@
   - `FTX-CORPUS-COMPAT-001` の全 100 文書を文書単位で集計し、各文書について「全ページの行分割位置差分率 <= 5% かつ全ページのページ分割位置が一致」を満たす文書数が 95 文書以上である。ここで行分割位置差分率は、各ページごとに `|Ferritex の改行位置集合 △ pdfLaTeX の改行位置集合| / max(1, |pdfLaTeX の改行位置集合|)` を計算し、その文書内ページ平均を取った値とする
   - `FTX-CORPUS-COMPAT-001/navigation-features` の全文書で、正規化した PDF manifest 上の annotation 数、named destination 数、outline 階層、主要 metadata key（`Title`, `Author`）が 100% 一致する
   - `FTX-CORPUS-COMPAT-001/embedded-assets` の全文書で、埋め込みフォント集合、画像・外部 PDF の resource inventory、参照先ページ数が 100% 一致する
-- **計測方法**: `FTX-CORPUS-COMPAT-001` の各文書を `FTX-ASSET-BUNDLE-001` 前提で両エンジンから生成し、レイアウト差分はページごとの改行位置集合の対称差から算出した差分率と、ページ分割位置一致を文書単位で集計する。PDF 機能差分は `FTX-CORPUS-COMPAT-001/navigation-features` と `FTX-CORPUS-COMPAT-001/embedded-assets` に対して annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数を正規化した manifest と埋め込み検証で比較する
+  - `FTX-CORPUS-COMPAT-001` 内の参考文献を含む文書で、参考文献リストのエントリ数・エントリ順序・各エントリの citation label が 100% 一致する。レイアウト互換性の判定は上記の行分割位置差分率基準を参考文献リスト部分にも適用する
+- **計測方法**: `FTX-CORPUS-COMPAT-001` の各文書を `FTX-ASSET-BUNDLE-001` 前提で両エンジンから生成し、レイアウト差分はページごとの改行位置集合の対称差から算出した差分率と、ページ分割位置一致を文書単位で集計する。PDF 機能差分は `FTX-CORPUS-COMPAT-001/navigation-features` と `FTX-CORPUS-COMPAT-001/embedded-assets` に対して annotation / destination / outline / metadata / resource inventory / 埋め込みフォント集合 / 外部 PDF 参照先ページ数を正規化した manifest と埋め込み検証で比較する。参考文献互換性は参考文献リスト内のエントリ抽出・正規化後に citation label とエントリ順序を比較する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -1092,6 +1095,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.20 | 2026-03-17 | REQ-NF-004 に計測方法を追加、REQ-FUNC-024 に処理境界を明記、REQ-NF-007 に参考文献互換指標を追加、FTX-CORPUS-COMPAT-001 に .bbl 同梱前提を明記 | Claude Opus 4.6 |
 | 0.1.19 | 2026-03-16 | REQ-NF-003 の計測スコープを compile + LiveAnalysisSnapshot に拡張し、REQ-NF-010 の対象を preview session エラーに拡大 | Claude Opus 4.6 |
 | 0.1.18 | 2026-03-16 | preview session bootstrap API、partition locator、pdfLaTeX 互換範囲、エラーメッセージ品質の必須項目を明文化し、未確定事項を整理 | Codex |
 | 0.1.17 | 2026-03-15 | `Runtime Options.jobname` への語彙統一、preview session の owner/lifecycle/policy 追加、active-job 限定の Output Artifact Registry 寿命、LSP 非ブロッキング read path を反映 | Codex |
