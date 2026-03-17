@@ -109,7 +109,7 @@ graph TB
     Bundle[(Asset Bundle<br>read-only mmap bundle)]
     Cache[(Persistent Cache Store<br>SQLite metadata + blob files)]
     Workspace[(Workspace / Output / Temp<br>ローカル filesystem)]
-    ExtTools[External Tool Gateway<br>bibtex / biber / shell escape]
+    ExtTools[ShellCommandGateway<br>bibtex / biber / shell escape]
 
     subgraph Ferritex
         Frontends[Entry Frontends<br>CLI / Watch / LSP / Preview]
@@ -130,6 +130,8 @@ graph TB
     Policy --> Workspace
     Policy --> ExtTools
 ```
+
+補足: Host Font APIs（fontconfig / CoreText / DirectWrite）はレベル 1 では外部システムとして描いているが、レベル 2 ではコンテナ内部から参照される OS プラットフォーム API であり、独立したコンテナを構成しないため省略している。実際の参照は Font Management コンポーネントが `OverlaySet` / `HostFontCatalog` を介して行う。
 
 ### 4.3 レベル3: Ferritex Runtime の主要コンポーネント
 
@@ -194,7 +196,7 @@ graph LR
     Assets --> Parser
     Assets --> Font
     Parser --> Bibliography
-    Bibliography --> Typeset
+    Bibliography --> Typeset : via DocumentState.BibliographyState
     Parser --> Typeset
     Parser --> Graphics
     Parser --> Incremental
@@ -231,7 +233,7 @@ graph LR
 | Typesetting Engine | 行分割、ページ分割、display math、フロート、脚注、目次/索引、参考文献リストのレイアウト | `PageBox`, `FloatPlacement`, `DocumentLayoutFragment`（差分コンパイルのパーティション統合用） |
 | Incremental Compilation | 依存グラフ、変更検知 (`REQ-FUNC-028`)、影響範囲判定、`DocumentPartitionPlanner` による stable `partitionId` と `PartitionLocator` 発行、再利用/再構築統合、固定点反復、文書パーティション統合 | `RecompilationScope`, `CompilationMergePlan`, `PaginationMergeResult`, `CompilationSnapshot` |
 | Graphics Rendering | `graphicx` / `tikz` を PDF 非依存プリミティブへ正規化 | `GraphicsScene`, `GraphicResourceSet` |
-| Font Management | `FontSpec` 正規化、フォント解決、TFM/OpenType 読み込み (`REQ-FUNC-017` / `REQ-FUNC-018`)、メトリクス・グリフ供給 | `ResolvedFont`, `FontMetrics`, `FontEmbeddingPlan` |
+| Font Management | `FontSpec` 正規化、フォント解決、TFM/OpenType 読み込み (`REQ-FUNC-017` / `REQ-FUNC-018`)、fontspec サポート (`REQ-FUNC-025`)、メトリクス・グリフ供給 | `ResolvedFont`, `FontMetrics`, `FontEmbeddingPlan` |
 | PDF Renderer | `PageBox` とグラフィック・フォントを PDF / SyncTeX へ射影 | `PdfDocument`, `SyncTexTrace`, `OutputArtifactManifest` |
 | Asset Runtime | bundle / overlay / host-local fallback の解決面を提供 | `AssetRef`, `AssetSnapshot`, `FontAssetRef` |
 | Kernel Runtime | 数値/寸法演算、stable ID、source span、snapshot version などの基底型だけを提供し、package/class/bibliography semantics や I/O は持たない | `SourceSpan`, `StableId`, `DimensionValue` |
