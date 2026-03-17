@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.20          |
+| バージョン | 0.1.21          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -539,24 +539,38 @@
 - **優先度**: Must
 - **出典**: ユーザー明示
 
-#### REQ-FUNC-024: biblatex/bibtex 連携
+#### REQ-FUNC-024: 参考文献読み込みと組版
 
-- **説明**: 参考文献処理のための外部ツール（`bibtex`, `biber`）との連携を行う
-- **入力**: `\bibliography`, `\addbibresource` 等を含む文書
+- **説明**: 事前生成済みの `.bbl` ファイルを読み込み、参考文献リストの組版と `\cite` 解決を行う
+- **入力**: `\bibliography`, `\addbibresource` 等を含む文書、および事前生成済みの `.bbl` ファイル
 - **処理**:
   - `.bbl` ファイルを読み込み、Bbl Snapshot と Citation Table を構築する
   - `\cite` コマンドの参照解決は Citation Table を用いて行い、`REQ-FUNC-011` のラベル/ページ参照とは責務を分離する
   - `BibliographyState` は `.bbl` 取り込み、Citation Table 構築、`BibliographyEntry` provenance 管理、参考文献リストの組版データ生成を担う
   - `CrossReferenceTable` は `\label` / `\ref` / `\pageref` のみを扱い、citation 系は扱わない
-  - `REQ-FUNC-047` 経由で Ferritex が制御した外部ツールが `.bbl` を output root 配下へ生成した場合は、Output Artifact Registry に trusted external artifact として登録する
-  - 外部ツール実行の案内（`bibtex` / `biber` の実行が必要な場合の通知）
-- **処理境界**: Ferritex は事前生成済みの `.bbl` ファイルの読み込みと参考文献リストの組版を常にサポートする。外部ツール（`bibtex` / `biber`）の自動実行は `--shell-escape` 有効時に `REQ-FUNC-047` 経由で行う任意機能であり、未生成または古い `.bbl` の検出時は外部ツールの手動実行を案内する診断を返す
+  - `.bbl` が存在しないか古い場合は、外部ツール（`bibtex` / `biber`）の手動実行を案内する診断を返す
 - **出力**: 引用テキストと参考文献リストが組版された出力
 - **受け入れ基準**:
   - Given bibtex で生成された `.bbl` ファイルがある文書, When コンパイル, Then 参考文献リストが正しく組版される
   - Given `\cite{knuth1984}` と対応する `.bbl` エントリがある文書, When コンパイル, Then `\cite` は Citation Table から解決される
+- **優先度**: Must
+- **出典**: ユーザー明示
+- **関連要件**: REQ-FUNC-024a
+
+#### REQ-FUNC-024a: 外部参考文献ツール連携
+
+- **説明**: 外部ツール（`bibtex`, `biber`）の自動実行による `.bbl` 生成を行う
+- **入力**: `\bibliography`, `\addbibresource` 等を含む文書、`--shell-escape` オプション
+- **処理**:
+  - `--shell-escape` 有効時に `REQ-FUNC-047` 経由で `bibtex` / `biber` を実行し、`.bbl` を生成する
+  - Ferritex が制御した外部ツールが `.bbl` を output root 配下へ生成した場合は、Output Artifact Registry に trusted external artifact として登録する
+- **出力**: 生成された `.bbl` ファイル（`REQ-FUNC-024` の入力として使用される）
+- **受け入れ基準**:
+  - Given `.bib` ファイルを参照する文書, When `--shell-escape` 付きでコンパイル, Then `bibtex` / `biber` が自動実行され `.bbl` が生成される
+  - Given `--shell-escape` なしでコンパイル, When `.bbl` が未生成, Then 外部ツールの手動実行を案内する診断が表示される
 - **優先度**: Should
 - **出典**: ユーザー明示
+- **関連要件**: REQ-FUNC-024, REQ-FUNC-047
 
 #### REQ-FUNC-025: fontspec サポート
 
@@ -1095,6 +1109,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.21 | 2026-03-17 | REQ-FUNC-024 を .bbl 読み込み＋参考文献組版（Must）と外部ツール連携 REQ-FUNC-024a（Should）に分割し、REQ-NF-007（Must）との優先度整合性を解消 | Claude Opus 4.6 |
 | 0.1.20 | 2026-03-17 | REQ-NF-004 に計測方法を追加、REQ-FUNC-024 に処理境界を明記、REQ-NF-007 に参考文献互換指標を追加、FTX-CORPUS-COMPAT-001 に .bbl 同梱前提を明記 | Claude Opus 4.6 |
 | 0.1.19 | 2026-03-16 | REQ-NF-003 の計測スコープを compile + LiveAnalysisSnapshot に拡張し、REQ-NF-010 の対象を preview session エラーに拡大 | Claude Opus 4.6 |
 | 0.1.18 | 2026-03-16 | preview session bootstrap API、partition locator、pdfLaTeX 互換範囲、エラーメッセージ品質の必須項目を明文化し、未確定事項を整理 | Codex |
