@@ -950,7 +950,7 @@ classDiagram
         +int zIndex
     }
     class GraphicGroup {
-        <<Entity>>
+        <<ValueObject>>
         +List~GraphicNode~ children
         +GraphicStyle inheritedStyle
         +ClipPath clipPath
@@ -2593,6 +2593,8 @@ stateDiagram-v2
 | 0.1.26 | 2026-03-17 | §3.2 DocumentState の read-only 表記から registerLabel を除き Mermaid note を追加、§3.6 PageRenderPlan の間接保持注記に PlacedDestination / LinkAnnotationPlan を追記 | Claude Opus 4.6 |
 | 0.1.25 | 2026-03-17 | メタ情報に architecture.md への参照を追加、§3.1 に LinkStyle/BorderStyle 重複定義の意図注記を追加、§3.6 に PageRenderPlan の source trace 間接保持注記を追加 | Claude Opus 4.6 |
 | 0.1.24 | 2026-03-17 | §3.1 に CompilationSnapshot クラスを追加、§3.8 に LspServer → CompileJobService の関連を追加 | Claude Opus 4.6 |
+| 0.1.23 | — | 欠番（内部改訂、公開版としてスキップ） | — |
+| 0.1.22 | — | 欠番（内部改訂、公開版としてスキップ） | — |
 | 0.1.21 | 2026-03-17 | DocumentStateDelta, GraphicsCommandStream, DependencyEvents の ValueObject 定義追加、Shared Entity ステレオタイプ補足、ErrorRecovery に REQ-FUNC-006 注記追加 | Claude Opus 4.6 |
 | 0.1.20 | 2026-03-16 | preview bootstrap 契約、partition locator、cache fallback の復旧意味論、package doc snapshot、永続化 port の責務を明文化 | Codex |
 | 0.1.19 | 2026-03-15 | `RuntimeOptions.jobname` と `PreviewPublicationPolicy` / `PreviewTarget` を導入し、preview session の owner/lifecycle、active-job 限定の Output Artifact Registry 寿命、LSP 非ブロッキング read path を反映 | Codex |

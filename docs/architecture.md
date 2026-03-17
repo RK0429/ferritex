@@ -306,7 +306,7 @@ runtime path のトップレベル crate はレイヤ境界として使い、`fe
 1. `CLI Adapter` が CLI フラグを `RuntimeOptions` に正規化する (`REQ-FUNC-042`)。
 2. `ExecutionPolicyFactory` が workspace と option から共通ポリシーを構築し、preview については `previewPublication` の既定制約（loopback 限定、active-job 限定、target 変更/再起動時の session 再発行）も埋め込む。
 3. `CompileJobService` が正規化済み `RuntimeOptions` と `ExecutionPolicy` を受けて `CompilationJob` を生成し、`Incremental Compilation` がフル or 差分方針と stable `partitionId` / `PartitionLocator` 付きの `DocumentPartitionPlan` を決める。cache 破損が報告された場合、`Incremental Compilation` は dependency graph を invalidation / watch-set refresh の補助にだけ使い、出力生成はフルコンパイルへ fallback させる。
-4. `Parser` は citation intent と label intent を分けて生成し、`Bibliography Integration` が `.bbl` 由来の `CitationTable` / `BibliographyEntry` を構築する。`Typesetting` は `CrossReferenceTable` を label 系に、`BibliographyState` を参考文献リスト組版に使い、その後 `Graphics` / `Font` / `PDF` が pipeline を実行する。
+4. `Parser` は citation 系参照（`\cite`）と label 系参照（`\ref`/`\pageref`）を分けて生成し、`Bibliography Integration` が `.bbl` 由来の `CitationTable` / `BibliographyEntry` を構築する。`Typesetting` は `CrossReferenceTable` を label 系に、`BibliographyState` を参考文献リスト組版に使い、その後 `Graphics` / `Font` / `PDF` が pipeline を実行する。
 5. `OutputArtifactRegistry` は active job に対する in-memory registry として更新し、trusted readback の一致判定は主入力 + jobname で行う。current pass number は current job の順序・出力命名・診断に使う運用属性、`producedPass` は artifact provenance の監査属性として保持し、必要に応じて監査用 manifest を出力する。
 6. `PDF Renderer` / `SyncTeX` が成果物を出力し、`CompileJobService` が diagnostics を集約する。`CacheMaintenanceService` は dependency graph / cache metadata の writeback と保守処理だけを担当する。
 

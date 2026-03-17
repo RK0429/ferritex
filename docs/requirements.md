@@ -147,6 +147,7 @@
 | Partition ID | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`Commit Barrier` の total order の一部として使う |
 | Partition Locator | 章/セクション境界を一意に示す論理位置。`entryFile`、見出しの source span、同一ファイル内での出現順を組にして表す |
 | Citation Table | `.bbl` 由来の citation key と citation 表示文字列 / provenance を対応付ける索引。`\cite` 解決に使い、provenance は本文側 citation 表示の trace に使う |
+| Citation Label | 参考文献リスト各エントリの番号またはキー表示（例: `[1]`, `[Knu84]`）。`CitationInfo.label` に対応し、`REQ-NF-007` の互換性判定で比較対象となる |
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
 | FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、8 GiB 以上の物理メモリ、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
@@ -605,7 +606,7 @@
   - Given `geometry`, `graphicx`, `xcolor` 等の標準パッケージが Asset Bundle に含まれる環境, When 読み込み, Then TeX Live 非導入環境でもエラーなく処理されパッケージの機能が利用可能
   - Given プロジェクト内に同名の `mystyle.sty` があり Bundle 内にも同名資産がある環境, When `\usepackage{mystyle}` を実行, Then プロジェクトローカル版が優先される
   - Given `FTX-ASSET-BUNDLE-001` に含まれる標準パッケージが package-facing pdfTeX 拡張プリミティブを使用する場合, When 読み込み, Then 互換層がそのプリミティブを吸収し package 機能が利用可能
-  - Given XeTeX 固有プリミティブまたは corpus / bundle 外の未対応 engine 拡張を含むパッケージ, When 読み込み, Then 未対応プリミティブ名と停止理由を含む警告が返る
+  - Given XeTeX 固有プリミティブまたは corpus / bundle 外の未対応 engine 拡張を含むパッケージ, When 読み込み, Then 未対応プリミティブ名と停止理由を含む構造化警告が出力され、依存箇所でコンパイルが停止する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
