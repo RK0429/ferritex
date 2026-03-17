@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.32          |
+| バージョン | 0.1.33          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -289,7 +289,7 @@
   - 脚注・フロート挿入の考慮
 - **出力**: ページ単位に分割された垂直ボックスのリスト
 - **受け入れ基準**:
-  - Given フロートと脚注を含む文書, When ページ分割を実行, Then フロートと脚注が適切なページに配置される
+  - Given `FTX-CORPUS-COMPAT-001` のうちフロートと脚注を含む文書と `FTX-ASSET-BUNDLE-001`, When ページ分割を実行, Then 全ページのページ分割位置が pdfLaTeX 出力と一致し、各フロート・脚注の配置先ページ番号が pdfLaTeX と一致する（`REQ-NF-007` のページ分割位置一致基準を適用）
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -304,7 +304,7 @@
   - アトム間スペーシング
 - **出力**: 数式ボックス
 - **受け入れ基準**:
-  - Given amsmath の `align` 環境を含む文書, When 数式組版を実行, Then pdfLaTeX と同等のレイアウトで出力される
+  - Given `FTX-CORPUS-COMPAT-001` のうち amsmath `align` 環境を含む文書と `FTX-ASSET-BUNDLE-001`, When 数式組版を実行, Then 数式を含む各ページの行分割位置差分率が 5% 以下かつページ分割位置が pdfLaTeX 出力と一致する（`REQ-NF-007` のレイアウト互換基準を適用）
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -350,7 +350,9 @@
   - Table Of Contents State / Index State を専用の組版サービスで box tree へ射影し、`\tableofcontents` / `\listoffigures` / `\listoftables` / `\printindex` の出力に再利用
 - **出力**: 目次・索引のボックスツリー
 - **受け入れ基準**:
-  - Given 章・節構造を持つ文書, When コンパイル, Then 正しいセクション番号とページ番号を含む目次が生成される
+  - Given `FTX-CORPUS-COMPAT-001` のうち章・節構造と `\tableofcontents` を含む文書と `FTX-ASSET-BUNDLE-001`, When コンパイル, Then 目次の各エントリのセクション番号・タイトル文字列・ページ番号が pdfLaTeX 出力と一致する
+  - Given `FTX-CORPUS-COMPAT-001` のうち図表と `\listoffigures` / `\listoftables` を含む文書と `FTX-ASSET-BUNDLE-001`, When コンパイル, Then 図表一覧の各エントリの番号・タイトル文字列・ページ番号が pdfLaTeX 出力と一致する
+  - Given `FTX-CORPUS-COMPAT-001` のうち `\index` / `\printindex` を含む文書と `FTX-ASSET-BUNDLE-001`, When コンパイル, Then 索引の各エントリの表示語・ソート順・ページ番号列が pdfLaTeX 出力と一致する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -384,7 +386,7 @@
   - ToUnicode CMap の生成（テキスト検索対応）
 - **出力**: フォントが埋め込まれた PDF
 - **受け入れ基準**:
-  - Given OpenType フォントを使用する文書, When PDF を生成, Then 使用グリフのみがサブセット埋め込みされ、PDF 上でテキスト検索が可能
+  - Given `FTX-CORPUS-COMPAT-001/embedded-assets` の文書と `FTX-ASSET-BUNDLE-001`, When PDF を生成, Then 埋め込みフォント集合が pdfLaTeX 出力と一致し（`REQ-NF-007` の判定基準）、各フォントがサブセット埋め込みであり、ToUnicode CMap によるテキスト抽出結果がソース文書の該当文字列と一致する
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -610,7 +612,7 @@
 - **出力**: パッケージ定義が適用された状態
 - **例外**: パッケージ未発見時にエラー報告。XeTeX 固有プリミティブや corpus / bundle 外の未対応 engine 拡張使用時は構造化警告を出力し、依存箇所は non-success として停止する
 - **受け入れ基準**:
-  - Given `geometry`, `graphicx`, `xcolor` 等の標準パッケージが Asset Bundle に含まれる環境, When 読み込み, Then TeX Live 非導入環境でもエラーなく処理されパッケージの機能が利用可能
+  - Given `geometry`, `graphicx`, `xcolor` 等の標準パッケージが `FTX-ASSET-BUNDLE-001` に含まれる環境, When 読み込み, Then TeX Live 非導入環境でもエラー・警告なくパッケージが読み込まれ、`FTX-CORPUS-COMPAT-001` の該当パッケージを使用する文書が `REQ-NF-007` のレイアウト互換基準を満たす PDF を生成する
   - Given プロジェクト内に同名の `mystyle.sty` があり Bundle 内にも同名資産がある環境, When `\usepackage{mystyle}` を実行, Then プロジェクトローカル版が優先される
   - Given `FTX-ASSET-BUNDLE-001` に含まれる標準パッケージが package-facing pdfTeX 拡張プリミティブを使用する場合, When 読み込み, Then 互換層がそのプリミティブを吸収し package 機能が利用可能
   - Given XeTeX 固有プリミティブまたは corpus / bundle 外の未対応 engine 拡張を含むパッケージ, When 読み込み, Then 未対応プリミティブ名と停止理由を含む構造化警告が出力され、依存箇所でコンパイルが停止する
@@ -1139,6 +1141,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.33 | 2026-03-17 | REQ-FUNC-008/009/012/014/026 の受け入れ基準を検証可能化。比較対象を pdfLaTeX に固定し、入力を `FTX-CORPUS-COMPAT-001` / `FTX-ASSET-BUNDLE-001` で限定、REQ-FUNC-012 は目次に加えて図表一覧・索引の一致条件まで明記し、許容条件を `REQ-NF-007` の既存判定基準へ委譲 | Claude Opus 4.6 |
 | 0.1.32 | 2026-03-17 | §1.6 の相対速度参照先を `REQ-NF-001a` へ分離し、非機能要件に pdfLaTeX baseline 比 50x/100x の相対速度要件を追加。未確定事項の関連要件も同期 | Codex |
 | 0.1.31 | 2026-03-17 | `REQ-FUNC-024` / `REQ-FUNC-024a` に bibliography freshness fingerprint・manual `.bbl` workflow・toolchain 選択・同一 `CompilationJob` 内の再実行境界を追加し、`REQ-NF-006` に pre-generated `.bbl` の read-only 例外を反映、`REQ-FUNC-040` と用語集に `no-store` 配信契約と preview bootstrap / transport 境界を反映、`REQ-FUNC-033` / `REQ-FUNC-043` に `FontTaskTrace` の `stderr` 出力契約と `Runtime Options.traceFontTasks` を追加し、`REQ-FUNC-044` に watch の option 継承境界、`REQ-FUNC-045` に LSP background compile の固定既定値、`REQ-FUNC-042` / `REQ-FUNC-048` に output root と既定値の明文化を追加 | Codex |
 | 0.1.30 | 2026-03-17 | `REQ-FUNC-024` の `.bbl` 古さ判定基準をコンテンツハッシュ比較として明確化 | Claude Opus 4.6 |

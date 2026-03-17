@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.33          |
+| バージョン | 0.1.34          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.32 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.19 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.33 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.20 |
 
 ## 1. サブドメイン分類
 
@@ -638,10 +638,55 @@ classDiagram
         +int passNumber
         +StageOrder stageOrder
         +String partitionId
-        +applyInOrder(List~DocumentStateDelta~, CompilationJob) void
+        +commit(StageCommitPayload, CompilationJob) void
     }
     CommitBarrier --> StageOrder
     CompilationJob --> CommitBarrier : owns
+    class StageCommitPayload {
+        <<ValueObject>>
+    }
+    class MacroSessionPayload {
+        <<ValueObject>>
+        +List~MacroDefinition~ macroWrites
+        +List~RegisterUpdate~ registerWrites
+        +Map~char, Catcode~ catcodeWrites
+    }
+    class RegisterUpdate {
+        <<ValueObject>>
+        +RegisterKind kind
+        +int index
+        +RegisterValue value
+    }
+    class DocumentReferencePayload {
+        <<ValueObject>>
+        +List~DocumentStateDelta~ deltas
+    }
+    class LayoutMergePayload {
+        <<ValueObject>>
+        +List~DocumentLayoutFragment~ fragments
+    }
+    class ArtifactCachePayload {
+        <<ValueObject>>
+        +List~OutputArtifactRecord~ artifactRecords
+        +List~CacheEntry~ cacheUpdates
+    }
+    class DocumentLayoutFragment {
+        <<ValueObject — §3.4>>
+    }
+    class CacheEntry {
+        <<ValueObject — §3.4>>
+    }
+    StageCommitPayload <|-- MacroSessionPayload
+    StageCommitPayload <|-- DocumentReferencePayload
+    StageCommitPayload <|-- LayoutMergePayload
+    StageCommitPayload <|-- ArtifactCachePayload
+    MacroSessionPayload o-- RegisterUpdate
+    DocumentReferencePayload o-- DocumentStateDelta
+    LayoutMergePayload o-- DocumentLayoutFragment
+    ArtifactCachePayload o-- OutputArtifactRecord
+    ArtifactCachePayload o-- CacheEntry
+    CommitBarrier --> StageCommitPayload
+    note for StageCommitPayload "StageOrder 各段階に対応する sealed subtypes で stage 固有の commit payload を表現する"
 ```
 
 ### 3.2 タイプセッティング コンテキスト
@@ -2121,9 +2166,15 @@ stateDiagram-v2
 | 解決コンテキスト (ResolutionContext) | current directory・ネスト深度・optional load 可否から成る資産解決用コンテキスト | InputStack, AssetResolver |
 | コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`RegisterBankView` / `CommandRegistryView` / `EnvironmentRegistryView` / `DocumentStateView` として commit 済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentStateView |
 | ドキュメント状態ビュー (DocumentStateView) | `DocumentState` から commit 完了時に導出される frozen read-only projection。`CounterStoreView` / `CrossReferenceTableView` / `BibliographyStateView` / `AuxStateView` / `TableOfContentsStateView` / `IndexStateView` / `NavigationStateView` を公開面として持つ | CompilationSnapshot, DocumentPartitionPlanner, StableCompileState |
-| コミットバリア (CommitBarrier) | 並列ステージの結果を `(passNumber, StageOrder, partitionId)` の total order で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可され、authority key が衝突した場合は winner を選ばず affected pass を sequential path へフォールバックさせる | CompilationJob, CompilationSnapshot, StageOrder |
-| ステージ順序 (StageOrder) | `CommitBarrier` が `DocumentStateDelta` を適用する順序を決定する列挙型。macro/session delta → document/reference/bibliography state → layout/page-number merge → artifact emission/cache metadata の 4 段階 | CommitBarrier, DocumentStateDelta |
-| Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の frozen read-only projection。`CommandRegistryView` / `EnvironmentRegistryView` / `CrossReferenceTableView` / `BibliographyStateView` を保持し、worker-local な未 commit 状態や失敗 pass の部分結果を含まない | LiveAnalysisSnapshot, CompilationJob |
+| コミットバリア (CommitBarrier) | 並列ステージの結果を `(passNumber, StageOrder, partitionId)` の total order で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可され、authority key が衝突した場合は winner を選ばず affected pass を sequential path へフォールバックさせる | CompilationJob, CompilationSnapshot, StageOrder, StageCommitPayload |
+| ステージ順序 (StageOrder) | `CommitBarrier` が `StageCommitPayload` を適用する順序を決定する列挙型。macro/session delta → document/reference/bibliography state → layout/page-number merge → artifact emission/cache metadata の 4 段階 | CommitBarrier, StageCommitPayload |
+| ステージコミットペイロード (StageCommitPayload) | `CommitBarrier.commit` が受け取る commit payload の sealed base type。`StageOrder` の各段階に対応する 4 つのサブタイプ（`MacroSessionPayload` / `DocumentReferencePayload` / `LayoutMergePayload` / `ArtifactCachePayload`）で stage 固有のデータを表現する | CommitBarrier, StageOrder |
+| マクロセッションペイロード (MacroSessionPayload) | `MACRO_SESSION_DELTA` ステージの commit payload。マクロ定義書き込み、レジスタ更新、catcode 変更を保持する | StageCommitPayload, MacroDefinition, RegisterUpdate |
+| レジスタ更新 (RegisterUpdate) | `MacroSessionPayload` 内のレジスタ書き込み 1 件を表す値。register 種別・インデックス・値の組 | MacroSessionPayload, RegisterBank |
+| 文書参照ペイロード (DocumentReferencePayload) | `DOCUMENT_REFERENCE_BIBLIOGRAPHY` ステージの commit payload。1 パーティションまたは 1 ステージが生成した `DocumentStateDelta` のリストを束ねる | StageCommitPayload, DocumentStateDelta |
+| レイアウトマージペイロード (LayoutMergePayload) | `LAYOUT_PAGE_NUMBER_MERGE` ステージの commit payload。各パーティションの `DocumentLayoutFragment` を保持し、`PaginationMergeCoordinator` の入力となる | StageCommitPayload, DocumentLayoutFragment, PaginationMergeCoordinator |
+| アーティファクトキャッシュペイロード (ArtifactCachePayload) | `ARTIFACT_EMISSION_CACHE_METADATA` ステージの commit payload。出力アーティファクト記録とキャッシュエントリ更新を保持する | StageCommitPayload, OutputArtifactRecord, CacheEntry |
+| Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の frozen read-only projection。`CommandRegistryView` / `EnvironmentRegistryView` / `CrossReferenceTableView` / `BibliographyStateView` / `PackageDocSnapshotCatalog` を保持し、worker-local な未 commit 状態や失敗 pass の部分結果を含まない | LiveAnalysisSnapshot, CompilationJob, PackageDocSnapshotCatalog |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback の一致判定キーである jobname / 主入力と、順序・診断用の現在パス番号を分離して扱う | CompilationSession, OutputArtifactRegistry |
 | ファイルアクセスゲート (FileAccessGate) | `\input` / `\openin` / `\openout` / engine-temp / engine-readback などの I/O 要求を `ExecutionPolicy` と `OutputArtifactRegistry` に照らして許可/拒否する共通ゲート | FileAccessRequest, SandboxedFileHandle |
 | 目次状態 (TableOfContentsState) | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 | DocumentState, TocEntry |
@@ -2137,7 +2188,7 @@ stateDiagram-v2
 | アーティファクト生成者種別 (ArtifactProducerKind) | Output Artifact Registry が記録する生成主体種別。Ferritex 本体か、Ferritex が制御した外部ツールかを区別する | OutputArtifactRecord, ShellCommandGateway |
 | プレビューターゲット (PreviewTarget) | preview session / revision が紐づく対象文書の識別子。workspace root、primaryInput、jobname の組 | PreviewSession, PreviewRevision |
 | プレビュー公開ポリシー (PreviewPublicationPolicy) | `ExecutionPolicy` に内包される preview 配信専用の制約。loopback bind 限定、active job の最新 PDF のみ publish、session target 一致、target 変更または process restart 時の session 再発行規約を保持する | ExecutionPolicy, PreviewSessionService |
-| 文書状態デルタ (DocumentStateDelta) | 1 つの文書パーティションまたは 1 つの commit barrier ステージが生成する `DocumentState` への変更セット。カウンタ差分、ラベル/citation/TOC/索引/ナビゲーション更新、aux 書き出しを含む。`CommitBarrier` が `(passNumber, stageOrder, partitionId)` の total order でデルタを適用し、非 idempotent な authority key 衝突を検知した場合は sequential fallback を要求する | CommitBarrier, DocumentState, DocumentPartitionPlan |
+| 文書状態デルタ (DocumentStateDelta) | 1 つの文書パーティションまたは 1 つの commit barrier ステージが生成する `DocumentState` への変更セット。カウンタ差分、ラベル/citation/TOC/索引/ナビゲーション更新、aux 書き出しを含む。`CommitBarrier` が `(passNumber, stageOrder, partitionId)` の total order でデルタを適用し、非 idempotent な authority key 衝突を検知した場合は sequential fallback を要求する | CommitBarrier, DocumentState, DocumentPartitionPlan, DocumentReferencePayload |
 | グラフィックコマンドストリーム (GraphicsCommandStream) | パーサーが tikz/graphicx コマンドを処理した際に生成する描画指示列。描画ディレクティブと参照先資産を保持し、`GraphicsCompiler` が `GraphicsBox` へ変換する | GraphicsCompiler, GraphicsScene |
 | 依存イベント列 (DependencyEvents) | パース中に発生するファイル読み込み・マクロ定義/使用・ラベル定義・参照使用などの依存追跡イベント列。`DependencyGraph` の構築・更新に使い、差分コンパイルの変更検知基盤を供給する | DependencyGraph, ChangeDetector |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
@@ -2679,6 +2730,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.34 | 2026-03-17 | §3.1 に `StageCommitPayload` sealed hierarchy を追加し `CommitBarrier.commit` が ADR-0002 の 4 段階すべての payload を受理する契約に拡張。§5.1 用語集に payload 型 7 件を追加し `StageOrder` / `CommitBarrier` / `DocumentStateDelta` の関連概念を更新。`Stable Compile State` 用語集に `PackageDocSnapshotCatalog` を追加し §3.8 型定義との整合を確保 | Claude Opus 4.6 |
 | 0.1.33 | 2026-03-17 | `CompilationSnapshot` / `StableCompileState` を frozen read-only view 契約で表現し、`DocumentStateDelta` を Hyperref/Typesetting 更新経路へ明示。`DocumentPartitionPlanner` の TOC primary / parser fallback 境界と `partitionId` の暫定性、preview bootstrap と publish の責務境界を文書全体で統一 | Codex |
 | 0.1.32 | 2026-03-17 | §3.1 / §5.1 に bibliography freshness metadata（`BibliographyInputFingerprint` / `BibliographyToolchain`）を追加し、toolchain 選択と sidecar 更新計画の owner を `Bibliography Integration`、`.bbl` 更新後の invalidation / 同一 job 内の追加 pass を `IncrementalCompilationCoordinator` へ固定。§3.4 の `CompilationCache` を論理集約へ整理し `CacheMetadataStore` / `BlobCacheStore` port と durability 順序を追記、§3.8 / §5.8 の `CompileJobService` caller 定義・`traceFontTasks` 正規化経路・preview transport/adapter 境界を統一し、§5.1 / BR-6 に `CommitBarrier` conflict fallback 規則、§6.7 / BR-8 に pre-generated `.bbl` readback 例外を追記 | Codex |
 | 0.1.31 | 2026-03-17 | §5.1 用語集に `StableId`（安定識別子）と `DimensionValue`（寸法値）の定義を追加し `architecture.md` §5.1 Kernel Runtime の公開契約との整合を確保 | Claude Opus 4.6 |
