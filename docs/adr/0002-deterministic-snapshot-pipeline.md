@@ -64,7 +64,7 @@ compile の並列ステージは `CompilationSnapshot` だけを読み、job-sco
 
 ## Barrier order
 
-`CommitBarrier` は worker の完了順ではなく、`(passNumber, stageOrder, partitionId)` の total order で結果を適用する。`stageOrder` は `macro/session delta -> document/reference/bibliography state -> layout/page-number merge -> artifact emission/cache metadata` の順に固定し、`partitionId` は `DocumentPartitionPlanner` が安定に発行する。`partitionId` の primary source は前 pass で確定した TOC であり、cold start または TOC 未確定時は sectioning pre-scan が検出した sectioning command の `SourceSpan` と `DependencyGraph` を fallback source として暫定 `partitionId` を発行する。
+`CommitBarrier` は worker の完了順ではなく、`(passNumber, stageOrder, partitionId)` の total order で結果を適用する。`stageOrder` は `macro/session delta -> document/reference/bibliography state -> layout/page-number merge -> artifact emission/cache metadata` の順に固定し、`partitionId` は `DocumentPartitionPlanner` が安定に発行する。`partitionId` の primary source は前 pass で commit 済みの `DocumentStateView.toc` であり、cold start または TOC 未確定時は sectioning pre-scan が検出した sectioning command の `SourceSpan` と `DependencyGraph` を fallback source として暫定 `partitionId` を発行する。
 
 authority key（macro/register key、label/citation key、TOC/navigation owner、artifact slot）が衝突した場合、barrier は winner を選ばない。`DocumentPartitionPlanner` は本来こうした衝突を避ける partition を生成すべきであり、衝突検知時は authority key と関与した `partitionId` 集合を deterministic に記録したうえで、affected pass を非並列の sequential path へフォールバックする。artifact metadata だけは content hash と provenance が完全一致する重複書き込みを idempotent とみなし、それ以外は同じく collision として扱う。
 

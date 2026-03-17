@@ -5,8 +5,8 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.36          |
-| 最終更新日 | 2026-03-17      |
+| バージョン | 0.1.37          |
+| 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
@@ -146,6 +146,8 @@
 | Partition Kind | 文書パーティションの種別。`chapter` / `section` など、`DocumentPartitionPlanner` が work unit を分類するための論理タグ |
 | Partition ID | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`Commit Barrier` の total order の一部として使う |
 | Partition Locator | 章/セクション境界を一意に示す論理位置。`entryFile`、見出しの source span、同一ファイル内での出現順を組にして表す |
+| Authority Key | 並列 commit 時の衝突判定単位。macro/register key、label/citation key、TOC/navigation owner、artifact slot の総称で、同一 pass / stage 内で非 idempotent に重複した場合は sequential fallback を要求する |
+| Artifact Slot | artifact emission / cache metadata 段階で使う authority key。artifact kind、logical output path、主入力、jobname に紐づく書き込み先単位を表し、content hash と provenance が完全一致する重複書き込みだけを idempotent とみなす |
 | Citation Table | `.bbl` 由来の citation key と citation 表示文字列 / provenance を対応付ける索引。`\cite` 解決に使い、provenance は本文側 citation 表示の trace に使う |
 | Citation Label | 参考文献リスト各エントリの番号またはキー表示（例: `[1]`, `[Knu84]`）。`CitationInfo.label` に対応し、`REQ-NF-007` の互換性判定で比較対象となる |
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
@@ -1058,7 +1060,7 @@
 #### REQ-NF-003: メモリ使用量
 
 - **説明**: フルコンパイルと `LiveAnalysisSnapshot` 構築を含むピークメモリ使用量を合理的な範囲に抑える
-- **定量基準**: `FTX-BENCH-001` のフルコンパイルと `LiveAnalysisSnapshot` 構築を含むピークメモリ使用量 < 1GB
+- **定量基準**: `FTX-BENCH-001` のフルコンパイルと `LiveAnalysisSnapshot` 構築を含むピークメモリ使用量 < 1 GiB
 - **計測方法**: `FTX-BENCH-001` を対象にフルコンパイルと `LiveAnalysisSnapshot` 構築を同時実行した状態で RSS（Resident Set Size）のピークを計測する
 - **優先度**: Should
 - **出典**: ユーザー確認済み（2026-03-16）
@@ -1144,6 +1146,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.37 | 2026-03-18 | `REQ-NF-003` のメモリ閾値表記を `1 GiB` に統一し、用語集に `Authority Key` / `Artifact Slot` を追加して並列 commit の衝突判定単位を定義 | Codex |
 | 0.1.36 | 2026-03-17 | `FTX-PARTITION-BENCH-001` を用語集へ追加し、`REQ-FUNC-032` の検証条件に 4 コア以上の CPU・8 GiB 以上の物理メモリ・`FTX-ASSET-BUNDLE-001` 前提を束ねた versioned benchmark profile を導入 | Codex |
 | 0.1.35 | 2026-03-17 | `FTX-CORPUS-COMPAT-001/partition-book` / `partition-article` を用語集へ追加し、`REQ-FUNC-032` の並列化検証入力を versioned corpus subset に固定 | Codex |
 | 0.1.34 | 2026-03-17 | `REQ-FUNC-031` / `REQ-FUNC-032` の受け入れ基準に `--jobs=1` / `--jobs=4` 比較、同一マシン・1 回ウォームアップ + 5 回計測、メタデータ差分除外の出力一致条件を追加し、並列化要件の判定条件を検証可能化 | Codex |

@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.34          |
-| 最終更新日 | 2026-03-17      |
+| バージョン | 0.1.35          |
+| 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.33 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.20 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.37 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.24 |
 
 ## 1. サブドメイン分類
 
@@ -2166,6 +2166,8 @@ stateDiagram-v2
 | 解決コンテキスト (ResolutionContext) | current directory・ネスト深度・optional load 可否から成る資産解決用コンテキスト | InputStack, AssetResolver |
 | コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`RegisterBankView` / `CommandRegistryView` / `EnvironmentRegistryView` / `DocumentStateView` として commit 済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentStateView |
 | ドキュメント状態ビュー (DocumentStateView) | `DocumentState` から commit 完了時に導出される frozen read-only projection。`CounterStoreView` / `CrossReferenceTableView` / `BibliographyStateView` / `AuxStateView` / `TableOfContentsStateView` / `IndexStateView` / `NavigationStateView` を公開面として持つ | CompilationSnapshot, DocumentPartitionPlanner, StableCompileState |
+| authority key (AuthorityKey) | `CommitBarrier` の collision 判定単位。macro/register key、label/citation key、TOC/navigation owner、artifact slot の総称で、同一 `(passNumber, StageOrder)` 内で非 idempotent に重複した場合は sequential fallback を要求する | CommitBarrier, DocumentStateDelta, ArtifactSlot |
+| アーティファクトスロット (ArtifactSlot) | `ArtifactCachePayload` 内で出力アーティファクトや cache metadata の書き込み先を表す authority key。artifact kind、logical output path、主入力、jobname を組にした単位で、content hash と provenance が完全一致する重複だけを idempotent とみなす | AuthorityKey, ArtifactCachePayload, OutputArtifactRegistry |
 | コミットバリア (CommitBarrier) | 並列ステージの結果を `(passNumber, StageOrder, partitionId)` の total order で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可され、authority key が衝突した場合は winner を選ばず affected pass を sequential path へフォールバックさせる | CompilationJob, CompilationSnapshot, StageOrder, StageCommitPayload |
 | ステージ順序 (StageOrder) | `CommitBarrier` が `StageCommitPayload` を適用する順序を決定する列挙型。macro/session delta → document/reference/bibliography state → layout/page-number merge → artifact emission/cache metadata の 4 段階 | CommitBarrier, StageCommitPayload |
 | ステージコミットペイロード (StageCommitPayload) | `CommitBarrier.commit` が受け取る commit payload の sealed base type。`StageOrder` の各段階に対応する 4 つのサブタイプ（`MacroSessionPayload` / `DocumentReferencePayload` / `LayoutMergePayload` / `ArtifactCachePayload`）で stage 固有のデータを表現する | CommitBarrier, StageOrder |
@@ -2700,7 +2702,7 @@ stateDiagram-v2
 | BR-3 | ラベル/ページ相互参照は同一 `CompilationJob` 内で最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
 | BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
 | BR-5 | 差分コンパイルは再構築ノードと再利用ノードをマージした後もフルコンパイルと同一の出力でなければならず、参照不安定時は最大 3 パスまで反復する | REQ-FUNC-030 | 差分コンパイル |
-| BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならず、並列ステージは読み取り専用 `CompilationSnapshot` のみを参照し、マクロ・レジスタ・文書状態への commit は `CommitBarrier` で逐次化される。authority key 衝突時は winner を選ばず sequential fallback を要求する | REQ-FUNC-031 | インフラストラクチャ層 |
+| BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならず、並列ステージは読み取り専用 `CompilationSnapshot` のみを参照し、マクロ・レジスタ・文書状態への commit は `CommitBarrier` で逐次化される。authority key は macro/register key、label/citation key、TOC/navigation owner、artifact slot の総称であり、非 idempotent な衝突時は winner を選ばず sequential fallback を要求する。artifact metadata だけは content hash と provenance が完全一致する重複書き込みを idempotent とみなす | REQ-FUNC-031 | インフラストラクチャ層 |
 | BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。compile / watch / LSP の各入口は指定を `RuntimeOptions(jobname を含む)` へ正規化したうえですべての実行要求を `ExecutionPolicy` へ通し、デフォルト上限は 30 秒、1 プロセス / `CompilationJob`、捕捉出力 4 MiB である。preview 配信制約は `ExecutionPolicy.previewPublication` に含まれる。Ferritex が制御した readback 対象補助ファイル生成物は `ShellCommandGateway` を通じて trusted external artifact として `OutputArtifactRegistry` に記録される | REQ-FUNC-043 / REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン / 開発者ツール |
 | BR-8 | ファイル読み書きはすべて `FileAccessGate` を経由し、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。current `artifactRoot` は、same-job の一致条件を current `JobContext` の `jobname` と主入力で満たし、かつ active-job 限定の `OutputArtifactRegistry` に記録された artifact provenance から trusted と確認できた `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能である。ただし bibliography input に限り、current `artifactRoot/${jobname}.bbl` と `artifactRoot/${jobname}.bbl.ferritex.json` は registry 未登録でも pre-generated read-only input として読み取り可能である。`producedPass` は監査属性であり、same-job 一致条件には含めない。書き込みはキャッシュディレクトリと current `artifactRoot` に制限され、private temp root は engine-temp 用にのみ使用する。registry は job 完了または process restart で invalidate される | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
@@ -2730,6 +2732,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.35 | 2026-03-18 | メタ情報の参照版を requirements v0.1.37 / architecture v0.1.24 へ更新し、用語集と BR-6 に `AuthorityKey` / `ArtifactSlot` を追加して `CommitBarrier` の衝突判定単位を定義 | Codex |
 | 0.1.34 | 2026-03-17 | §3.1 に `StageCommitPayload` sealed hierarchy を追加し `CommitBarrier.commit` が ADR-0002 の 4 段階すべての payload を受理する契約に拡張。§5.1 用語集に payload 型 7 件を追加し `StageOrder` / `CommitBarrier` / `DocumentStateDelta` の関連概念を更新。`Stable Compile State` 用語集に `PackageDocSnapshotCatalog` を追加し §3.8 型定義との整合を確保 | Claude Opus 4.6 |
 | 0.1.33 | 2026-03-17 | `CompilationSnapshot` / `StableCompileState` を frozen read-only view 契約で表現し、`DocumentStateDelta` を Hyperref/Typesetting 更新経路へ明示。`DocumentPartitionPlanner` の TOC primary / parser fallback 境界と `partitionId` の暫定性、preview bootstrap と publish の責務境界を文書全体で統一 | Codex |
 | 0.1.32 | 2026-03-17 | §3.1 / §5.1 に bibliography freshness metadata（`BibliographyInputFingerprint` / `BibliographyToolchain`）を追加し、toolchain 選択と sidecar 更新計画の owner を `Bibliography Integration`、`.bbl` 更新後の invalidation / 同一 job 内の追加 pass を `IncrementalCompilationCoordinator` へ固定。§3.4 の `CompilationCache` を論理集約へ整理し `CacheMetadataStore` / `BlobCacheStore` port と durability 順序を追記、§3.8 / §5.8 の `CompileJobService` caller 定義・`traceFontTasks` 正規化経路・preview transport/adapter 境界を統一し、§5.1 / BR-6 に `CommitBarrier` conflict fallback 規則、§6.7 / BR-8 に pre-generated `.bbl` readback 例外を追記 | Codex |
