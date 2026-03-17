@@ -4,12 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.24          |
+| バージョン | 0.1.25          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.22 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.23 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.8 |
 
 ## 1. サブドメイン分類
 
@@ -75,6 +76,8 @@ graph LR
 ### 3.1 パーサー/マクロエンジン コンテキスト
 
 `CompilationJob` は最大 3 パスまでのコンパイル全体を表す集約であり、pass 間で共有される `DocumentState` / active-job 限定の `OutputArtifactRegistry` / `ExecutionPolicy` を所有する。`CompilationSession` はその内部の 1 パスを表し、カテゴリコード・レジスタ・スコープに加えて current-file 基準の解決、`\include` ガード、ネスト深度管理を担う `InputStack` / `IncludeState` などの pass-local 状態を保持する。パイプライン並列化を行う場合でも、各ステージが参照できるのは `CompilationSession` / `DocumentState` から導出した読み取り専用 snapshot のみであり、可変状態への commit は `CompilationJob` が所有する決定的 barrier で逐次に行う。`OutputArtifactRegistry` は job 完了時に invalidate され、process restart をまたいで再利用しない。
+
+注記: `LinkStyle` / `BorderStyle` は §3.2 タイプセッティングコンテキストにも同名・同構造で定義されている。これはコンテキスト間の型独立性を示すための意図的な重複であり、各コンテキストが upstream の型に依存しないことを明確にしている。
 
 ```mermaid
 classDiagram
@@ -1343,7 +1346,7 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
-`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`FontEmbeddingPlanner` は `TextRun` 群からページ横断の使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` と `ToUnicode CMap` を構築する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`PageRenderPlan` は `pageBox` と `graphics` をフィールドとして持ち、requirements.md の用語定義にある「source trace」は `PageBox` 内の `PlacedNode.sourceSpan` を介して間接的に保持される。`FontEmbeddingPlanner` は `TextRun` 群からページ横断の使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` と `ToUnicode CMap` を構築する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
 
 ```mermaid
 classDiagram
@@ -2658,6 +2661,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.25 | 2026-03-17 | メタ情報に architecture.md への参照を追加、§3.1 に LinkStyle/BorderStyle 重複定義の意図注記を追加、§3.6 に PageRenderPlan の source trace 間接保持注記を追加 | Claude Opus 4.6 |
 | 0.1.24 | 2026-03-17 | §3.1 に CompilationSnapshot クラスを追加、§3.8 に LspServer → CompileJobService の関連を追加 | Claude Opus 4.6 |
 | 0.1.21 | 2026-03-17 | DocumentStateDelta, GraphicsCommandStream, DependencyEvents の ValueObject 定義追加、Shared Entity ステレオタイプ補足、ErrorRecovery に REQ-FUNC-006 注記追加 | Claude Opus 4.6 |
 | 0.1.20 | 2026-03-16 | preview bootstrap 契約、partition locator、cache fallback の復旧意味論、package doc snapshot、永続化 port の責務を明文化 | Codex |
