@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.26          |
+| バージョン | 0.1.27          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -74,10 +74,10 @@
 | 基準               | 現行（基準）           | 目標                       |
 | ---------------- | ---------------- | ------------------------ |
 | FTX-BENCH-001 のフルコンパイル時間 | 同一入力・同一マシンでの pdfLaTeX baseline | 中央値 1.0 秒未満 |
-| FTX-BENCH-001 の相対速度    | 1x               | pdfLaTeX 比 100x 以上                     |
+| FTX-BENCH-001 の相対速度    | 1x               | pdfLaTeX 比 50x 以上（最低基準）、100x 以上（目標）|
 | LaTeX 互換性        | —                | 主要パッケージを含む標準的な論文がコンパイル可能 |
 
-※ 絶対速度と相対速度は同じ benchmark profile `FTX-BENCH-001` で判定し、詳細条件は `REQ-NF-001` / `REQ-NF-002` に定義する。
+※ 絶対速度と相対速度は同じ benchmark profile `FTX-BENCH-001` で判定し、詳細条件は `REQ-NF-001` / `REQ-NF-002` に定義する。相対速度 50x は最低基準（これを下回ると PoC として不成立）、100x は目標基準とする。
 
 
 ## 2. 用語集
@@ -150,7 +150,7 @@
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
 | FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
-| FTX-LSP-BENCH-001 | Ferritex の LSP 応答性能を判定する versioned benchmark profile。`FTX-BENCH-001` の入力文書と同一の 100 ページ学術論文テンプレートを LSP で開き、`FTX-BENCH-001` が規定する 4 コア以上の CPU と `REQ-NF-003` の peak RSS < 1 GiB を満たすメモリを含むハードウェア条件を適用し、キャッシュと `Stable Compile State` が構築済みの warm 状態から、診断・補完・定義ジャンプの各操作を含む replayable LSP trace を再生する計測条件を指す |
+| FTX-LSP-BENCH-001 | Ferritex の LSP 応答性能を判定する versioned benchmark profile。`FTX-BENCH-001` の入力文書と同一の 100 ページ学術論文テンプレートを LSP で開き、`FTX-BENCH-001` が規定する 4 コア以上の CPU と `REQ-NF-003` の peak RSS < 1 GiB を満たすメモリを含むハードウェア条件を適用し、キャッシュと `Stable Compile State` が構築済みの warm 状態から、診断・補完・定義ジャンプの各操作を含む replayable LSP trace を再生する計測条件を指す。trace は各操作種別（diagnostics / completion / definition）につき最低 5 回を含み、カーソル位置は文書の序盤（1〜30 ページ相当）・中盤（31〜70 ページ相当）・終盤（71〜100 ページ相当）にわたって分散させる |
 | FTX-CORPUS-COMPAT-001 | pdfLaTeX 互換性を判定する versioned 回帰コーパス。article/report/book/letter の基準文書に加え、hyperref、フォント埋め込み、画像埋め込み、外部 PDF 埋め込み、参考文献、目次/しおりを含む 100 文書で構成し、`FTX-ASSET-BUNDLE-001` を前提に評価する。参考文献を含む文書には事前生成済みの `.bbl` ファイルを同梱し、`bibtex` / `biber` の実行を前提としない |
 | FTX-CORPUS-COMPAT-001/layout-core | `FTX-CORPUS-COMPAT-001` のうち article/report/book/letter の baseline 文書群を束ねる stable subset ID。レイアウト互換の基準ケースに使う |
 | FTX-CORPUS-COMPAT-001/layout-core/article | `FTX-CORPUS-COMPAT-001/layout-core` に含まれる article baseline 文書の stable case ID |
@@ -1105,13 +1105,14 @@
 | --- | ----------------------------------------------------------------------------------------------------- | ------------ | ---- |
 | 1   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
 | 2   | Ferritex Asset Bundle の初回セットアップ時の取得戦略。自動ダウンロード / 手動配置 / バイナリ同梱のいずれを採用するか。`cargo install ferritex` 後のユーザー体験に影響する | REQ-NF-009, REQ-FUNC-046 | 開発者  |
-| 3   | pdfLaTeX 比 100x の達成可能性。成功基準（§1.6）に直結し、PoC で律速ステージの確認が必要。`architecture.md` §12 でもリスクとして識別済み | REQ-NF-001 | 開発者  |
+| 3   | pdfLaTeX 比 100x の達成可能性。成功基準（§1.6）では 50x を最低基準、100x を目標基準とし、PoC で律速ステージの確認が必要。`architecture.md` §12 でもリスクとして識別済み | REQ-NF-001 | 開発者  |
 
 ## 変更履歴
 
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.27 | 2026-03-17 | §1.6 の相対速度成功基準を 50x（最低基準）/ 100x（目標）の 2 段階に変更、`FTX-LSP-BENCH-001` に trace 構成の最低要件（操作種別ごと最低 5 回、カーソル位置の文書内分散）を追加、§5#3 を更新 | Claude Opus 4.6 |
 | 0.1.26 | 2026-03-17 | §5 未確定事項に pdfLaTeX 比 100x 達成可能性のリスクを追加（architecture.md §12 との整合） | Claude Opus 4.6 |
 | 0.1.25 | 2026-03-17 | §5 未確定事項に Ferritex Asset Bundle の初回取得戦略を追加 | Claude Opus 4.6 |
 | 0.1.24 | 2026-03-17 | `FTX-LSP-BENCH-001` のハードウェア条件に `REQ-NF-003` のメモリ要件（peak RSS < 1 GiB）を明示 | Claude Opus 4.6 |
