@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.29          |
+| バージョン | 0.1.30          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.28 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.14 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.29 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.15 |
 
 ## 1. サブドメイン分類
 
@@ -1216,6 +1216,7 @@ classDiagram
     CacheMaintenanceService --> CompilationCache : writeback / eviction
     CacheMaintenanceService --> DependencyGraphStore : writeback
     CacheMaintenanceService ..> IncrementalCompilationCoordinator : notifies corruption
+    note for CacheMaintenanceService "アプリケーション層サービス。\nドメインモデル図に含むのは\ninfrastructure との接点を示すため"
     CompilationCache o-- CacheEntry
     CompilationCache --> CacheConfig
 ```
@@ -1654,7 +1655,7 @@ classDiagram
         +String text
     }
     class LiveAnalysisSnapshotFactory {
-        <<Service>>
+        <<Application Service>>
         +build(OpenDocumentBuffer, StableCompileState) LiveAnalysisSnapshot
     }
     class StableCompileState {
@@ -1760,7 +1761,7 @@ classDiagram
         +isEmpty() bool
     }
     class RecompileScheduler {
-        <<Service>>
+        <<Application Service>>
         +bool compileInFlight
         +enqueue(FileChangeEvent) void
         +syncWatchSet(DependencyGraph) void
@@ -1793,7 +1794,7 @@ classDiagram
         +String recoveryInstruction
     }
     class PreviewSessionService {
-        <<Service>>
+        <<Application Service>>
         +openSession(PreviewTarget, ExecutionPolicy) PreviewSession
         +publish(PreviewSession, PreviewRevision, ExecutionPolicy) void
     }
@@ -1868,7 +1869,7 @@ classDiagram
         +advertiseOptionalProviders(LspBuildConfig) ServerCapabilities
     }
     class ExecutionPolicyFactory {
-        <<Service>>
+        <<Application Service>>
         +build(RuntimeOptions, WorkspaceContext) ExecutionPolicy
     }
     class CompileOptions {
@@ -2585,6 +2586,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.30 | 2026-03-17 | §3.4 に `CacheMaintenanceService` のアプリケーション層配置理由を示す Mermaid note を追加、§3.8 の `RecompileScheduler` / `ExecutionPolicyFactory` / `LiveAnalysisSnapshotFactory` / `PreviewSessionService` のステレオタイプを `<<Service>>` から `<<Application Service>>` に修正し architecture.md §5.2 の分類と統一 | Claude Opus 4.6 |
 | 0.1.29 | 2026-03-17 | §3.2 / §3.6 の共有型・upstream 型のフィールド定義を削除し、stereotype + 正規セクション参照形式に統一（§3.1 注記参照）。§3.3 `GraphicsScene` を `<<ValueObject>>` に変更。§3.3 / §3.4 の upstream 型にも参照先を付記 | Claude Opus 4.6 |
 | 0.1.28 | 2026-03-17 | §3.1 に `StageOrder` 列挙型と `CommitBarrier` 値オブジェクトを追加、§3.1 の `%%` コメントをラベル付き矢印に変更、§3.4 に cache 破損時の fallback 動作を明示、§5.1 に `StageOrder` 用語を追加し `CommitBarrier` 定義を拡充 | Claude Opus 4.6 |
 | 0.1.27 | 2026-03-17 | §3.4 に CacheMaintenanceService を追加、§3.8 に WorkspaceJobScheduler と LspCapabilityService を追加、§5.4 / §5.8 の用語集にそれぞれ追記、§3.1 に CompilationSession → CompilationJob の back-reference コメントを追加 | Claude Opus 4.6 |
