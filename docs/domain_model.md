@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.37          |
+| バージョン | 0.1.38          |
 | 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.39 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.26 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.40 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.27 |
 
 ## 1. サブドメイン分類
 
@@ -479,11 +479,29 @@ classDiagram
     class GraphicsCommandStream {
         <<ValueObject>>
         +List~GraphicsDirective~ directives
-        +List~AssetRef~ referencedAssets
+        +List~AssetHandle~ referencedAssets
     }
     class DependencyEvents {
         <<ValueObject>>
         +List~DependencyEvent~ events
+    }
+    class DependencyEvent {
+        <<ValueObject>>
+        +DependencyEventKind kind
+        +String targetKey
+        +SourceSpan sourceSpan
+        +int sequenceNumber
+    }
+    class DependencyEventKind {
+        <<Enumeration>>
+        INPUT_READ
+        MACRO_DEFINE
+        MACRO_USE
+        LABEL_DEFINE
+        LABEL_USE
+        PACKAGE_LOAD
+        CLASS_LOAD
+        BIBLIOGRAPHY_READ
     }
 
     Token <|-- ControlSequenceToken
@@ -569,6 +587,9 @@ classDiagram
     CompilationSession ..> DocumentStateDelta : produces per partition
     CompilationSession ..> GraphicsCommandStream : emits to graphics
     CompilationSession ..> DependencyEvents : emits to incremental
+    DependencyEvents o-- DependencyEvent
+    DependencyEvent --> DependencyEventKind
+    DependencyEvent --> SourceSpan
     class CompilationSnapshot {
         <<ValueObject>>
         +RegisterBankView confirmedRegisters
@@ -1344,6 +1365,22 @@ classDiagram
 
 ```mermaid
 classDiagram
+    class LogicalAssetId {
+        <<ValueObject>>
+        +AssetNamespace namespace
+        +String logicalName
+    }
+    class AssetNamespace {
+        <<Enumeration>>
+        CLASS
+        PACKAGE
+        FONT
+    }
+    class AssetHandle {
+        <<ValueObject>>
+        +FilePath normalizedPath
+        +ContentHash contentHash
+    }
     class AssetBundle {
         <<Entity>>
         +BundleVersion version
@@ -1403,9 +1440,13 @@ classDiagram
 
     AssetBundle --> BundleManifest
     AssetBundle --> AssetIndex
+    LogicalAssetId --> AssetNamespace
+    AssetIndex --> AssetHandle
     OverlaySet --> AssetBundle
     OverlaySet --> HostFontCatalog
     OverlaySet o-- OverlayLayer
+    OverlaySet --> AssetHandle
+    OverlaySet --> LogicalAssetId
     AssetIndex o-- PackageSnapshot
     AssetIndex o-- ClassSnapshot
     AssetIndex o-- FontSnapshot
@@ -1751,9 +1792,11 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、bootstrap request では上位 adapter から委譲された `PreviewTarget` を session に解決する。`ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。session 失効・target 不一致・policy 拒否時は `SessionErrorResponse`（エラー種別・対象 sessionId・回復手順）を返す（`REQ-NF-010`）。compile / watch / LSP の入口は `CliAdapter` / `WatchAdapter` / `LspServer` として分離され、各入口のオプションを `RuntimeOptions` に正規化する。`WatchAdapter` は `RecompileScheduler` を起動し、`CliAdapter` と `LspServer` と `RecompileScheduler` は共通の `CompileJobService` にコンパイルを委譲する。`CompileJobService` は `WorkspaceJobScheduler` に workspace 単位の active job 排他制御と compile / preview publish の順序保証を委譲する（`REQ-FUNC-039`）。`LspCapabilityService` は `initialize` 応答の `ServerCapabilities` 構築と optional provider（`definitionProvider`, `hoverProvider` 等）の有効/無効切り替えを担う（`REQ-FUNC-045`）。`ExecutionPolicyFactory` は `RuntimeOptions` と `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から導出した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。`CompletionIndex` / `SymbolIndex` / `HoverDocCatalog` はいずれも `LiveAnalysisSnapshot` から request-scoped に導出される immutable read model であり、mutable cache として長寿命保持しない。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、bootstrap request では上位 adapter から委譲された `PreviewTarget` を session に解決する。`ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。session 失効・target 不一致・policy 拒否時は `SessionErrorResponse`（エラー種別・対象 sessionId・回復手順）を返す（`REQ-NF-010`）。compile / watch / LSP の入口は `CliAdapter` / `WatchAdapter` / `LspServer` として分離され、各入口のオプションを `RuntimeOptions` に正規化する。`WatchAdapter` は `RecompileScheduler` を起動し、`CliAdapter` と `LspServer` と `RecompileScheduler` は共通の `CompileJobService` にコンパイルを委譲する。`CompileJobService` は `WorkspaceJobScheduler` に workspace 単位の active job 排他制御と compile / preview publish の順序保証を委譲する（`REQ-FUNC-039`）。`LspCapabilityService` は `initialize` 応答の `ServerCapabilities` 構築と optional provider（`definitionProvider`, `hoverProvider` 等）の有効/無効切り替えを担う（`REQ-FUNC-045`）。`ExecutionPolicyFactory` は `RuntimeOptions` と `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 なお、preview の protocol translation だけを担う `PreviewAdapter` は architecture 上の entry adapter として扱い、この domain model では `PreviewSessionService` と `PreviewTransport` の間に正規化された transport port だけを表す。
+
+以下の `Position`, `Range`, `Location`, `CompletionItem`, `Diagnostic`, `Hover`, `CodeAction`, `ServerCapabilities`, `LspRequest`, `LspResponse` は LSP 3.17 の protocol-native type として扱い、ここでは Ferritex 固有 read model との境界だけを示す。
 
 ```mermaid
 classDiagram
@@ -1817,8 +1860,8 @@ classDiagram
         +complete(LiveAnalysisSnapshot, Position) List~CompletionItem~
     }
     class CompletionIndex {
-        <<Entity>>
-        +rebuild(LiveAnalysisSnapshot) void
+        <<ValueObject>>
+        +from(LiveAnalysisSnapshot) CompletionIndex
         +lookupCommands(String) List~CompletionCandidate~
         +lookupEnvironments(String) List~CompletionCandidate~
         +lookupLabels(String) List~CompletionCandidate~
@@ -1837,18 +1880,18 @@ classDiagram
         +findDefinition(LiveAnalysisSnapshot, Position) Location
     }
     class SymbolIndex {
-        <<Entity>>
+        <<ValueObject>>
         +Map~SymbolKey, DefinitionProvenance~ entries
-        +rebuild(LiveAnalysisSnapshot) void
-        +lookup(TextDocument, Position) DefinitionProvenance
+        +from(LiveAnalysisSnapshot) SymbolIndex
+        +lookup(OpenDocumentBuffer, Position) DefinitionProvenance
     }
     class HoverProvider {
         <<Service>>
         +hover(LiveAnalysisSnapshot, Position) Hover
     }
     class HoverDocCatalog {
-        <<Entity>>
-        +rebuild(LiveAnalysisSnapshot) void
+        <<ValueObject>>
+        +from(LiveAnalysisSnapshot) HoverDocCatalog
         +lookup(SymbolKey) HoverDoc
     }
     class HoverDoc {
@@ -2192,6 +2235,7 @@ stateDiagram-v2
 | プレビュー公開ポリシー (PreviewPublicationPolicy) | `ExecutionPolicy` に内包される preview 配信専用の制約。loopback bind 限定、active job の最新 PDF のみ publish、session target 一致、target 変更または process restart 時の session 再発行規約を保持する | ExecutionPolicy, PreviewSessionService |
 | 文書状態デルタ (DocumentStateDelta) | 1 つの文書パーティションまたは 1 つの commit barrier ステージが生成する `DocumentState` への変更セット。カウンタ差分、ラベル/citation/TOC/索引/ナビゲーション更新、aux 書き出しを含む。`CommitBarrier` が `(passNumber, stageOrder, partitionId)` の total order でデルタを適用し、非 idempotent な authority key 衝突を検知した場合は sequential fallback を要求する | CommitBarrier, DocumentState, DocumentPartitionPlan, DocumentReferencePayload |
 | グラフィックコマンドストリーム (GraphicsCommandStream) | パーサーが tikz/graphicx コマンドを処理した際に生成する描画指示列。描画ディレクティブと参照先資産を保持し、`GraphicsCompiler` が `GraphicsBox` へ変換する | GraphicsCompiler, GraphicsScene |
+| 依存イベント (DependencyEvent) | 依存追跡イベント 1 件。event kind、target key、source span、同一パーティション内で単調増加する sequence number を持つ。consumer は同一 `(kind, targetKey, sourceSpan)` の重複を idempotent とみなし collapse できる | DependencyEvents, DependencyGraph |
 | 依存イベント列 (DependencyEvents) | パース中に発生するファイル読み込み・マクロ定義/使用・ラベル定義・参照使用などの依存追跡イベント列。`DependencyGraph` の構築・更新に使い、差分コンパイルの変更検知基盤を供給する | DependencyGraph, ChangeDetector |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 | 安定識別子 (StableId) | ノードやエンティティに付与される安定な識別子。ソースの軽微な変更で変化しないことを保証し、差分コンパイルのキャッシュキーや依存グラフのノード同一性判定に使う基底型 | DependencyGraph, CompilationCache |
@@ -2277,6 +2321,8 @@ stateDiagram-v2
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
 | Ferritex Asset Bundle | 実行時に参照するクラス・パッケージ・フォント資産の不変スナップショット | AssetIndex, OverlaySet |
+| 論理アセット識別子 (LogicalAssetId) | class/package/font の namespace と論理名を束ねた lookup key。overlay と bundle の共通解決キーとして使う | AssetIndex, OverlaySet |
+| アセットハンドル (AssetHandle) | 正規化済みパスと content hash を持つ解決済み asset 参照。`AssetResolver` / `OverlaySet` / `FontManager` が downstream に渡す | LogicalAssetId, AssetResolver, FontManager |
 | Asset Index | 論理名から資産ハンドルを高速解決する索引構造 | AssetBundle |
 | オーバーレイ (Overlay) | project-local 資産、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local font catalog fallback を優先順位付きで束ねる解決レイヤー | OverlaySet, OverlayLayer |
 | Host Font Catalog | platform font discovery API から収集したホストフォント索引。overlay の一種として解決面に参加する | PlatformFontScanner, FontSnapshot |
@@ -2340,6 +2386,8 @@ stateDiagram-v2
 | RuntimeOptions | compile (`REQ-FUNC-042`) / watch (`REQ-FUNC-044`) / LSP (`REQ-FUNC-045`) の入口固有指定を `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`traceFontTasks`、`shellEscapeAllowed` へ正規化した共通実行オプション。`traceFontTasks=true` の場合、`CompileJobService` が `FontTaskTrace` の `stderr` 出力を有効化する。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
 | AssetBundleRef | Asset Bundle の参照値。ファイルパスまたは組み込み識別子を区別して保持する | RuntimeOptions, CompileOptions, WatchOptions |
 | WorkspaceContext | プロジェクトルート、overlay roots、キャッシュ位置、利用可能な bundle 探索範囲/組み込み識別子をまとめた実行文脈 | ExecutionPolicyFactory |
+| コンテキスト境界 (ContextBoundary) | 単一プロセス内で各コンテキストの direct dependency を `kernel` と peer `api` へ限定する明示境界。性能のため共有メモリを維持しつつ、内部実装への侵入を防ぐ | ContextMap, CompileJobService |
+| peer API | 各コンテキストが他コンテキスト向けに公開する narrow interface。`internal` 実装を含まず、context 間依存はこの面だけを通す | ContextBoundary, CompileJobService |
 
 ## 6. 判断記録
 
@@ -2703,13 +2751,13 @@ stateDiagram-v2
 - **日付**: 2026-03-18
 - **関連コンテキスト**: 全コンテキスト横断
 - **関連 ADR**: ADR-0001
-- **判断内容**: パーサー/マクロエンジン、タイプセッティング、差分コンパイル、アセットランタイム、グラフィック描画、PDF 生成、フォント管理、開発者ツールの 8 コンテキストは、独立プロセスや技術レイヤではなく単一 Rust プロセス内の明示的な境界として保持する。各コンテキストは `kernel` と peer の `api` にのみ依存し、peer の internal 実装には直接依存しない
+- **判断内容**: パーサー/マクロエンジン、タイプセッティング、差分コンパイル、アセットランタイム、グラフィック描画、PDF 生成、フォント管理、開発者ツールの 8 コンテキストは、独立プロセスや技術レイヤではなく単一 Rust プロセス内の明示的な `ContextBoundary` として保持する。各コンテキストは `kernel` と peer `API` にのみ依存し、peer の internal 実装には直接依存しない
 - **根拠**:
   - 観測事実: `REQ-NF-001` / `REQ-NF-002` / `REQ-NF-004` は IPC やネットワーク越し通信を避ける低遅延を要求し、`REQ-NF-009` は単一バイナリ配布を Must として要求している
   - 代替案: コンテキストごとに別プロセス化する、または `controllers / services / repositories` 型の技術レイヤ中心モノリスにする
   - 分離証人: compile / watch / lsp / preview が同じ `CompilationJob`、`ExecutionPolicy`、`DocumentState` を共有しつつも、グラフィック描画や PDF 射影の内部実装へは `api` 越しにしかアクセスさせたくないケース。明示境界付き単一プロセスモデルでは共有メモリと境界規律を両立できるが、分散モデルでは性能要件が崩れ、技術レイヤ中心モデルではドメイン境界が曖昧になる
 - **等価性への影響**: 観測的非等価（配備方式と依存方向が変わるが、要求する機能集合は同一）
-- **語彙への影響**: 「コンテキスト境界」「peer api」を導入
+- **語彙への影響**: 「ContextBoundary」「peer API」を導入
 
 ## 7. ビジネスルール一覧
 
@@ -2752,6 +2800,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.38 | 2026-03-18 | メタ情報参照を requirements v0.1.40 / architecture v0.1.27 へ更新し、`DependencyEvent` / `LogicalAssetId` / `AssetHandle` / `ContextBoundary` / `peer API` を定義、LSP read model を request-scoped immutable projection として明文化 | Codex |
 | 0.1.37 | 2026-03-18 | 判断記録 6.1 / 6.2 / 6.7 / 6.12 / 6.16 / 6.19 / 6.29 に対応 ADR を明示し、ADR-0001 を逆引きできる判断記録 6.30 を追加。メタ情報参照を requirements v0.1.39 / architecture v0.1.26 へ更新 | Codex |
 | 0.1.36 | 2026-03-18 | `SymbolIndex` の関連概念を `LiveAnalysisSnapshot` 基準へ統一し、メタ情報の準拠要件参照を requirements v0.1.38、関連設計参照を architecture v0.1.25 へ更新 | Codex |
 | 0.1.35 | 2026-03-18 | メタ情報の参照版を requirements v0.1.37 / architecture v0.1.24 へ更新し、用語集と BR-6 に `AuthorityKey` / `ArtifactSlot` を追加して `CommitBarrier` の衝突判定単位を定義 | Codex |

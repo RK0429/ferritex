@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.39          |
+| バージョン | 0.1.40          |
 | 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -156,7 +156,7 @@
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
 | Bibliography Input Fingerprint | 現在の bibliography 宣言（`\bibliography`, `\addbibresource`）、解決済み `.bib` / bibliography style 入力、選択された toolchain（`bibtex` / `biber`）を正規化して得る fingerprint。`.bbl` の鮮度診断と `REQ-FUNC-024a` の自動再生成判定に使う |
 | Bibliography Sidecar Metadata | `${jobname}.bbl.ferritex.json` に保存される bibliography freshness metadata。`Bibliography Input Fingerprint`、選択 toolchain、生成 provenance を保持し、`.bbl` と対で再読込される |
-| FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
+| FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含み、Ferritex バイナリと同じリリース単位で archive として配布される |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、8 GiB 以上の物理メモリ、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
 | FTX-LSP-BENCH-001 | Ferritex の LSP 応答性能を判定する versioned benchmark profile。`FTX-BENCH-001` の入力文書と同一の 100 ページ学術論文テンプレートを LSP で開き、`FTX-BENCH-001` が規定する 4 コア以上の CPU と `REQ-NF-003` の peak RSS < 1 GiB を満たすメモリを含むハードウェア条件を適用し、キャッシュと `Stable Compile State` が構築済みの warm 状態から、診断・補完・定義ジャンプの各操作を含む replayable LSP trace を再生する計測条件を指す。warm 状態の構築手順は (1) `--no-cache` なしでフルコンパイルを 1 回実行しキャッシュと依存グラフを構築、(2) `ferritex lsp` を起動し `initialize` ハンドシェイクを完了、(3) 対象文書を `textDocument/didOpen` で開き初回 `Stable Compile State` が確定するまで待機、の 3 ステップとする。trace は各操作種別（diagnostics / completion / definition）につき最低 5 回を含み、カーソル位置は文書の序盤（1〜30 ページ相当）・中盤（31〜70 ページ相当）・終盤（71〜100 ページ相当）にわたって分散させる |
 | FTX-PARTITION-BENCH-001 | Ferritex の文書パーティション並列化を判定する versioned benchmark profile。`FTX-CORPUS-COMPAT-001/partition-book` と `FTX-CORPUS-COMPAT-001/partition-article`、`FTX-ASSET-BUNDLE-001`、4 コア以上の CPU、8 GiB 以上の物理メモリ、同一入力・同一マシンでの `--jobs=1` / `--jobs=4` 比較を前提にした計測条件を指す |
@@ -982,6 +982,7 @@
 - **例外**: バージョン不一致または破損時は診断を表示し、互換バンドルがなければ起動を失敗させる
 - **受け入れ基準**:
   - Given `FTX-ASSET-BUNDLE-001` のみが存在する環境, When `ferritex compile main.tex` を実行, Then TeX Live 非導入でも `FTX-CORPUS-COMPAT-001/layout-core` の baseline 文書群がコンパイルできる
+  - Given Ferritex バイナリと同じリリースで配布された `FTX-ASSET-BUNDLE-001` archive を展開し `--asset-bundle <展開先>` で指定した環境, When `ferritex compile main.tex --asset-bundle <展開先>` を実行, Then 追加の TeX ランタイム設定なしで asset 解決が開始される
   - Given Asset Bundle と Host Font Catalog の両方に同名フォント資産が存在する環境, When 通常の解決 API を呼び出す, Then Asset Bundle 側の資産が優先される
   - Given バンドルが破損している環境, When 読み込み, Then 破損診断が表示されコンパイルは開始されない
 - **優先度**: Must
@@ -1123,7 +1124,7 @@
 #### REQ-NF-009: インストール容易性
 
 - **説明**: 単一バイナリで配布可能とし、外部ランタイムへの依存を最小化する
-- **定量基準**: `cargo install ferritex` または単一バイナリのダウンロードと公式 Ferritex Asset Bundle の配置で利用開始可能。コンパイル実行時に TeX Live / kpathsea のインストールを要求しない
+- **定量基準**: `cargo install ferritex` または単一バイナリのダウンロード後、同じリリースで配布される公式 Ferritex Asset Bundle archive を展開し `ferritex compile main.tex --asset-bundle <展開先>` を実行するだけで利用開始可能。コンパイル実行時に TeX Live / kpathsea のインストールを要求しない
 - **優先度**: Must
 - **出典**: エージェント推測（Rust ツールチェーンの標準的な配布方法）
 
@@ -1142,14 +1143,14 @@
 | #   | 内容                                                                                                    | 関連要件         | 確認相手 |
 | --- | ----------------------------------------------------------------------------------------------------- | ------------ | ---- |
 | 1   | Ferritex Asset Bundle のスナップショット更新戦略。CTAN / TeX Live からどの頻度で資産を取り込み、互換バージョンをどう保持するか                                     | REQ-FUNC-046 | 開発者  |
-| 2   | Ferritex Asset Bundle の初回セットアップ時の取得戦略。自動ダウンロード / 手動配置 / バイナリ同梱のいずれを採用するか。`cargo install ferritex` 後のユーザー体験に影響する | REQ-NF-009, REQ-FUNC-046 | 開発者  |
-| 3   | pdfLaTeX 比 100x の達成可能性。成功基準（§1.6）では 50x を最低基準、100x を目標基準とし、PoC で律速ステージの確認が必要。`architecture.md` §12 でもリスクとして識別済み | REQ-NF-001a | 開発者  |
+| 2   | pdfLaTeX 比 100x の達成可能性。成功基準（§1.6）では 50x を最低基準、100x を目標基準とし、PoC で律速ステージの確認が必要。`architecture.md` §12 でもリスクとして識別済み | REQ-NF-001a | 開発者  |
 
 ## 変更履歴
 
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.40 | 2026-03-18 | `REQ-NF-009` と `REQ-FUNC-046` に公式 Asset Bundle archive を `--asset-bundle <展開先>` で指定する初回導入フローを明記し、未確定事項から初回取得戦略を削除 | Codex |
 | 0.1.39 | 2026-03-18 | 用語集に `OverlaySet` / `PageBox` / `FontTaskTrace` を追加し、requirements 単体で語彙を解決できるようにした | Codex |
 | 0.1.38 | 2026-03-18 | §1.6 の LaTeX 互換性成功基準を `REQ-NF-007` / `FTX-CORPUS-COMPAT-001` / `FTX-ASSET-BUNDLE-001` に接続し、`REQ-FUNC-015` の受け入れ基準に internal/external link と named destination の検証条件を追加 | Codex |
 | 0.1.37 | 2026-03-18 | `REQ-NF-003` のメモリ閾値表記を `1 GiB` に統一し、用語集に `Authority Key` / `Artifact Slot` を追加して並列 commit の衝突判定単位を定義 | Codex |
