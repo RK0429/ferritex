@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.25          |
+| バージョン | 0.1.26          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.23 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.8 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.24 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.9 |
 
 ## 1. サブドメイン分類
 
@@ -789,9 +789,9 @@ classDiagram
         +IndexState index
         +NavigationState navigation
         +int passCount
-        +registerLabel(String, LabelInfo) void
         +resolveLabel(String) ResolvedRef
     }
+    note for DocumentState "タイプセッティングコンテキストでは read-only。\nregisterLabel 等の書き込み操作は\nパーサー/マクロエンジンコンテキスト\n(§3.1) からのみ呼ばれる"
     class AuxState {
         <<Entity>>
         +List~AuxWrite~ pendingWrites
@@ -1346,7 +1346,7 @@ classDiagram
 
 ### 3.6 PDF 生成 コンテキスト
 
-`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`PageRenderPlan` は `pageBox` と `graphics` をフィールドとして持ち、requirements.md の用語定義にある「source trace」は `PageBox` 内の `PlacedNode.sourceSpan` を介して間接的に保持される。`FontEmbeddingPlanner` は `TextRun` 群からページ横断の使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` と `ToUnicode CMap` を構築する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
+`PdfRenderer` が `PageRenderPlan` と `NavigationState` を `PdfDocument` へ射影し、配置済み `LinkAnnotationPlan` と `PlacedDestination` を `Annotation` / named destination へ変換する。`PageRenderPlan` は `pageBox` と `graphics` をフィールドとして持ち、requirements.md の用語定義にある「placed destination」「リンク注釈計画」「source trace」は `PageBox` 内の `PlacedDestination` / `LinkAnnotationPlan` / `PlacedNode.sourceSpan` を介して間接的に保持される。`FontEmbeddingPlanner` は `TextRun` 群からページ横断の使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して `EmbeddedFont` と `ToUnicode CMap` を構築する。`SyncTexBuilder` は `PlacedNode` の source trace を fragment 単位で `SyncTexData` に索引化する。`GraphicResourceEncoder` はラスタ画像と外部 PDF を XObject / Form XObject へ正規化する。
 
 ```mermaid
 classDiagram
@@ -2661,6 +2661,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.26 | 2026-03-17 | §3.2 DocumentState の read-only 表記から registerLabel を除き Mermaid note を追加、§3.6 PageRenderPlan の間接保持注記に PlacedDestination / LinkAnnotationPlan を追記 | Claude Opus 4.6 |
 | 0.1.25 | 2026-03-17 | メタ情報に architecture.md への参照を追加、§3.1 に LinkStyle/BorderStyle 重複定義の意図注記を追加、§3.6 に PageRenderPlan の source trace 間接保持注記を追加 | Claude Opus 4.6 |
 | 0.1.24 | 2026-03-17 | §3.1 に CompilationSnapshot クラスを追加、§3.8 に LspServer → CompileJobService の関連を追加 | Claude Opus 4.6 |
 | 0.1.21 | 2026-03-17 | DocumentStateDelta, GraphicsCommandStream, DependencyEvents の ValueObject 定義追加、Shared Entity ステレオタイプ補足、ErrorRecovery に REQ-FUNC-006 注記追加 | Claude Opus 4.6 |
