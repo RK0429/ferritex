@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.30          |
+| バージョン | 0.1.31          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
 | 準拠要件  | [requirements.md](requirements.md) v0.1.29 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.15 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.16 |
 
 ## 1. サブドメイン分類
 
@@ -2055,6 +2055,8 @@ stateDiagram-v2
 | グラフィックコマンドストリーム (GraphicsCommandStream) | パーサーが tikz/graphicx コマンドを処理した際に生成する描画指示列。描画ディレクティブと参照先資産を保持し、`GraphicsCompiler` が `GraphicsBox` へ変換する | GraphicsCompiler, GraphicsScene |
 | 依存イベント列 (DependencyEvents) | パース中に発生するファイル読み込み・マクロ定義/使用・ラベル定義・参照使用などの依存追跡イベント列。`DependencyGraph` の構築・更新に使い、差分コンパイルの変更検知基盤を供給する | DependencyGraph, ChangeDetector |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
+| 安定識別子 (StableId) | ノードやエンティティに付与される安定な識別子。ソースの軽微な変更で変化しないことを保証し、差分コンパイルのキャッシュキーや依存グラフのノード同一性判定に使う基底型 | DependencyGraph, CompilationCache |
+| 寸法値 (DimensionValue) | TeX の寸法演算（pt, mm, em, ex 等の単位付き長さ）を表す基底型。グルー・ボックス・フォントメトリクスなど寸法を扱う全コンテキストの共通表現 | Glue, Box, FontMetrics |
 | プレビュー配信契約 (PreviewTransport) | loopback に bind し、`PreviewSessionService` が `POST /preview/session` bootstrap 応答と session ごとの HTTP document endpoint / WebSocket events endpoint を公開するための双方向 port。`PreviewTarget` 付き revision 通知を配信し、view-state 更新を受信する。session 失効時は `SessionErrorResponse` を返す | PreviewSession, PreviewRevision, SessionErrorResponse |
 
 ### 5.2 タイプセッティング コンテキスト
@@ -2586,6 +2588,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.31 | 2026-03-17 | §5.1 用語集に `StableId`（安定識別子）と `DimensionValue`（寸法値）の定義を追加し `architecture.md` §5.1 Kernel Runtime の公開契約との整合を確保 | Claude Opus 4.6 |
 | 0.1.30 | 2026-03-17 | §3.4 に `CacheMaintenanceService` のアプリケーション層配置理由を示す Mermaid note を追加、§3.8 の `RecompileScheduler` / `ExecutionPolicyFactory` / `LiveAnalysisSnapshotFactory` / `PreviewSessionService` のステレオタイプを `<<Service>>` から `<<Application Service>>` に修正し architecture.md §5.2 の分類と統一 | Claude Opus 4.6 |
 | 0.1.29 | 2026-03-17 | §3.2 / §3.6 の共有型・upstream 型のフィールド定義を削除し、stereotype + 正規セクション参照形式に統一（§3.1 注記参照）。§3.3 `GraphicsScene` を `<<ValueObject>>` に変更。§3.3 / §3.4 の upstream 型にも参照先を付記 | Claude Opus 4.6 |
 | 0.1.28 | 2026-03-17 | §3.1 に `StageOrder` 列挙型と `CommitBarrier` 値オブジェクトを追加、§3.1 の `%%` コメントをラベル付き矢印に変更、§3.4 に cache 破損時の fallback 動作を明示、§5.1 に `StageOrder` 用語を追加し `CommitBarrier` 定義を拡充 | Claude Opus 4.6 |
