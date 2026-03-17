@@ -3,7 +3,7 @@
 | 項目 | 値 |
 | --- | --- |
 | ステータス | 承認 |
-| 日付 | 2026-03-15 |
+| 日付 | 2026-03-17 |
 | 著者 | ferritex team |
 | 関連ADR | ADR-0001, ADR-0002, ADR-0003 |
 | 反映先 | [architecture.md](../architecture.md) §5.2 Application Services（ExecutionPolicyFactory）, §5.3 Infrastructure Adapters（ShellCommandGateway）, §11.2 セキュリティ設計 |
