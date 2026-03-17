@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.23          |
+| バージョン | 0.1.24          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.21 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.22 |
 
 ## 1. サブドメイン分類
 
@@ -553,6 +553,18 @@ classDiagram
     CompilationSession ..> DocumentStateDelta : produces per partition
     CompilationSession ..> GraphicsCommandStream : emits to graphics
     CompilationSession ..> DependencyEvents : emits to incremental
+    class CompilationSnapshot {
+        <<ValueObject>>
+        +RegisterBank confirmedRegisters
+        +CommandRegistry confirmedCommands
+        +EnvironmentRegistry confirmedEnvironments
+        +DocumentState confirmedDocumentState
+    }
+    CompilationJob ..> CompilationSnapshot : derives read-only projection
+    CompilationSnapshot --> RegisterBank
+    CompilationSnapshot --> CommandRegistry
+    CompilationSnapshot --> EnvironmentRegistry
+    CompilationSnapshot --> DocumentState
 ```
 
 ### 3.2 タイプセッティング コンテキスト
@@ -1974,6 +1986,7 @@ classDiagram
     LspServer --> OpenDocumentStore
     LspServer --> LiveAnalysisSnapshotFactory
     LspServer --> ExecutionPolicyFactory
+    LspServer ..> CompileJobService : triggers background compile
     LspServer --> RuntimeOptions : normalizes
     OpenDocumentStore o-- OpenDocumentBuffer
     LiveAnalysisSnapshotFactory --> OpenDocumentBuffer
@@ -2645,6 +2658,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.24 | 2026-03-17 | §3.1 に CompilationSnapshot クラスを追加、§3.8 に LspServer → CompileJobService の関連を追加 | Claude Opus 4.6 |
 | 0.1.21 | 2026-03-17 | DocumentStateDelta, GraphicsCommandStream, DependencyEvents の ValueObject 定義追加、Shared Entity ステレオタイプ補足、ErrorRecovery に REQ-FUNC-006 注記追加 | Claude Opus 4.6 |
 | 0.1.20 | 2026-03-16 | preview bootstrap 契約、partition locator、cache fallback の復旧意味論、package doc snapshot、永続化 port の責務を明文化 | Codex |
 | 0.1.19 | 2026-03-15 | `RuntimeOptions.jobname` と `PreviewPublicationPolicy` / `PreviewTarget` を導入し、preview session の owner/lifecycle、active-job 限定の Output Artifact Registry 寿命、LSP 非ブロッキング read path を反映 | Codex |

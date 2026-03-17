@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.21          |
+| バージョン | 0.1.22          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -150,6 +150,7 @@
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
 | FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
+| FTX-LSP-BENCH-001 | Ferritex の LSP 応答性能を判定する versioned benchmark profile。`FTX-BENCH-001` の入力文書と同一の 100 ページ学術論文テンプレートを LSP で開き、`FTX-BENCH-001` が規定する 4 コア以上の CPU を含むハードウェア条件を適用し、キャッシュと `Stable Compile State` が構築済みの warm 状態から、診断・補完・定義ジャンプの各操作を含む replayable LSP trace を再生する計測条件を指す |
 | FTX-CORPUS-COMPAT-001 | pdfLaTeX 互換性を判定する versioned 回帰コーパス。article/report/book/letter の基準文書に加え、hyperref、フォント埋め込み、画像埋め込み、外部 PDF 埋め込み、参考文献、目次/しおりを含む 100 文書で構成し、`FTX-ASSET-BUNDLE-001` を前提に評価する。参考文献を含む文書には事前生成済みの `.bbl` ファイルを同梱し、`bibtex` / `biber` の実行を前提としない |
 | FTX-CORPUS-COMPAT-001/layout-core | `FTX-CORPUS-COMPAT-001` のうち article/report/book/letter の baseline 文書群を束ねる stable subset ID。レイアウト互換の基準ケースに使う |
 | FTX-CORPUS-COMPAT-001/layout-core/article | `FTX-CORPUS-COMPAT-001/layout-core` に含まれる article baseline 文書の stable case ID |
@@ -1037,7 +1038,7 @@
   - 診断更新: < 500ms（編集後）
   - 補完候補提示: < 100ms
   - 定義ジャンプ: < 200ms
-- **計測方法**: `FTX-BENCH-001` 相当の文書（`FTX-BENCH-001` が規定する 4 コア以上の CPU を含むハードウェア条件を適用）を LSP で開き、キャッシュと `Stable Compile State` が構築済みの warm 状態から、replayable LSP trace（診断・補完・定義ジャンプの各操作を含む）を 1 回ウォームアップ後に 5 回再生し中央値を採用する
+- **計測方法**: versioned benchmark profile `FTX-LSP-BENCH-001` の LSP trace を 1 回ウォームアップ後に 5 回再生し中央値を採用する
 - **優先度**: Must
 - **出典**: ユーザー明示（REQ-FUNC-034 の受け入れ基準から導出）
 
@@ -1109,6 +1110,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.22 | 2026-03-17 | REQ-NF-004 の計測対象を専用 benchmark profile `FTX-LSP-BENCH-001` として定義し、用語集に追加 | Claude Opus 4.6 |
 | 0.1.21 | 2026-03-17 | REQ-FUNC-024 を .bbl 読み込み＋参考文献組版（Must）と外部ツール連携 REQ-FUNC-024a（Should）に分割し、REQ-NF-007（Must）との優先度整合性を解消 | Claude Opus 4.6 |
 | 0.1.20 | 2026-03-17 | REQ-NF-004 に計測方法を追加、REQ-FUNC-024 に処理境界を明記、REQ-NF-007 に参考文献互換指標を追加、FTX-CORPUS-COMPAT-001 に .bbl 同梱前提を明記 | Claude Opus 4.6 |
 | 0.1.19 | 2026-03-16 | REQ-NF-003 の計測スコープを compile + LiveAnalysisSnapshot に拡張し、REQ-NF-010 の対象を preview session エラーに拡大 | Claude Opus 4.6 |
