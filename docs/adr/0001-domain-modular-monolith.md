@@ -94,4 +94,5 @@ LSP、preview、compile、cache を別プロセスまたは別サービスに分
 
 - crate 昇格は stable API、独立 compile の利点、OS 依存や外部ライブラリ依存の局所化が揃った場合だけ許可する
 - `kernel` は catch-all shared module にせず、基底型だけを置く
-- CI は `ferritex-core` から `ferritex-application` / `ferritex-infra` への依存 0、循環依存 0 を強制する
+- `ferritex-core` 内では peer context の内部モジュール直参照を禁止し、各 context は `kernel` と peer の `api` submodule だけを参照してよい
+- CI は `ferritex-core` から `ferritex-application` / `ferritex-infra` への依存 0、crate cycle 0、peer context の internal import 0、peer `api` submodule 間 cycle 0 を強制する

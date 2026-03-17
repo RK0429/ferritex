@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.30          |
+| バージョン | 0.1.31          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -107,7 +107,7 @@
 | Host Font Catalog | platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集したホストフォント索引。Ferritex では host-local overlay として扱う |
 | Configured Overlay Root | 起動時設定で明示された読み取り専用の追加資産ディレクトリ。project root 外に置かれた `.tex` / `.sty` / クラス / フォント資産を allowlist として解決面へ追加する |
 | Execution Policy | `compile` / `watch` / `lsp` など全 entry point で共有される実行制約の集合。shell-escape 可否、パス許可境界、タイムアウト、出力上限に加え、preview 配信専用の `Preview Publication Policy` を含む |
-| Runtime Options | compile / watch / LSP の入口固有指定を正規化した共通実行記述。`primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` を保持し `ExecutionPolicy` 構築に使う |
+| Runtime Options | compile / watch / LSP の入口固有指定を正規化した共通実行記述。`primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`traceFontTasks`、`shellEscapeAllowed` を保持し、`ExecutionPolicy` 構築とフォント処理 stage の `stderr` trace 有効化に使う |
 | Asset Bundle Reference | Ferritex Asset Bundle を参照するための値。ファイルパスまたは組み込みバンドル識別子で表す |
 | Artifact Kind | Output Artifact Registry が記録する補助ファイル種別。`.aux`、`.toc`、`.lof`、`.lot`、`.bbl`、`.synctex` など trusted readback 対象の論理分類を表す |
 | Artifact Producer Kind | Output Artifact Registry が記録する生成主体種別。Ferritex 本体が生成した成果物か、Ferritex が制御した外部ツールが生成した成果物かを区別する |
@@ -138,7 +138,7 @@
 | Preview View State | プレビューアの現在ページ、ページ内オフセット、ズーム倍率など、更新後も保持すべき閲覧位置情報 |
 | Preview Revision | active job が生成した PDF の改訂。`Preview Target` に紐づく revision 番号と pageCount を保持する |
 | Preview Session Service | `Preview Session` の発行・再発行・失効を管理し、`POST /preview/session` から受けた `Preview Target` を同一 process / 同一 target の既存 session に解決する。`Execution Policy.previewPublication` に照らして許可された publish だけを `Preview Transport` へ委譲する調停役 |
-| Preview Transport | loopback のみへ bind し、session bootstrap / document / events endpoint を提供する preview 配信契約。`POST /preview/session` への `sessionId` / `documentUrl` / `eventsUrl` 応答内容は `Preview Session Service` が決定し、`GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で `Preview Revision` 更新通知と view-state 更新を扱う |
+| Preview Transport | loopback のみへ bind し、session ごとの document / events endpoint を提供する preview 配信契約。session bootstrap は別責務とし、`Preview Session Service` が決定した `sessionId` / `documentUrl` / `eventsUrl` に基づいて `GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で `Preview Revision` 更新通知と view-state 更新を扱う |
 | Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
 | Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
 | Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
@@ -149,6 +149,8 @@
 | Citation Table | `.bbl` 由来の citation key と citation 表示文字列 / provenance を対応付ける索引。`\cite` 解決に使い、provenance は本文側 citation 表示の trace に使う |
 | Citation Label | 参考文献リスト各エントリの番号またはキー表示（例: `[1]`, `[Knu84]`）。`CitationInfo.label` に対応し、`REQ-NF-007` の互換性判定で比較対象となる |
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。表示文字列、citation key、由来情報を持ち、`\cite` の定義ジャンプはこの provenance を authority とする |
+| Bibliography Input Fingerprint | 現在の bibliography 宣言（`\bibliography`, `\addbibresource`）、解決済み `.bib` / bibliography style 入力、選択された toolchain（`bibtex` / `biber`）を正規化して得る fingerprint。`.bbl` の鮮度診断と `REQ-FUNC-024a` の自動再生成判定に使う |
+| Bibliography Sidecar Metadata | `${jobname}.bbl.ferritex.json` に保存される bibliography freshness metadata。`Bibliography Input Fingerprint`、選択 toolchain、生成 provenance を保持し、`.bbl` と対で再読込される |
 | FTX-ASSET-BUNDLE-001 | 互換性・性能評価で基準に使う versioned 公式 Asset Bundle。LaTeX カーネル、標準クラス、標準パッケージ、基準フォント資産を固定内容で含む |
 | FTX-BENCH-001 | Ferritex の性能要件を判定する共通 benchmark profile。100 ページの学術論文テンプレート、`amsmath` + `hyperref` + `graphicx`、固定 Ferritex Asset Bundle、外部参考文献処理なし、tikz/pgf なし、4 コア以上の CPU、8 GiB 以上の物理メモリ、同一入力・同一マシンでの pdfLaTeX 比較を前提にした versioned 計測条件を指す |
 | FTX-LSP-BENCH-001 | Ferritex の LSP 応答性能を判定する versioned benchmark profile。`FTX-BENCH-001` の入力文書と同一の 100 ページ学術論文テンプレートを LSP で開き、`FTX-BENCH-001` が規定する 4 コア以上の CPU と `REQ-NF-003` の peak RSS < 1 GiB を満たすメモリを含むハードウェア条件を適用し、キャッシュと `Stable Compile State` が構築済みの warm 状態から、診断・補完・定義ジャンプの各操作を含む replayable LSP trace を再生する計測条件を指す。warm 状態の構築手順は (1) `--no-cache` なしでフルコンパイルを 1 回実行しキャッシュと依存グラフを構築、(2) `ferritex lsp` を起動し `initialize` ハンドシェイクを完了、(3) 対象文書を `textDocument/didOpen` で開き初回 `Stable Compile State` が確定するまで待機、の 3 ステップとする。trace は各操作種別（diagnostics / completion / definition）につき最低 5 回を含み、カーソル位置は文書の序盤（1〜30 ページ相当）・中盤（31〜70 ページ相当）・終盤（71〜100 ページ相当）にわたって分散させる |
@@ -548,13 +550,16 @@
 - **処理**:
   - `.bbl` ファイルを読み込み、Bbl Snapshot と Citation Table を構築する
   - `\cite` コマンドの参照解決は Citation Table を用いて行い、`REQ-FUNC-011` のラベル/ページ参照とは責務を分離する
-  - `BibliographyState` は `.bbl` 取り込み、Citation Table 構築、`BibliographyEntry` provenance 管理、参考文献リストの組版データ生成を担う
+  - `BibliographyState` は `.bbl` 取り込み、Citation Table 構築、`BibliographyEntry` provenance 管理、読み込み時点の `Bibliography Input Fingerprint` 記録、参考文献リストの組版データ生成を担う
   - `CrossReferenceTable` は `\label` / `\ref` / `\pageref` のみを扱い、citation 系は扱わない
-  - `.bbl` が存在しない場合、または `.bbl` のコンテンツハッシュが前回取り込み時の `BblSnapshot` と異なる場合は「古い」と判定し、外部ツール（`bibtex` / `biber`）の手動実行を案内する診断を返す
+  - 事前生成済み `.bbl` は project root、設定済み read-only overlay roots、または current `artifactRoot` 配下の `${jobname}.bbl` から読み込める。paired な sidecar metadata は `${jobname}.bbl.ferritex.json` とする
+  - `Bibliography Input Fingerprint` は現在の bibliography 宣言、解決済み `.bib` / bibliography style 入力、選択された toolchain から算出する
+  - `.bbl` が存在しない場合、Ferritex が生成した `${jobname}.bbl.ferritex.json` に記録された `Bibliography Input Fingerprint` が現在値と一致しない場合、または sidecar がない環境で解決済み bibliography input のいずれかが `.bbl` より新しい場合は「stale」と判定し、外部ツールの手動実行または `--shell-escape` 付き再実行を案内する診断を返す
 - **出力**: 引用テキストと参考文献リストが組版された出力
 - **受け入れ基準**:
   - Given bibtex で生成された `.bbl` ファイルがある文書, When コンパイル, Then 参考文献リストが正しく組版される
   - Given `\cite{knuth1984}` と対応する `.bbl` エントリがある文書, When コンパイル, Then `\cite` は Citation Table から解決される
+  - Given `.bib` ファイル更新後に `.bbl` が再生成されていない文書, When `--shell-escape` なしでコンパイル, Then `.bbl` は stale と診断され、古い `.bbl` が fresh と誤判定されない
 - **優先度**: Must
 - **出典**: ユーザー明示
 - **関連要件**: REQ-FUNC-024a
@@ -564,11 +569,13 @@
 - **説明**: 外部ツール（`bibtex`, `biber`）の自動実行による `.bbl` 生成を行う
 - **入力**: `\bibliography`, `\addbibresource` 等を含む文書、`--shell-escape` オプション
 - **処理**:
-  - `--shell-escape` 有効時に `REQ-FUNC-047` 経由で `bibtex` / `biber` を実行し、`.bbl` を生成する
-  - Ferritex が制御した外部ツールが `.bbl` を output root 配下へ生成した場合は、Output Artifact Registry に trusted external artifact として登録する
+  - `--shell-escape` 有効時に `REQ-FUNC-047` 経由で bibliography toolchain を選択し、`.bbl` 欠落または `REQ-FUNC-024` の stale 診断が出た場合に限って `bibtex` / `biber` を自動実行する
+  - v1 の toolchain 選択規則は bibliography 宣言だけから決定し、`\addbibresource` を使う場合は `biber`、それ以外で `\bibliography` を使う場合は `bibtex` とする
+  - Ferritex が制御した外部ツールが `.bbl` を output root 配下へ生成した場合は、Output Artifact Registry に trusted external artifact として登録し、同時に `Bibliography Input Fingerprint` と toolchain を `${jobname}.bbl.ferritex.json` として sidecar metadata に保存する
+  - `.bbl` 更新後は bibliography 依存キャッシュを invalidation し、同一 `CompilationJob` 内で参考文献依存 pass を再実行して最終 PDF と diagnostics を更新する
 - **出力**: 生成された `.bbl` ファイル（`REQ-FUNC-024` の入力として使用される）
 - **受け入れ基準**:
-  - Given `.bib` ファイルを参照する文書, When `--shell-escape` 付きでコンパイル, Then `bibtex` / `biber` が自動実行され `.bbl` が生成される
+  - Given `.bib` ファイルを参照し `.bbl` が存在しない文書, When `--shell-escape` 付きでコンパイル, Then 適切な toolchain が 1 回だけ自動実行され `.bbl` と `${jobname}.bbl.ferritex.json` が生成され、同じ `CompilationJob` の最終 PDF に更新済み参考文献が反映される
   - Given `--shell-escape` なしでコンパイル, When `.bbl` が未生成, Then 外部ツールの手動実行を案内する診断が表示される
 - **優先度**: Should
 - **出典**: ユーザー明示
@@ -720,10 +727,12 @@
 
 - **説明**: 複数フォントの読み込み・埋め込みを並列に実行する
 - **入力**: 使用フォントのリスト
-- **処理**: 各フォントのファイル読み込み・パース・サブセット化を独立したタスクとして並列実行
+- **処理**:
+  - 各フォントのファイル読み込み・パース・サブセット化を独立したタスクとして並列実行
+  - 計測用 trace を有効にした場合は `fontTaskId`, `fontAsset`, `startedAt`, `finishedAt`, `workerId` を含む `FontTaskTrace` を `stderr` に出力し、overlap 判定に使えるようにする
 - **出力**: 並列処理されたフォントデータ
 - **受け入れ基準**:
-  - Given 10種類以上のフォントを使用する文書, When コンパイル, Then フォント処理が並列実行され、逐次処理より短い時間で完了する
+  - Given 10種類以上のフォントを使用する文書と `--jobs=4`, When 計測用 trace を有効にしてコンパイル, Then font load / subset の独立タスクが少なくとも 2 件以上 overlap し、出力は `--jobs=1` と同一になる
 - **優先度**: Could
 - **出典**: ユーザー明示
 
@@ -843,6 +852,7 @@
 - **処理**:
   - preview client は `(workspaceRoot, primaryInput, jobname)` から成る `Preview Target` を loopback 上の `POST /preview/session` へ送信し、`Preview Session Service` は同一 process かつ同一 target の既存 session があれば再利用し、なければ新しい `sessionId` と `documentUrl` / `eventsUrl` を返す。process restart または target 変更時は sessionId を再発行し、旧 sessionId を失効させる
   - `Preview Session Service` が `Execution Policy.previewPublication` に照らして publish 可否を判定し、active job の `Preview Target` と session owner が一致する場合だけ `Preview Transport` を loopback に bind した `GET /preview/{sessionId}/document` で最新 PDF を配信する
+  - `GET /preview/{sessionId}/document` の応答は常に `Cache-Control: no-store, no-cache, must-revalidate` を返し、ブラウザや埋め込み preview client が古い PDF をキャッシュ再利用しないようにする
   - 同じ session に対して `Preview Session Service` が `Preview Transport` の `WS /preview/{sessionId}/events` を介して target 付き `Preview Revision`、page count、view-state 更新を交換する
   - sessionId ごとに `Preview Session` を保持し、`Preview Target` と `Preview View State` として現在ページ、ページ内オフセット、ズーム倍率を保存する
   - PDF 更新時は保持済みの `Preview View State` を優先して再適用し、該当ページが消滅した場合のみ最近傍の有効ページへフォールバックする
@@ -850,6 +860,7 @@
 - **受け入れ基準**:
   - Given preview client が `POST /preview/session` に `(workspaceRoot, primaryInput, jobname)` を送る, When 同一 process かつ同一 target の session が存在する, Then 同じ `sessionId` と `documentUrl` / `eventsUrl` が返る
   - Given loopback 上で `(workspaceRoot, primaryInput, jobname)` に紐づく preview session が確立済みで `GET /preview/{sessionId}/document` と `WS /preview/{sessionId}/events` に接続したプレビューア, When 同じ target の再コンパイル完了, Then 1秒以内に target 付き document revision 通知が届き閲覧ページ位置が維持される
+  - Given 同じ `sessionId` で `GET /preview/{sessionId}/document` を再取得する preview client, When 応答ヘッダを確認, Then `Cache-Control: no-store, no-cache, must-revalidate` が返り stale PDF がキャッシュ再利用されない
   - Given 再コンパイル前に 20 ページ目を閲覧中で、再コンパイル後の PDF が 15 ページに短縮された場合, When プレビューが更新, Then 最近傍の有効ページである 15 ページ目へフォールバックしズーム倍率を維持する
   - Given process restart 後または別 `Preview Target` へ切り替え後の古い `sessionId`, When 旧 session へ接続または publish を試みる, Then 旧 session は `410 Gone` 相当で拒否され、新しい `POST /preview/session` による sessionId 再取得が要求される
 - **優先度**: Must
@@ -879,6 +890,7 @@
 - **入力**: `ferritex compile <file.tex>`
 - **処理**:
   - 入力ファイルの読み込みとコンパイルパイプラインの実行
+  - `--output-dir` 未指定時は `primaryInput` の親ディレクトリを既定 `artifactRoot` とし、同ディレクトリを current job の output root として `ExecutionPolicy` に組み込む
   - 進捗表示（ページ数、処理中ファイル名）
   - 終了コード: 0（成功）、1（警告あり成功）、2（エラー）
 - **出力**: PDF ファイル、コンパイルログ
@@ -893,15 +905,16 @@
 - **説明**: コンパイルの動作を制御する各種 CLI オプションを提供する
 - **入力**: CLI フラグ・引数
 - **処理**: 以下のオプションをサポート
-  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加し、Ferritex または Ferritex が制御した外部ツール実行で生成され Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等のうち、current Compilation Job の `jobname` と主入力に整合するものだけ readback を許可する。現在パス番号と生成パス番号は監査用に保持するが一致条件には含めない
+  - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加する。未指定時は `primaryInput` の親ディレクトリを既定 `artifactRoot` / output root とみなす。Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等のうち、current Compilation Job の `jobname` と主入力に整合するものだけ `engine-readback` を許可する。現在パス番号と生成パス番号は監査用に保持するが一致条件には含めない
   - `--jobname <name>`: ジョブ名（出力ファイル名）の指定。`Runtime Options.jobname` に正規化され、same-job 判定と出力命名の共通語彙として使う
   - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）
   - `--no-cache`: キャッシュを無効化しフルコンパイル
   - `--asset-bundle <ref>`: 使用する Ferritex Asset Bundle の指定。`<ref>` はファイルパスまたは組み込みバンドル識別子
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`）
   - `--synctex`: SyncTeX データの生成有無
+  - `--trace-font-tasks`: `REQ-FUNC-033` の検証に使う `FontTaskTrace` を `stderr` に出力する
   - `--shell-escape` / `--no-shell-escape`: 外部コマンド実行の許可
-  - compile / watch / LSP の各入口で受け取った指定は `primaryInput`, `artifactRoot`, `jobname`, `parallelism`, `reuseCache`, `assetBundleRef`, `interactionMode`, `synctex`, `shellEscapeAllowed` から成る共通の `Runtime Options` に正規化され、それを基に同一の `Execution Policy` を構築する
+  - compile / watch / LSP の各入口で受け取った指定は `primaryInput`, `artifactRoot`, `jobname`, `parallelism`, `reuseCache`, `assetBundleRef`, `interactionMode`, `synctex`, `traceFontTasks`, `shellEscapeAllowed` から成る共通の `Runtime Options` に正規化され、それを基に同一の `Execution Policy` を構築する
 - **出力**: 指定オプションに従ったコンパイル動作
 - **受け入れ基準**:
   - Given `--output-dir build` を指定, When コンパイル, Then `build/` ディレクトリに PDF が生成される
@@ -912,9 +925,10 @@
 #### REQ-FUNC-044: ウォッチモード
 
 - **説明**: ファイル監視と自動再コンパイルを CLI から利用可能にする
-- **入力**: `ferritex watch <file.tex>`
+- **入力**: `ferritex watch <file.tex>`。コンパイル結果に影響する CLI オプションは `REQ-FUNC-043` と同じく `--output-dir`, `--jobname`, `--jobs`, `--no-cache`, `--asset-bundle`, `--interaction`, `--synctex`, `--trace-font-tasks`, `--shell-escape` / `--no-shell-escape` を受け付ける
 - **処理**:
   - ファイル監視（REQ-FUNC-038）の開始
+  - `REQ-FUNC-043` と同じ compile-affecting option 群を `Runtime Options` へ正規化して watch 実行へ引き継ぐ
   - 変更検知時の差分コンパイル連携（REQ-FUNC-039）
   - Ctrl+C によるグレースフル停止
 - **出力**: 継続的な PDF 更新
@@ -932,11 +946,14 @@
   - 標準入出力（stdio）を介した LSP プロトコル通信の開始
   - `initialize` ハンドシェイクで必須 capability（`textDocumentSync`, `completionProvider`, `codeActionProvider`）を通知し、optional provider の capability（`definitionProvider`, `hoverProvider` など）は provider 有効時のみ advertise する
   - プロジェクトルートの自動検出
+  - `primaryInput` は現在開いている TeX 文書の URI から導出し、`artifactRoot` は workspace 設定の `ferritex.outputDir` があればその正規化先、なければ `primaryInput` の親ディレクトリ、`jobname` は workspace 設定の `ferritex.jobname` があればその値、なければ `primaryInput` の stem を使う
+  - LSP 由来の `Runtime Options` で未指定の compile-affecting 項目は固定既定値で補う。`parallelism=利用可能 CPU コア数`、`reuseCache=true`、`assetBundleRef=互換な組み込み Ferritex Asset Bundle`、`interactionMode=nonstopmode`、`synctex=false`、`traceFontTasks=false`、`shellEscapeAllowed=false`
 - **出力**: LSP プロトコルに準拠したリクエスト/レスポンス
 - **受け入れ基準**:
   - Given `ferritex lsp` を起動, When エディタから `initialize` リクエストを受信, Then 必須 capability（`textDocumentSync`, `completionProvider`, `codeActionProvider`）を含む応答が返される
   - Given definition provider が有効な build, When `initialize` リクエストを受信, Then `definitionProvider` を含む応答が返される
   - Given hover provider が有効なビルド, When `initialize` リクエストを受信, Then `hoverProvider` を含む応答が返される
+  - Given workspace 設定に `ferritex.outputDir` と `ferritex.jobname` がない環境, When `chapters/main.tex` を `didOpen` した LSP session が background compile を要求, Then `primaryInput=chapters/main.tex`, `artifactRoot=chapters/`, `jobname=main`, `parallelism=利用可能 CPU コア数`, `reuseCache=true`, `assetBundleRef=互換な組み込み Ferritex Asset Bundle`, `interactionMode=nonstopmode`, `synctex=false`, `traceFontTasks=false`, `shellEscapeAllowed=false` として `Runtime Options` が構築される
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -985,7 +1002,7 @@
 - **処理**:
   - パス正規化とシンボリックリンク解決
   - すべての `\input`, `\include`, `\openin`, `\openout`, asset read, engine-temp / engine-output / engine-readback 要求を共通 File Access Gate に集約する
-  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Compilation Job の `jobname` と主入力の双方に整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。現在パス番号と生成パス番号は監査・診断属性として保持するが same-job 一致条件には含めない。書き込みはキャッシュ、明示的 output root、private temp root に限定する
+  - 許可領域の判定。読み取りはプロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュに限定し、`engine-readback` に限って Output Artifact Registry が current Compilation Job の `jobname` と主入力の双方に整合する trusted artifact として確認した補助ファイル（`.aux`, `.toc`, `.lof`, `.lot`, `.bbl`, `.synctex` など）の再読込を許可する。加えて bibliography 入力に限り、current `artifactRoot` 配下の `${jobname}.bbl` と `${jobname}.bbl.ferritex.json` は registry 未登録でも read-only の pre-generated input として読み込み可能にする。現在パス番号と生成パス番号は監査・診断属性として保持するが same-job 一致条件には含めない。書き込みはキャッシュ、output root、private temp root に限定する
   - Ferritex 自身が確保した private temp dir をキャッシュ配下または明示的 output root 配下に作成し、`engine-temp` 用にのみ許可
   - Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルを、正規化パス・主入力・artifact kind・jobname・生成パス番号・生成者種別・生成パス・コンテンツハッシュ付きで Output Artifact Registry に記録する。生成パス番号は監査属性であり、trusted readback の一致判定は主入力と jobname で行う
   - Output Artifact Registry は current active `Compilation Job` にだけ属する in-memory authority とし、job 完了または process restart で必ず無効化する。append-only manifest は監査専用であり trusted 判定には使わない
@@ -997,6 +1014,7 @@
   - Given 設定済み read-only overlay root にある `shared.sty` を読み込む文書, When コンパイル, Then 読み込みは許可されるが同 root への書き込みは拒否される
   - Given `--output-dir ../dist` を指定してコンパイル, When PDF / `.aux` / `.log` を生成, Then 正規化済み output root 配下への書き込みのみが許可される
   - Given `--output-dir ../dist` を指定して 2 パス以上のコンパイルを行う文書, When Ferritex が前パスで生成し Output Artifact Registry に記録した `../dist/main.aux` と `../dist/main.toc` を後続パスから再読込, Then `producedPass` と current pass number が異なっていても `engine-readback` として許可される
+  - Given `--output-dir ../dist` を指定し、手動生成済みの `../dist/main.bbl` と `../dist/main.bbl.ferritex.json` が存在する文書, When コンパイル, Then その 2 ファイルは bibliography input として読み込み可能だが、同じ output root 内の他の未登録補助ファイルは `engine-readback` としては許可されない
   - Given 同じ output root 配下に `foo.aux` と `bar.aux` が存在する環境, When current Job Context の jobname が `foo` のコンパイルから `bar.aux` を `engine-readback` しようとする, Then same-job 不一致として拒否される
   - Given `thesis.tex` と `article.tex` を同じ `--jobname shared` と同じ output root で順にコンパイルする環境, When `thesis.tex` の current Job Context から `article.tex` が生成した `shared.aux` を `engine-readback` しようとする, Then 主入力不一致として拒否される
   - Given `--output-dir ../dist` 配下にユーザーが事前配置した未登録の `main.aux` がある文書, When コンパイル, Then `engine-readback` は拒否され provenance 不一致の診断が表示される
@@ -1054,8 +1072,8 @@
 
 #### REQ-NF-006: ファイルアクセス制御
 
-- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Output Artifact Registry により current `Compilation Job` の `jobname` と主入力の双方に整合する trusted artifact と確認された補助ファイルの readback に限って読み取りを許可する。Output Artifact Registry は active job 限定の in-memory authority とし、job 完了または process restart で無効化する。現在パス番号と生成パス番号は監査属性として保持するが same-job 一致条件には含めない。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
-- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、active job の Output Artifact Registry に記録され current `Compilation Job` の `jobname` / 主入力の双方が一致する output root 配下の trusted artifact。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
+- **説明**: TeX の `\openin`, `\openout` によるファイルアクセスを、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Ferritex Asset Bundle、キャッシュディレクトリに制限し、明示的 output root は Output Artifact Registry により current `Compilation Job` の `jobname` と主入力の双方に整合する trusted artifact と確認された補助ファイルの readback に限って読み取りを許可する。ただし bibliography input に限り、current `artifactRoot` 配下の `${jobname}.bbl` と `${jobname}.bbl.ferritex.json` は registry 未登録でも read-only の pre-generated input として読み取りを許可する。Output Artifact Registry は active job 限定の in-memory authority とし、job 完了または process restart で無効化する。現在パス番号と生成パス番号は監査属性として保持するが same-job 一致条件には含めない。書き込みはキャッシュディレクトリ、明示的 output root、Ferritex 管理下の private temp dir に制限する
+- **定量基準**: 許可領域（読み取り: プロジェクト、設定済み read-only overlay roots、Asset Bundle、キャッシュ、active job の Output Artifact Registry に記録され current `Compilation Job` の `jobname` / 主入力の双方が一致する output root 配下の trusted artifact、および bibliography input に限る current `artifactRoot/${jobname}.bbl` と `${jobname}.bbl.ferritex.json` の pre-generated input。書き込み: キャッシュ、明示的 output root、Ferritex 管理下の private temp dir）外への読み書きが発生する経路がゼロ
 - **優先度**: Must
 - **出典**: エージェント推測（pdfLaTeX の `openout_any = p` を発展させ、runtime bundle 設計へ適用）
 
@@ -1113,6 +1131,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.31 | 2026-03-17 | `REQ-FUNC-024` / `REQ-FUNC-024a` に bibliography freshness fingerprint・manual `.bbl` workflow・toolchain 選択・同一 `CompilationJob` 内の再実行境界を追加し、`REQ-NF-006` に pre-generated `.bbl` の read-only 例外を反映、`REQ-FUNC-040` と用語集に `no-store` 配信契約と preview bootstrap / transport 境界を反映、`REQ-FUNC-033` / `REQ-FUNC-043` に `FontTaskTrace` の `stderr` 出力契約と `Runtime Options.traceFontTasks` を追加し、`REQ-FUNC-044` に watch の option 継承境界、`REQ-FUNC-045` に LSP background compile の固定既定値、`REQ-FUNC-042` / `REQ-FUNC-048` に output root と既定値の明文化を追加 | Codex |
 | 0.1.30 | 2026-03-17 | `REQ-FUNC-024` の `.bbl` 古さ判定基準をコンテンツハッシュ比較として明確化 | Claude Opus 4.6 |
 | 0.1.29 | 2026-03-17 | `FTX-BENCH-001` のハードウェア条件に物理メモリ下限（8 GiB 以上）を追加し、計測結果の再現性を強化 | Claude Opus 4.6 |
 | 0.1.28 | 2026-03-17 | `FTX-LSP-BENCH-001` に warm 状態構築手順（フルコンパイル→LSP 起動→didOpen 待機）を追加、`REQ-NF-007` の参考文献互換計測方法に正規化ルール（空白畳み込み・citation label trim・フォント差吸収）を追加 | Claude Opus 4.6 |

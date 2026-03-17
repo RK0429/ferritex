@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.31          |
+| バージョン | 0.1.32          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.30 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.17 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.31 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.18 |
 
 ## 1. サブドメイン分類
 
@@ -246,6 +246,17 @@ classDiagram
     class BblSnapshot {
         <<ValueObject>>
         +List~BibliographyEntry~ entries
+        +BibliographyInputFingerprint inputFingerprint
+        +BibliographyToolchain toolchain
+    }
+    class BibliographyInputFingerprint {
+        <<ValueObject>>
+        +String value
+    }
+    class BibliographyToolchain {
+        <<Enumeration>>
+        bibtex
+        biber
     }
     class BibliographyEntry {
         <<ValueObject>>
@@ -390,7 +401,7 @@ classDiagram
         +List~FilePath~ overlayRoots
         +List~FilePath~ bundleRoots
         +FilePath cacheDir
-        +List~FilePath~ outputRoots
+        +FilePath artifactRoot
         +Set~String~ outputReadbackExtensions
         +FilePath privateTempRoot
     }
@@ -504,6 +515,8 @@ classDiagram
     BibliographyState --> BblSnapshot
     CitationTable o-- CitationInfo
     BblSnapshot o-- BibliographyEntry
+    BblSnapshot --> BibliographyInputFingerprint
+    BblSnapshot --> BibliographyToolchain
     NavigationState --> PdfMetadataDraft
     NavigationState o-- OutlineDraftEntry
     NavigationState o-- DestinationAnchor
@@ -1060,7 +1073,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。`CacheMaintenanceService` は dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知する。通知を受けた `IncrementalCompilationCoordinator` は dependency graph を invalidation 範囲の特定と watch-set refresh の補助にのみ使用し、出力生成はフルコンパイルへ fallback させる（`RecompilationScope.requiresFullRecompile = true`）。実際のスレッド実行はインフラストラクチャ層へ委譲する。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。ここでの `CompilationCache` は差分再利用の論理集約であり、metadata の永続化は `CacheMetadataStore`、blob payload の永続化は `BlobCacheStore` が担う。metadata publish は durable な blob write 成功後にのみ許可され、missing blob を指す entry は integrity check で invalidation される。`CacheMaintenanceService` は dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知する。通知を受けた `IncrementalCompilationCoordinator` は dependency graph を invalidation 範囲の特定と watch-set refresh の補助にのみ使用し、出力生成はフルコンパイルへ fallback させる（`RecompilationScope.requiresFullRecompile = true`）。実際のスレッド実行はインフラストラクチャ層へ委譲する。
 
 ```mermaid
 classDiagram
@@ -1163,16 +1176,27 @@ classDiagram
     class CompilationCache {
         <<Entity>>
         +CacheConfig config
-        +store(NodeId, CacheEntry) void
-        +retrieve(NodeId) CacheEntry
+        +lookup(NodeId, ContentHash) CacheEntry
         +invalidate(Set~NodeId~) void
+    }
+    class CacheMetadataStore {
+        <<Port>>
+        +load(NodeId, ContentHash) CacheEntry
+        +save(CacheEntry) void
+        +delete(Set~NodeId~) void
         +verify() CacheIntegrity
+    }
+    class BlobCacheStore {
+        <<Port>>
+        +load(ContentHash) bytes
+        +store(ContentHash, bytes) void
+        +deleteUnreferenced(Set~ContentHash~) void
     }
     class CacheEntry {
         <<ValueObject>>
         +NodeId nodeId
         +ContentHash sourceHash
-        +bytes data
+        +ContentHash blobHash
         +Instant lastAccessed
     }
     class CacheConfig {
@@ -1206,6 +1230,8 @@ classDiagram
     IncrementalCompilationCoordinator --> CompilationMergePlan
     IncrementalCompilationCoordinator --> IncrementalCompilationResult
     IncrementalCompilationCoordinator --> CompilationCache
+    CompilationCache ..> CacheMetadataStore : delegates metadata persistence
+    CompilationCache ..> BlobCacheStore : resolves blob payloads
     class CacheMaintenanceService {
         <<Application Service>>
         +writeback(DependencyGraph, CompilationCache) void
@@ -1213,7 +1239,9 @@ classDiagram
         +evict(CompilationCache) void
         +notifyCorruption(CacheIntegrity) void
     }
-    CacheMaintenanceService --> CompilationCache : writeback / eviction
+    CacheMaintenanceService --> CompilationCache : invalidation policy
+    CacheMaintenanceService --> CacheMetadataStore : writeback / integrity
+    CacheMaintenanceService --> BlobCacheStore : promote / GC
     CacheMaintenanceService --> DependencyGraphStore : writeback
     CacheMaintenanceService ..> IncrementalCompilationCoordinator : notifies corruption
     note for CacheMaintenanceService "アプリケーション層サービス。\nドメインモデル図に含むのは\ninfrastructure との接点を示すため"
@@ -1632,7 +1660,9 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、loopback 上の `POST /preview/session` bootstrap request と `ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。session 失効・target 不一致・policy 拒否時は `SessionErrorResponse`（エラー種別・対象 sessionId・回復手順）を返す（`REQ-NF-010`）。compile / watch / LSP の入口は `CliAdapter` / `WatchAdapter` / `LspServer` として分離され、各入口のオプションを `RuntimeOptions` に正規化する。`WatchAdapter` は `RecompileScheduler` を起動し、`CliAdapter` と `RecompileScheduler` は共通の `CompileJobService` にコンパイルを委譲する。`CompileJobService` は `WorkspaceJobScheduler` に workspace 単位の active job 排他制御と compile / preview publish の順序保証を委譲する（`REQ-FUNC-039`）。`LspCapabilityService` は `initialize` 応答の `ServerCapabilities` 構築と optional provider（`definitionProvider`, `hoverProvider` 等）の有効/無効切り替えを担う（`REQ-FUNC-045`）。`ExecutionPolicyFactory` は `RuntimeOptions` と `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、bootstrap request では上位 adapter から委譲された `PreviewTarget` を session に解決する。`ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。session 失効・target 不一致・policy 拒否時は `SessionErrorResponse`（エラー種別・対象 sessionId・回復手順）を返す（`REQ-NF-010`）。compile / watch / LSP の入口は `CliAdapter` / `WatchAdapter` / `LspServer` として分離され、各入口のオプションを `RuntimeOptions` に正規化する。`WatchAdapter` は `RecompileScheduler` を起動し、`CliAdapter` と `LspServer` と `RecompileScheduler` は共通の `CompileJobService` にコンパイルを委譲する。`CompileJobService` は `WorkspaceJobScheduler` に workspace 単位の active job 排他制御と compile / preview publish の順序保証を委譲する（`REQ-FUNC-039`）。`LspCapabilityService` は `initialize` 応答の `ServerCapabilities` 構築と optional provider（`definitionProvider`, `hoverProvider` 等）の有効/無効切り替えを担う（`REQ-FUNC-045`）。`ExecutionPolicyFactory` は `RuntimeOptions` と `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+
+なお、preview の protocol translation だけを担う `PreviewAdapter` は architecture 上の entry adapter として扱い、この domain model では `PreviewSessionService` と `PreviewTransport` の間に正規化された transport port だけを表す。
 
 ```mermaid
 classDiagram
@@ -1782,11 +1812,12 @@ classDiagram
         +bool reissueOnProcessRestart
     }
     class PreviewTransport {
-        <<Service>>
+        <<Port>>
         +publish(PreviewSession, PreviewRevision) void
         +receiveViewUpdate(String, PreviewViewState) void
         +respondError(String, SessionErrorResponse) void
     }
+    note for PreviewTransport "HTTP 契約の正本は architecture.md。\nこのモデルでは PreviewAdapter が正規化した\ntransport port だけを表す"
     class SessionErrorResponse {
         <<ValueObject>>
         +SessionErrorKind errorKind
@@ -1831,6 +1862,7 @@ classDiagram
         +AssetBundleRef assetBundleRef
         +InteractionMode interactionMode
         +bool synctex
+        +bool traceFontTasks
         +bool shellEscapeAllowed
     }
     class AssetBundleRef {
@@ -1882,6 +1914,7 @@ classDiagram
         +AssetBundleRef assetBundle
         +InteractionMode interaction
         +bool synctex
+        +bool traceFontTasks
         +bool shellEscape
     }
     class WatchOptions {
@@ -1894,6 +1927,7 @@ classDiagram
         +AssetBundleRef assetBundle
         +InteractionMode interaction
         +bool synctex
+        +bool traceFontTasks
         +bool shellEscape
         +Duration debounce
     }
@@ -2035,7 +2069,7 @@ stateDiagram-v2
 | include 状態 (IncludeState) | `\include` のガード対象と分離された `.aux` 出力先を保持する pass-local 状態 | CompilationSession, JobContext |
 | 解決コンテキスト (ResolutionContext) | current directory・ネスト深度・optional load 可否から成る資産解決用コンテキスト | InputStack, AssetResolver |
 | コンパイルスナップショット (CompilationSnapshot) | 並列ステージ境界で共有する読み取り専用の状態スナップショット。`CompilationSession` / `DocumentState` の確定済み部分だけを参照可能にする | CompilationJob, CompilationSession, DocumentState |
-| コミットバリア (CommitBarrier) | 並列ステージの結果を `(passNumber, StageOrder, partitionId)` の total order で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可される | CompilationJob, CompilationSnapshot, StageOrder |
+| コミットバリア (CommitBarrier) | 並列ステージの結果を `(passNumber, StageOrder, partitionId)` の total order で `CompilationJob` へ反映する同期点。マクロ・レジスタ・文書状態の破壊的更新はここでのみ許可され、authority key が衝突した場合は winner を選ばず affected pass を sequential path へフォールバックさせる | CompilationJob, CompilationSnapshot, StageOrder |
 | ステージ順序 (StageOrder) | `CommitBarrier` が `DocumentStateDelta` を適用する順序を決定する列挙型。macro/session delta → document/reference/bibliography state → layout/page-number merge → artifact emission/cache metadata の 4 段階 | CommitBarrier, DocumentStateDelta |
 | Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の投影。worker-local な未 commit 状態や失敗 pass の部分結果を含まない | LiveAnalysisSnapshot, CompilationJob |
 | ジョブコンテキスト (JobContext) | current jobname・主入力・現在パス番号を保持する値。`CompilationJob` 内の現在パスを識別し、same-job readback の一致判定キーである jobname / 主入力と、順序・診断用の現在パス番号を分離して扱う | CompilationSession, OutputArtifactRegistry |
@@ -2045,19 +2079,19 @@ stateDiagram-v2
 | ナビゲーション状態 (NavigationState) | hyperref とセクショニングが生成する PDF metadata draft、しおり候補、named destination、既定リンク装飾を保持する job-scope 状態 | DocumentState, PdfMetadataDraft, OutlineDraftEntry |
 | リンク装飾 (LinkStyle) | hyperref の `colorlinks` や枠線指定から正規化されたリンク描画規則。既定値として `NavigationState` に保持され、配置済みリンクへコピーされる | NavigationState, LinkAnnotationPlan |
 | 定義 provenance (DefinitionProvenance) | マクロ・ラベル・参考文献エントリの定義元を示す SourceLocation と由来種別の組。`CitationInfo.traceProvenance` のような trace 用参照にも使う | MacroDefinition, LabelInfo, BibliographyEntry, CitationInfo(trace) |
-| パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / output roots / private temp root と、output root から再読込可能な補助ファイル拡張子 allowlist を保持する静的ポリシー。実際の readback 可否は OutputArtifactRegistry と組み合わせて判定する | ExecutionPolicy, OutputArtifactRegistry |
+| パスアクセスポリシー (PathAccessPolicy) | 読み書き可能な project root / overlay roots / bundle roots / cache dir / current artifactRoot / private temp root と、artifactRoot から再読込可能な補助ファイル拡張子 allowlist を保持する静的ポリシー。実際の readback 可否は OutputArtifactRegistry と組み合わせて判定する | ExecutionPolicy, OutputArtifactRegistry |
 | 出力アーティファクトレジストリ (OutputArtifactRegistry) | Ferritex または Ferritex が制御した外部ツール実行で生成した readback 対象補助ファイルの provenance を保持し、current Compilation Job の `jobname` と主入力の双方に整合する trusted artifact のみを再読込可能にする active-job 限定 in-memory 台帳。`producedPass` は監査属性であり、same-job の一致条件には含めない。job 完了または process restart で無効化し、append-only manifest は監査専用とする | OutputArtifactRecord, JobContext, ExecutionPolicy |
 | アーティファクト種別 (ArtifactKind) | Output Artifact Registry が記録する補助ファイル種別。`.aux`、`.toc`、`.lof`、`.lot`、`.bbl`、`.synctex` など trusted readback 対象の論理分類を表す | OutputArtifactRecord, OutputArtifactRegistry |
 | アーティファクト生成者種別 (ArtifactProducerKind) | Output Artifact Registry が記録する生成主体種別。Ferritex 本体か、Ferritex が制御した外部ツールかを区別する | OutputArtifactRecord, ShellCommandGateway |
 | プレビューターゲット (PreviewTarget) | preview session / revision が紐づく対象文書の識別子。workspace root、primaryInput、jobname の組 | PreviewSession, PreviewRevision |
 | プレビュー公開ポリシー (PreviewPublicationPolicy) | `ExecutionPolicy` に内包される preview 配信専用の制約。loopback bind 限定、active job の最新 PDF のみ publish、session target 一致、target 変更または process restart 時の session 再発行規約を保持する | ExecutionPolicy, PreviewSessionService |
-| 文書状態デルタ (DocumentStateDelta) | 1 つの文書パーティションまたは 1 つの commit barrier ステージが生成する `DocumentState` への変更セット。カウンタ差分、ラベル/citation/TOC/索引/ナビゲーション更新、aux 書き出しを含む。`CommitBarrier` が `(passNumber, stageOrder, partitionId)` の total order でデルタを適用する | CommitBarrier, DocumentState, DocumentPartitionPlan |
+| 文書状態デルタ (DocumentStateDelta) | 1 つの文書パーティションまたは 1 つの commit barrier ステージが生成する `DocumentState` への変更セット。カウンタ差分、ラベル/citation/TOC/索引/ナビゲーション更新、aux 書き出しを含む。`CommitBarrier` が `(passNumber, stageOrder, partitionId)` の total order でデルタを適用し、非 idempotent な authority key 衝突を検知した場合は sequential fallback を要求する | CommitBarrier, DocumentState, DocumentPartitionPlan |
 | グラフィックコマンドストリーム (GraphicsCommandStream) | パーサーが tikz/graphicx コマンドを処理した際に生成する描画指示列。描画ディレクティブと参照先資産を保持し、`GraphicsCompiler` が `GraphicsBox` へ変換する | GraphicsCompiler, GraphicsScene |
 | 依存イベント列 (DependencyEvents) | パース中に発生するファイル読み込み・マクロ定義/使用・ラベル定義・参照使用などの依存追跡イベント列。`DependencyGraph` の構築・更新に使い、差分コンパイルの変更検知基盤を供給する | DependencyGraph, ChangeDetector |
 | ソース位置 (SourceLocation) | ファイル名・行番号・列番号の組。エラー報告と SyncTeX で使用 | エラー回復 |
 | 安定識別子 (StableId) | ノードやエンティティに付与される安定な識別子。ソースの軽微な変更で変化しないことを保証し、差分コンパイルのキャッシュキーや依存グラフのノード同一性判定に使う基底型 | DependencyGraph, CompilationCache |
 | 寸法値 (DimensionValue) | TeX の寸法演算（pt, mm, em, ex 等の単位付き長さ）を表す基底型。グルー・ボックス・フォントメトリクスなど寸法を扱う全コンテキストの共通表現 | Glue, Box, FontMetrics |
-| プレビュー配信契約 (PreviewTransport) | loopback に bind し、`PreviewSessionService` が `POST /preview/session` bootstrap 応答と session ごとの HTTP document endpoint / WebSocket events endpoint を公開するための双方向 port。`PreviewTarget` 付き revision 通知を配信し、view-state 更新を受信する。session 失効時は `SessionErrorResponse` を返す | PreviewSession, PreviewRevision, SessionErrorResponse |
+| プレビュー配信契約 (PreviewTransport) | loopback に bind し、session ごとの HTTP document endpoint / WebSocket events endpoint を公開するための双方向 port。bootstrap は上位 adapter から `PreviewSessionService` へ委譲され、この port は `PreviewTarget` 付き revision 通知の配信と view-state 更新の受信だけを担う。session 失効時は `SessionErrorResponse` を返す | PreviewSession, PreviewRevision, SessionErrorResponse |
 
 ### 5.2 タイプセッティング コンテキスト
 
@@ -2077,9 +2111,11 @@ stateDiagram-v2
 | 数式タグ (EquationTag) | 自動番号、`\tag`、`\notag` を正規化した式番号付け規則 | MathAlignmentRow, CounterStore |
 | ドキュメント状態 (DocumentState) | カウンタ、ラベル、参考文献、目次、索引、ナビゲーション状態など、組版中に更新される文書単位の状態 | CounterStore, CrossReferenceTable, BibliographyState, TableOfContentsState, IndexState, NavigationState |
 | 相互参照 (Cross Reference) | `\label`/`\ref`/`\pageref` による文書内の参照。最大 3 パスで解決 | CrossReferenceTable |
-| 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table と参考文献エントリを保持し、`\cite` 解決と参考文献リスト組版の入力を管理する状態 | CitationTable, BblSnapshot |
+| 参考文献状態 (BibliographyState) | `.bbl` 由来の Citation Table、参考文献エントリ、freshness 判定用 metadata を保持し、`\cite` 解決と参考文献リスト組版の入力を管理する状態 | CitationTable, BblSnapshot |
 | Citation Table | citation key から `CitationInfo` を引く索引。`CitationInfo.label` は citation label、`CitationInfo.formattedText` は本文中の `\cite` 表示文字列を保持する | BibliographyState, CitationInfo |
 | Bibliography Entry | 参考文献 1 件分の整形済みエントリ。`renderedBlock` は参考文献リストへ流し込むブロック表示を保持し、本文中の citation 表示とは分離する | BblSnapshot, BibliographyState |
+| Bibliography Input Fingerprint | 現在の bibliography 宣言、解決済み `.bib` / style 入力、`Bibliography Integration` が選択した toolchain を正規化した freshness 判定用 fingerprint。`${jobname}.bbl.ferritex.json` として保存・再読込される | BblSnapshot, BibliographyToolchain |
+| Bibliography Toolchain | `bibtex` / `biber` のいずれで `.bbl` を生成したかを表す列挙。toolchain の選択自体は parser/macro engine コンテキスト内の `Bibliography Integration` が bibliography 宣言から決定し、freshness sidecar metadata の一部として扱う | BblSnapshot, BibliographyInputFingerprint |
 | 目次エントリ (TocEntry) | 章節・図表一覧の項目名、番号、ページ番号、階層を保持する値 | TableOfContentsState |
 | 索引エントリ (IndexEntry) | 索引語、ソートキー、対応ページ番号を保持する値 | IndexState |
 | ソース範囲 (SourceSpan) | 組版結果 1 単位に対応付くソース開始/終了位置。SyncTeX と診断の由来追跡に使う | PlacedNode, SourceLocation |
@@ -2117,6 +2153,8 @@ stateDiagram-v2
 | コンテンツハッシュ (ContentHash) | ファイル/ノード内容のハッシュ値。変更検知に使用 | ChangeDetector |
 | 再コンパイル範囲 (RecompilationScope) | 変更検知 (`REQ-FUNC-028`) の影響伝播により再処理が必要なノードの集合。参照影響の有無を含む | ChangeDetector |
 | コンパイルキャッシュ (CompilationCache) | 差分再利用の論理集約。永続化は `CacheMetadataStore` と `BlobCacheStore` に分離され、`IncrementalCompilationCoordinator` からは一貫した cache 契約として見える | CacheEntry, IncrementalCompilationCoordinator |
+| キャッシュメタデータストア (CacheMetadataStore) | `CompilationCache` の metadata port。cache key、source hash、blob 参照、integrity、LRU 情報を保存し、missing blob を検知した entry を invalidation 対象として返す | CompilationCache, CacheEntry |
+| blob キャッシュストア (BlobCacheStore) | content-addressed な blob payload の保存 port。staging + atomic promote で durable に保存し、unreferenced blob の GC を担当する | CompilationCache, CacheEntry |
 | コンパイルマージプラン (CompilationMergePlan) | 再構築ノードと再利用ノードの境界、および参照安定化の要否を表す計画 | IncrementalCompilationCoordinator |
 | 差分コンパイルコーディネータ (IncrementalCompilationCoordinator) | 差分コンパイル時のプランニング、`CompilationJob` 単位の pass 反復、再処理、マージ、参照安定化を統括するサービス | RecompilationScope, CompilationCache, CompilationJob |
 | 文書パーティション計画 (DocumentPartitionPlan) | 章またはセクション単位並列化で独立に処理できる work unit 群と、逐次ページ番号を保てるかの条件を表す計画 | DocumentPartitionPlanner, DocumentWorkUnit |
@@ -2125,7 +2163,7 @@ stateDiagram-v2
 | パーティション識別子 (partitionId) | `DocumentPartitionPlanner` が各文書パーティションへ安定に発行する識別子。`CommitBarrier` の total order を決定するキーの 1 つ | DocumentWorkUnit, CommitBarrier |
 | パーティション位置 (PartitionLocator) | 同一ファイル内でも章/セクション境界を一意に特定する論理位置。`entryFile`、見出しの `SourceSpan`、出現順 ordinal を組にして表す | DocumentWorkUnit, DocumentLayoutFragment |
 | ページ統合調停役 (PaginationMergeCoordinator) | 各文書パーティションの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | DocumentLayoutFragment, PaginationMergeResult |
-| キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
+| キャッシュエントリ (CacheEntry) | コンパイル中間結果への metadata handle。ソースハッシュと blob hash を保持し、payload 本体は `BlobCacheStore` から取得する | CompilationCache, CacheMetadataStore, BlobCacheStore |
 | キャッシュ保守サービス (CacheMaintenanceService) | dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括する application service。cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知し、フルコンパイルへの fallback を可能にする | CompilationCache, DependencyGraphStore, IncrementalCompilationCoordinator |
 
 ### 5.5 アセットランタイム コンテキスト
@@ -2186,14 +2224,14 @@ stateDiagram-v2
 | 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら `CompileJobService` への再コンパイル要求を逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph, CompileJobService |
 | CLI アダプタ (CliAdapter) | CLI からのコンパイル要求を `RuntimeOptions` に正規化し、`CompileJobService` に委譲する entry adapter | CompileOptions, RuntimeOptions, CompileJobService |
 | watch アダプタ (WatchAdapter) | watch モードの起動を `RuntimeOptions` に正規化し、`RecompileScheduler` を起動する entry adapter | WatchOptions, RuntimeOptions, RecompileScheduler |
-| コンパイルジョブサービス (CompileJobService) | `CliAdapter` と `RecompileScheduler` から正規化済みの `RuntimeOptions` を受け取り、共通のコンパイル use case を統合する application service。job scheduling は `WorkspaceJobScheduler` に委譲し、compile 完了後の `PreviewSessionService` への publish 委譲も担う | RuntimeOptions, ExecutionPolicy, WorkspaceJobScheduler, PreviewSessionService |
+| コンパイルジョブサービス (CompileJobService) | `CliAdapter` と `LspServer` と `RecompileScheduler` から正規化済みの `RuntimeOptions` を受け取り、共通のコンパイル use case を統合する application service。job scheduling は `WorkspaceJobScheduler` に委譲し、compile 完了後の `PreviewSessionService` への publish 委譲も担う | RuntimeOptions, ExecutionPolicy, WorkspaceJobScheduler, PreviewSessionService |
 | ワークスペースジョブスケジューラ (WorkspaceJobScheduler) | workspace ごとの active job 排他制御と compile / preview publish の順序保証を担う application service。`CompileJobService` から委譲を受け、同一 workspace で同時にアクティブな `CompilationJob` を 1 つに制限し、追加要求を coalesce する（`REQ-FUNC-039`） | CompileJobService, CompilationJob |
 | LSP ケイパビリティサービス (LspCapabilityService) | `initialize` 応答で advertise する `ServerCapabilities` の構築と、`definitionProvider` / `hoverProvider` などの optional provider の有効/無効切り替えを担う application service（`REQ-FUNC-045`） | LspServer, ServerCapabilities |
 | セッションエラー応答 (SessionErrorResponse) | preview session の失効・target 不一致・policy 拒否時に返すエラー応答。エラー種別・対象 sessionId・回復手順（`POST /preview/session` による再取得）を含む（`REQ-NF-010`） | PreviewSessionService, PreviewTransport |
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
 | プレビューセッション (PreviewSession) | sessionId ごとの preview 状態。`PreviewTarget` を owner として保持し、同一 target かつ同一 process の間だけ再利用される。`PreviewSessionService.openSession` から bootstrap され、閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewTransport, PreviewViewState |
 | プレビュー表示状態 (PreviewViewState) | 現在ページ、ページ内オフセット、ズーム倍率など、プレビュー更新後も維持すべき閲覧位置。新 PDF のページ数に対して最近傍の有効ページへ clamp できる | PreviewSession |
-| RuntimeOptions | compile (`REQ-FUNC-042`) / watch (`REQ-FUNC-044`) / LSP (`REQ-FUNC-045`) の入口固有指定を `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` へ正規化した共通実行オプション。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
+| RuntimeOptions | compile (`REQ-FUNC-042`) / watch (`REQ-FUNC-044`) / LSP (`REQ-FUNC-045`) の入口固有指定を `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`traceFontTasks`、`shellEscapeAllowed` へ正規化した共通実行オプション。`traceFontTasks=true` の場合、`CompileJobService` が `FontTaskTrace` の `stderr` 出力を有効化する。`ExecutionPolicyFactory` の入力となる | ExecutionPolicyFactory, AssetBundleRef |
 | AssetBundleRef | Asset Bundle の参照値。ファイルパスまたは組み込み識別子を区別して保持する | RuntimeOptions, CompileOptions, WatchOptions |
 | WorkspaceContext | プロジェクトルート、overlay roots、キャッシュ位置、利用可能な bundle 探索範囲/組み込み識別子をまとめた実行文脈 | ExecutionPolicyFactory |
 
@@ -2275,7 +2313,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
-- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 `outputRoots` へ変換する。`ExecutionPolicy` はデフォルト上限として `commandTimeout = 30s`、`maxConcurrentProcesses = 1`、`maxCapturedOutputBytes = 4 MiB` を保持し、preview 配信については `previewPublication` に loopback 限定、active-job 限定、session target 一致、target 変更または process restart 時の session 再発行規約を保持する。private temp root は Ferritex が管理する専用ディレクトリに限定し、output root の readback は、まず current `JobContext` の `jobname` と主入力で same-job を確認し、次に `OutputArtifactRegistry` に記録された正規化パス・生成パス・生成者・コンテンツハッシュなどの artifact provenance で個別 artifact を trusted と確認した補助ファイルに限って許可する。`producedPass` は監査属性であり、same-job の一致条件には含めない。Ferritex が制御した外部ツールの生成物は `ShellCommandGateway` が trusted external artifact として同レジストリへ登録し、registry は active job 完了時に invalidate される
+- **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 current `artifactRoot` へ変換する。`ExecutionPolicy` はデフォルト上限として `commandTimeout = 30s`、`maxConcurrentProcesses = 1`、`maxCapturedOutputBytes = 4 MiB` を保持し、preview 配信については `previewPublication` に loopback 限定、active-job 限定、session target 一致、target 変更または process restart 時の session 再発行規約を保持する。private temp root は Ferritex が管理する専用ディレクトリに限定し、artifactRoot の readback は、まず current `JobContext` の `jobname` と主入力で same-job を確認し、次に `OutputArtifactRegistry` に記録された正規化パス・生成パス・生成者・コンテンツハッシュなどの artifact provenance で個別 artifact を trusted と確認した補助ファイルに限って許可する。ただし bibliography input に限り、current `artifactRoot/${jobname}.bbl` と `artifactRoot/${jobname}.bbl.ferritex.json` は registry 未登録でも pre-generated read-only input として許可する。`producedPass` は監査属性であり、same-job の一致条件には含めない。Ferritex が制御した外部ツールの生成物は `ShellCommandGateway` が trusted external artifact として同レジストリへ登録し、registry は active job 完了時に invalidate される
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれ、REQ-FUNC-024 / REQ-FUNC-047 / REQ-FUNC-048 は Ferritex 制御外部ツール生成物の provenance 記録を要求する
   - 代替案: 各入口で個別に shell escape とファイルアクセス判定を実装する
@@ -2335,7 +2373,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール / パーサー/マクロエンジン
-- **判断内容**: CLI 固有の `CompileOptions` を直接 `ExecutionPolicyFactory` に渡さず、compile / watch / LSP から得た指定を `RuntimeOptions` へ正規化してから `WorkspaceContext` と合わせて `ExecutionPolicy` を構築する。`RuntimeOptions` は `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`shellEscapeAllowed` だけを保持し、debounce や transport など入口固有の制御情報は含めない。preview session ごとの owner や lifetime は `ExecutionPolicy.previewPublication` と `PreviewSessionService` が扱い、`RuntimeOptions` には混ぜない。Asset Bundle 指定は `AssetBundleRef` としてファイルパスと組み込み識別子の両方を表現する
+- **判断内容**: CLI 固有の `CompileOptions` を直接 `ExecutionPolicyFactory` に渡さず、compile / watch / LSP から得た指定を `RuntimeOptions` へ正規化してから `WorkspaceContext` と合わせて `ExecutionPolicy` を構築する。`RuntimeOptions` は `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`traceFontTasks`、`shellEscapeAllowed` を保持し、debounce や transport など入口固有の制御情報は含めない。`traceFontTasks` はフォント処理ステージの `stderr` trace 有効化だけに使い、preview session ごとの owner や lifetime は `ExecutionPolicy.previewPublication` と `PreviewSessionService` が扱うため `RuntimeOptions` へ混ぜない。LSP 入口で `ferritex.outputDir` / `ferritex.jobname` 以外の compile-affecting 項目が未指定の場合は、`parallelism=利用可能 CPU コア数`、`reuseCache=true`、`assetBundleRef=互換な組み込み Ferritex Asset Bundle`、`interactionMode=nonstopmode`、`synctex=false`、`traceFontTasks=false`、`shellEscapeAllowed=false` の固定既定値で補う。Asset Bundle 指定は `AssetBundleRef` としてファイルパスと組み込み識別子の両方を表現する
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP から呼ばれ、REQ-FUNC-046 は Asset Bundle をパスまたは組み込み識別子で受ける
   - 代替案: `CompileOptions` を共通入力として流用し、watch/LSP は暗黙変換で吸収する
@@ -2419,7 +2457,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール
-- **判断内容**: `PreviewTransport` は loopback 上の `POST /preview/session` bootstrap endpoint、HTTP document endpoint、WebSocket events endpoint を公開する双方向 port とし、view-state 更新の受信と許可済み revision 通知の publish を担う。`PreviewSessionService` は `PreviewTarget` ごとに session を発行し、同一 process かつ同一 target の間だけ再利用し、target 変更または process restart 時は再発行する。client からの bootstrap request には `PreviewSessionService` が応答し、publish 前には `ExecutionPolicy.previewPublication` に照らして active job の `PreviewTarget` と session owner の一致を判定し、`PreviewSession` が保持する閲覧位置を再適用してから `PreviewTransport` へ配信を委譲する。旧 session は `410 Gone` 相当で拒否し、client に bootstrap の再実行を要求する。`PreviewRevision` は target 付き revision と pageCount を持ち、保持ページが新 PDF に存在しない場合は最近傍の有効ページへ clamp する
+- **判断内容**: `PreviewTransport` は loopback 上の session ごとの HTTP document endpoint と WebSocket events endpoint を公開する双方向 port とし、view-state 更新の受信と許可済み revision 通知の publish を担う。bootstrap request は上位 adapter から `PreviewSessionService` へ委譲し、同 service が `PreviewTarget` ごとに session を発行し、同一 process かつ同一 target の間だけ再利用し、target 変更または process restart 時は再発行する。publish 前には `ExecutionPolicy.previewPublication` に照らして active job の `PreviewTarget` と session owner の一致を判定し、`PreviewSession` が保持する閲覧位置を再適用してから `PreviewTransport` へ配信を委譲する。旧 session は `410 Gone` 相当で拒否し、client に bootstrap の再実行を要求する。`PreviewRevision` は target 付き revision と pageCount を持ち、保持ページが新 PDF に存在しない場合は最近傍の有効ページへ clamp する
 - **根拠**:
   - 観測事実: REQ-FUNC-040 はホットリロード後も閲覧ページ位置が維持されること、および保持ページが消滅した場合は最近傍の有効ページへフォールバックすることを要求している
   - 代替案: preview クライアントが暗黙に位置復元すると仮定し、サーバー側モデルでは raw PDF 配信だけを表現する
@@ -2558,20 +2596,20 @@ stateDiagram-v2
 | BR-3 | ラベル/ページ相互参照は同一 `CompilationJob` 内で最大 3 パスで解決する。未解決は `??` を出力し警告 | REQ-FUNC-011 | タイプセッティング |
 | BR-4 | フロート配置は指定子（`[htbp!]`）の優先順位に従い、配置不可時はキューに繰り延べ | REQ-FUNC-010 | タイプセッティング |
 | BR-5 | 差分コンパイルは再構築ノードと再利用ノードをマージした後もフルコンパイルと同一の出力でなければならず、参照不安定時は最大 3 パスまで反復する | REQ-FUNC-030 | 差分コンパイル |
-| BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならず、並列ステージは読み取り専用 `CompilationSnapshot` のみを参照し、マクロ・レジスタ・文書状態への commit は `CommitBarrier` で逐次化される | REQ-FUNC-031 | インフラストラクチャ層 |
+| BR-6 | 並列処理の出力はシングルスレッド実行と同一でなければならず、並列ステージは読み取り専用 `CompilationSnapshot` のみを参照し、マクロ・レジスタ・文書状態への commit は `CommitBarrier` で逐次化される。authority key 衝突時は winner を選ばず sequential fallback を要求する | REQ-FUNC-031 | インフラストラクチャ層 |
 | BR-7 | `--shell-escape` なしでは外部コマンド実行経路がゼロ。compile / watch / LSP の各入口は指定を `RuntimeOptions(jobname を含む)` へ正規化したうえですべての実行要求を `ExecutionPolicy` へ通し、デフォルト上限は 30 秒、1 プロセス / `CompilationJob`、捕捉出力 4 MiB である。preview 配信制約は `ExecutionPolicy.previewPublication` に含まれる。Ferritex が制御した readback 対象補助ファイル生成物は `ShellCommandGateway` を通じて trusted external artifact として `OutputArtifactRegistry` に記録される | REQ-FUNC-043 / REQ-FUNC-047 / REQ-NF-005 | パーサー/マクロエンジン / 開発者ツール |
-| BR-8 | ファイル読み書きはすべて `FileAccessGate` を経由し、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。明示的 output root は、same-job の一致条件を current `JobContext` の `jobname` と主入力で満たし、かつ active-job 限定の `OutputArtifactRegistry` に記録された artifact provenance から trusted と確認できた `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能である。`producedPass` は監査属性であり、same-job 一致条件には含めない。書き込みはキャッシュディレクトリ、明示的 output root に制限され、private temp root は engine-temp 用にのみ使用する。registry は job 完了または process restart で invalidate される | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
+| BR-8 | ファイル読み書きはすべて `FileAccessGate` を経由し、読み取りではプロジェクトディレクトリ、設定済み read-only overlay roots、Asset Bundle、キャッシュディレクトリに制限される。current `artifactRoot` は、same-job の一致条件を current `JobContext` の `jobname` と主入力で満たし、かつ active-job 限定の `OutputArtifactRegistry` に記録された artifact provenance から trusted と確認できた `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` などの補助ファイル readback に限って読み取り可能である。ただし bibliography input に限り、current `artifactRoot/${jobname}.bbl` と `artifactRoot/${jobname}.bbl.ferritex.json` は registry 未登録でも pre-generated read-only input として読み取り可能である。`producedPass` は監査属性であり、same-job 一致条件には含めない。書き込みはキャッシュディレクトリと current `artifactRoot` に制限され、private temp root は engine-temp 用にのみ使用する。registry は job 完了または process restart で invalidate される | REQ-FUNC-048 / REQ-NF-006 | パーサー/マクロエンジン |
 | BR-9 | キャッシュ破損時はフルコンパイルにフォールバック | REQ-FUNC-029 | 差分コンパイル |
 | BR-10 | 行分割は Knuth-Plass アルゴリズムにより総デメリット最小化 | REQ-FUNC-007 | タイプセッティング |
 | BR-11 | クラス・パッケージ・フォント資産はプロジェクトオーバーレイ、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local Font Catalog fallback の順で解決し、実行時の `TEXMF` 全走査や OS フォント全走査を行わない。host-local font を直接解決した出力は REQ-NF-008 のバイト同一保証対象外とする | REQ-FUNC-005 / REQ-FUNC-019 / REQ-FUNC-026 / REQ-FUNC-046 / REQ-NF-008 | アセットランタイム / パーサー/マクロエンジン / フォント管理 |
 | BR-12 | カウンタ更新、ラベル登録、`.aux` 書き出しは同一 `CompilationJob` が所有する job-scope の `DocumentState` / `OutputArtifactRegistry` に対して行われ、各 pass の `CompilationSession` から参照される | REQ-FUNC-011 / REQ-FUNC-020 / REQ-FUNC-026 / REQ-FUNC-048 | パーサー/マクロエンジン / タイプセッティング |
-| BR-13 | `\cite` の解決と参考文献リスト組版は `BibliographyState` / `CitationTable` が担い、label 系の `CrossReferenceTable` とは責務を分離する | REQ-FUNC-024 | パーサー/マクロエンジン / タイプセッティング |
+| BR-13 | `\cite` の解決と参考文献リスト組版は `BibliographyState` / `CitationTable` が担い、label 系の `CrossReferenceTable` とは責務を分離する。`REQ-FUNC-024a` の bibliography toolchain 選択規則、stale 判定結果に基づく `ShellCommandGateway` への実行委譲、成功時の sidecar metadata 更新計画は parser/macro engine コンテキスト内の `Bibliography Integration` が所有し、`.bbl` 更新後の bibliography 依存キャッシュ invalidation と同一 `CompilationJob` 内の追加 pass 起動は `IncrementalCompilationCoordinator` が所有する | REQ-FUNC-024 / REQ-FUNC-024a | パーサー/マクロエンジン / タイプセッティング |
 | BR-14 | 定義ジャンプは `MacroDefinition` / `LabelInfo` / `BibliographyEntry` の authoritative な `DefinitionProvenance` を `SymbolIndex` に投影して解決する。`CitationInfo.traceProvenance` は本文側 citation 表示の trace に使う補助情報であり、`\cite` の authority にはしない | REQ-FUNC-036 | パーサー/マクロエンジン / 開発者ツール |
 | BR-15 | 目次・図表一覧・索引のエントリは同一 `CompilationJob` が所有する `TableOfContentsState` / `IndexState` に蓄積され、pass をまたいで merge されたうえで `TocTypesetter` / `IndexTypesetter` により box tree へ再投影される | REQ-FUNC-012 | パーサー/マクロエンジン / タイプセッティング |
 | BR-16 | hyperref が収集する PDF metadata draft、しおり候補、named destination、既定リンク装飾は `NavigationState` に集約され、配置済みリンクは `LinkAnnotationPlan` に、named destination は `PlacedDestination` に正規化される。`LinkStyle.textColor` は必要に応じて `TextRun.style.fillColor` へコピーされ、`PdfRenderer` はそれらを `PdfMetadata` / `PdfOutline` / text color / `Annotation` へ射影する | REQ-FUNC-015 / REQ-FUNC-022 | パーサー/マクロエンジン / タイプセッティング / PDF 生成 |
 | BR-17 | SyncTeX は `PageBox` に含まれる `PlacedNode` の `SourceSpan` と配置矩形から `SyncTexBuilder` が `SyncTraceFragment` 群を生成し、forward search では SourceLocation に交差する fragment 群を、inverse search では `PdfPosition` を含む fragment に対応する `SourceSpan` を返す | REQ-FUNC-041 | タイプセッティング / PDF 生成 |
 | BR-18 | watch 実行中の追加変更は `RecompileScheduler` が `PendingChangeQueue` へ集約し、コンパイル中に並列実行せず、現在のコンパイル完了後に coalesce 済み変更集合で再コンパイルする。各コンパイル完了後は最新 `DependencyGraph` から `FileWatcher.watchedPaths` を再同期する | REQ-FUNC-038 / REQ-FUNC-039 | 開発者ツール / 差分コンパイル |
-| BR-19 | PDF プレビュー配信は `PreviewSessionService` が `PreviewTarget` ごとに session を発行・失効管理し、loopback `POST /preview/session` bootstrap request に応答して session を返す。`ExecutionPolicy.previewPublication` に照らして active job の target と session owner が一致する場合だけ publish 可否を判定する。`PreviewTransport` は session ごとの HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。`PreviewSession` は `PreviewViewState` を保持して PDF 更新時に保存済みの同じページ位置とズームを再適用し、保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする。target 変更または process restart 時の旧 session は `410 Gone` 相当で拒否する | REQ-FUNC-040 | 開発者ツール |
+| BR-19 | PDF プレビュー配信は `PreviewSessionService` が `PreviewTarget` ごとに session を発行・失効管理し、上位 adapter から委譲された bootstrap request に対して session を返す。`ExecutionPolicy.previewPublication` に照らして active job の target と session owner が一致する場合だけ publish 可否を判定する。`PreviewTransport` は session ごとの HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。`PreviewSession` は `PreviewViewState` を保持して PDF 更新時に保存済みの同じページ位置とズームを再適用し、保持ページが存在しない場合は `pageCount` に基づき最近傍の有効ページへフォールバックする。target 変更または process restart 時の旧 session は `410 Gone` 相当で拒否する | REQ-FUNC-040 | 開発者ツール |
 | BR-20 | PDF フォント埋め込みは `FontEmbeddingPlanner` が `TextRun` 群から使用グリフ集合を `FontSubsetPlan` として集約し、`FontManager` / `GlyphSubsetter` と協調して subset font と ToUnicode CMap を生成する | REQ-FUNC-014 / REQ-FUNC-017 | PDF 生成 / フォント管理 |
 | BR-21 | tikz/pgf の描画は `GraphicGroup` が継承スタイルと clip path を保持し、`VectorPath` が path ごとの矢印指定を保持したまま PDF 射影へ渡される | REQ-FUNC-023 | グラフィック描画 / PDF 生成 |
 | BR-22 | 脚注は `FootnoteQueue` に蓄積され、`PageBuilder` が現在ページ下部へ予約できる脚注だけを `FootnotePlacement` として確定し、残りを次ページへ繰り延べる | REQ-FUNC-008 | タイプセッティング |
@@ -2588,6 +2626,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.32 | 2026-03-17 | §3.1 / §5.1 に bibliography freshness metadata（`BibliographyInputFingerprint` / `BibliographyToolchain`）を追加し、toolchain 選択と sidecar 更新計画の owner を `Bibliography Integration`、`.bbl` 更新後の invalidation / 同一 job 内の追加 pass を `IncrementalCompilationCoordinator` へ固定。§3.4 の `CompilationCache` を論理集約へ整理し `CacheMetadataStore` / `BlobCacheStore` port と durability 順序を追記、§3.8 / §5.8 の `CompileJobService` caller 定義・`traceFontTasks` 正規化経路・preview transport/adapter 境界を統一し、§5.1 / BR-6 に `CommitBarrier` conflict fallback 規則、§6.7 / BR-8 に pre-generated `.bbl` readback 例外を追記 | Codex |
 | 0.1.31 | 2026-03-17 | §5.1 用語集に `StableId`（安定識別子）と `DimensionValue`（寸法値）の定義を追加し `architecture.md` §5.1 Kernel Runtime の公開契約との整合を確保 | Claude Opus 4.6 |
 | 0.1.30 | 2026-03-17 | §3.4 に `CacheMaintenanceService` のアプリケーション層配置理由を示す Mermaid note を追加、§3.8 の `RecompileScheduler` / `ExecutionPolicyFactory` / `LiveAnalysisSnapshotFactory` / `PreviewSessionService` のステレオタイプを `<<Service>>` から `<<Application Service>>` に修正し architecture.md §5.2 の分類と統一 | Claude Opus 4.6 |
 | 0.1.29 | 2026-03-17 | §3.2 / §3.6 の共有型・upstream 型のフィールド定義を削除し、stereotype + 正規セクション参照形式に統一（§3.1 注記参照）。§3.3 `GraphicsScene` を `<<ValueObject>>` に変更。§3.3 / §3.4 の upstream 型にも参照先を付記 | Claude Opus 4.6 |

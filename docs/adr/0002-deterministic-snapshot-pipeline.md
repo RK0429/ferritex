@@ -66,6 +66,8 @@ compile の並列ステージは `CompilationSnapshot` だけを読み、job-sco
 
 `CommitBarrier` は worker の完了順ではなく、`(passNumber, stageOrder, partitionId)` の total order で結果を適用する。`stageOrder` は `macro/session delta -> document/reference/bibliography state -> layout/page-number merge -> artifact emission/cache metadata` の順に固定し、`partitionId` は `DocumentPartitionPlanner` が安定に発行する。
 
+authority key（macro/register key、label/citation key、TOC/navigation owner、artifact slot）が衝突した場合、barrier は winner を選ばない。`DocumentPartitionPlanner` は本来こうした衝突を避ける partition を生成すべきであり、衝突検知時は authority key と関与した `partitionId` 集合を deterministic に記録したうえで、affected pass を非並列の sequential path へフォールバックする。artifact metadata だけは content hash と provenance が完全一致する重複書き込みを idempotent とみなし、それ以外は同じく collision として扱う。
+
 ## 要件トレーサビリティ
 
 | 要件 | この ADR で固定する点 |
@@ -86,7 +88,7 @@ compile の並列ステージは `CompilationSnapshot` だけを読み、job-sco
 ### ネガティブ
 
 - snapshot の粒度設計を誤るとメモリと CPU を浪費する
-- merge conflict ルールの実装が必要
+- conflict 検知と sequential fallback の実装が必要
 
 ### リスク
 

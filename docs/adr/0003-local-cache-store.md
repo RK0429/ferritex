@@ -34,7 +34,7 @@ Ferritex は `DependencyGraph` と `CompilationCache` を永続化して `REQ-NF
 
 ### 選択肢 C: 独立ストア群
 
-`DependencyGraphStore`、`CacheMetadataStore`、`BlobCacheStore` を分離し、必要に応じて同じ SQLite 技術を使っても論理的に独立させる。`OutputArtifactRegistry` は active job の in-memory state とし、監査用にのみ append-only manifest を残す。registry record には normalized path、primary input、artifact kind、jobname、`producedPass`、artifact producer kind、produced path、content hash を保持するが、trusted readback の same-job 判定は primary input と jobname だけで行う。current pass number は registry record ではなく active `JobContext` 側の運用属性として扱う。
+`DependencyGraphStore`、`CacheMetadataStore`、`BlobCacheStore` を分離し、必要に応じて同じ SQLite 技術を使っても論理的に独立させる。`OutputArtifactRegistry` は active job の in-memory state とし、監査用にのみ append-only manifest を残す。registry record には normalized path、primary input、artifact kind、jobname、`producedPass`、artifact producer kind、produced path、content hash を保持するが、trusted readback の same-job 判定は primary input と jobname だけで行う。current pass number は registry record ではなく active `JobContext` 側の運用属性として扱う。`BlobCacheStore` は content-addressed blob を staging path へ書き出してから atomic promote し、`CacheMetadataStore` は blob の durable 化完了後にだけ参照 metadata を publish する。crash recovery では metadata が missing blob を指した場合に integrity check がその entry を invalidation し、orphan blob は GC 対象とする。
 
 - 利点:
   - dependency graph と cache の破損を障害分離できる
@@ -84,3 +84,4 @@ Ferritex は `DependencyGraph` と `CompilationCache` を永続化して `REQ-NF
 - blob GC 不備でディスク肥大化する
 - hot path で SQL アクセスが多すぎると性能目標を阻害する
 - active job 終了時の registry 無効化漏れがあると readback 制約が崩れる
+- metadata publish より前に blob durability を保証できない実装だと dangling metadata / orphan blob の回復規約が破綻する
