@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.26          |
+| バージョン | 0.1.27          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.24 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.9 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.25 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.10 |
 
 ## 1. サブドメイン分類
 
@@ -482,7 +482,7 @@ classDiagram
     CompilationJob --> OutputArtifactRegistry
     CompilationJob --> ExecutionPolicy
     CompilationSession --> CatcodeTable
-    CompilationSession --> CompilationJob
+    CompilationSession --> CompilationJob  %% back-reference to owner
     CompilationSession --> JobContext
     CompilationSession --> InputStack
     CompilationSession --> IncludeState
@@ -1120,7 +1120,7 @@ classDiagram
 
 ### 3.4 差分コンパイル コンテキスト
 
-差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
+差分コンパイルの「再処理範囲の決定」だけでなく、「再構築結果と再利用結果の統合」「参照安定化までの反復」も Ferritex のコアドメイン責務としてこのモデルに含める。`IncrementalCompilationCoordinator` は job-scope の固定点反復の所有者であり、`CompilationJob.beginPass(passNumber)` を介して各反復の `CompilationSession` を生成する。文書パーティション単位並列化では `DocumentPartitionPlanner` が `DependencyGraph` / `DocumentState` から独立した章/セクション単位を `DocumentPartitionPlan` として切り出す。セクション境界の認識は `DocumentState.toc` が保持する `TocEntry` の `DefinitionProvenance`（`SourceLocation`）から導出し、ファイル間依存は `DependencyGraph` から取得する。`PaginationMergeCoordinator` が各 `DocumentLayoutFragment` をページオフセットと参照整合性を保ったまま統合する。`CacheMaintenanceService` は dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括し、cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知する。実際のスレッド実行はインフラストラクチャ層へ委譲する。
 
 ```mermaid
 classDiagram
@@ -1267,6 +1267,16 @@ classDiagram
     IncrementalCompilationCoordinator --> CompilationMergePlan
     IncrementalCompilationCoordinator --> IncrementalCompilationResult
     IncrementalCompilationCoordinator --> CompilationCache
+    class CacheMaintenanceService {
+        <<Application Service>>
+        +writeback(DependencyGraph, CompilationCache) void
+        +runIntegrityCheck(CompilationCache) CacheIntegrity
+        +evict(CompilationCache) void
+        +notifyCorruption(CacheIntegrity) void
+    }
+    CacheMaintenanceService --> CompilationCache : writeback / eviction
+    CacheMaintenanceService --> DependencyGraphStore : writeback
+    CacheMaintenanceService ..> IncrementalCompilationCoordinator : notifies corruption
     CompilationCache o-- CacheEntry
     CompilationCache --> CacheConfig
 ```
@@ -1726,7 +1736,7 @@ classDiagram
 
 ### 3.8 開発者ツール コンテキスト
 
-`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、loopback 上の `POST /preview/session` bootstrap request と `ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。session 失効・target 不一致・policy 拒否時は `SessionErrorResponse`（エラー種別・対象 sessionId・回復手順）を返す（`REQ-NF-010`）。compile / watch / LSP の入口は `CliAdapter` / `WatchAdapter` / `LspServer` として分離され、各入口のオプションを `RuntimeOptions` に正規化する。`WatchAdapter` は `RecompileScheduler` を起動し、`CliAdapter` と `RecompileScheduler` は共通の `CompileJobService` にコンパイルを委譲する。`ExecutionPolicyFactory` は `RuntimeOptions` と `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
+`LspServer` は未保存変更を含む `OpenDocumentBuffer` を `OpenDocumentStore` に保持し、最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State と合成した `LiveAnalysisSnapshot` を全 LSP provider の共通入力にする。`DefinitionProvider` は暗黙の外部インデックスに依存せず、`LiveAnalysisSnapshot` から再構築した `SymbolIndex` を利用する。`CompletionProvider` は active なコマンド/環境レジストリと label / citation 状態を `CompletionIndex` へ投影し、package-aware な候補のみを返す。`HoverProvider` は `StableCompileState.packageDocs` が保持する active な class/package snapshot 由来の説明資産を `HoverDocCatalog` に正規化し、コマンド構文・要約・例を返す。LSP の read path は active compile/watch job の完了を待たず、常に最新の Stable Compile State を読む。watch 系の再コンパイル順序は `RecompileScheduler` が `PendingChangeQueue` を用いて制御し、各コンパイル完了後に最新 `DependencyGraph` から `FileWatcher` の監視対象集合を再同期する。preview 配信は `PreviewSessionService` が `PreviewTarget` ごとの session を発行・失効管理し、loopback 上の `POST /preview/session` bootstrap request と `ExecutionPolicy.previewPublication` に照らして許可された場合だけ `PreviewTransport` を通じて HTTP document endpoint と WebSocket events endpoint へ target 付き revision 通知を配信し、view-state 更新を受信する。session 失効・target 不一致・policy 拒否時は `SessionErrorResponse`（エラー種別・対象 sessionId・回復手順）を返す（`REQ-NF-010`）。compile / watch / LSP の入口は `CliAdapter` / `WatchAdapter` / `LspServer` として分離され、各入口のオプションを `RuntimeOptions` に正規化する。`WatchAdapter` は `RecompileScheduler` を起動し、`CliAdapter` と `RecompileScheduler` は共通の `CompileJobService` にコンパイルを委譲する。`CompileJobService` は `WorkspaceJobScheduler` に workspace 単位の active job 排他制御と compile / preview publish の順序保証を委譲する（`REQ-FUNC-039`）。`LspCapabilityService` は `initialize` 応答の `ServerCapabilities` 構築と optional provider（`definitionProvider`, `hoverProvider` 等）の有効/無効切り替えを担う（`REQ-FUNC-045`）。`ExecutionPolicyFactory` は `RuntimeOptions` と `WorkspaceContext` から共通の `ExecutionPolicy` を構築する。
 
 ```mermaid
 classDiagram
@@ -1948,8 +1958,19 @@ classDiagram
         <<Service>>
         +watch(WatchOptions) void
     }
+    class WorkspaceJobScheduler {
+        <<Application Service>>
+        +schedule(CompilationJob) void
+        +coalesceOrReject(CompilationJob) void
+        +ensurePublishOrder() void
+    }
     class CompileJobService {
         <<Application Service>>
+    }
+    class LspCapabilityService {
+        <<Application Service>>
+        +buildCapabilities(LspBuildConfig) ServerCapabilities
+        +advertiseOptionalProviders(LspBuildConfig) ServerCapabilities
     }
     class ExecutionPolicyFactory {
         <<Service>>
@@ -2030,6 +2051,10 @@ classDiagram
     PreviewSession --> PreviewViewState
     PreviewSession --> PreviewTarget
     PreviewRevision --> PreviewTarget
+    CompileJobService --> WorkspaceJobScheduler : delegates job scheduling
+    WorkspaceJobScheduler ..> CompilationJob : schedules / coalesces
+    LspCapabilityService ..> LspServer : builds capabilities for
+    LspServer --> LspCapabilityService
     CliAdapter --> CompileOptions
     CliAdapter --> RuntimeOptions : normalizes
     CliAdapter --> ExecutionPolicyFactory
@@ -2202,6 +2227,7 @@ stateDiagram-v2
 | パーティション位置 (PartitionLocator) | 同一ファイル内でも章/セクション境界を一意に特定する論理位置。`entryFile`、見出しの `SourceSpan`、出現順 ordinal を組にして表す | DocumentWorkUnit, DocumentLayoutFragment |
 | ページ統合調停役 (PaginationMergeCoordinator) | 各文書パーティションの組版結果を順序付きで統合し、ページオフセットと参照整合性を確定するサービス | DocumentLayoutFragment, PaginationMergeResult |
 | キャッシュエントリ (CacheEntry) | コンパイル中間結果のシリアライズデータ。ソースハッシュで整合性を検証 | CompilationCache |
+| キャッシュ保守サービス (CacheMaintenanceService) | dependency graph / cache metadata の writeback、invalidation、integrity check、LRU eviction を統括する application service。cache 破損を検知した場合は `IncrementalCompilationCoordinator` へ通知し、フルコンパイルへの fallback を可能にする | CompilationCache, DependencyGraphStore, IncrementalCompilationCoordinator |
 
 ### 5.5 アセットランタイム コンテキスト
 
@@ -2261,7 +2287,9 @@ stateDiagram-v2
 | 再コンパイルスケジューラ (RecompileScheduler) | watch 実行中の変更イベントを受け、コンパイル中フラグと pending queue を管理しながら `CompileJobService` への再コンパイル要求を逐次実行する調停役。各コンパイル完了後は最新の `DependencyGraph` から `FileWatcher` の監視対象集合も再同期する | FileWatcher, PendingChangeQueue, DependencyGraph, CompileJobService |
 | CLI アダプタ (CliAdapter) | CLI からのコンパイル要求を `RuntimeOptions` に正規化し、`CompileJobService` に委譲する entry adapter | CompileOptions, RuntimeOptions, CompileJobService |
 | watch アダプタ (WatchAdapter) | watch モードの起動を `RuntimeOptions` に正規化し、`RecompileScheduler` を起動する entry adapter | WatchOptions, RuntimeOptions, RecompileScheduler |
-| コンパイルジョブサービス (CompileJobService) | `CliAdapter` と `RecompileScheduler` から正規化済みの `RuntimeOptions` を受け取り、共通のコンパイル use case を統合する application service。compile 完了後の `PreviewSessionService` への publish 委譲も担う | RuntimeOptions, ExecutionPolicy, PreviewSessionService |
+| コンパイルジョブサービス (CompileJobService) | `CliAdapter` と `RecompileScheduler` から正規化済みの `RuntimeOptions` を受け取り、共通のコンパイル use case を統合する application service。job scheduling は `WorkspaceJobScheduler` に委譲し、compile 完了後の `PreviewSessionService` への publish 委譲も担う | RuntimeOptions, ExecutionPolicy, WorkspaceJobScheduler, PreviewSessionService |
+| ワークスペースジョブスケジューラ (WorkspaceJobScheduler) | workspace ごとの active job 排他制御と compile / preview publish の順序保証を担う application service。`CompileJobService` から委譲を受け、同一 workspace で同時にアクティブな `CompilationJob` を 1 つに制限し、追加要求を coalesce する（`REQ-FUNC-039`） | CompileJobService, CompilationJob |
+| LSP ケイパビリティサービス (LspCapabilityService) | `initialize` 応答で advertise する `ServerCapabilities` の構築と、`definitionProvider` / `hoverProvider` などの optional provider の有効/無効切り替えを担う application service（`REQ-FUNC-045`） | LspServer, ServerCapabilities |
 | セッションエラー応答 (SessionErrorResponse) | preview session の失効・target 不一致・policy 拒否時に返すエラー応答。エラー種別・対象 sessionId・回復手順（`POST /preview/session` による再取得）を含む（`REQ-NF-010`） | PreviewSessionService, PreviewTransport |
 | 保留変更キュー (PendingChangeQueue) | コンパイル中に到着した追加変更を coalesce して保持し、完了後の再トリガーに渡す待ち行列 | RecompileScheduler, FileChangeEvent |
 | プレビューセッション (PreviewSession) | sessionId ごとの preview 状態。`PreviewTarget` を owner として保持し、同一 target かつ同一 process の間だけ再利用される。`PreviewSessionService.openSession` から bootstrap され、閲覧位置を保持し、PDF 更新後の view restore に使う | PreviewTransport, PreviewViewState |
@@ -2661,6 +2689,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.27 | 2026-03-17 | §3.4 に CacheMaintenanceService を追加、§3.8 に WorkspaceJobScheduler と LspCapabilityService を追加、§5.4 / §5.8 の用語集にそれぞれ追記、§3.1 に CompilationSession → CompilationJob の back-reference コメントを追加 | Claude Opus 4.6 |
 | 0.1.26 | 2026-03-17 | §3.2 DocumentState の read-only 表記から registerLabel を除き Mermaid note を追加、§3.6 PageRenderPlan の間接保持注記に PlacedDestination / LinkAnnotationPlan を追記 | Claude Opus 4.6 |
 | 0.1.25 | 2026-03-17 | メタ情報に architecture.md への参照を追加、§3.1 に LinkStyle/BorderStyle 重複定義の意図注記を追加、§3.6 に PageRenderPlan の source trace 間接保持注記を追加 | Claude Opus 4.6 |
 | 0.1.24 | 2026-03-17 | §3.1 に CompilationSnapshot クラスを追加、§3.8 に LspServer → CompileJobService の関連を追加 | Claude Opus 4.6 |
