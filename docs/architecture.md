@@ -7,7 +7,7 @@
 | バージョン | 0.1.6 |
 | 最終更新日 | 2026-03-17 |
 | ステータス | ドラフト |
-| 入力 | [requirements.md](requirements.md) v0.1.20, [domain_model.md](domain_model.md) v0.1.22 |
+| 入力 | [requirements.md](requirements.md) v0.1.21, [domain_model.md](domain_model.md) v0.1.23 |
 
 ## 1. 設計方針
 
@@ -179,7 +179,7 @@ graph LR
     LSP --> OpenDocs
     OpenDocs --> AnalysisSvc
     Watch --> Recompile
-    Recompile --> Scheduler
+    Recompile --> CompileSvc
     Preview --> PreviewSvc
 
     CompileSvc --> Scheduler
@@ -216,7 +216,7 @@ graph LR
     Scheduler --> Tools
 ```
 
-補足: `Scheduler --> Tools` の詳細は §7.1 ステップ 3〜5 を参照。実際の外部コマンド実行は `ExecutionPolicy` による許可判定を受ける。
+補足: `Scheduler --> Tools` は runtime 上の協調関係を簡略表現したものであり、実際の外部コマンド実行は `CompileJobService` が起動するコンパイルパイプライン内部から `ExecutionPolicy` による許可判定を経て `ShellCommandGateway` に委譲される（§7.1 ステップ 3〜5 参照）。
 
 ## 5. コンポーネント分割
 

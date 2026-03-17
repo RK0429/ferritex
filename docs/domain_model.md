@@ -4,12 +4,12 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.22          |
+| バージョン | 0.1.23          |
 | 最終更新日 | 2026-03-17      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.20 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.21 |
 
 ## 1. サブドメイン分類
 
@@ -352,7 +352,7 @@ classDiagram
         +AccessPurpose purpose
     }
     class FileAccessGate {
-        <<Service>>
+        <<Port>>
         +authorize(FileAccessRequest, ExecutionPolicy, JobContext, OutputArtifactRegistry) SandboxedFileHandle
     }
     class ShellCommandGateway {
@@ -1745,6 +1745,22 @@ classDiagram
         +BibliographyState bibliography
         +PackageDocSnapshotCatalog packageDocs
     }
+    class PackageDocSnapshotCatalog {
+        <<ValueObject>>
+        +Map~String, PackageDocEntry~ entries
+        +lookup(String) PackageDocEntry
+    }
+    class PackageDocEntry {
+        <<ValueObject>>
+        +String packageName
+        +Map~String, CommandDoc~ commandDocs
+    }
+    class CommandDoc {
+        <<ValueObject>>
+        +String syntax
+        +String summary
+        +String example
+    }
     class LiveAnalysisSnapshot {
         <<ValueObject>>
         +OpenDocumentBuffer buffer
@@ -1965,6 +1981,9 @@ classDiagram
     LiveAnalysisSnapshotFactory --> LiveAnalysisSnapshot
     LiveAnalysisSnapshot --> OpenDocumentBuffer
     LiveAnalysisSnapshot --> StableCompileState
+    StableCompileState --> PackageDocSnapshotCatalog
+    PackageDocSnapshotCatalog o-- PackageDocEntry
+    PackageDocEntry o-- CommandDoc
     CompletionProvider --> CompletionIndex
     DefinitionProvider --> SymbolIndex
     HoverProvider --> HoverDocCatalog
