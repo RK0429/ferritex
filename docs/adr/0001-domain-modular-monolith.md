@@ -6,7 +6,7 @@
 | 日付 | 2026-03-17 |
 | 著者 | ferritex team |
 | 関連ADR | なし |
-| 反映先 | [architecture.md](../architecture.md) §1 設計方針, §3.1 採用パターン, §5.1 Compilation Core, §6 推奨クレート構成 |
+| 反映先 | [architecture.md](../architecture.md) §1 設計方針, §3.1 採用パターン, §3.3 依存方向ルール, §5.1 Compilation Core, §6 推奨クレート構成, §10.14 アーキテクチャ境界; [domain_model.md](../domain_model.md) §1 サブドメイン分類, §2 コンテキストマップ, §6.30 判断記録（ADR-0001） |
 
 ## コンテキスト
 

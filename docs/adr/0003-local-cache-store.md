@@ -6,7 +6,7 @@
 | 日付 | 2026-03-17 |
 | 著者 | ferritex team |
 | 関連ADR | ADR-0002 |
-| 反映先 | [architecture.md](../architecture.md) §5.3 Infrastructure Adapters（DependencyGraphStore / CacheMetadataStore / BlobCacheStore）, §8 技術選定（SQLite） |
+| 反映先 | [architecture.md](../architecture.md) §5.3 Infrastructure Adapters（DependencyGraphStore / CacheMetadataStore / BlobCacheStore）, §8 技術選定（SQLite）, §10.2 差分コンパイル性能; [domain_model.md](../domain_model.md) §6.2 判断記録（ADR-0003） |
 
 ## コンテキスト
 

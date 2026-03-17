@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.37          |
+| バージョン | 0.1.39          |
 | 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -71,13 +71,13 @@
 ### 1.6 成功基準
 
 
-| 基準               | 現行（基準）           | 目標                       |
+| 基準 | 現行（基準） | 目標 |
 | ---------------- | ---------------- | ------------------------ |
 | FTX-BENCH-001 のフルコンパイル時間 | 同一入力・同一マシンでの pdfLaTeX baseline | 中央値 1.0 秒未満 |
-| FTX-BENCH-001 の相対速度    | 1x               | pdfLaTeX 比 50x 以上（最低基準）、100x 以上（目標）|
-| LaTeX 互換性        | —                | 主要パッケージを含む標準的な論文がコンパイル可能 |
+| FTX-BENCH-001 の相対速度 | 1x | pdfLaTeX 比 50x 以上（最低基準）、100x 以上（目標） |
+| LaTeX 互換性 | — | `FTX-CORPUS-COMPAT-001` を `FTX-ASSET-BUNDLE-001` 前提で処理し、`REQ-NF-007` の判定基準を満たす |
 
-※ 絶対速度と相対速度は同じ benchmark profile `FTX-BENCH-001` で判定し、詳細条件は `REQ-NF-001` / `REQ-NF-001a` に定義する。相対速度 50x は最低基準（これを下回ると PoC として不成立）、100x は目標基準とする。
+※ 絶対速度と相対速度は同じ benchmark profile `FTX-BENCH-001` で判定し、詳細条件は `REQ-NF-001` / `REQ-NF-001a` に定義する。LaTeX 互換性は `REQ-NF-007` に定義し、`FTX-CORPUS-COMPAT-001` を `FTX-ASSET-BUNDLE-001` 前提で評価する。相対速度 50x は最低基準（これを下回ると PoC として不成立）、100x は目標基準とする。
 
 
 ## 2. 用語集
@@ -106,6 +106,7 @@
 | Asset Index      | Ferritex Asset Bundle 内の資産を論理名から O(1) 近傍で引ける索引構造        |
 | Host Font Catalog | platform font discovery API（fontconfig / CoreText / DirectWrite）から事前収集したホストフォント索引。Ferritex では host-local overlay として扱う |
 | Configured Overlay Root | 起動時設定で明示された読み取り専用の追加資産ディレクトリ。project root 外に置かれた `.tex` / `.sty` / クラス / フォント資産を allowlist として解決面へ追加する |
+| OverlaySet | project-local 資産、設定済み read-only overlay roots、Ferritex Asset Bundle、Host Font Catalog overlay fallback を優先順位付きで束ねる解決面。クラス・パッケージ・フォントの検索を単一の lookup として扱う |
 | Execution Policy | `compile` / `watch` / `lsp` など全 entry point で共有される実行制約の集合。shell-escape 可否、パス許可境界、タイムアウト、出力上限に加え、preview 配信専用の `Preview Publication Policy` を含む |
 | Runtime Options | compile / watch / LSP の入口固有指定を正規化した共通実行記述。`primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`traceFontTasks`、`shellEscapeAllowed` を保持し、`ExecutionPolicy` 構築とフォント処理 stage の `stderr` trace 有効化に使う |
 | Asset Bundle Reference | Ferritex Asset Bundle を参照するための値。ファイルパスまたは組み込みバンドル識別子で表す |
@@ -123,6 +124,7 @@
 | Link Annotation Plan | 配置済みリンク 1 件分の PDF 注釈化計画。リンク矩形、リンク先、装飾設定を保持し、PDF 生成段階で Annotation に射影される |
 | Link Style | hyperref の `colorlinks` や枠線設定から正規化したリンク装飾値。テキスト色と注釈境界線の描画規則を保持する |
 | Source Span | 組版済みノードに対応付くソース範囲。開始/終了の SourceLocation を持ち、SyncTeX と診断の由来追跡に用いる |
+| PageBox | 単一ページに確定した box tree。配置済みノード、確定済みフロート配置、placed destination、リンク注釈計画を保持し、PDF 射影のページ単位入力になる |
 | Placed Node | `PageBox` 内で確定した配置矩形と Source Span を伴う組版ノード。PDF 射影と SyncTeX の共通入力 |
 | Placed Destination | internal named destination の配置済みアンカー。destination 名とページ内矩形を持ち、内部リンク・しおり解決に用いる |
 | Table Of Contents State | `.toc` / `.lof` / `.lot` 由来の目次・図表一覧エントリを保持する job-scope 状態 |
@@ -140,6 +142,7 @@
 | Preview Session Service | `Preview Session` の発行・再発行・失効を管理し、`POST /preview/session` から受けた `Preview Target` を同一 process / 同一 target の既存 session に解決する。`Execution Policy.previewPublication` に照らして許可された publish だけを `Preview Transport` へ委譲する調停役 |
 | Preview Transport | loopback のみへ bind し、session ごとの document / events endpoint を提供する preview 配信契約。session bootstrap は別責務とし、`Preview Session Service` が決定した `sessionId` / `documentUrl` / `eventsUrl` に基づいて `GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で `Preview Revision` 更新通知と view-state 更新を扱う |
 | Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
+| FontTaskTrace | フォント処理並列化の計測用 trace レコード。`fontTaskId`、`fontAsset`、`startedAt`、`finishedAt`、`workerId` を持ち、`stderr` へ出力して overlap 判定に使う |
 | Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
 | Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の frozen read-only projection。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
 | Live Analysis Snapshot | `Open Document Buffer` と Stable Compile State（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
@@ -406,7 +409,8 @@
   - Navigation State に蓄積された named destination と PDF metadata draft、および Page Render Plan が保持する placed destination を参照し、PDF アウトライン（しおり）のセクション構造を生成
 - **出力**: リンクアノテーションとアウトラインを含む PDF
 - **受け入れ基準**:
-  - Given セクション構造を持つ文書, When PDF を生成, Then PDF ビューアのしおりパネルにセクション階層が表示される
+  - Given `FTX-CORPUS-COMPAT-001/navigation-features` の文書と `FTX-ASSET-BUNDLE-001`, When コンパイル, Then 内部リンク/外部リンクの annotation、named destination 数、outline 階層が pdfLaTeX 出力と一致する（`REQ-NF-007` の navigation manifest 基準を適用）
+  - Given セクション構造を持つ文書, When PDF を生成, Then PDF ビューアのしおりパネルにセクション階層が表示され、各項目から対応セクションへ遷移できる
 - **優先度**: Must
 - **出典**: ユーザー明示
 - **関連要件**: REQ-FUNC-022
@@ -1146,6 +1150,8 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.39 | 2026-03-18 | 用語集に `OverlaySet` / `PageBox` / `FontTaskTrace` を追加し、requirements 単体で語彙を解決できるようにした | Codex |
+| 0.1.38 | 2026-03-18 | §1.6 の LaTeX 互換性成功基準を `REQ-NF-007` / `FTX-CORPUS-COMPAT-001` / `FTX-ASSET-BUNDLE-001` に接続し、`REQ-FUNC-015` の受け入れ基準に internal/external link と named destination の検証条件を追加 | Codex |
 | 0.1.37 | 2026-03-18 | `REQ-NF-003` のメモリ閾値表記を `1 GiB` に統一し、用語集に `Authority Key` / `Artifact Slot` を追加して並列 commit の衝突判定単位を定義 | Codex |
 | 0.1.36 | 2026-03-17 | `FTX-PARTITION-BENCH-001` を用語集へ追加し、`REQ-FUNC-032` の検証条件に 4 コア以上の CPU・8 GiB 以上の物理メモリ・`FTX-ASSET-BUNDLE-001` 前提を束ねた versioned benchmark profile を導入 | Codex |
 | 0.1.35 | 2026-03-17 | `FTX-CORPUS-COMPAT-001/partition-book` / `partition-article` を用語集へ追加し、`REQ-FUNC-032` の並列化検証入力を versioned corpus subset に固定 | Codex |

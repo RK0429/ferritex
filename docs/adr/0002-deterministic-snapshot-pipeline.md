@@ -6,7 +6,7 @@
 | 日付 | 2026-03-17 |
 | 著者 | ferritex team |
 | 関連ADR | ADR-0001 |
-| 反映先 | [architecture.md](../architecture.md) §3.1 採用パターン（commit 順序）, §5.1 Compilation Core（CompilationSnapshot）, §11.4 性能設計 |
+| 反映先 | [architecture.md](../architecture.md) §3.1 採用パターン（commit 順序）, §5.1 Compilation Core（CompilationSnapshot）, §7.1 `compile`, §7.3 `lsp`, §10.12 パイプライン並列化, §11.4 性能設計; [domain_model.md](../domain_model.md) §6.1 判断記録（ADR-0002）, §6.29 判断記録（ADR-0002） |
 
 ## コンテキスト
 

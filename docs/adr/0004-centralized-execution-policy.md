@@ -6,7 +6,7 @@
 | 日付 | 2026-03-17 |
 | 著者 | ferritex team |
 | 関連ADR | ADR-0001, ADR-0002, ADR-0003 |
-| 反映先 | [architecture.md](../architecture.md) §5.2 Application Services（ExecutionPolicyFactory）, §5.3 Infrastructure Adapters（ShellCommandGateway）, §11.2 セキュリティ設計 |
+| 反映先 | [architecture.md](../architecture.md) §5.2 Application Services（ExecutionPolicyFactory）, §5.3 Infrastructure Adapters（ShellCommandGateway）, §7.1 `compile`, §7.2 `watch` / preview, §7.3 `lsp`, §10.15 セキュリティ境界, §11.2 セキュリティ設計; [domain_model.md](../domain_model.md) §6.7 判断記録（ADR-0004）, §6.12 判断記録（ADR-0004）, §6.16 判断記録（ADR-0004）, §6.19 判断記録（ADR-0004） |
 
 ## コンテキスト
 

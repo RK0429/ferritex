@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.35          |
+| バージョン | 0.1.37          |
 | 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.37 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.24 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.39 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.26 |
 
 ## 1. サブドメイン分類
 
@@ -2318,7 +2318,7 @@ stateDiagram-v2
 
 | 用語 | 定義 | 関連概念 |
 |---|---|---|
-| シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, CompilationSession |
+| シンボル索引 (SymbolIndex) | `DefinitionProvenance` を LSP 向けに投影した read model。カーソル位置からジャンプ先を解決する | DefinitionProvider, LiveAnalysisSnapshot |
 | 補完索引 (CompletionIndex) | `LiveAnalysisSnapshot` から active な command/environment registry、未保存 buffer、label/citation 状態を LSP 補完向けに射影した read model | CompletionProvider, CompletionCandidate |
 | 補完候補 (CompletionCandidate) | コマンド、環境、ラベル、参考文献キーの補完項目。表示名、挿入文字列、由来情報を保持する | CompletionIndex |
 | パッケージ説明スナップショット群 (PackageDocSnapshotCatalog) | active な class/package snapshot の説明資産を保持する `StableCompileState` 側の読み取りモデル | StableCompileState, HoverDocCatalog |
@@ -2347,6 +2347,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: 全コンテキスト横断
+- **関連 ADR**: ADR-0002
 - **判断内容**: パイプライン並列化（ステージ間バッファリング・スレッドプール管理）はドメインモデルに含めず、インフラストラクチャ層の関心事とする。ただし `REQ-FUNC-031` の並列安全性を満たすため、各ステージは `CompilationSession` / `DocumentState` から導出した読み取り専用 `CompilationSnapshot` のみを観測し、可変状態の反映は `CompilationJob` 配下の `CommitBarrier` で逐次化する
 - **根拠**:
   - 観測事実: BR-6 (REQ-FUNC-031)「並列処理の出力はシングルスレッド実行と同一」および REQ-FUNC-031「並列安全なレジスタ・マクロ状態管理」— ドメインロジックは実行モデルに依存しないが、状態可視性の契約は必要
@@ -2359,6 +2360,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: 差分コンパイル
+- **関連 ADR**: ADR-0003
 - **判断内容**: `DependencyGraph` は `CompilationCache` とは独立したストレージに永続化する
 - **根拠**:
   - 観測事実: BR-9 (REQ-FUNC-029)「キャッシュ破損時はフルコンパイルにフォールバック」。依存グラフが失われると変更検知自体が不可能になり、フォールバックのコストが不必要に増大する
@@ -2419,6 +2421,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-11
 - **関連コンテキスト**: パーサー/マクロエンジン / 開発者ツール
+- **関連 ADR**: ADR-0004
 - **判断内容**: `--shell-escape` やパス制御は CLI の一時的な分岐ではなく、全エントリポイントで共通に使う `ExecutionPolicy` / `PathAccessPolicy` として表現する。設定済み read-only overlay roots は `overlayRoots` として allowlist 化し、`--output-dir` は明示的 current `artifactRoot` へ変換する。`ExecutionPolicy` はデフォルト上限として `commandTimeout = 30s`、`maxConcurrentProcesses = 1`、`maxCapturedOutputBytes = 4 MiB` を保持し、preview 配信については `previewPublication` に loopback 限定、active-job 限定、session target 一致、target 変更または process restart 時の session 再発行規約を保持する。private temp root は Ferritex が管理する専用ディレクトリに限定し、artifactRoot の readback は、まず current `JobContext` の `jobname` と主入力で same-job を確認し、次に `OutputArtifactRegistry` に記録された正規化パス・生成パス・生成者・コンテンツハッシュなどの artifact provenance で個別 artifact を trusted と確認した補助ファイルに限って許可する。ただし bibliography input に限り、current `artifactRoot/${jobname}.bbl` と `artifactRoot/${jobname}.bbl.ferritex.json` は registry 未登録でも pre-generated read-only input として許可する。`producedPass` は監査属性であり、same-job の一致条件には含めない。Ferritex が制御した外部ツールの生成物は `ShellCommandGateway` が trusted external artifact として同レジストリへ登録し、registry は active job 完了時に invalidate される
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP、プレビュー再コンパイルから呼ばれ、REQ-FUNC-024 / REQ-FUNC-047 / REQ-FUNC-048 は Ferritex 制御外部ツール生成物の provenance 記録を要求する
@@ -2479,6 +2482,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール / パーサー/マクロエンジン
+- **関連 ADR**: ADR-0004
 - **判断内容**: CLI 固有の `CompileOptions` を直接 `ExecutionPolicyFactory` に渡さず、compile / watch / LSP から得た指定を `RuntimeOptions` へ正規化してから `WorkspaceContext` と合わせて `ExecutionPolicy` を構築する。`RuntimeOptions` は `primaryInput`、`artifactRoot`、`jobname`、`parallelism`、`reuseCache`、`assetBundleRef`、`interactionMode`、`synctex`、`traceFontTasks`、`shellEscapeAllowed` を保持し、debounce や transport など入口固有の制御情報は含めない。`traceFontTasks` はフォント処理ステージの `stderr` trace 有効化だけに使い、preview session ごとの owner や lifetime は `ExecutionPolicy.previewPublication` と `PreviewSessionService` が扱うため `RuntimeOptions` へ混ぜない。LSP 入口で `ferritex.outputDir` / `ferritex.jobname` 以外の compile-affecting 項目が未指定の場合は、`parallelism=利用可能 CPU コア数`、`reuseCache=true`、`assetBundleRef=互換な組み込み Ferritex Asset Bundle`、`interactionMode=nonstopmode`、`synctex=false`、`traceFontTasks=false`、`shellEscapeAllowed=false` の固定既定値で補う。Asset Bundle 指定は `AssetBundleRef` としてファイルパスと組み込み識別子の両方を表現する
 - **根拠**:
   - 観測事実: 同じコンパイル機能が CLI、watch、LSP から呼ばれ、REQ-FUNC-046 は Asset Bundle をパスまたは組み込み識別子で受ける
@@ -2527,6 +2531,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: パーサー/マクロエンジン / アセットランタイム / 開発者ツール
+- **関連 ADR**: ADR-0004
 - **判断内容**: `\input` / `\include` / `\openin` / `\openout` / asset read / engine-temp / engine-readback を個別コンポーネントに散在させず、`FileAccessGate` が `ExecutionPolicy` / `OutputArtifactRegistry` / `JobContext` を受けて一元的に許可判定する
 - **根拠**:
   - 観測事実: REQ-FUNC-048 は「コンパイル中のすべてのファイル読み書き」を同一ポリシーで制御することを要求し、外部コマンドだけでなく通常の TeX I/O も対象に含む
@@ -2563,6 +2568,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール
+- **関連 ADR**: ADR-0004
 - **判断内容**: `PreviewTransport` は loopback 上の session ごとの HTTP document endpoint と WebSocket events endpoint を公開する双方向 port とし、view-state 更新の受信と許可済み revision 通知の publish を担う。bootstrap request は上位 adapter から `PreviewSessionService` へ委譲し、同 service が `PreviewTarget` ごとに session を発行し、同一 process かつ同一 target の間だけ再利用し、target 変更または process restart 時は再発行する。publish 前には `ExecutionPolicy.previewPublication` に照らして active job の `PreviewTarget` と session owner の一致を判定し、`PreviewSession` が保持する閲覧位置を再適用してから `PreviewTransport` へ配信を委譲する。旧 session は `410 Gone` 相当で拒否し、client に bootstrap の再実行を要求する。`PreviewRevision` は target 付き revision と pageCount を持ち、保持ページが新 PDF に存在しない場合は最近傍の有効ページへ clamp する
 - **根拠**:
   - 観測事実: REQ-FUNC-040 はホットリロード後も閲覧ページ位置が維持されること、および保持ページが消滅した場合は最近傍の有効ページへフォールバックすることを要求している
@@ -2683,6 +2689,7 @@ stateDiagram-v2
 
 - **日付**: 2026-03-12
 - **関連コンテキスト**: 開発者ツール / パーサー/マクロエンジン
+- **関連 ADR**: ADR-0002
 - **判断内容**: `diagnostics` / `completion` / `definition` / `hover` / `codeAction` は、保存済みファイルを個別に再読込するのではなく、`OpenDocumentStore` が保持する `OpenDocumentBuffer` と最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State から `LiveAnalysisSnapshot` を構築し、それを共通入力として扱う。LSP の read path は active compile/watch job の完了を待たず、常に直近の Stable Compile State を読み取る
 - **根拠**:
   - 観測事実: REQ-FUNC-034 / REQ-FUNC-035 / REQ-FUNC-036 / REQ-FUNC-037 は保存前の `didChange` 状態に対して一貫した診断・補完・定義ジャンプ・hover を返す必要がある
@@ -2690,6 +2697,19 @@ stateDiagram-v2
   - 分離証人: 未保存の `\label{fig:new}` 追加直後に `\ref{fig:` 補完と hover を引き、同時に diagnostics を更新するケース。`LiveAnalysisSnapshot` モデルでは全 provider が同じ buffer version を観測できるが、個別参照モデルでは completion だけ新しい label を見えて diagnostics/hover が古い状態を返しうる
 - **等価性への影響**: 理論等価（外部仕様は同一で、LSP の一貫した入力境界が明確になる）
 - **語彙への影響**: 「OpenDocumentStore」「OpenDocumentBuffer」「LiveAnalysisSnapshot」「LiveAnalysisSnapshotFactory」を導入
+
+### 6.30 8 コンテキストは単一プロセス内の明示境界として保持する
+
+- **日付**: 2026-03-18
+- **関連コンテキスト**: 全コンテキスト横断
+- **関連 ADR**: ADR-0001
+- **判断内容**: パーサー/マクロエンジン、タイプセッティング、差分コンパイル、アセットランタイム、グラフィック描画、PDF 生成、フォント管理、開発者ツールの 8 コンテキストは、独立プロセスや技術レイヤではなく単一 Rust プロセス内の明示的な境界として保持する。各コンテキストは `kernel` と peer の `api` にのみ依存し、peer の internal 実装には直接依存しない
+- **根拠**:
+  - 観測事実: `REQ-NF-001` / `REQ-NF-002` / `REQ-NF-004` は IPC やネットワーク越し通信を避ける低遅延を要求し、`REQ-NF-009` は単一バイナリ配布を Must として要求している
+  - 代替案: コンテキストごとに別プロセス化する、または `controllers / services / repositories` 型の技術レイヤ中心モノリスにする
+  - 分離証人: compile / watch / lsp / preview が同じ `CompilationJob`、`ExecutionPolicy`、`DocumentState` を共有しつつも、グラフィック描画や PDF 射影の内部実装へは `api` 越しにしかアクセスさせたくないケース。明示境界付き単一プロセスモデルでは共有メモリと境界規律を両立できるが、分散モデルでは性能要件が崩れ、技術レイヤ中心モデルではドメイン境界が曖昧になる
+- **等価性への影響**: 観測的非等価（配備方式と依存方向が変わるが、要求する機能集合は同一）
+- **語彙への影響**: 「コンテキスト境界」「peer api」を導入
 
 ## 7. ビジネスルール一覧
 
@@ -2732,6 +2752,8 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.37 | 2026-03-18 | 判断記録 6.1 / 6.2 / 6.7 / 6.12 / 6.16 / 6.19 / 6.29 に対応 ADR を明示し、ADR-0001 を逆引きできる判断記録 6.30 を追加。メタ情報参照を requirements v0.1.39 / architecture v0.1.26 へ更新 | Codex |
+| 0.1.36 | 2026-03-18 | `SymbolIndex` の関連概念を `LiveAnalysisSnapshot` 基準へ統一し、メタ情報の準拠要件参照を requirements v0.1.38、関連設計参照を architecture v0.1.25 へ更新 | Codex |
 | 0.1.35 | 2026-03-18 | メタ情報の参照版を requirements v0.1.37 / architecture v0.1.24 へ更新し、用語集と BR-6 に `AuthorityKey` / `ArtifactSlot` を追加して `CommitBarrier` の衝突判定単位を定義 | Codex |
 | 0.1.34 | 2026-03-17 | §3.1 に `StageCommitPayload` sealed hierarchy を追加し `CommitBarrier.commit` が ADR-0002 の 4 段階すべての payload を受理する契約に拡張。§5.1 用語集に payload 型 7 件を追加し `StageOrder` / `CommitBarrier` / `DocumentStateDelta` の関連概念を更新。`Stable Compile State` 用語集に `PackageDocSnapshotCatalog` を追加し §3.8 型定義との整合を確保 | Claude Opus 4.6 |
 | 0.1.33 | 2026-03-17 | `CompilationSnapshot` / `StableCompileState` を frozen read-only view 契約で表現し、`DocumentStateDelta` を Hyperref/Typesetting 更新経路へ明示。`DocumentPartitionPlanner` の TOC primary / parser fallback 境界と `partitionId` の暫定性、preview bootstrap と publish の責務境界を文書全体で統一 | Codex |
