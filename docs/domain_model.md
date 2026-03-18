@@ -4,13 +4,13 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.38          |
+| バージョン | 0.1.39          |
 | 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
-| 準拠要件  | [requirements.md](requirements.md) v0.1.40 |
-| 関連設計  | [architecture.md](architecture.md) v0.1.27 |
+| 準拠要件  | [requirements.md](requirements.md) v0.1.41 |
+| 関連設計  | [architecture.md](architecture.md) v0.1.28 |
 
 ## 1. サブドメイン分類
 
@@ -2324,7 +2324,7 @@ stateDiagram-v2
 | 論理アセット識別子 (LogicalAssetId) | class/package/font の namespace と論理名を束ねた lookup key。overlay と bundle の共通解決キーとして使う | AssetIndex, OverlaySet |
 | アセットハンドル (AssetHandle) | 正規化済みパスと content hash を持つ解決済み asset 参照。`AssetResolver` / `OverlaySet` / `FontManager` が downstream に渡す | LogicalAssetId, AssetResolver, FontManager |
 | Asset Index | 論理名から資産ハンドルを高速解決する索引構造 | AssetBundle |
-| オーバーレイ (Overlay) | project-local 資産、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local font catalog fallback を優先順位付きで束ねる解決レイヤー | OverlaySet, OverlayLayer |
+| OverlaySet | project-local 資産、設定済み read-only overlay roots、Ferritex Asset Bundle、host-local font catalog fallback を優先順位付きで束ねる解決レイヤー。文中ではオーバーレイ (Overlay) とも呼ぶ | OverlayLayer |
 | Host Font Catalog | platform font discovery API から収集したホストフォント索引。overlay の一種として解決面に参加する | PlatformFontScanner, FontSnapshot |
 
 ### 5.6 PDF 生成 コンテキスト
@@ -2800,6 +2800,7 @@ stateDiagram-v2
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.39 | 2026-03-18 | 用語集の正規名を `OverlaySet` に揃え、メタ情報参照を requirements v0.1.41 / architecture v0.1.28 へ更新 | Codex |
 | 0.1.38 | 2026-03-18 | メタ情報参照を requirements v0.1.40 / architecture v0.1.27 へ更新し、`DependencyEvent` / `LogicalAssetId` / `AssetHandle` / `ContextBoundary` / `peer API` を定義、LSP read model を request-scoped immutable projection として明文化 | Codex |
 | 0.1.37 | 2026-03-18 | 判断記録 6.1 / 6.2 / 6.7 / 6.12 / 6.16 / 6.19 / 6.29 に対応 ADR を明示し、ADR-0001 を逆引きできる判断記録 6.30 を追加。メタ情報参照を requirements v0.1.39 / architecture v0.1.26 へ更新 | Codex |
 | 0.1.36 | 2026-03-18 | `SymbolIndex` の関連概念を `LiveAnalysisSnapshot` 基準へ統一し、メタ情報の準拠要件参照を requirements v0.1.38、関連設計参照を architecture v0.1.25 へ更新 | Codex |

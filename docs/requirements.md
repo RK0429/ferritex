@@ -5,7 +5,7 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.40          |
+| バージョン | 0.1.41          |
 | 最終更新日 | 2026-03-18      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
@@ -981,7 +981,7 @@
 - **出力**: アセット解決ハンドル
 - **例外**: バージョン不一致または破損時は診断を表示し、互換バンドルがなければ起動を失敗させる
 - **受け入れ基準**:
-  - Given `FTX-ASSET-BUNDLE-001` のみが存在する環境, When `ferritex compile main.tex` を実行, Then TeX Live 非導入でも `FTX-CORPUS-COMPAT-001/layout-core` の baseline 文書群がコンパイルできる
+  - Given Ferritex バイナリと同じリリースで配布された `FTX-ASSET-BUNDLE-001` archive を展開し `--asset-bundle <展開先>` で指定した bundle-only 環境, When `ferritex compile main.tex --asset-bundle <展開先>` を実行, Then TeX Live 非導入でも `FTX-CORPUS-COMPAT-001/layout-core` の baseline 文書群がコンパイルできる
   - Given Ferritex バイナリと同じリリースで配布された `FTX-ASSET-BUNDLE-001` archive を展開し `--asset-bundle <展開先>` で指定した環境, When `ferritex compile main.tex --asset-bundle <展開先>` を実行, Then 追加の TeX ランタイム設定なしで asset 解決が開始される
   - Given Asset Bundle と Host Font Catalog の両方に同名フォント資産が存在する環境, When 通常の解決 API を呼び出す, Then Asset Bundle 側の資産が優先される
   - Given バンドルが破損している環境, When 読み込み, Then 破損診断が表示されコンパイルは開始されない
@@ -1150,6 +1150,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.41 | 2026-03-18 | `REQ-FUNC-046` の baseline 文書群成功条件を `--asset-bundle <展開先>` 明示指定へ統一し、`REQ-NF-009` / architecture の bootstrap 契約と整合させた | Codex |
 | 0.1.40 | 2026-03-18 | `REQ-NF-009` と `REQ-FUNC-046` に公式 Asset Bundle archive を `--asset-bundle <展開先>` で指定する初回導入フローを明記し、未確定事項から初回取得戦略を削除 | Codex |
 | 0.1.39 | 2026-03-18 | 用語集に `OverlaySet` / `PageBox` / `FontTaskTrace` を追加し、requirements 単体で語彙を解決できるようにした | Codex |
 | 0.1.38 | 2026-03-18 | §1.6 の LaTeX 互換性成功基準を `REQ-NF-007` / `FTX-CORPUS-COMPAT-001` / `FTX-ASSET-BUNDLE-001` に接続し、`REQ-FUNC-015` の受け入れ基準に internal/external link と named destination の検証条件を追加 | Codex |
