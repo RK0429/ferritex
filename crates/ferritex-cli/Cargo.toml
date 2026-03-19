@@ -1,0 +1,19 @@
+[package]
+name = "ferritex-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ferritex"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ferritex-application = { path = "../ferritex-application" }
+ferritex-core = { path = "../ferritex-core" }
+ferritex-infra = { path = "../ferritex-infra" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

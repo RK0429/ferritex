@@ -1,0 +1,15 @@
+[package]
+name = "ferritex-infra"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ferritex-application = { path = "../ferritex-application" }
+ferritex-core = { path = "../ferritex-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

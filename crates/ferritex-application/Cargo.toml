@@ -1,0 +1,11 @@
+[package]
+name = "ferritex-application"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ferritex-core = { path = "../ferritex-core" }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
