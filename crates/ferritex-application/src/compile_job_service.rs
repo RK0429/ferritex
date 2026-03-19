@@ -541,6 +541,9 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         ParseError::UnclosedBrace { .. } => diagnostic
             .with_context("the parser reached EOF while braces were still open")
             .with_suggestion("close the outstanding { ... } group"),
+        ParseError::MacroExpansionLimit { .. } => diagnostic
+            .with_context("macro expansion did not converge within the development safety limit")
+            .with_suggestion("check for recursive macro definitions such as \\def\\foo{\\foo}"),
     }
 }
 

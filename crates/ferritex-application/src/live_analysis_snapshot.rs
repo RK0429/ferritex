@@ -313,6 +313,9 @@ fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnosti
             ParseError::UnclosedBrace { .. } => {
                 Some("close the outstanding { ... } group".to_string())
             }
+            ParseError::MacroExpansionLimit { .. } => {
+                Some("check for recursive macro definitions and reduce expansion depth".to_string())
+            }
             _ => None,
         },
     }

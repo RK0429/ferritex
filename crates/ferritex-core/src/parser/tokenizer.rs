@@ -146,6 +146,10 @@ impl<'a> Tokenizer<'a> {
         self.catcodes[char_code as usize] = cat;
     }
 
+    pub fn reset_catcodes(&mut self) {
+        self.catcodes = default_catcode_table();
+    }
+
     fn is_finished(&self) -> bool {
         self.lookahead.is_none()
             && self.index >= self.input.len()

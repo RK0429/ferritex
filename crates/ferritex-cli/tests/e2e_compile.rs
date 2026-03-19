@@ -49,6 +49,67 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 }
 
 #[test]
+fn compile_expands_def_macro_into_pdf_output() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("macro.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\def\\hello{Hello, Macro!}\n\\begin{document}\n\\hello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("macro.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Hello, Macro!"));
+}
+
+#[test]
+fn compile_applies_catcode_changes_during_parsing() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("catcode.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\catcode`\\@=11\n\\def\\make@title{Catcode parsing works}\n\\begin{document}\n\\make@title\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("catcode.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Catcode parsing works"));
+}
+
+#[test]
+fn compile_respects_group_scoped_macros() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("scoped.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n{\\def\\local{Scoped }\\local}\\local\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("scoped.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Scoped "));
+    assert!(pdf.contains("\\\\local"));
+}
+
+#[test]
 fn compile_resolves_nested_input_files() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let main = dir.path().join("main.tex");
@@ -121,8 +182,11 @@ fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
         r#"{"name":"default","version":"2026.03.18","min_ferritex_version":"0.1.0"}"#,
     )
     .expect("write bundle manifest");
-    std::fs::write(bundle_root.join("texmf/bundled.tex"), "Bundled from asset bundle.\n")
-        .expect("write bundled tex input");
+    std::fs::write(
+        bundle_root.join("texmf/bundled.tex"),
+        "Bundled from asset bundle.\n",
+    )
+    .expect("write bundled tex input");
     std::fs::write(
         project_root.join("src/main.tex"),
         "\\documentclass{article}\n\\begin{document}\n\\input{bundled}\n\\end{document}\n",
