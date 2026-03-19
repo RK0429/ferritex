@@ -124,6 +124,7 @@ struct ParserDriver<'a> {
     conditionals: ConditionalState,
     pending_tokens: VecDeque<QueuedToken>,
     runtime_group_stack: Vec<u32>,
+    semisimple_group_stack: Vec<u32>,
     document_class: Option<String>,
     document_class_error: Option<ParseError>,
     package_count: usize,
@@ -152,6 +153,7 @@ impl<'a> ParserDriver<'a> {
             conditionals: ConditionalState::default(),
             pending_tokens: VecDeque::new(),
             runtime_group_stack: Vec::new(),
+            semisimple_group_stack: Vec::new(),
             document_class: None,
             document_class_error: None,
             package_count: 0,
@@ -191,6 +193,10 @@ impl<'a> ParserDriver<'a> {
         }
 
         if let Some(line) = self.runtime_group_stack.last().copied() {
+            return Err(ParseError::UnclosedBrace { line });
+        }
+
+        if let Some(line) = self.semisimple_group_stack.last().copied() {
             return Err(ParseError::UnclosedBrace { line });
         }
 
@@ -311,10 +317,9 @@ impl<'a> ParserDriver<'a> {
                     }
                     _ => {
                         let _ = self.take_global_prefix();
-                        if let Some(definition) = self.macro_engine.lookup(&name).cloned() {
-                            self.record_macro_expansion(token.line)?;
-                            let args = self.collect_macro_arguments(definition.parameter_count)?;
-                            let expansion = self.macro_engine.expand(&name, &args);
+                        if let Some(expansion) =
+                            self.expand_defined_control_sequence_token(&token)?
+                        {
                             self.push_front_tokens(expansion);
                         } else {
                             self.body.push_str(&render_token(&token));
@@ -368,6 +373,16 @@ impl<'a> ParserDriver<'a> {
                 self.parse_def(is_global)?;
                 Ok(true)
             }
+            "let" => {
+                let is_global = self.take_global_prefix();
+                self.parse_let(is_global)?;
+                Ok(true)
+            }
+            "edef" => {
+                let is_global = self.take_global_prefix();
+                self.parse_edef(is_global)?;
+                Ok(true)
+            }
             "gdef" => {
                 let _ = self.take_global_prefix();
                 self.parse_def(true)?;
@@ -385,6 +400,44 @@ impl<'a> ParserDriver<'a> {
             }
             "global" => {
                 self.global_prefix = true;
+                Ok(true)
+            }
+            "noexpand" => {
+                let _ = self.take_global_prefix();
+                if let Some(next) = self.next_raw_token() {
+                    self.push_front_token(next);
+                }
+                Ok(true)
+            }
+            "expandafter" => {
+                let _ = self.take_global_prefix();
+                self.parse_expandafter()?;
+                Ok(true)
+            }
+            "begingroup" => {
+                let _ = self.take_global_prefix();
+                self.semisimple_group_stack.push(token.line);
+                self.macro_engine.push_group();
+                self.registers.push_group();
+                Ok(true)
+            }
+            "endgroup" => {
+                let _ = self.take_global_prefix();
+                if self.semisimple_group_stack.pop().is_none() {
+                    return Err(ParseError::UnexpectedClosingBrace { line: token.line });
+                }
+                self.macro_engine.pop_group();
+                self.registers.pop_group();
+                self.sync_tokenizer_catcodes();
+                Ok(true)
+            }
+            "csname" => {
+                let _ = self.take_global_prefix();
+                self.parse_csname(token.line)?;
+                Ok(true)
+            }
+            "endcsname" => {
+                let _ = self.take_global_prefix();
                 Ok(true)
             }
             "count" => {
@@ -828,45 +881,53 @@ impl<'a> ParserDriver<'a> {
     }
 
     fn parse_def(&mut self, is_global: bool) -> Result<(), ParseError> {
-        let Some(name_token) = self.next_significant_token() else {
+        let Some((name, parameter_count, open_line)) = self.read_macro_definition_head()? else {
             return Ok(());
         };
-        let Some(name) = control_sequence_name(&name_token) else {
+        let body = self.read_group_contents(open_line)?;
+        self.store_macro_definition(name, parameter_count, body, is_global);
+        Ok(())
+    }
+
+    fn parse_let(&mut self, is_global: bool) -> Result<(), ParseError> {
+        let Some(target_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        let Some(target) = control_sequence_name(&target_token) else {
             return Ok(());
         };
 
-        let mut parameter_count = 0usize;
-        loop {
-            let Some(token) = self.next_significant_token() else {
-                return Ok(());
-            };
-            match token.kind {
-                TokenKind::Parameter(index) => {
-                    parameter_count = parameter_count.max(index as usize);
-                }
-                TokenKind::CharToken {
-                    cat: CatCode::BeginGroup,
-                    ..
-                } => {
-                    if parameter_count > 2 {
-                        return Ok(());
-                    }
-                    let body = self.read_group_contents(token.line)?;
-                    let definition = MacroDef {
-                        name: name.clone(),
-                        parameter_count,
-                        body,
-                    };
-                    if is_global {
-                        self.macro_engine.define_global(name, definition);
-                    } else {
-                        self.macro_engine.define_local(name, definition);
-                    }
-                    return Ok(());
-                }
-                _ => return Ok(()),
+        if let Some(token) = self.next_significant_token() {
+            if !matches!(token.kind, TokenKind::CharToken { char: '=', .. }) {
+                self.push_front_token(token);
             }
         }
+
+        let Some(rhs_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        match rhs_token.kind {
+            TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => {
+                let source_name = control_sequence_name(&rhs_token).expect("control sequence rhs");
+                let source_def = self.macro_engine.lookup(&source_name).cloned();
+                self.macro_engine.let_assign(target, source_def, is_global);
+            }
+            TokenKind::CharToken { .. } => {
+                self.store_macro_definition(target, 0, vec![rhs_token], is_global);
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn parse_edef(&mut self, is_global: bool) -> Result<(), ParseError> {
+        let Some((name, parameter_count, open_line)) = self.read_macro_definition_head()? else {
+            return Ok(());
+        };
+        let body = self.expand_edef_body(open_line)?;
+        self.store_macro_definition(name, parameter_count, body, is_global);
+        Ok(())
     }
 
     fn parse_newcommand(&mut self) -> Result<(), ParseError> {
@@ -947,6 +1008,73 @@ impl<'a> ParserDriver<'a> {
         Ok(())
     }
 
+    fn parse_expandafter(&mut self) -> Result<(), ParseError> {
+        let Some(first) = self.next_raw_token() else {
+            return Ok(());
+        };
+        let Some(second) = self.next_raw_token() else {
+            self.push_front_token(first);
+            return Ok(());
+        };
+
+        match control_sequence_name(&second).as_deref() {
+            Some("csname") => {
+                self.parse_csname(second.line)?;
+            }
+            Some("the") => {
+                self.expand_the(second.line)?;
+            }
+            _ => {
+                if let Some(expansion) = self.expand_defined_control_sequence_token(&second)? {
+                    self.push_front_tokens(expansion);
+                } else {
+                    self.push_front_token(second);
+                }
+            }
+        }
+        self.push_front_queued_token(first, false);
+        Ok(())
+    }
+
+    fn parse_csname(&mut self, line: u32) -> Result<(), ParseError> {
+        let mut name = String::new();
+
+        loop {
+            let Some(token) = self.next_raw_token() else {
+                return Err(ParseError::UnclosedBrace { line });
+            };
+            match token.kind {
+                TokenKind::ControlWord(ref control_word) if control_word == "endcsname" => break,
+                TokenKind::CharToken { char, .. } => name.push(char),
+                TokenKind::ControlWord(ref control_word) if control_word == "the" => {
+                    self.expand_the(token.line)?;
+                }
+                TokenKind::ControlWord(ref control_word) if control_word == "csname" => {
+                    self.parse_csname(token.line)?;
+                }
+                TokenKind::ControlWord(ref control_word) if control_word == "expandafter" => {
+                    self.parse_expandafter()?;
+                }
+                TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => {
+                    if let Some(expansion) = self.expand_defined_control_sequence_token(&token)? {
+                        self.push_front_tokens(expansion);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.push_front_queued_token(
+            Token {
+                kind: TokenKind::ControlWord(name),
+                line,
+                column: 1,
+            },
+            true,
+        );
+        Ok(())
+    }
+
     fn collect_macro_arguments(
         &mut self,
         parameter_count: usize,
@@ -966,6 +1094,85 @@ impl<'a> ParserDriver<'a> {
             }
         }
         Ok(arguments)
+    }
+
+    fn read_macro_definition_head(&mut self) -> Result<Option<(String, usize, u32)>, ParseError> {
+        let Some(name_token) = self.next_significant_token() else {
+            return Ok(None);
+        };
+        let Some(name) = control_sequence_name(&name_token) else {
+            return Ok(None);
+        };
+
+        let mut parameter_count = 0usize;
+        loop {
+            let Some(token) = self.next_significant_token() else {
+                return Ok(None);
+            };
+            match token.kind {
+                TokenKind::Parameter(index) => {
+                    parameter_count = parameter_count.max(index as usize);
+                }
+                TokenKind::CharToken {
+                    cat: CatCode::BeginGroup,
+                    ..
+                } => {
+                    if parameter_count > 2 {
+                        return Ok(None);
+                    }
+                    return Ok(Some((name, parameter_count, token.line)));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    fn expand_edef_body(&mut self, open_line: u32) -> Result<Vec<Token>, ParseError> {
+        let mut depth = 1usize;
+        let mut body = Vec::new();
+
+        while let Some(token) = self.next_raw_token() {
+            match token.kind {
+                TokenKind::CharToken {
+                    cat: CatCode::BeginGroup,
+                    ..
+                } => {
+                    depth += 1;
+                    body.push(token);
+                }
+                TokenKind::CharToken {
+                    cat: CatCode::EndGroup,
+                    ..
+                } => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(body);
+                    }
+                    body.push(token);
+                }
+                TokenKind::ControlWord(ref name) if name == "noexpand" => {
+                    if let Some(next) = self.next_raw_token() {
+                        body.push(next);
+                    }
+                }
+                TokenKind::ControlWord(ref name) if name == "the" => {
+                    self.expand_the(token.line)?;
+                }
+                TokenKind::ControlWord(ref name) if name == "csname" => {
+                    self.parse_csname(token.line)?;
+                }
+                TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => {
+                    if let Some(expansion) = self.expand_defined_control_sequence_token(&token)? {
+                        self.push_front_tokens(expansion);
+                    } else {
+                        body.push(token);
+                    }
+                }
+                _ => body.push(token),
+            }
+        }
+
+        Err(ParseError::UnclosedBrace { line: open_line })
     }
 
     fn read_environment_name(&mut self) -> Result<Option<String>, ParseError> {
@@ -1019,6 +1226,41 @@ impl<'a> ParserDriver<'a> {
         }
 
         Err(ParseError::UnclosedBrace { line: open_line })
+    }
+
+    fn store_macro_definition(
+        &mut self,
+        name: String,
+        parameter_count: usize,
+        body: Vec<Token>,
+        is_global: bool,
+    ) {
+        let definition = MacroDef {
+            name: name.clone(),
+            parameter_count,
+            body,
+        };
+        if is_global {
+            self.macro_engine.define_global(name, definition);
+        } else {
+            self.macro_engine.define_local(name, definition);
+        }
+    }
+
+    fn expand_defined_control_sequence_token(
+        &mut self,
+        token: &Token,
+    ) -> Result<Option<Vec<Token>>, ParseError> {
+        let Some(name) = control_sequence_name(token) else {
+            return Ok(None);
+        };
+        let Some(definition) = self.macro_engine.lookup(&name).cloned() else {
+            return Ok(None);
+        };
+
+        self.record_macro_expansion(token.line)?;
+        let args = self.collect_macro_arguments(definition.parameter_count)?;
+        Ok(Some(self.macro_engine.expand(&name, &args)))
     }
 
     fn read_optional_bracket_tokens(&mut self) -> Result<Option<Vec<Token>>, ParseError> {
@@ -1497,6 +1739,83 @@ mod tests {
     }
 
     #[test]
+    fn let_copies_macro_definition() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\foo{hello}\n\\begin{document}\n\\let\\bar=\\foo\\bar\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "hello");
+    }
+
+    #[test]
+    fn let_with_char_token() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\let\\star=*\\star\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "*");
+    }
+
+    #[test]
+    fn let_respects_group_scope() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\foo{hello}\n\\begin{document}\n{\\let\\bar=\\foo}\\bar\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "\\bar");
+    }
+
+    #[test]
+    fn edef_expands_body_at_definition_time() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\x{world}\n\\edef\\y{hello \\x}\n\\def\\x{changed}\n\\begin{document}\n\\y\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "hello world");
+    }
+
+    #[test]
+    fn edef_respects_noexpand() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\x{world}\n\\edef\\y{\\noexpand\\x}\n\\def\\x{changed}\n\\begin{document}\n\\y\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "changed");
+    }
+
+    #[test]
+    fn edef_expands_the_at_definition_time() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\count0=1\n\\edef\\foo{\\the\\count0}\n\\count0=2\n\\begin{document}\n\\foo\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "1");
+    }
+
+    #[test]
+    fn edef_expands_csname_at_definition_time() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\bar{old}\n\\def\\x{bar}\n\\edef\\y{\\csname \\x\\endcsname}\n\\def\\bar{new}\n\\begin{document}\n\\y\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "old");
+    }
+
+    #[test]
     fn rejects_recursive_macro_expansion() {
         let error = MinimalLatexParser
             .parse(
@@ -1505,6 +1824,17 @@ mod tests {
             .expect_err("parse should fail");
 
         assert_eq!(error, ParseError::MacroExpansionLimit { line: 2 });
+    }
+
+    #[test]
+    fn rejects_recursive_csname_expansion() {
+        let error = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\x{\\csname x\\endcsname}\n\\begin{document}\n\\x\n\\end{document}\n",
+            )
+            .expect_err("parse should fail");
+
+        assert!(matches!(error, ParseError::MacroExpansionLimit { .. }));
     }
 
     #[test]
@@ -1618,6 +1948,28 @@ mod tests {
     }
 
     #[test]
+    fn expandafter_expands_second_token() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\name{\\bar}\n\\begin{document}\n\\expandafter\\def\\name{X}\\bar\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "X");
+    }
+
+    #[test]
+    fn expandafter_def_csname() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\expandafter\\def\\csname foo\\endcsname{X}\n\\begin{document}\n\\foo\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "X");
+    }
+
+    #[test]
     fn advance_multiply_and_divide_update_registers() {
         let document = MinimalLatexParser
             .parse(
@@ -1714,6 +2066,39 @@ mod tests {
             .expect("parse document");
 
         assert_eq!(document.body, "inner outer");
+    }
+
+    #[test]
+    fn begingroup_endgroup_scope() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\foo{outer }\n\\begin{document}\n\\count0=1\\begingroup\\def\\foo{inner }\\count0=2\\foo\\endgroup\\foo\\the\\count0\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "inner outer 1");
+    }
+
+    #[test]
+    fn csname_builds_dynamic_control_sequence() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\o{o}\n\\def\\foo{made}\n\\begin{document}\n\\csname fo\\o\\endcsname\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "made");
+    }
+
+    #[test]
+    fn csname_expands_the_primitive() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\count0=1\n\\expandafter\\def\\csname foo1\\endcsname{made}\n\\begin{document}\n\\csname foo\\the\\count0\\endcsname\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "made");
     }
 
     #[test]

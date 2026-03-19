@@ -54,6 +54,31 @@ impl MacroEngine {
         }
     }
 
+    pub fn let_assign(&mut self, target: String, source_def: Option<MacroDef>, global: bool) {
+        match source_def {
+            Some(mut definition) => {
+                definition.name = target.clone();
+                if global {
+                    self.define_global(target, definition);
+                } else {
+                    self.define_local(target, definition);
+                }
+            }
+            None if global => {
+                for scope in &mut self.scope_stack {
+                    let _ = scope.remove(&target);
+                }
+            }
+            None => {
+                let _ = self
+                    .scope_stack
+                    .last_mut()
+                    .expect("macro engine always has at least one scope")
+                    .remove(&target);
+            }
+        }
+    }
+
     pub fn lookup(&self, name: &str) -> Option<&MacroDef> {
         self.scope_stack.last().and_then(|scope| scope.get(name))
     }
