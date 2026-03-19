@@ -110,6 +110,29 @@ fn compile_respects_group_scoped_macros() {
 }
 
 #[test]
+fn compile_handles_conditionals_and_registers() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("conditionals.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\count0 42\\advance\\count0 8\\dimen0 2pt\\iftrue Visible \\the\\count0\\fi\\ifnum\\count0>40 Positive \\the\\dimen0\\fi\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf =
+        std::fs::read_to_string(dir.path().join("conditionals.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Visible 50"));
+    assert!(pdf.contains("Positive"));
+    assert!(pdf.contains("2.0pt"));
+}
+
+#[test]
 fn compile_resolves_nested_input_files() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let main = dir.path().join("main.tex");

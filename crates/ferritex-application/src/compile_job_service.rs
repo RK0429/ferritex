@@ -541,6 +541,21 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         ParseError::UnclosedBrace { .. } => diagnostic
             .with_context("the parser reached EOF while braces were still open")
             .with_suggestion("close the outstanding { ... } group"),
+        ParseError::InvalidRegisterIndex { .. } => diagnostic
+            .with_context("a count/dimen register index must be between 0 and 32767")
+            .with_suggestion("use a register number in the supported range"),
+        ParseError::UnclosedConditional { .. } => diagnostic
+            .with_context("the parser reached EOF while a conditional branch was still open")
+            .with_suggestion("add the missing \\fi for the open \\if... branch"),
+        ParseError::UnexpectedElse { .. } => diagnostic
+            .with_context("the parser found \\else without a matching open conditional")
+            .with_suggestion("remove the stray \\else or add the matching \\if..."),
+        ParseError::UnexpectedFi { .. } => diagnostic
+            .with_context("the parser found \\fi without a matching open conditional")
+            .with_suggestion("remove the stray \\fi or add the matching \\if..."),
+        ParseError::DivisionByZero { .. } => diagnostic
+            .with_context("register division requires a non-zero divisor")
+            .with_suggestion("change the divisor to a non-zero integer"),
         ParseError::MacroExpansionLimit { .. } => diagnostic
             .with_context("macro expansion did not converge within the development safety limit")
             .with_suggestion("check for recursive macro definitions such as \\def\\foo{\\foo}"),

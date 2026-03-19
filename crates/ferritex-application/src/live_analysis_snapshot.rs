@@ -313,6 +313,21 @@ fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnosti
             ParseError::UnclosedBrace { .. } => {
                 Some("close the outstanding { ... } group".to_string())
             }
+            ParseError::InvalidRegisterIndex { .. } => {
+                Some("use a count or dimen register between 0 and 32767".to_string())
+            }
+            ParseError::UnclosedConditional { .. } => {
+                Some("add the missing \\fi for the open conditional".to_string())
+            }
+            ParseError::UnexpectedElse { .. } => {
+                Some("remove the stray \\else or add the matching \\if...".to_string())
+            }
+            ParseError::UnexpectedFi { .. } => {
+                Some("remove the stray \\fi or add the matching \\if...".to_string())
+            }
+            ParseError::DivisionByZero { .. } => {
+                Some("change the divisor to a non-zero integer".to_string())
+            }
             ParseError::MacroExpansionLimit { .. } => {
                 Some("check for recursive macro definitions and reduce expansion depth".to_string())
             }
