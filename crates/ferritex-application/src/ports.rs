@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub trait AssetBundleLoaderPort: Send + Sync {
     fn validate(&self, bundle_path: &Path) -> Result<(), String>;
+    fn resolve_tex_input(&self, bundle_path: &Path, relative_path: &str) -> Option<PathBuf>;
 }
 
 pub trait PreviewTransportPort: Send + Sync {

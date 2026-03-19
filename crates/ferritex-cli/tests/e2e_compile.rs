@@ -79,6 +79,73 @@ fn compile_resolves_nested_input_files() {
 }
 
 #[test]
+fn compile_resolves_project_root_fallback_from_nested_input() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let project_root = dir.path().join("project");
+    let src_dir = project_root.join("src");
+    let section_dir = src_dir.join("chapters");
+    let shared_dir = project_root.join("shared");
+    std::fs::create_dir_all(&section_dir).expect("create source tree");
+    std::fs::create_dir_all(&shared_dir).expect("create shared tree");
+
+    std::fs::write(
+        src_dir.join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\n\\input{chapters/section}\n\\end{document}\n",
+    )
+    .expect("write main");
+    std::fs::write(section_dir.join("section.tex"), "\\input{shared/macros}\n")
+        .expect("write nested section");
+    std::fs::write(shared_dir.join("macros.tex"), "Project root fallback.\n")
+        .expect("write shared macros");
+
+    let output = ferritex_bin()
+        .current_dir(&project_root)
+        .args(["compile", "src/main.tex"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(src_dir.join("main.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Project root fallback."));
+}
+
+#[test]
+fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let project_root = dir.path().join("project");
+    let bundle_root = dir.path().join("bundle");
+    std::fs::create_dir_all(project_root.join("src")).expect("create source tree");
+    std::fs::create_dir_all(bundle_root.join("texmf")).expect("create bundle texmf");
+    std::fs::write(
+        bundle_root.join("manifest.json"),
+        r#"{"name":"default","version":"2026.03.18","min_ferritex_version":"0.1.0"}"#,
+    )
+    .expect("write bundle manifest");
+    std::fs::write(bundle_root.join("texmf/bundled.tex"), "Bundled from asset bundle.\n")
+        .expect("write bundled tex input");
+    std::fs::write(
+        project_root.join("src/main.tex"),
+        "\\documentclass{article}\n\\begin{document}\n\\input{bundled}\n\\end{document}\n",
+    )
+    .expect("write main");
+
+    let output = ferritex_bin()
+        .current_dir(&project_root)
+        .args([
+            "compile",
+            "src/main.tex",
+            "--asset-bundle",
+            bundle_root.to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(project_root.join("src/main.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Bundled from asset bundle."));
+}
+
+#[test]
 fn compile_rejects_commented_out_documentclass() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("broken.tex");

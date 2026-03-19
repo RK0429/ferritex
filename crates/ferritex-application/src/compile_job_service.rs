@@ -54,6 +54,8 @@ impl<'a> CompileJobService<'a> {
 
     pub fn compile(&self, options: &RuntimeOptions) -> CompileResult {
         let input_path = options.input_file.to_string_lossy().into_owned();
+        let execution_policy = ExecutionPolicyFactory::create(options);
+        let project_root = project_root_for_policy(&execution_policy, &options.input_file);
 
         if let Some(bundle_path) = &options.asset_bundle {
             let manifest_path = bundle_path.join("manifest.json");
@@ -103,7 +105,11 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
-        let source_tree = match self.load_source_tree(&options.input_file) {
+        let source_tree = match self.load_source_tree(
+            &options.input_file,
+            &project_root,
+            options.asset_bundle.as_deref(),
+        ) {
             Ok(tree) => tree,
             Err(diagnostic) => {
                 let diagnostics = vec![diagnostic];
@@ -123,7 +129,7 @@ impl<'a> CompileJobService<'a> {
                 let compilation_job = compilation_job(
                     options.input_file.clone(),
                     options.jobname.clone(),
-                    ExecutionPolicyFactory::create(options),
+                    execution_policy.clone(),
                 );
 
                 return CompileResult {
@@ -195,7 +201,7 @@ impl<'a> CompileJobService<'a> {
         let compilation_job = compilation_job(
             options.input_file.clone(),
             options.jobname.clone(),
-            ExecutionPolicyFactory::create(options),
+            execution_policy,
         );
 
         if let Err(error) = self
@@ -242,13 +248,12 @@ impl<'a> CompileJobService<'a> {
     pub fn compile_from_source(&self, source: &str, uri: &str) -> StableCompileState {
         let primary_input = primary_input_from_uri(uri);
         let jobname = jobname_for_input(&primary_input);
-        let compilation_job = compilation_job(
-            primary_input.clone(),
-            jobname.clone(),
-            in_memory_execution_policy(&primary_input, &jobname),
-        );
+        let execution_policy = in_memory_execution_policy(&primary_input, &jobname);
+        let project_root = project_root_for_policy(&execution_policy, &primary_input);
+        let compilation_job =
+            compilation_job(primary_input.clone(), jobname.clone(), execution_policy);
         let source_tree = self
-            .load_source_tree_with_root_source(&primary_input, Some(source))
+            .load_source_tree_with_root_source(&primary_input, Some(source), &project_root, None)
             .unwrap_or_else(|_| LoadedSourceTree {
                 source: source.to_string(),
                 document_state: DocumentState::default(),
@@ -282,21 +287,24 @@ impl<'a> CompileJobService<'a> {
         }
     }
 
-    fn load_source_tree(&self, input_file: &Path) -> Result<LoadedSourceTree, Diagnostic> {
-        self.load_source_tree_with_root_source(input_file, None)
+    fn load_source_tree(
+        &self,
+        input_file: &Path,
+        project_root: &Path,
+        asset_bundle_path: Option<&Path>,
+    ) -> Result<LoadedSourceTree, Diagnostic> {
+        self.load_source_tree_with_root_source(input_file, None, project_root, asset_bundle_path)
     }
 
     fn load_source_tree_with_root_source(
         &self,
         input_file: &Path,
         root_source: Option<&str>,
+        project_root: &Path,
+        asset_bundle_path: Option<&Path>,
     ) -> Result<LoadedSourceTree, Diagnostic> {
         let root_input = normalize_existing_path(input_file);
-        let workspace_root = root_input
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        let project_root = normalize_existing_path(project_root);
         let mut visited = BTreeSet::new();
         let mut include_guard = BTreeSet::new();
         let mut source_files = BTreeSet::new();
@@ -304,8 +312,9 @@ impl<'a> CompileJobService<'a> {
         let mut citations = BTreeMap::new();
         let source = self.load_source_file(
             &root_input,
-            &workspace_root,
+            &project_root,
             root_source,
+            asset_bundle_path,
             &mut visited,
             &mut include_guard,
             &mut source_files,
@@ -334,6 +343,7 @@ impl<'a> CompileJobService<'a> {
         path: &Path,
         workspace_root: &Path,
         source_override: Option<&str>,
+        asset_bundle_path: Option<&Path>,
         visited: &mut BTreeSet<PathBuf>,
         include_guard: &mut BTreeSet<PathBuf>,
         source_files: &mut BTreeSet<PathBuf>,
@@ -368,6 +378,7 @@ impl<'a> CompileJobService<'a> {
             &normalized_path,
             base_dir,
             workspace_root,
+            asset_bundle_path,
             visited,
             include_guard,
             source_files,
@@ -393,6 +404,20 @@ fn stable_compile_state(
         success,
         diagnostics,
     }
+}
+
+fn project_root_for_policy(policy: &ExecutionPolicy, input_file: &Path) -> PathBuf {
+    policy
+        .allowed_read_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| {
+            input_file
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
 }
 
 fn compilation_job(
@@ -549,6 +574,7 @@ fn expand_inputs(
     source_path: &Path,
     base_dir: &Path,
     workspace_root: &Path,
+    asset_bundle_path: Option<&Path>,
     visited: &mut BTreeSet<PathBuf>,
     include_guard: &mut BTreeSet<PathBuf>,
     source_files: &mut BTreeSet<PathBuf>,
@@ -569,32 +595,98 @@ fn expand_inputs(
         for command in matches {
             expanded.push_str(&line[cursor..command.start]);
 
-            let resolved = resolve_input_path(base_dir, workspace_root, &command.value);
-            if command.name == "include" && !include_guard.insert(resolved.clone()) {
-                cursor = command.end;
-                continue;
-            }
+            let resolved = resolve_input_path(
+                base_dir,
+                workspace_root,
+                &command.value,
+                service.asset_bundle_loader,
+                asset_bundle_path,
+            );
 
-            let nested = service
-                .load_source_file(
-                    &resolved,
-                    workspace_root,
-                    None,
-                    visited,
-                    include_guard,
-                    source_files,
-                    labels,
-                    citations,
-                )
-                .map_err(|diagnostic| {
-                    diagnostic_for_nested_input_error(
-                        diagnostic,
-                        source_path,
-                        command.line,
-                        &command.value,
-                    )
-                })?;
-            expanded.push_str(&nested);
+            match &command.kind {
+                InlineCommandKind::Input => {
+                    let nested = service
+                        .load_source_file(
+                            &resolved,
+                            workspace_root,
+                            None,
+                            asset_bundle_path,
+                            visited,
+                            include_guard,
+                            source_files,
+                            labels,
+                            citations,
+                        )
+                        .map_err(|diagnostic| {
+                            diagnostic_for_nested_input_error(
+                                diagnostic,
+                                source_path,
+                                command.line,
+                                &command.value,
+                            )
+                        })?;
+                    expanded.push_str(&nested);
+                }
+                InlineCommandKind::Include => {
+                    if !include_guard.insert(resolved.clone()) {
+                        cursor = command.end;
+                        continue;
+                    }
+
+                    let nested = service
+                        .load_source_file(
+                            &resolved,
+                            workspace_root,
+                            None,
+                            asset_bundle_path,
+                            visited,
+                            include_guard,
+                            source_files,
+                            labels,
+                            citations,
+                        )
+                        .map_err(|diagnostic| {
+                            diagnostic_for_nested_input_error(
+                                diagnostic,
+                                source_path,
+                                command.line,
+                                &command.value,
+                            )
+                        })?;
+                    expanded.push_str(&nested);
+                }
+                InlineCommandKind::InputIfFileExists {
+                    true_branch,
+                    false_branch,
+                } => {
+                    if resolved.exists() {
+                        let nested = service
+                            .load_source_file(
+                                &resolved,
+                                workspace_root,
+                                None,
+                                asset_bundle_path,
+                                visited,
+                                include_guard,
+                                source_files,
+                                labels,
+                                citations,
+                            )
+                            .map_err(|diagnostic| {
+                                diagnostic_for_nested_input_error(
+                                    diagnostic,
+                                    source_path,
+                                    command.line,
+                                    &command.value,
+                                )
+                            })?;
+                        expanded.push_str(&nested);
+                        expanded.push_str(true_branch);
+                    } else {
+                        expanded.push_str(false_branch);
+                    }
+                }
+            }
             cursor = command.end;
         }
 
@@ -625,18 +717,34 @@ fn normalize_existing_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn resolve_input_path(base_dir: &Path, workspace_root: &Path, value: &str) -> PathBuf {
+fn resolve_input_path(
+    base_dir: &Path,
+    workspace_root: &Path,
+    value: &str,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    asset_bundle_path: Option<&Path>,
+) -> PathBuf {
     let candidate = tex_path_candidate(base_dir, value);
-    if candidate.exists() || base_dir == workspace_root {
+    if candidate.exists() {
         return candidate;
     }
 
     let workspace_candidate = tex_path_candidate(workspace_root, value);
     if workspace_candidate.exists() {
-        workspace_candidate
-    } else {
-        candidate
+        return workspace_candidate;
     }
+
+    if let Some(bundle_path) = asset_bundle_path {
+        if let Some(relative_path) = bundle_relative_input_path(base_dir, bundle_path, value) {
+            if let Some(path) = asset_bundle_loader
+                .resolve_tex_input(bundle_path, relative_path.to_string_lossy().as_ref())
+            {
+                return path;
+            }
+        }
+    }
+
+    candidate
 }
 
 fn tex_path_candidate(base_dir: &Path, value: &str) -> PathBuf {
@@ -654,9 +762,44 @@ fn tex_path_candidate(base_dir: &Path, value: &str) -> PathBuf {
     }
 }
 
+fn tex_relative_candidate(path: &Path) -> PathBuf {
+    if path.extension().is_some() {
+        path.to_path_buf()
+    } else {
+        path.with_extension("tex")
+    }
+}
+
+fn bundle_relative_input_path(base_dir: &Path, bundle_path: &Path, value: &str) -> Option<PathBuf> {
+    let candidate = tex_path_candidate(base_dir, value);
+    if let Ok(relative_path) = candidate.strip_prefix(bundle_path) {
+        return Some(tex_relative_candidate(relative_path));
+    }
+
+    let value_path = Path::new(value);
+    if value_path.is_absolute() {
+        return value_path
+            .strip_prefix(bundle_path)
+            .ok()
+            .map(tex_relative_candidate);
+    }
+
+    Some(tex_relative_candidate(value_path))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InlineCommandKind {
+    Input,
+    Include,
+    InputIfFileExists {
+        true_branch: String,
+        false_branch: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InlineCommand {
-    name: &'static str,
+    kind: InlineCommandKind,
     value: String,
     start: usize,
     end: usize,
@@ -668,6 +811,7 @@ fn input_commands_in_line(line: &str, line_number: u32) -> Vec<InlineCommand> {
         .into_iter()
         .flat_map(|command| find_braced_commands(line, command, line_number))
         .collect::<Vec<_>>();
+    matches.extend(find_input_if_file_exists_commands(line, line_number));
     matches.sort_by_key(|command| command.start);
     matches
 }
@@ -680,32 +824,105 @@ fn find_braced_commands(line: &str, command: &'static str, line_number: u32) -> 
     while let Some(found) = line[search_offset..].find(&needle) {
         let start = search_offset + found;
         let mut cursor = start + needle.len();
-        cursor += line[cursor..]
-            .chars()
-            .take_while(|ch| ch.is_whitespace())
-            .map(char::len_utf8)
-            .sum::<usize>();
-        if !line[cursor..].starts_with('{') {
+        cursor = skip_command_whitespace(line, cursor);
+        let Some((value, end)) = parse_braced_group(line, cursor) else {
             search_offset = cursor;
             continue;
-        }
-
-        let value_start = cursor + 1;
-        let Some(value_end_relative) = line[value_start..].find('}') else {
-            break;
         };
-        let value_end = value_start + value_end_relative;
         matches.push(InlineCommand {
-            name: command,
-            value: line[value_start..value_end].to_string(),
+            kind: match command {
+                "input" => InlineCommandKind::Input,
+                "include" => InlineCommandKind::Include,
+                _ => unreachable!("unsupported inline command"),
+            },
+            value,
             start,
-            end: value_end + 1,
+            end,
             line: line_number,
         });
-        search_offset = value_end + 1;
+        search_offset = end;
     }
 
     matches
+}
+
+fn find_input_if_file_exists_commands(line: &str, line_number: u32) -> Vec<InlineCommand> {
+    let needle = "\\InputIfFileExists";
+    let mut matches = Vec::new();
+    let mut search_offset = 0usize;
+
+    while let Some(found) = line[search_offset..].find(needle) {
+        let start = search_offset + found;
+        let mut cursor = skip_command_whitespace(line, start + needle.len());
+        let Some((value, next_cursor)) = parse_braced_group(line, cursor) else {
+            break;
+        };
+        cursor = skip_command_whitespace(line, next_cursor);
+        let Some((true_branch, next_cursor)) = parse_braced_group(line, cursor) else {
+            break;
+        };
+        cursor = skip_command_whitespace(line, next_cursor);
+        let Some((false_branch, end)) = parse_braced_group(line, cursor) else {
+            break;
+        };
+
+        matches.push(InlineCommand {
+            kind: InlineCommandKind::InputIfFileExists {
+                true_branch,
+                false_branch,
+            },
+            value,
+            start,
+            end,
+            line: line_number,
+        });
+        search_offset = end;
+    }
+
+    matches
+}
+
+fn skip_command_whitespace(line: &str, cursor: usize) -> usize {
+    cursor
+        + line[cursor..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(char::len_utf8)
+            .sum::<usize>()
+}
+
+fn parse_braced_group(line: &str, cursor: usize) -> Option<(String, usize)> {
+    let start = skip_command_whitespace(line, cursor);
+    if !line[start..].starts_with('{') {
+        return None;
+    }
+
+    let content_start = start + 1;
+    let mut depth = 1u32;
+    let mut escaped = false;
+
+    for (offset, ch) in line[content_start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let content_end = content_start + offset;
+                    let end = content_end + 1;
+                    return Some((line[content_start..content_end].to_string(), end));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn strip_line_comment(line: &str) -> String {
@@ -783,6 +1000,8 @@ fn diagnostic_for_nested_input_error(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -876,13 +1095,78 @@ mod tests {
         }
     }
 
+    struct FsTestFileAccessGate;
+
+    impl FileAccessGate for FsTestFileAccessGate {
+        fn ensure_directory(&self, path: &Path) -> Result<(), FileAccessError> {
+            fs::create_dir_all(path).map_err(FileAccessError::from)
+        }
+
+        fn check_read(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_write(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_readback(
+            &self,
+            _path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+
+        fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), FileAccessError> {
+            fs::write(path, content).map_err(FileAccessError::from)
+        }
+
+        fn read_readback(
+            &self,
+            path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+    }
+
     struct MockAssetBundleLoader {
         result: Result<(), String>,
+        tex_inputs: BTreeMap<String, PathBuf>,
+    }
+
+    impl MockAssetBundleLoader {
+        fn valid() -> Self {
+            Self {
+                result: Ok(()),
+                tex_inputs: BTreeMap::new(),
+            }
+        }
     }
 
     impl AssetBundleLoaderPort for MockAssetBundleLoader {
         fn validate(&self, _bundle_path: &Path) -> Result<(), String> {
             self.result.clone()
+        }
+
+        fn resolve_tex_input(&self, _bundle_path: &Path, relative_path: &str) -> Option<PathBuf> {
+            let lookup_key = if Path::new(relative_path).extension().is_some() {
+                relative_path.to_string()
+            } else {
+                Path::new(relative_path)
+                    .with_extension("tex")
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            self.tex_inputs.get(&lookup_key).cloned()
         }
     }
 
@@ -908,6 +1192,14 @@ mod tests {
         CompileJobService::new(file_access_gate, asset_bundle_loader)
     }
 
+    fn document(body: &str) -> String {
+        format!("\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
+    }
+
+    fn read_pdf(path: &Path) -> String {
+        fs::read_to_string(path).expect("read output pdf")
+    }
+
     #[test]
     fn returns_missing_input_diagnostic_for_nonexistent_file() {
         let dir = tempdir().expect("create tempdir");
@@ -919,7 +1211,7 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 2);
@@ -944,7 +1236,7 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 2);
@@ -969,7 +1261,7 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 0);
@@ -1000,7 +1292,10 @@ mod tests {
         drop(writes);
 
         let created_dirs = gate.created_dirs.lock().expect("lock created dirs");
-        assert_eq!(created_dirs.as_slice(), [options.output_dir.clone()]);
+        assert_eq!(
+            created_dirs.as_slice(),
+            std::slice::from_ref(&options.output_dir)
+        );
     }
 
     #[test]
@@ -1017,7 +1312,7 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 2);
@@ -1042,7 +1337,7 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 2);
@@ -1068,7 +1363,7 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
 
         let state = service(&gate, &loader).compile_from_source(
             "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
@@ -1093,7 +1388,7 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 2);
@@ -1117,6 +1412,7 @@ mod tests {
         };
         let loader = MockAssetBundleLoader {
             result: Err("bundle not found at /tmp/bundle".to_string()),
+            tex_inputs: BTreeMap::new(),
         };
         let result = service(&gate, &loader).compile(&options);
 
@@ -1143,12 +1439,166 @@ mod tests {
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
         };
-        let loader = MockAssetBundleLoader { result: Ok(()) };
+        let loader = MockAssetBundleLoader::valid();
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 2);
         assert_eq!(result.diagnostics[0].message, "asset bundle access denied");
         assert_eq!(result.output_pdf, None);
         assert_eq!(result.stable_compile_state, None);
+    }
+
+    #[test]
+    fn current_file_relative_takes_precedence_over_project_root() {
+        let dir = tempdir().expect("create tempdir");
+        let subdir = dir.path().join("subdir");
+        fs::create_dir_all(&subdir).expect("create subdir");
+        fs::write(dir.path().join("helper.tex"), "PROJECT ROOT HELPER\n")
+            .expect("write root helper");
+        fs::write(subdir.join("helper.tex"), "CURRENT FILE HELPER\n").expect("write local helper");
+        fs::write(
+            dir.path().join("main.tex"),
+            document("\\input{subdir/section}"),
+        )
+        .expect("write main");
+        fs::write(subdir.join("section.tex"), "\\input{helper}\n").expect("write section");
+
+        let options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("CURRENT FILE HELPER"));
+        assert!(!pdf.contains("PROJECT ROOT HELPER"));
+    }
+
+    #[test]
+    fn project_root_fallback_resolves_when_not_in_current_dir() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let src = project_root.join("src");
+        let subdir = src.join("subdir");
+        let shared = project_root.join("shared");
+        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&subdir).expect("create subdir");
+        fs::create_dir_all(&shared).expect("create shared");
+        fs::write(shared.join("macros.tex"), "PROJECT ROOT MACROS\n").expect("write macros");
+        fs::write(src.join("main.tex"), document("\\input{subdir/section}")).expect("write main");
+        fs::write(subdir.join("section.tex"), "\\input{shared/macros}\n").expect("write section");
+
+        let options = runtime_options(src.join("main.tex"), project_root.join("out"));
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("PROJECT ROOT MACROS"));
+    }
+
+    #[test]
+    fn input_if_file_exists_uses_false_branch_when_missing() {
+        let dir = tempdir().expect("create tempdir");
+        fs::write(
+            dir.path().join("main.tex"),
+            document("\\InputIfFileExists{missing}{TRUE}{FALSE BRANCH}"),
+        )
+        .expect("write main");
+
+        let options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("FALSE BRANCH"));
+        assert!(!pdf.contains("TRUE"));
+    }
+
+    #[test]
+    fn input_if_file_exists_uses_true_branch_and_file_when_found() {
+        let dir = tempdir().expect("create tempdir");
+        fs::write(
+            dir.path().join("main.tex"),
+            document("\\InputIfFileExists{helper}{AFTER INPUT}{MISSING}"),
+        )
+        .expect("write main");
+        fs::write(dir.path().join("helper.tex"), "HELPER CONTENT\n").expect("write helper");
+
+        let options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("HELPER CONTENT"));
+        assert!(pdf.contains("AFTER INPUT"));
+        assert!(!pdf.contains("MISSING"));
+    }
+
+    #[test]
+    fn input_if_file_exists_resolves_from_bundle() {
+        let dir = tempdir().expect("create tempdir");
+        let bundle_root = dir.path().join("bundle");
+        let bundled_file = bundle_root.join("texmf/bundled.tex");
+        fs::create_dir_all(bundled_file.parent().expect("bundle texmf parent"))
+            .expect("create bundle texmf");
+        fs::write(&bundled_file, "BUNDLED FILE CONTENT\n").expect("write bundled file");
+        fs::write(
+            dir.path().join("main.tex"),
+            document("\\InputIfFileExists{bundled}{AFTER BUNDLE INPUT}{FALLBACK}"),
+        )
+        .expect("write main");
+
+        let mut options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        options.asset_bundle = Some(bundle_root);
+
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader {
+            result: Ok(()),
+            tex_inputs: BTreeMap::from([("bundled.tex".to_string(), bundled_file)]),
+        };
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("BUNDLED FILE CONTENT"));
+        assert!(pdf.contains("AFTER BUNDLE INPUT"));
+        assert!(!pdf.contains("FALLBACK"));
+    }
+
+    #[test]
+    fn bundle_backed_resolution_provides_tex_input() {
+        let dir = tempdir().expect("create tempdir");
+        let bundle_root = dir.path().join("bundle");
+        let bundled_file = bundle_root.join("texmf/bundled.tex");
+        fs::create_dir_all(bundled_file.parent().expect("bundle texmf parent"))
+            .expect("create bundle texmf");
+        fs::write(&bundled_file, "BUNDLED CONTENT\n").expect("write bundled file");
+        fs::write(dir.path().join("main.tex"), document("\\input{bundled}")).expect("write main");
+
+        let mut options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        options.asset_bundle = Some(bundle_root);
+
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader {
+            result: Ok(()),
+            tex_inputs: BTreeMap::from([("bundled.tex".to_string(), bundled_file)]),
+        };
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("BUNDLED CONTENT"));
     }
 }

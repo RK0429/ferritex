@@ -20,6 +20,20 @@ impl AssetBundleLoaderPort for AssetBundleLoader {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    fn resolve_tex_input(&self, bundle_path: &Path, relative_path: &str) -> Option<PathBuf> {
+        let bundle_relative = tex_relative_candidate(Path::new(relative_path));
+        let texmf_root = bundle_path.join("texmf");
+        let tex_input_path = texmf_root.join(bundle_relative);
+
+        let resolved = tex_input_path.canonicalize().ok()?;
+        let texmf_resolved = texmf_root.canonicalize().ok()?;
+        if !resolved.starts_with(&texmf_resolved) {
+            return None;
+        }
+
+        Some(resolved)
+    }
 }
 
 impl AssetBundleLoader {
@@ -131,20 +145,25 @@ fn parse_version(input: &str) -> Result<Vec<u64>, String> {
     Ok(segments)
 }
 
+fn tex_relative_candidate(relative_path: &Path) -> PathBuf {
+    if relative_path.extension().is_some() {
+        relative_path.to_path_buf()
+    } else {
+        relative_path.with_extension("tex")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use ferritex_application::ports::AssetBundleLoaderPort;
+    use tempfile::tempdir;
 
     use super::{AssetBundleError, AssetBundleLoader, AssetBundleManifest};
 
     fn fixture_root() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is before unix epoch")
-            .as_nanos();
-
-        std::env::temp_dir().join(format!("ferritex-asset-bundle-loader-{unique}"))
+        tempdir().expect("create tempdir").keep()
     }
 
     fn write_manifest(
@@ -205,5 +224,75 @@ mod tests {
         let manifest = AssetBundleLoader::load(&bundle_root).expect("bundle should load");
 
         assert_eq!(manifest, expected);
+    }
+
+    #[test]
+    fn resolves_tex_input_from_bundle_texmf_directory() {
+        let bundle_root = fixture_root();
+        write_manifest(
+            &bundle_root,
+            &AssetBundleManifest {
+                name: "default".to_string(),
+                version: "2026.03.18".to_string(),
+                min_ferritex_version: "0.1.0".to_string(),
+            },
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(bundle_root.join("texmf/shared")).expect("create texmf");
+        std::fs::write(
+            bundle_root.join("texmf/shared/macros.tex"),
+            "Bundled macros.\n",
+        )
+        .expect("write bundled tex input");
+
+        let resolved = AssetBundleLoader.resolve_tex_input(&bundle_root, "shared/macros");
+
+        assert_eq!(
+            resolved,
+            Some(
+                bundle_root
+                    .join("texmf/shared/macros.tex")
+                    .canonicalize()
+                    .expect("canonicalize bundled tex input"),
+            )
+        );
+    }
+
+    #[test]
+    fn returns_none_when_bundle_tex_input_is_missing() {
+        let bundle_root = fixture_root();
+        write_manifest(
+            &bundle_root,
+            &AssetBundleManifest {
+                name: "default".to_string(),
+                version: "2026.03.18".to_string(),
+                min_ferritex_version: "0.1.0".to_string(),
+            },
+        )
+        .expect("write manifest");
+
+        let resolved = AssetBundleLoader.resolve_tex_input(&bundle_root, "missing");
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_tex_input_resolution() {
+        let bundle_root = fixture_root();
+        write_manifest(
+            &bundle_root,
+            &AssetBundleManifest {
+                name: "default".to_string(),
+                version: "2026.03.18".to_string(),
+                min_ferritex_version: "0.1.0".to_string(),
+            },
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(bundle_root.join("texmf")).expect("create texmf");
+        std::fs::write(bundle_root.join("secret.tex"), "SECRET").expect("write secret");
+
+        let resolved = AssetBundleLoader.resolve_tex_input(&bundle_root, "../secret");
+
+        assert_eq!(resolved, None);
     }
 }
