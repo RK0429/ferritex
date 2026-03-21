@@ -49,6 +49,42 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 }
 
 #[test]
+fn compile_long_paragraph_produces_multi_page_pdf() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("long.tex");
+    let first_word = "Alpha".repeat(14);
+    let filler_word = "BetaX".repeat(14);
+    let last_word = "Omega".repeat(14);
+    let paragraph = std::iter::once(first_word.as_str())
+        .chain((0..58).map(|_| filler_word.as_str()))
+        .chain(std::iter::once(last_word.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    std::fs::write(
+        &tex_file,
+        format!(
+            "\\documentclass{{article}}\n\\begin{{document}}\n{paragraph}\n\\end{{document}}\n"
+        ),
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read_to_string(dir.path().join("long.pdf")).expect("read output pdf");
+    assert!(pdf.starts_with("%PDF-1.4"));
+    assert!(pdf.contains(&first_word));
+    assert!(pdf.contains(&last_word));
+    assert!(!pdf.contains("Ferritex placeholder PDF"));
+    assert!(pdf_page_count(&pdf) >= 2);
+}
+
+#[test]
 fn compile_expands_def_macro_into_pdf_output() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("macro.tex");
@@ -754,6 +790,17 @@ fn lsp_diagnostics_include_compile_errors() {
     );
 
     assert!(child.wait().expect("wait lsp").success());
+}
+
+fn pdf_page_count(pdf: &str) -> usize {
+    let marker = "/Count ";
+    let start = pdf.find(marker).expect("pdf page count marker");
+    let digits = pdf[start + marker.len()..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+
+    digits.parse().expect("parse pdf page count")
 }
 
 fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration, message: &str) {

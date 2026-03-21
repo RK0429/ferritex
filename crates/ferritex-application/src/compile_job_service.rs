@@ -5,16 +5,26 @@ use ferritex_core::compilation::{
     CompilationJob, CompilationSnapshot, DocumentState, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
+use ferritex_core::font::TfmMetrics;
+use ferritex_core::kernel::api::DimensionValue;
 use ferritex_core::parser::{MinimalLatexParser, ParseError, Parser};
 use ferritex_core::pdf::PdfRenderer;
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
-use ferritex_core::typesetting::MinimalTypesetter;
+use ferritex_core::typesetting::{MinimalTypesetter, TfmWidthProvider};
 
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::AssetBundleLoaderPort;
 use crate::runtime_options::RuntimeOptions;
 use crate::stable_compile_state::StableCompileState;
+
+const DEFAULT_TFM_FALLBACK_WIDTH: DimensionValue = DimensionValue(65_536);
+const CMR10_TFM_CANDIDATES: [&str; 4] = [
+    "texmf/fonts/tfm/public/cm/cmr10.tfm",
+    "fonts/tfm/public/cm/cmr10.tfm",
+    "texmf/cmr10.tfm",
+    "cmr10.tfm",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileResult {
@@ -196,7 +206,18 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
-        let typeset_document = self.typesetter.typeset(&parsed_document);
+        let typeset_document = if let Some(metrics) =
+            load_cmr10_metrics(self.file_access_gate, options.asset_bundle.as_deref())
+        {
+            let provider = TfmWidthProvider {
+                metrics: &metrics,
+                fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+            };
+            self.typesetter
+                .typeset_with_provider(&parsed_document, &provider)
+        } else {
+            self.typesetter.typeset(&parsed_document)
+        };
         let pdf_document = self.pdf_renderer.render(&typeset_document);
         let compilation_job = compilation_job(
             options.input_file.clone(),
@@ -735,6 +756,53 @@ fn normalize_existing_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn load_cmr10_metrics(
+    file_access_gate: &dyn FileAccessGate,
+    asset_bundle_path: Option<&Path>,
+) -> Option<TfmMetrics> {
+    let bundle_path = asset_bundle_path?;
+
+    for relative_path in CMR10_TFM_CANDIDATES {
+        let candidate = bundle_path.join(relative_path);
+        if !candidate.is_file() {
+            continue;
+        }
+
+        if file_access_gate.check_read(&candidate) == PathAccessDecision::Denied {
+            tracing::warn!(
+                path = %candidate.display(),
+                "cmr10.tfm access denied; falling back to fixed-width typesetting"
+            );
+            continue;
+        }
+
+        let bytes = match file_access_gate.read_file(&candidate) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    %error,
+                    "failed to read cmr10.tfm; falling back to fixed-width typesetting"
+                );
+                continue;
+            }
+        };
+
+        match TfmMetrics::parse(&bytes) {
+            Ok(metrics) => return Some(metrics),
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    %error,
+                    "failed to parse cmr10.tfm; falling back to fixed-width typesetting"
+                );
+            }
+        }
+    }
+
+    None
+}
+
 fn resolve_input_path(
     base_dir: &Path,
     workspace_root: &Path,
@@ -1218,6 +1286,39 @@ mod tests {
         fs::read_to_string(path).expect("read output pdf")
     }
 
+    fn build_test_tfm() -> Vec<u8> {
+        let bc = 65u16;
+        let ec = 122u16;
+        let char_count = usize::from(ec - bc + 1);
+        let lh = 2u16;
+        let nw = 3u16;
+        let nh = 1u16;
+        let nd = 1u16;
+        let ni = 1u16;
+        let lf = 6u16 + lh + char_count as u16 + nw + nh + nd + ni;
+        let mut data = Vec::with_capacity(usize::from(lf) * 4);
+
+        for value in [lf, lh, bc, ec, nw, nh, nd, ni, 0, 0, 0, 0] {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&10_485_760i32.to_be_bytes());
+
+        for code in bc..=ec {
+            let width_index = if code == u16::from(b'A') { 2u8 } else { 1u8 };
+            data.extend_from_slice(&[width_index, 0, 0, 0]);
+        }
+
+        data.extend_from_slice(&0i32.to_be_bytes());
+        data.extend_from_slice(&104_858i32.to_be_bytes());
+        data.extend_from_slice(&20_971_520i32.to_be_bytes());
+        data.extend_from_slice(&0i32.to_be_bytes());
+        data.extend_from_slice(&0i32.to_be_bytes());
+        data.extend_from_slice(&0i32.to_be_bytes());
+
+        data
+    }
+
     #[test]
     fn returns_missing_input_diagnostic_for_nonexistent_file() {
         let dir = tempdir().expect("create tempdir");
@@ -1618,5 +1719,49 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         let pdf = read_pdf(&options.output_dir.join("main.pdf"));
         assert!(pdf.contains("BUNDLED CONTENT"));
+    }
+
+    #[test]
+    fn falls_back_to_fixed_width_typesetting_when_bundle_has_no_cmr10_tfm() {
+        let dir = tempdir().expect("create tempdir");
+        let bundle_root = dir.path().join("bundle");
+        fs::create_dir_all(&bundle_root).expect("create bundle");
+        fs::write(dir.path().join("main.tex"), document("AA")).expect("write main");
+
+        let mut options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        options.asset_bundle = Some(bundle_root);
+
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("(AA) Tj"));
+        assert!(!pdf.contains("(A) Tj\n0 -18 Td\n(A) Tj"));
+    }
+
+    #[test]
+    fn uses_bundle_cmr10_tfm_metrics_when_available() {
+        let dir = tempdir().expect("create tempdir");
+        let bundle_root = dir.path().join("bundle");
+        let tfm_path = bundle_root.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
+        fs::create_dir_all(tfm_path.parent().expect("cmr10 parent")).expect("create tfm dir");
+        fs::write(&tfm_path, build_test_tfm()).expect("write cmr10.tfm");
+        fs::write(dir.path().join("main.tex"), document("AA")).expect("write main");
+
+        let mut options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        options.asset_bundle = Some(bundle_root);
+
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(!pdf.contains("(AA) Tj"));
+        assert!(pdf.contains("(A) Tj\n0 -18 Td\n(A) Tj"));
     }
 }

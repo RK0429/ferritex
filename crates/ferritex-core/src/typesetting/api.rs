@@ -1,3 +1,5 @@
+use super::{knuth_plass::BreakParams, line_breaker};
+
 use crate::font::api::TfmMetrics;
 use crate::kernel::api::DimensionValue;
 use crate::parser::api::{DocumentNode, ParsedDocument};
@@ -8,6 +10,8 @@ const PAGE_HEIGHT_PT: i64 = 792;
 const TOP_MARGIN_PT: i64 = 72;
 const LINE_HEIGHT_PT: i64 = 18;
 const MAX_LINE_CHARS: usize = 70;
+const LINE_WIDTH_SAMPLE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+#[cfg(test)]
 const MAX_LINE_WIDTH: DimensionValue =
     DimensionValue(MAX_LINE_CHARS as i64 * SCALED_POINTS_PER_POINT);
 const LINES_PER_PAGE: usize = 36;
@@ -35,6 +39,30 @@ pub struct TypesetDocument {
     pub pages: Vec<TypesetPage>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum GlueOrder {
+    #[default]
+    Normal,
+    Fil,
+    Fill,
+    Filll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlueComponent {
+    pub value: DimensionValue,
+    pub order: GlueOrder,
+}
+
+impl GlueComponent {
+    pub fn normal(value: DimensionValue) -> Self {
+        Self {
+            value,
+            order: GlueOrder::Normal,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HListItem {
     Char {
@@ -43,8 +71,11 @@ pub enum HListItem {
     },
     Glue {
         width: DimensionValue,
-        stretch: DimensionValue,
-        shrink: DimensionValue,
+        stretch: GlueComponent,
+        shrink: GlueComponent,
+    },
+    Kern {
+        width: DimensionValue,
     },
     Penalty {
         value: i32,
@@ -102,14 +133,39 @@ pub struct MinimalTypesetter;
 
 impl MinimalTypesetter {
     pub fn typeset(&self, document: &ParsedDocument) -> TypesetDocument {
+        let provider = default_fixed_width_provider();
+        self.typeset_with_provider(document, &provider)
+    }
+
+    pub fn typeset_with_provider(
+        &self,
+        document: &ParsedDocument,
+        provider: &dyn CharWidthProvider,
+    ) -> TypesetDocument {
         let page_box = page_box_for_class(&document.document_class);
         let nodes = document.body_nodes();
-        let provider = default_fixed_width_provider();
-        let hlist = document_nodes_to_hlist(&nodes, &provider);
-        let wrapped_lines = wrap_hlist(&hlist, MAX_LINE_WIDTH);
+        let hlist = document_nodes_to_hlist(&nodes, provider);
+        let params = break_params_for_provider(provider);
+        let wrapped_lines = line_breaker::break_paragraph(&hlist, &params);
         let pages = paginate_lines(&wrapped_lines, &page_box);
 
         TypesetDocument { pages }
+    }
+}
+
+fn break_params_for_provider(provider: &dyn CharWidthProvider) -> BreakParams {
+    let sample_count = LINE_WIDTH_SAMPLE.chars().count() as i64;
+    let sample_width_sum = LINE_WIDTH_SAMPLE
+        .chars()
+        .map(|codepoint| provider.char_width(codepoint).0)
+        .sum::<i64>();
+    let average_char_width = (sample_width_sum / sample_count)
+        .max(provider.space_width().0)
+        .max(SCALED_POINTS_PER_POINT);
+
+    BreakParams {
+        line_width: DimensionValue(average_char_width * MAX_LINE_CHARS as i64),
+        ..BreakParams::default()
     }
 }
 
@@ -132,8 +188,8 @@ pub fn document_nodes_to_hlist(
     provider: &dyn CharWidthProvider,
 ) -> Vec<HListItem> {
     let space_width = provider.space_width();
-    let stretch = DimensionValue(space_width.0 / 2);
-    let shrink = DimensionValue(space_width.0 / 3);
+    let stretch = GlueComponent::normal(DimensionValue(space_width.0 / 2));
+    let shrink = GlueComponent::normal(DimensionValue(space_width.0 / 3));
     let mut hlist = Vec::new();
 
     for node in nodes {
@@ -196,6 +252,7 @@ fn paginate_lines(lines: &[String], page_box: &PageBox) -> Vec<TypesetPage> {
         .collect()
 }
 
+#[cfg(test)]
 fn wrap_hlist(hlist: &[HListItem], max_line_width: DimensionValue) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current_line = String::new();
@@ -207,7 +264,14 @@ fn wrap_hlist(hlist: &[HListItem], max_line_width: DimensionValue) -> Vec<String
     for item in hlist {
         match item {
             HListItem::Char { codepoint, width } => {
-                current_word.push((*codepoint, *width));
+                current_word.push(WordSegment::Char {
+                    codepoint: *codepoint,
+                    width: *width,
+                });
+                last_item_forced_break = false;
+            }
+            HListItem::Kern { width } => {
+                current_word.push(WordSegment::Kern { width: *width });
                 last_item_forced_break = false;
             }
             HListItem::Glue { width, .. } => {
@@ -265,6 +329,27 @@ fn wrap_hlist(hlist: &[HListItem], max_line_width: DimensionValue) -> Vec<String
     }
 
     lines
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordSegment {
+    Char {
+        codepoint: char,
+        width: DimensionValue,
+    },
+    Kern {
+        width: DimensionValue,
+    },
+}
+
+#[cfg(test)]
+impl WordSegment {
+    fn width(self) -> DimensionValue {
+        match self {
+            Self::Char { width, .. } | Self::Kern { width } => width,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,11 +418,12 @@ fn wrap_long_word(word: &str, lines: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 fn append_word_to_line(
     lines: &mut Vec<String>,
     current_line: &mut String,
     current_line_width: &mut DimensionValue,
-    current_word: &mut Vec<(char, DimensionValue)>,
+    current_word: &mut Vec<WordSegment>,
     pending_glue_width: &mut Option<DimensionValue>,
     max_line_width: DimensionValue,
 ) {
@@ -381,24 +467,28 @@ fn append_word_to_line(
     *current_line_width = *current_line_width + word_width;
 }
 
+#[cfg(test)]
 fn split_long_word_to_lines(
     lines: &mut Vec<String>,
     current_line: &mut String,
     current_line_width: &mut DimensionValue,
-    word: &[(char, DimensionValue)],
+    word: &[WordSegment],
     max_line_width: DimensionValue,
 ) {
     let mut chunk = String::new();
     let mut chunk_width = DimensionValue::zero();
 
-    for (codepoint, width) in word {
-        if !chunk.is_empty() && chunk_width + *width > max_line_width {
+    for segment in word {
+        let width = segment.width();
+        if !chunk.is_empty() && chunk_width + width > max_line_width {
             lines.push(std::mem::take(&mut chunk));
             chunk_width = DimensionValue::zero();
         }
 
-        chunk.push(*codepoint);
-        chunk_width = chunk_width + *width;
+        if let WordSegment::Char { codepoint, .. } = segment {
+            chunk.push(*codepoint);
+        }
+        chunk_width = chunk_width + width;
 
         if chunk_width > max_line_width {
             lines.push(std::mem::take(&mut chunk));
@@ -414,15 +504,21 @@ fn split_long_word_to_lines(
     *current_line_width = DimensionValue::zero();
 }
 
-fn word_width(word: &[(char, DimensionValue)]) -> DimensionValue {
-    word.iter()
-        .fold(DimensionValue::zero(), |width, (_, char_width)| {
-            width + *char_width
-        })
+#[cfg(test)]
+fn word_width(word: &[WordSegment]) -> DimensionValue {
+    word.iter().fold(DimensionValue::zero(), |width, segment| {
+        width + segment.width()
+    })
 }
 
-fn word_to_string(word: &[(char, DimensionValue)]) -> String {
-    word.iter().map(|(codepoint, _)| *codepoint).collect()
+#[cfg(test)]
+fn word_to_string(word: &[WordSegment]) -> String {
+    word.iter()
+        .filter_map(|segment| match segment {
+            WordSegment::Char { codepoint, .. } => Some(*codepoint),
+            WordSegment::Kern { .. } => None,
+        })
+        .collect()
 }
 
 fn points(value: i64) -> DimensionValue {
@@ -433,18 +529,35 @@ fn points(value: i64) -> DimensionValue {
 mod tests {
     use super::{
         default_fixed_width_provider, document_nodes_to_hlist, points, wrap_body, wrap_hlist,
-        CharWidthProvider, HListItem, MinimalTypesetter, TextLine, TfmWidthProvider,
-        LINE_HEIGHT_PT, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORCED, TOP_MARGIN_PT,
+        CharWidthProvider, GlueComponent, GlueOrder, HListItem, MinimalTypesetter, TextLine,
+        TfmWidthProvider, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
+        PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::font::api::TfmMetrics;
     use crate::kernel::api::DimensionValue;
     use crate::parser::api::{DocumentNode, ParsedDocument};
+    use crate::typesetting::{knuth_plass::BreakParams, line_breaker};
 
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
             document_class: "article".to_string(),
             package_count: 0,
             body: body.to_string(),
+        }
+    }
+
+    struct SkewedWidthProvider;
+
+    impl CharWidthProvider for SkewedWidthProvider {
+        fn char_width(&self, codepoint: char) -> DimensionValue {
+            match codepoint {
+                'A' => points(200),
+                _ => points(1),
+            }
+        }
+
+        fn space_width(&self) -> DimensionValue {
+            points(1)
         }
     }
 
@@ -504,6 +617,21 @@ mod tests {
     }
 
     #[test]
+    fn typeset_with_provider_uses_custom_character_widths() {
+        let document =
+            MinimalTypesetter.typeset_with_provider(&parsed_document("AA"), &SkewedWidthProvider);
+
+        assert_eq!(
+            document.pages[0]
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "A"]
+        );
+    }
+
+    #[test]
     fn document_nodes_to_hlist_produces_chars_and_glue() {
         let hlist = document_nodes_to_hlist(
             &[DocumentNode::Text("A B".to_string())],
@@ -519,8 +647,8 @@ mod tests {
                 },
                 HListItem::Glue {
                     width: points(1),
-                    stretch: DimensionValue(points(1).0 / 2),
-                    shrink: DimensionValue(points(1).0 / 3),
+                    stretch: GlueComponent::normal(DimensionValue(points(1).0 / 2)),
+                    shrink: GlueComponent::normal(DimensionValue(points(1).0 / 3)),
                 },
                 HListItem::Char {
                     codepoint: 'B',
@@ -549,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_hlist_matches_char_counting() {
+    fn line_breaker_matches_char_counting_for_explicit_breaks() {
         let body = format!(
             "{}\n{}",
             "a".repeat(71),
@@ -557,15 +685,21 @@ mod tests {
         );
         let nodes = parsed_document(&body).body_nodes();
         let hlist = document_nodes_to_hlist(&nodes, &default_fixed_width_provider());
+        let params = BreakParams {
+            line_width: MAX_LINE_WIDTH,
+            ..BreakParams::default()
+        };
 
-        assert_eq!(wrap_hlist(&hlist, MAX_LINE_WIDTH), wrap_body(&body));
+        assert_eq!(
+            line_breaker::break_paragraph(&hlist, &params),
+            wrap_body(&body)
+        );
     }
 
     #[test]
     fn explicit_par_break_produces_blank_output_line() {
-        let document = MinimalTypesetter.typeset(&parsed_document(
-            r"First paragraph\par Second paragraph",
-        ));
+        let document =
+            MinimalTypesetter.typeset(&parsed_document(r"First paragraph\par Second paragraph"));
 
         assert_eq!(
             document.pages[0]
@@ -582,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_hlist_matches_char_counting_with_paragraph_breaks_and_mixed_words() {
+    fn line_breaker_uses_knuth_plass_breaks_for_mixed_overfull_paragraphs() {
         let body = format!(
             "intro {} tail words\n\nprefix short {} end",
             "a".repeat(71),
@@ -590,8 +724,185 @@ mod tests {
         );
         let nodes = parsed_document(&body).body_nodes();
         let hlist = document_nodes_to_hlist(&nodes, &default_fixed_width_provider());
+        let params = BreakParams {
+            line_width: MAX_LINE_WIDTH,
+            ..BreakParams::default()
+        };
 
-        assert_eq!(wrap_hlist(&hlist, MAX_LINE_WIDTH), wrap_body(&body));
+        assert_eq!(
+            line_breaker::break_paragraph(&hlist, &params),
+            vec![
+                format!("intro {} tail words", "a".repeat(71)),
+                String::new(),
+                format!("prefix short {} end", "b".repeat(72)),
+            ]
+        );
+    }
+
+    #[test]
+    fn kp_produces_different_split_from_greedy() {
+        let hlist = vec![
+            HListItem::Char {
+                codepoint: 'a',
+                width: points(10),
+            },
+            HListItem::Glue {
+                width: points(1),
+                stretch: GlueComponent::normal(points(60)),
+                shrink: GlueComponent::normal(points(1)),
+            },
+            HListItem::Char {
+                codepoint: 'b',
+                width: points(10),
+            },
+            HListItem::Glue {
+                width: points(1),
+                stretch: GlueComponent::normal(points(60)),
+                shrink: GlueComponent::normal(points(1)),
+            },
+            HListItem::Char {
+                codepoint: 'c',
+                width: points(10),
+            },
+            HListItem::Penalty { value: 100 },
+            HListItem::Glue {
+                width: points(1),
+                stretch: GlueComponent::normal(points(60)),
+                shrink: GlueComponent::normal(points(1)),
+            },
+            HListItem::Char {
+                codepoint: 'd',
+                width: points(10),
+            },
+            HListItem::Glue {
+                width: points(1),
+                stretch: GlueComponent::normal(points(60)),
+                shrink: GlueComponent::normal(points(1)),
+            },
+            HListItem::Char {
+                codepoint: 'e',
+                width: points(10),
+            },
+        ];
+        let params = BreakParams {
+            line_width: points(32),
+            ..BreakParams::default()
+        };
+
+        assert_eq!(
+            wrap_hlist(&hlist, points(32)),
+            vec!["a b c".to_string(), "d e".to_string()]
+        );
+        assert_eq!(
+            line_breaker::break_paragraph(&hlist, &params),
+            vec!["a b".to_string(), "c d e".to_string()]
+        );
+    }
+
+    #[test]
+    fn kp_par_break_produces_blank_line() {
+        let nodes = parsed_document(r"First paragraph\par Second paragraph").body_nodes();
+        let hlist = document_nodes_to_hlist(&nodes, &default_fixed_width_provider());
+        let params = BreakParams {
+            line_width: MAX_LINE_WIDTH,
+            ..BreakParams::default()
+        };
+
+        assert_eq!(
+            line_breaker::break_paragraph(&hlist, &params),
+            vec![
+                "First paragraph".to_string(),
+                String::new(),
+                "Second paragraph".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn kp_long_paragraph_paginates_correctly() {
+        let word = "a".repeat(MAX_LINE_CHARS);
+        let body = (0..60).map(|_| word.as_str()).collect::<Vec<_>>().join(" ");
+
+        let document = MinimalTypesetter.typeset(&parsed_document(&body));
+        let total_lines = document
+            .pages
+            .iter()
+            .map(|page| page.lines.len())
+            .sum::<usize>();
+
+        assert_eq!(document.pages.len(), 2);
+        assert_eq!(document.pages[0].lines.len(), 36);
+        assert_eq!(document.pages[1].lines.len(), 24);
+        assert!(total_lines >= 50);
+        assert!(document
+            .pages
+            .iter()
+            .all(|page| page.lines.iter().all(|line| line.text == word)));
+    }
+
+    #[test]
+    fn glue_component_normal_helper() {
+        assert_eq!(
+            GlueComponent::normal(DimensionValue(100)),
+            GlueComponent {
+                value: DimensionValue(100),
+                order: GlueOrder::Normal,
+            }
+        );
+    }
+
+    #[test]
+    fn glue_order_default_is_normal() {
+        assert_eq!(GlueOrder::default(), GlueOrder::Normal);
+    }
+
+    #[test]
+    fn kern_in_hlist_does_not_break_line() {
+        let hlist = vec![
+            HListItem::Char {
+                codepoint: 'A',
+                width: points(1),
+            },
+            HListItem::Kern { width: points(1) },
+            HListItem::Char {
+                codepoint: 'B',
+                width: points(1),
+            },
+            HListItem::Glue {
+                width: points(1),
+                stretch: GlueComponent::normal(points(0)),
+                shrink: GlueComponent::normal(points(0)),
+            },
+            HListItem::Char {
+                codepoint: 'C',
+                width: points(1),
+            },
+        ];
+
+        assert_eq!(
+            wrap_hlist(&hlist, points(3)),
+            vec!["AB".to_string(), "C".to_string()]
+        );
+    }
+
+    #[test]
+    fn kern_adds_width_to_line() {
+        let hlist = vec![
+            HListItem::Char {
+                codepoint: 'A',
+                width: points(1),
+            },
+            HListItem::Kern { width: points(1) },
+            HListItem::Char {
+                codepoint: 'B',
+                width: points(1),
+            },
+        ];
+
+        assert_eq!(
+            wrap_hlist(&hlist, points(1)),
+            vec!["A".to_string(), "B".to_string()]
+        );
     }
 
     #[test]
