@@ -8,13 +8,13 @@ const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
 const PAGE_HEIGHT_PT: i64 = 792;
 const TOP_MARGIN_PT: i64 = 72;
+const BOTTOM_MARGIN_PT: i64 = 72;
 const LINE_HEIGHT_PT: i64 = 18;
 const MAX_LINE_CHARS: usize = 70;
 const LINE_WIDTH_SAMPLE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 #[cfg(test)]
 const MAX_LINE_WIDTH: DimensionValue =
     DimensionValue(MAX_LINE_CHARS as i64 * SCALED_POINTS_PER_POINT);
-const LINES_PER_PAGE: usize = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageBox {
@@ -76,6 +76,21 @@ pub enum HListItem {
     },
     Kern {
         width: DimensionValue,
+    },
+    Penalty {
+        value: i32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VListItem {
+    Box {
+        content: String,
+        height: DimensionValue,
+        depth: DimensionValue,
+    },
+    Glue {
+        height: DimensionValue,
     },
     Penalty {
         value: i32,
@@ -147,7 +162,8 @@ impl MinimalTypesetter {
         let hlist = document_nodes_to_hlist(&nodes, provider);
         let params = break_params_for_provider(provider);
         let wrapped_lines = line_breaker::break_paragraph(&hlist, &params);
-        let pages = paginate_lines(&wrapped_lines, &page_box);
+        let vlist = lines_to_vlist(&wrapped_lines);
+        let pages = paginate_vlist(&vlist, &page_box);
 
         TypesetDocument { pages }
     }
@@ -226,30 +242,97 @@ pub fn document_nodes_to_hlist(
     hlist
 }
 
-fn paginate_lines(lines: &[String], page_box: &PageBox) -> Vec<TypesetPage> {
-    if lines.is_empty() {
+fn lines_to_vlist(lines: &[String]) -> Vec<VListItem> {
+    lines
+        .iter()
+        .map(|line| VListItem::Box {
+            content: line.clone(),
+            height: points(LINE_HEIGHT_PT),
+            depth: DimensionValue::zero(),
+        })
+        .collect()
+}
+
+fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
+    let content_height = page_box.height - points(TOP_MARGIN_PT) - points(BOTTOM_MARGIN_PT);
+
+    if vlist.is_empty() {
         return vec![TypesetPage {
             lines: Vec::new(),
             page_box: page_box.clone(),
         }];
     }
 
-    lines
-        .chunks(LINES_PER_PAGE)
-        .map(|page_lines| TypesetPage {
-            lines: page_lines
-                .iter()
-                .enumerate()
-                .map(|(line_index, text)| TextLine {
-                    text: text.clone(),
-                    y: points(
-                        PAGE_HEIGHT_PT - TOP_MARGIN_PT - (line_index as i64 * LINE_HEIGHT_PT),
-                    ),
-                })
-                .collect(),
-            page_box: page_box.clone(),
-        })
-        .collect()
+    let mut pages = Vec::new();
+    let mut current_page = Vec::new();
+    let mut current_height = DimensionValue::zero();
+
+    for item in vlist {
+        if matches!(
+            item,
+            VListItem::Penalty { value } if *value <= PENALTY_FORCED
+        ) {
+            pages.push(typeset_page_from_vlist(&current_page, page_box));
+            current_page.clear();
+            current_height = DimensionValue::zero();
+            continue;
+        }
+
+        let item_height = vlist_item_height(item);
+        if !current_page.is_empty() && current_height + item_height > content_height {
+            pages.push(typeset_page_from_vlist(&current_page, page_box));
+            current_page.clear();
+            current_height = DimensionValue::zero();
+        }
+
+        current_page.push(item.clone());
+        current_height = current_height + item_height;
+    }
+
+    if current_page.is_empty() && !pages.is_empty() {
+        return pages;
+    }
+
+    pages.push(typeset_page_from_vlist(&current_page, page_box));
+    pages
+}
+
+fn vlist_item_height(item: &VListItem) -> DimensionValue {
+    match item {
+        VListItem::Box { height, depth, .. } => *height + *depth,
+        VListItem::Glue { height } => *height,
+        VListItem::Penalty { .. } => DimensionValue::zero(),
+    }
+}
+
+fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPage {
+    let mut lines = Vec::new();
+    let mut consumed_height = DimensionValue::zero();
+
+    for item in items {
+        match item {
+            VListItem::Box {
+                content,
+                height,
+                depth,
+            } => {
+                lines.push(TextLine {
+                    text: content.clone(),
+                    y: page_box.height - points(TOP_MARGIN_PT) - consumed_height,
+                });
+                consumed_height = consumed_height + *height + *depth;
+            }
+            VListItem::Glue { height } => {
+                consumed_height = consumed_height + *height;
+            }
+            VListItem::Penalty { .. } => {}
+        }
+    }
+
+    TypesetPage {
+        lines,
+        page_box: page_box.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -528,10 +611,10 @@ fn points(value: i64) -> DimensionValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_fixed_width_provider, document_nodes_to_hlist, points, wrap_body, wrap_hlist,
-        CharWidthProvider, GlueComponent, GlueOrder, HListItem, MinimalTypesetter, TextLine,
-        TfmWidthProvider, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
-        PENALTY_FORCED, TOP_MARGIN_PT,
+        default_fixed_width_provider, document_nodes_to_hlist, page_box_for_class, paginate_vlist,
+        points, wrap_body, wrap_hlist, CharWidthProvider, GlueComponent, GlueOrder, HListItem,
+        MinimalTypesetter, TextLine, TfmWidthProvider, VListItem, LINE_HEIGHT_PT, MAX_LINE_CHARS,
+        MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::font::api::TfmMetrics;
     use crate::kernel::api::DimensionValue;
@@ -602,6 +685,93 @@ mod tests {
         assert_eq!(document.pages[0].lines.len(), 36);
         assert_eq!(document.pages[1].lines.len(), 1);
         assert_eq!(document.pages[1].lines[0].text, "Line 37");
+    }
+
+    #[test]
+    fn paginate_vlist_empty_produces_single_page() {
+        let pages = paginate_vlist(&[], &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].lines.is_empty());
+    }
+
+    #[test]
+    fn height_based_pagination_respects_content_area() {
+        let mut vlist = (1..=35)
+            .map(|index| VListItem::Box {
+                content: format!("Line {index}"),
+                height: points(LINE_HEIGHT_PT),
+                depth: DimensionValue::zero(),
+            })
+            .collect::<Vec<_>>();
+        vlist.push(VListItem::Glue {
+            height: points(LINE_HEIGHT_PT),
+        });
+        vlist.push(VListItem::Box {
+            content: "Overflow".to_string(),
+            height: points(LINE_HEIGHT_PT),
+            depth: DimensionValue::zero(),
+        });
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].lines.len(), 35);
+        assert_eq!(pages[1].lines.len(), 1);
+        assert_eq!(pages[1].lines[0].text, "Overflow");
+    }
+
+    #[test]
+    fn mixed_height_lines_break_by_accumulated_height() {
+        let mut vlist = (1..=16)
+            .map(|index| VListItem::Box {
+                content: format!("Tall {index}"),
+                height: points(LINE_HEIGHT_PT * 2),
+                depth: DimensionValue::zero(),
+            })
+            .collect::<Vec<_>>();
+        vlist.extend((1..=5).map(|index| VListItem::Box {
+            content: format!("Short {index}"),
+            height: points(LINE_HEIGHT_PT),
+            depth: DimensionValue::zero(),
+        }));
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].lines.len(), 20);
+        assert_eq!(pages[1].lines.len(), 1);
+        assert_eq!(
+            pages[0].lines[1].y,
+            points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - (LINE_HEIGHT_PT * 2))
+        );
+        assert_eq!(pages[1].lines[0].text, "Short 5");
+        assert_eq!(pages[1].lines[0].y, points(PAGE_HEIGHT_PT - TOP_MARGIN_PT));
+    }
+
+    #[test]
+    fn vlist_penalty_forced_forces_page_break() {
+        let vlist = vec![
+            VListItem::Box {
+                content: "First".to_string(),
+                height: points(LINE_HEIGHT_PT),
+                depth: DimensionValue::zero(),
+            },
+            VListItem::Penalty {
+                value: PENALTY_FORCED,
+            },
+            VListItem::Box {
+                content: "Second".to_string(),
+                height: points(LINE_HEIGHT_PT),
+                depth: DimensionValue::zero(),
+            },
+        ];
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].lines[0].text, "First");
+        assert_eq!(pages[1].lines[0].text, "Second");
     }
 
     #[test]
