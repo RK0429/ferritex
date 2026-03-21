@@ -4,8 +4,11 @@ mod macro_engine;
 mod registers;
 mod tokenizer;
 
-pub use api::{MinimalLatexParser, ParseError, ParseOutput, ParsedDocument, Parser};
-pub use macro_engine::{MacroDef, MacroEngine};
+pub use api::{
+    DocumentLabels, MinimalLatexParser, ParseError, ParseOutput, ParsedDocument, Parser,
+    SectionEntry,
+};
+pub use macro_engine::{EnvironmentDef, MacroDef, MacroEngine};
 pub use tokenizer::{
     default_catcode_table, CatCode, Token, TokenKind, Tokenizer, TokenizerDiagnostic,
 };

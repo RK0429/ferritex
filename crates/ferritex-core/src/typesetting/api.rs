@@ -27,9 +27,17 @@ pub struct PageBox {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextLineLink {
+    pub url: String,
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextLine {
     pub text: String,
     pub y: DimensionValue,
+    pub links: Vec<TextLineLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +49,17 @@ pub struct TypesetPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypesetDocument {
     pub pages: Vec<TypesetPage>,
+    pub outlines: Vec<TypesetOutline>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypesetOutline {
+    pub level: u8,
+    pub title: String,
+    pub page_index: usize,
+    pub y: DimensionValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,11 +120,13 @@ pub enum HListItem {
     Char {
         codepoint: char,
         width: DimensionValue,
+        link: Option<String>,
     },
     Glue {
         width: DimensionValue,
         stretch: GlueComponent,
         shrink: GlueComponent,
+        link: Option<String>,
     },
     Kern {
         width: DimensionValue,
@@ -117,9 +138,17 @@ pub enum HListItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VListItem {
-    Box { tex_box: TeXBox, content: String },
-    Glue { height: DimensionValue },
-    Penalty { value: i32 },
+    Box {
+        tex_box: TeXBox,
+        content: String,
+        links: Vec<TextLineLink>,
+    },
+    Glue {
+        height: DimensionValue,
+    },
+    Penalty {
+        value: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,8 +230,14 @@ impl MinimalTypesetter {
         let vlist =
             document_nodes_to_vlist_with_config(&nodes, provider, Some(&hyphenator), &params);
         let pages = paginate_vlist(&vlist, &page_box);
+        let outlines = collect_outlines(document, &pages);
 
-        TypesetDocument { pages }
+        TypesetDocument {
+            pages,
+            outlines,
+            title: document.title.clone(),
+            author: document.author.clone(),
+        }
     }
 }
 
@@ -304,6 +339,7 @@ fn document_nodes_to_hlist_with_config(
                                 width: space_width,
                                 stretch,
                                 shrink,
+                                link: None,
                             });
                         }
                         codepoint => {
@@ -327,6 +363,30 @@ fn document_nodes_to_hlist_with_config(
                     hyphenator,
                     hyphen_penalty,
                 ));
+            }
+            DocumentNode::Link { url, children } => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+                let mut link_hlist = document_nodes_to_hlist_with_config(
+                    children,
+                    provider,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+                for item in &mut link_hlist {
+                    match item {
+                        HListItem::Char { link, .. } | HListItem::Glue { link, .. } => {
+                            *link = Some(url.clone());
+                        }
+                        HListItem::Kern { .. } | HListItem::Penalty { .. } => {}
+                    }
+                }
+                hlist.extend(link_hlist);
             }
             DocumentNode::InlineMath(nodes) => {
                 flush_word(
@@ -362,6 +422,32 @@ fn document_nodes_to_hlist_with_config(
                     stretch,
                     shrink,
                 );
+                push_forced_break_if_needed(&mut hlist);
+            }
+            DocumentNode::EquationEnv { lines, aligned, .. } => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+                if !hlist.is_empty() {
+                    push_forced_break_if_needed(&mut hlist);
+                }
+                for (index, line) in lines.iter().enumerate() {
+                    append_literal_text_to_hlist(
+                        &mut hlist,
+                        &render_math_line(line, *aligned),
+                        provider,
+                        space_width,
+                        stretch,
+                        shrink,
+                    );
+                    if index + 1 < lines.len() {
+                        push_forced_break_if_needed(&mut hlist);
+                    }
+                }
                 push_forced_break_if_needed(&mut hlist);
             }
             DocumentNode::ParBreak => {
@@ -458,7 +544,7 @@ fn append_nodes_segment_to_vlist(
         return;
     }
 
-    let wrapped_lines = line_breaker::break_paragraph(&hlist, params);
+    let wrapped_lines = line_breaker::break_paragraph_with_links(&hlist, params);
     vlist.extend(lines_to_vlist(&wrapped_lines));
 }
 
@@ -483,6 +569,7 @@ fn render_math_node(node: &MathNode) -> String {
             )
         }
         MathNode::Group(nodes) => render_math_nodes(nodes),
+        MathNode::Text(text) => text.clone(),
     }
 }
 
@@ -491,6 +578,27 @@ fn render_math_attachment(node: &MathNode) -> String {
         MathNode::Group(nodes) if nodes.len() > 1 => format!("({})", render_math_nodes(nodes)),
         _ => render_math_node(node),
     }
+}
+
+fn render_math_line(line: &crate::parser::api::MathLine, aligned: bool) -> String {
+    let separator = if aligned { " " } else { "" };
+    let mut rendered = line
+        .segments
+        .iter()
+        .map(|segment| render_math_nodes(segment))
+        .collect::<Vec<_>>()
+        .join(separator);
+
+    if let Some(display_tag) = line.display_tag.as_deref() {
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push('(');
+        rendered.push_str(display_tag);
+        rendered.push(')');
+    }
+
+    rendered
 }
 
 fn append_literal_text_to_hlist(
@@ -510,10 +618,12 @@ fn append_literal_text_to_hlist(
                 width: space_width,
                 stretch,
                 shrink,
+                link: None,
             }),
             codepoint => hlist.push(HListItem::Char {
                 codepoint,
                 width: provider.char_width(codepoint),
+                link: None,
             }),
         }
     }
@@ -550,7 +660,11 @@ fn flush_word(
     let mut byte_offset = 0;
 
     for (index, (codepoint, width)) in word_items.iter().copied().enumerate() {
-        hlist.push(HListItem::Char { codepoint, width });
+        hlist.push(HListItem::Char {
+            codepoint,
+            width,
+            link: None,
+        });
         byte_offset += codepoint.len_utf8();
 
         if index + 1 == word_items.len() {
@@ -569,14 +683,62 @@ fn flush_word(
     word_items.clear();
 }
 
-fn lines_to_vlist(lines: &[String]) -> Vec<VListItem> {
+fn lines_to_vlist(lines: &[line_breaker::BrokenLine]) -> Vec<VListItem> {
     lines
         .iter()
         .map(|line| VListItem::Box {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
-            content: line.clone(),
+            content: line.text.clone(),
+            links: line.links.clone(),
         })
         .collect()
+}
+
+fn collect_outlines(document: &ParsedDocument, pages: &[TypesetPage]) -> Vec<TypesetOutline> {
+    let mut anchors = Vec::new();
+    let mut used = Vec::new();
+
+    for (page_index, page) in pages.iter().enumerate() {
+        for line in &page.lines {
+            anchors.push((page_index, line));
+            used.push(false);
+        }
+    }
+
+    let mut outlines = Vec::new();
+    for entry in document.section_entries.iter().rev() {
+        let title = entry.display_title();
+        if title.is_empty() {
+            continue;
+        }
+
+        if let Some(anchor_index) = find_outline_anchor(&anchors, &used, &title) {
+            used[anchor_index] = true;
+            let (page_index, line) = anchors[anchor_index];
+            outlines.push(TypesetOutline {
+                level: entry.level,
+                title,
+                page_index,
+                y: line.y,
+            });
+        }
+    }
+
+    outlines.reverse();
+    outlines
+}
+
+fn find_outline_anchor(
+    anchors: &[(usize, &TextLine)],
+    used: &[bool],
+    title: &str,
+) -> Option<usize> {
+    anchors
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, (_, line))| !used[*index] && line.text.trim() == title)
+        .map(|(index, _)| index)
 }
 
 fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
@@ -701,10 +863,15 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
 
     for item in items {
         match item {
-            VListItem::Box { tex_box, content } => {
+            VListItem::Box {
+                tex_box,
+                content,
+                links,
+            } => {
                 lines.push(TextLine {
                     text: content.clone(),
                     y: page_box.height - points(TOP_MARGIN_PT) - consumed_height,
+                    links: links.clone(),
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
@@ -732,7 +899,9 @@ fn wrap_hlist(hlist: &[HListItem], max_line_width: DimensionValue) -> Vec<String
 
     for item in hlist {
         match item {
-            HListItem::Char { codepoint, width } => {
+            HListItem::Char {
+                codepoint, width, ..
+            } => {
                 current_word.push(WordSegment::Char {
                     codepoint: *codepoint,
                     width: *width,
@@ -1006,7 +1175,9 @@ mod tests {
     };
     use crate::font::api::TfmMetrics;
     use crate::kernel::api::DimensionValue;
-    use crate::parser::api::{DocumentNode, MathNode, MinimalLatexParser, ParsedDocument, Parser};
+    use crate::parser::api::{
+        DocumentNode, LineTag, MathLine, MathNode, MinimalLatexParser, ParsedDocument, Parser,
+    };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
     };
@@ -1063,10 +1234,12 @@ mod tests {
                 TextLine {
                     text: "Hello".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
+                    links: Vec::new(),
                 },
                 TextLine {
                     text: "Ferritex".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
+                    links: Vec::new(),
                 },
             ]
         );
@@ -1101,6 +1274,7 @@ mod tests {
             .map(|index| VListItem::Box {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: format!("Line {index}"),
+                links: Vec::new(),
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Glue {
@@ -1109,6 +1283,7 @@ mod tests {
         vlist.push(VListItem::Box {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: "Overflow".to_string(),
+            links: Vec::new(),
         });
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -1125,11 +1300,13 @@ mod tests {
             .map(|index| VListItem::Box {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT * 2)),
                 content: format!("Tall {index}"),
+                links: Vec::new(),
             })
             .collect::<Vec<_>>();
         vlist.extend((1..=5).map(|index| VListItem::Box {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Short {index}"),
+            links: Vec::new(),
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -1151,6 +1328,7 @@ mod tests {
             VListItem::Box {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "First".to_string(),
+                links: Vec::new(),
             },
             VListItem::Penalty {
                 value: PENALTY_FORCED,
@@ -1158,6 +1336,7 @@ mod tests {
             VListItem::Box {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "Second".to_string(),
+                links: Vec::new(),
             },
         ];
 
@@ -1174,12 +1353,14 @@ mod tests {
             .map(|index| VListItem::Box {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: format!("Line {index}"),
+                links: Vec::new(),
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Penalty { value: 50 });
         vlist.extend((35..=37).map(|index| VListItem::Box {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Line {index}"),
+            links: Vec::new(),
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -1203,6 +1384,7 @@ mod tests {
             .map(|index| VListItem::Box {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: format!("Line {index}"),
+                links: Vec::new(),
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Penalty {
@@ -1211,6 +1393,7 @@ mod tests {
         vlist.extend((35..=37).map(|index| VListItem::Box {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Line {index}"),
+            links: Vec::new(),
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -1262,6 +1445,7 @@ mod tests {
         let content = vec![HListItem::Char {
             codepoint: 'A',
             width: points(1),
+            link: None,
         }];
         let hbox = HBox {
             tex_box: TeXBox::new(points(10), points(11), points(12)),
@@ -1277,6 +1461,7 @@ mod tests {
         let content = vec![VListItem::Box {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: "Line".to_string(),
+            links: Vec::new(),
         }];
         let vbox = VBox {
             tex_box: TeXBox::new(points(10), points(11), points(12)),
@@ -1292,6 +1477,7 @@ mod tests {
         let item = VListItem::Box {
             tex_box: TeXBox::new(points(10), points(11), points(12)),
             content: "Line".to_string(),
+            links: Vec::new(),
         };
 
         assert_eq!(vlist_item_height(&item), points(23));
@@ -1337,15 +1523,18 @@ mod tests {
                 HListItem::Char {
                     codepoint: 'A',
                     width: points(1),
+                    link: None,
                 },
                 HListItem::Glue {
                     width: points(1),
                     stretch: GlueComponent::normal(DimensionValue(points(1).0 / 2)),
                     shrink: GlueComponent::normal(DimensionValue(points(1).0 / 3)),
+                    link: None,
                 },
                 HListItem::Char {
                     codepoint: 'B',
                     width: points(1),
+                    link: None,
                 },
             ]
         );
@@ -1409,6 +1598,51 @@ mod tests {
     }
 
     #[test]
+    fn document_nodes_to_hlist_puts_equation_environment_on_separate_lines() {
+        let hlist = document_nodes_to_hlist(
+            &[
+                DocumentNode::Text("Before".to_string()),
+                DocumentNode::EquationEnv {
+                    lines: vec![
+                        MathLine {
+                            segments: vec![vec![
+                                MathNode::Ordinary('a'),
+                                MathNode::Ordinary('='),
+                                MathNode::Ordinary('b'),
+                            ]],
+                            tag: LineTag::Auto,
+                            display_tag: Some("1".to_string()),
+                        },
+                        MathLine {
+                            segments: vec![
+                                vec![MathNode::Ordinary('c')],
+                                vec![MathNode::Ordinary('=')],
+                                vec![MathNode::Text("done".to_string())],
+                            ],
+                            tag: LineTag::Custom("A".to_string()),
+                            display_tag: Some("A".to_string()),
+                        },
+                    ],
+                    numbered: true,
+                    aligned: true,
+                },
+                DocumentNode::Text("After".to_string()),
+            ],
+            &default_fixed_width_provider(),
+        );
+
+        assert_eq!(
+            wrap_hlist(&hlist, MAX_LINE_WIDTH),
+            vec![
+                "Before".to_string(),
+                "a=b (1)".to_string(),
+                "c = done (A)".to_string(),
+                "After".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn minimal_typesetter_renders_inline_and_display_math_lines() {
         let document = MinimalTypesetter.typeset(&parsed_latex_document(
             "Inline $x^2$.\n\\[\\frac{a}{b}\\]\nAfter",
@@ -1421,6 +1655,28 @@ mod tests {
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["Inline x^2.", "(a)/(b)", "After"]
+        );
+    }
+
+    #[test]
+    fn minimal_typesetter_renders_multiline_math_environments() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(
+            "\\begin{equation}E=mc^2\\label{eq:e}\\end{equation}\n\
+             Ref \\ref{eq:e}.\n\
+             \\begin{align}\n\
+             a&=&b\\notag\\\\\n\
+             c&=&\\text{done}\\tag{A}\\label{eq:done}\n\
+             \\end{align}\n\
+             Also \\ref{eq:done}.",
+        ));
+
+        assert_eq!(
+            document.pages[0]
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["E=mc^2 (1)", "Ref 1.", "a = b", "c = done (A)", "Also A."]
         );
     }
 
@@ -1439,27 +1695,33 @@ mod tests {
                 HListItem::Char {
                     codepoint: 'b',
                     width: points(1),
+                    link: None,
                 },
                 HListItem::Char {
                     codepoint: 'a',
                     width: points(1),
+                    link: None,
                 },
                 HListItem::Char {
                     codepoint: 's',
                     width: points(1),
+                    link: None,
                 },
                 HListItem::Penalty { value: 50 },
                 HListItem::Char {
                     codepoint: 'k',
                     width: points(1),
+                    link: None,
                 },
                 HListItem::Char {
                     codepoint: 'e',
                     width: points(1),
+                    link: None,
                 },
                 HListItem::Char {
                     codepoint: 't',
                     width: points(1),
+                    link: None,
                 },
             ]
         );
@@ -1558,6 +1820,9 @@ mod tests {
         let plain_vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params);
         let plain_document = super::TypesetDocument {
             pages: paginate_vlist(&plain_vlist, &page_box_for_class(&parsed.document_class)),
+            outlines: Vec::new(),
+            title: None,
+            author: None,
         };
         let hyphenated_lines = document.pages[0]
             .lines
@@ -1605,43 +1870,52 @@ mod tests {
             HListItem::Char {
                 codepoint: 'a',
                 width: points(10),
+                link: None,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 'b',
                 width: points(10),
+                link: None,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 'c',
                 width: points(10),
+                link: None,
             },
             HListItem::Penalty { value: 100 },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 'd',
                 width: points(10),
+                link: None,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 'e',
                 width: points(10),
+                link: None,
             },
         ];
         let params = BreakParams {
@@ -1812,20 +2086,24 @@ mod tests {
             HListItem::Char {
                 codepoint: 'A',
                 width: points(1),
+                link: None,
             },
             HListItem::Kern { width: points(1) },
             HListItem::Char {
                 codepoint: 'B',
                 width: points(1),
+                link: None,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(0)),
                 shrink: GlueComponent::normal(points(0)),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 'C',
                 width: points(1),
+                link: None,
             },
         ];
 
@@ -1841,11 +2119,13 @@ mod tests {
             HListItem::Char {
                 codepoint: 'A',
                 width: points(1),
+                link: None,
             },
             HListItem::Kern { width: points(1) },
             HListItem::Char {
                 codepoint: 'B',
                 width: points(1),
+                link: None,
             },
         ];
 

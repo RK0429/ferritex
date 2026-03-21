@@ -322,6 +322,7 @@ fn build_prefix_metrics(hlist: &[HListItem]) -> Vec<Metrics> {
                 width,
                 stretch,
                 shrink,
+                ..
             } => {
                 next.width += width.0;
                 // Current feasibility math only supports finite glue.
@@ -426,6 +427,7 @@ mod tests {
                         hlist.push(HListItem::Char {
                             codepoint,
                             width: provider.char_width(codepoint),
+                            link: None,
                         });
                     }
                 }
@@ -433,6 +435,7 @@ mod tests {
                     width: provider.space_width(),
                     stretch: GlueComponent::normal(stretch),
                     shrink: GlueComponent::normal(shrink),
+                    link: None,
                 }),
                 TestPart::Penalty(value) => hlist.push(HListItem::Penalty { value: *value }),
             }

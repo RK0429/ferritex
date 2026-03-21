@@ -1,8 +1,11 @@
 use crate::kernel::api::DimensionValue;
-use crate::typesetting::api::{TypesetDocument, TypesetPage};
+use crate::typesetting::api::{TextLine, TypesetDocument, TypesetOutline, TypesetPage};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const LEFT_MARGIN_PT: i64 = 72;
+const LINK_CHAR_WIDTH_PT: i64 = 6;
+const LINK_HEIGHT_PT: i64 = 12;
+const LINK_DESCENT_PT: i64 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PdfDocument {
@@ -49,6 +52,22 @@ pub struct PdfRenderer {
     fonts: Vec<FontResource>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfLinkAnnotation {
+    object_id: usize,
+    url: String,
+    x_start: DimensionValue,
+    x_end: DimensionValue,
+    y_bottom: DimensionValue,
+    y_top: DimensionValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutlineObject {
+    object_id: usize,
+    body: String,
+}
+
 impl PdfRenderer {
     pub fn new() -> Self {
         Self {
@@ -73,15 +92,44 @@ impl PdfRenderer {
         let mut offsets = Vec::<usize>::new();
         let page_object_start = 3usize;
         let content_object_start = page_object_start + page_count;
-        let font_object_start = content_object_start + page_count;
+        let annotation_object_start = content_object_start + page_count;
+        let mut page_annotations = document
+            .pages
+            .iter()
+            .map(page_link_annotations)
+            .collect::<Vec<_>>();
+        let next_object_after_annotations =
+            assign_annotation_object_ids(&mut page_annotations, annotation_object_start);
+        let outline_root_object_id =
+            (!document.outlines.is_empty()).then_some(next_object_after_annotations);
+        let outline_item_object_start =
+            next_object_after_annotations + usize::from(outline_root_object_id.is_some());
+        let outline_objects = outline_root_object_id.map_or_else(Vec::new, |root_object_id| {
+            build_outline_objects(
+                &document.outlines,
+                page_object_start,
+                root_object_id,
+                outline_item_object_start,
+            )
+        });
+        let font_object_start = outline_item_object_start + outline_objects.len();
         let font_objects = build_font_objects(&self.fonts, font_object_start);
+        let font_object_count = font_objects
+            .iter()
+            .map(|font_object| font_object.objects.len())
+            .sum::<usize>();
+        let info_object_id =
+            build_info_dictionary(document).map(|_| font_object_start + font_object_count);
         let page_font_resources = page_font_resources(&font_objects);
+        let catalog_outlines = outline_root_object_id
+            .map(|object_id| format!(" /Outlines {object_id} 0 R"))
+            .unwrap_or_default();
 
         pdf.extend_from_slice(b"%PDF-1.4\n");
         append_object(
             &mut pdf,
             &mut offsets,
-            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            &format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R{catalog_outlines} >>\nendobj\n"),
         );
         append_object(
             &mut pdf,
@@ -96,11 +144,20 @@ impl PdfRenderer {
         for (page_index, page) in document.pages.iter().enumerate() {
             let page_object_id = page_object_start + page_index;
             let content_object_id = content_object_start + page_index;
+            let page_annots = page_annotations[page_index]
+                .iter()
+                .map(|annotation| format!("{} 0 R", annotation.object_id))
+                .collect::<Vec<_>>();
+            let annots_entry = if page_annots.is_empty() {
+                String::new()
+            } else {
+                format!(" /Annots [{}]", page_annots.join(" "))
+            };
             append_object(
                 &mut pdf,
                 &mut offsets,
                 &format!(
-                    "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >> >> >>\nendobj\n",
+                    "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >> >>{annots_entry} >>\nendobj\n",
                     points_to_pdf_number(page.page_box.width),
                     points_to_pdf_number(page.page_box.height),
                     page_font_resources,
@@ -122,10 +179,68 @@ impl PdfRenderer {
             );
         }
 
+        for annotations in &page_annotations {
+            for annotation in annotations {
+                append_object(
+                    &mut pdf,
+                    &mut offsets,
+                    &format!(
+                        "{} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border [0 0 0] /A << /Type /Action /S /URI /URI ({}) >> >>\nendobj\n",
+                        annotation.object_id,
+                        points_to_pdf_number(annotation.x_start),
+                        points_to_pdf_number(annotation.y_bottom),
+                        points_to_pdf_number(annotation.x_end),
+                        points_to_pdf_number(annotation.y_top),
+                        escape_pdf_text(&annotation.url),
+                    ),
+                );
+            }
+        }
+
+        if let Some(root_object_id) = outline_root_object_id {
+            let first_object_id = outline_objects.first().map(|item| item.object_id);
+            let last_object_id = outline_objects.last().map(|item| item.object_id);
+            append_object(
+                &mut pdf,
+                &mut offsets,
+                &format!(
+                    "{root_object_id} 0 obj\n<< /Type /Outlines{}{} /Count {} >>\nendobj\n",
+                    first_object_id
+                        .map(|object_id| format!(" /First {object_id} 0 R"))
+                        .unwrap_or_default(),
+                    last_object_id
+                        .map(|object_id| format!(" /Last {object_id} 0 R"))
+                        .unwrap_or_default(),
+                    outline_objects.len(),
+                ),
+            );
+
+            for outline_object in &outline_objects {
+                append_object(
+                    &mut pdf,
+                    &mut offsets,
+                    &format!(
+                        "{} 0 obj\n{}\nendobj\n",
+                        outline_object.object_id, outline_object.body
+                    ),
+                );
+            }
+        }
+
         for font_object in &font_objects {
             for object in &font_object.objects {
                 append_object_bytes(&mut pdf, &mut offsets, object);
             }
+        }
+
+        if let (Some(object_id), Some(info_dictionary)) =
+            (info_object_id, build_info_dictionary(document))
+        {
+            append_object(
+                &mut pdf,
+                &mut offsets,
+                &format!("{object_id} 0 obj\n{info_dictionary}\nendobj\n"),
+            );
         }
 
         let xref_offset = pdf.len();
@@ -136,8 +251,11 @@ impl PdfRenderer {
         }
         pdf.extend_from_slice(
             format!(
-                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+                "trailer\n<< /Size {} /Root 1 0 R{} >>\nstartxref\n{}\n%%EOF\n",
                 offsets.len() + 1,
+                info_object_id
+                    .map(|object_id| format!(" /Info {object_id} 0 R"))
+                    .unwrap_or_default(),
                 xref_offset
             )
             .as_bytes(),
@@ -358,8 +476,95 @@ fn render_page_stream(page: &TypesetPage) -> String {
     stream
 }
 
+fn assign_annotation_object_ids(
+    page_annotations: &mut [Vec<PdfLinkAnnotation>],
+    start_object_id: usize,
+) -> usize {
+    let mut next_object_id = start_object_id;
+    for annotations in page_annotations {
+        for annotation in annotations {
+            annotation.object_id = next_object_id;
+            next_object_id += 1;
+        }
+    }
+    next_object_id
+}
+
+fn page_link_annotations(page: &TypesetPage) -> Vec<PdfLinkAnnotation> {
+    page.lines.iter().flat_map(line_link_annotations).collect()
+}
+
+fn line_link_annotations(line: &TextLine) -> Vec<PdfLinkAnnotation> {
+    line.links
+        .iter()
+        .filter(|link| !link.url.is_empty() && link.start_char < link.end_char)
+        .map(|link| PdfLinkAnnotation {
+            object_id: 0,
+            url: link.url.clone(),
+            x_start: points(LEFT_MARGIN_PT + LINK_CHAR_WIDTH_PT * link.start_char as i64),
+            x_end: points(LEFT_MARGIN_PT + LINK_CHAR_WIDTH_PT * link.end_char as i64),
+            y_bottom: line.y - points(LINK_DESCENT_PT),
+            y_top: line.y + points(LINK_HEIGHT_PT - LINK_DESCENT_PT),
+        })
+        .collect()
+}
+
+fn build_outline_objects(
+    outlines: &[TypesetOutline],
+    page_object_start: usize,
+    root_object_id: usize,
+    first_object_id: usize,
+) -> Vec<OutlineObject> {
+    outlines
+        .iter()
+        .enumerate()
+        .map(|(index, outline)| {
+            let object_id = first_object_id + index;
+            let prev = (index > 0).then_some(object_id - 1);
+            let next = (index + 1 < outlines.len()).then_some(object_id + 1);
+            let page_object_id = page_object_start + outline.page_index;
+            OutlineObject {
+                object_id,
+                body: format!(
+                    "<< /Title ({}) /Parent {} 0 R{}{} /Dest [{} 0 R /XYZ {} {} 0] >>",
+                    escape_pdf_text(&outline.title),
+                    root_object_id,
+                    prev.map(|id| format!(" /Prev {id} 0 R"))
+                        .unwrap_or_default(),
+                    next.map(|id| format!(" /Next {id} 0 R"))
+                        .unwrap_or_default(),
+                    page_object_id,
+                    LEFT_MARGIN_PT,
+                    points_to_pdf_number(outline.y),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn build_info_dictionary(document: &TypesetDocument) -> Option<String> {
+    let mut fields = Vec::new();
+
+    if let Some(title) = document.title.as_deref().filter(|title| !title.is_empty()) {
+        fields.push(format!("/Title ({})", escape_pdf_text(title)));
+    }
+    if let Some(author) = document
+        .author
+        .as_deref()
+        .filter(|author| !author.is_empty())
+    {
+        fields.push(format!("/Author ({})", escape_pdf_text(author)));
+    }
+
+    (!fields.is_empty()).then(|| format!("<< {} >>", fields.join(" ")))
+}
+
 fn points_to_pdf_number(value: DimensionValue) -> i64 {
     value.0 / SCALED_POINTS_PER_POINT
+}
+
+fn points(value: i64) -> DimensionValue {
+    DimensionValue(value * SCALED_POINTS_PER_POINT)
 }
 
 fn append_object(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, object: &str) {
@@ -409,6 +614,7 @@ mod tests {
                 .map(|(index, text)| TextLine {
                     text: (*text).to_string(),
                     y: points(720 - (index as i64 * 18)),
+                    links: Vec::new(),
                 })
                 .collect(),
         }
@@ -417,6 +623,9 @@ mod tests {
     fn single_page(lines: &[&str]) -> TypesetDocument {
         TypesetDocument {
             pages: vec![page(lines)],
+            outlines: Vec::new(),
+            title: None,
+            author: None,
         }
     }
 
@@ -440,6 +649,9 @@ mod tests {
     fn tracks_page_count_for_multi_page_documents() {
         let document = TypesetDocument {
             pages: vec![page(&["Page 1"]), page(&["Page 2"])],
+            outlines: Vec::new(),
+            title: None,
+            author: None,
         };
         let pdf = PdfRenderer::default().render(&document);
         let content = String::from_utf8_lossy(&pdf.bytes);

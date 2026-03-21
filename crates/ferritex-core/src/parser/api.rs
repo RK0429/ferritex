@@ -1,11 +1,14 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::{Deref, DerefMut},
+};
 
 use thiserror::Error;
 
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
     registers::{RegisterStore, MAX_REGISTER_INDEX},
-    CatCode, MacroDef, MacroEngine, Token, TokenKind, Tokenizer,
+    CatCode, EnvironmentDef, MacroDef, MacroEngine, Token, TokenKind, Tokenizer,
 };
 
 const MAX_CONSECUTIVE_MACRO_EXPANSIONS: usize = 1_000;
@@ -18,15 +21,129 @@ const BODY_INLINE_MATH_START: char = '\u{E005}';
 const BODY_INLINE_MATH_END: char = '\u{E006}';
 const BODY_DISPLAY_MATH_START: char = '\u{E007}';
 const BODY_DISPLAY_MATH_END: char = '\u{E008}';
+const BODY_HREF_START: char = '\u{E009}';
+const BODY_HREF_URL_END: char = '\u{E00A}';
+const BODY_HREF_END: char = '\u{E00B}';
+const BODY_URL_START: char = '\u{E00C}';
+const BODY_URL_END: char = '\u{E00D}';
+const BODY_EQUATION_ENV_START: char = '\u{E00E}';
+const BODY_EQUATION_ENV_END: char = '\u{E00F}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
+const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
+const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
+const EQUATION_ENV_SEGMENT_SEPARATOR: char = '\u{001D}';
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SectionEntry {
+    pub level: u8,
+    pub number: String,
+    pub title: String,
+}
+
+impl SectionEntry {
+    pub fn display_title(&self) -> String {
+        match (self.number.is_empty(), self.title.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => self.number.clone(),
+            (true, false) => self.title.clone(),
+            (false, false) => format!("{} {}", self.number, self.title),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentLabels {
+    entries: BTreeMap<String, String>,
+    pub citations: Vec<String>,
+    pub bibliography: BTreeMap<String, String>,
+    pub section_entries: Vec<SectionEntry>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub has_unresolved_toc: bool,
+}
+
+impl DocumentLabels {
+    fn with_metadata(
+        entries: BTreeMap<String, String>,
+        citations: Vec<String>,
+        bibliography: BTreeMap<String, String>,
+        section_entries: Vec<SectionEntry>,
+        title: Option<String>,
+        author: Option<String>,
+        has_unresolved_toc: bool,
+    ) -> Self {
+        Self {
+            entries,
+            citations,
+            bibliography,
+            section_entries,
+            title,
+            author,
+            has_unresolved_toc,
+        }
+    }
+
+    pub fn into_inner(self) -> BTreeMap<String, String> {
+        self.entries
+    }
+}
+
+impl From<BTreeMap<String, String>> for DocumentLabels {
+    fn from(entries: BTreeMap<String, String>) -> Self {
+        Self {
+            entries,
+            ..Self::default()
+        }
+    }
+}
+
+impl Deref for DocumentLabels {
+    type Target = BTreeMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl DerefMut for DocumentLabels {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
+impl PartialEq<BTreeMap<String, String>> for DocumentLabels {
+    fn eq(&self, other: &BTreeMap<String, String>) -> bool {
+        self.entries == *other
+    }
+}
+
+impl PartialEq<DocumentLabels> for BTreeMap<String, String> {
+    fn eq(&self, other: &DocumentLabels) -> bool {
+        *self == other.entries
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedDocument {
     pub document_class: String,
     pub package_count: usize,
     pub body: String,
-    pub labels: BTreeMap<String, String>,
+    pub labels: DocumentLabels,
     pub has_unresolved_refs: bool,
+}
+
+impl Deref for ParsedDocument {
+    type Target = DocumentLabels;
+
+    fn deref(&self) -> &Self::Target {
+        &self.labels
+    }
+}
+
+impl DerefMut for ParsedDocument {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.labels
+    }
 }
 
 /// Result of a parse-with-recovery attempt.
@@ -48,17 +165,41 @@ pub enum MathNode {
         denom: Vec<MathNode>,
     },
     Group(Vec<MathNode>),
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineTag {
+    Auto,
+    Notag,
+    Custom(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MathLine {
+    pub segments: Vec<Vec<MathNode>>,
+    pub tag: LineTag,
+    pub display_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentNode {
     Text(String),
+    Link {
+        url: String,
+        children: Vec<DocumentNode>,
+    },
     ParBreak,
     PageBreak,
     HBox(Vec<DocumentNode>),
     VBox(Vec<DocumentNode>),
     InlineMath(Vec<MathNode>),
     DisplayMath(Vec<MathNode>),
+    EquationEnv {
+        lines: Vec<MathLine>,
+        numbered: bool,
+        aligned: bool,
+    },
 }
 
 impl ParsedDocument {
@@ -91,6 +232,8 @@ pub enum ParseError {
     InvalidRegisterIndex { line: u32 },
     #[error("unclosed conditional")]
     UnclosedConditional { line: u32 },
+    #[error("unclosed environment `{name}`")]
+    UnclosedEnvironment { line: u32, name: String },
     #[error("unexpected \\else")]
     UnexpectedElse { line: u32 },
     #[error("unexpected \\fi")]
@@ -114,6 +257,7 @@ impl ParseError {
             | Self::UnclosedBrace { line }
             | Self::InvalidRegisterIndex { line }
             | Self::UnclosedConditional { line }
+            | Self::UnclosedEnvironment { line, .. }
             | Self::UnexpectedElse { line }
             | Self::UnexpectedFi { line }
             | Self::DivisionByZero { line }
@@ -141,7 +285,7 @@ impl Parser for MinimalLatexParser {
 
 impl MinimalLatexParser {
     pub fn parse_recovering(&self, source: &str) -> ParseOutput {
-        self.parse_recovering_with_labels(source, BTreeMap::new())
+        self.parse_recovering_with_context(source, BTreeMap::new(), Vec::new(), BTreeMap::new())
     }
 
     pub fn parse_with_labels(
@@ -152,10 +296,58 @@ impl MinimalLatexParser {
         parse_minimal_latex_with_labels(source, initial_labels)
     }
 
+    pub fn parse_with_state(
+        &self,
+        source: &str,
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+    ) -> Result<ParsedDocument, ParseError> {
+        parse_minimal_latex_with_state(source, initial_labels, initial_section_entries)
+    }
+
+    pub fn parse_with_context(
+        &self,
+        source: &str,
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+        initial_bibliography: BTreeMap<String, String>,
+    ) -> Result<ParsedDocument, ParseError> {
+        parse_minimal_latex_with_context(
+            source,
+            initial_labels,
+            initial_section_entries,
+            initial_bibliography,
+        )
+    }
+
     pub fn parse_recovering_with_labels(
         &self,
         source: &str,
         initial_labels: BTreeMap<String, String>,
+    ) -> ParseOutput {
+        self.parse_recovering_with_context(source, initial_labels, Vec::new(), BTreeMap::new())
+    }
+
+    pub fn parse_recovering_with_state(
+        &self,
+        source: &str,
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+    ) -> ParseOutput {
+        self.parse_recovering_with_context(
+            source,
+            initial_labels,
+            initial_section_entries,
+            BTreeMap::new(),
+        )
+    }
+
+    pub fn parse_recovering_with_context(
+        &self,
+        source: &str,
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+        initial_bibliography: BTreeMap<String, String>,
     ) -> ParseOutput {
         if source.trim().is_empty() {
             return ParseOutput {
@@ -164,23 +356,57 @@ impl MinimalLatexParser {
             };
         }
 
-        ParserDriver::new_with_labels(source, initial_labels).run_recovering()
+        ParserDriver::new_with_context(
+            source,
+            initial_labels,
+            initial_section_entries,
+            initial_bibliography,
+        )
+        .run_recovering()
     }
 }
 
 fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
-    parse_minimal_latex_with_labels(source, BTreeMap::new())
+    parse_minimal_latex_with_context(source, BTreeMap::new(), Vec::new(), BTreeMap::new())
 }
 
 fn parse_minimal_latex_with_labels(
     source: &str,
     initial_labels: BTreeMap<String, String>,
 ) -> Result<ParsedDocument, ParseError> {
+    parse_minimal_latex_with_context(source, initial_labels, Vec::new(), BTreeMap::new())
+}
+
+fn parse_minimal_latex_with_state(
+    source: &str,
+    initial_labels: BTreeMap<String, String>,
+    initial_section_entries: Vec<SectionEntry>,
+) -> Result<ParsedDocument, ParseError> {
+    parse_minimal_latex_with_context(
+        source,
+        initial_labels,
+        initial_section_entries,
+        BTreeMap::new(),
+    )
+}
+
+fn parse_minimal_latex_with_context(
+    source: &str,
+    initial_labels: BTreeMap<String, String>,
+    initial_section_entries: Vec<SectionEntry>,
+    initial_bibliography: BTreeMap<String, String>,
+) -> Result<ParsedDocument, ParseError> {
     if source.trim().is_empty() {
         return Err(ParseError::EmptyInput);
     }
 
-    ParserDriver::new_with_labels(source, initial_labels).run()
+    ParserDriver::new_with_context(
+        source,
+        initial_labels,
+        initial_section_entries,
+        initial_bibliography,
+    )
+    .run()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,25 +436,41 @@ struct ParserState {
     subsection: u32,
     subsubsection: u32,
     current_section_number: Option<String>,
+    equation_counter: u32,
     labels: BTreeMap<String, String>,
+    citations: Vec<String>,
+    bibliography: BTreeMap<String, String>,
+    section_entries: Vec<SectionEntry>,
+    initial_section_entries: Vec<SectionEntry>,
     has_unresolved_refs: bool,
+    has_unresolved_toc: bool,
 }
 
 impl Default for ParserState {
     fn default() -> Self {
-        Self::new(BTreeMap::new())
+        Self::new(BTreeMap::new(), Vec::new(), BTreeMap::new())
     }
 }
 
 impl ParserState {
-    fn new(initial_labels: BTreeMap<String, String>) -> Self {
+    fn new(
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+        initial_bibliography: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             section: 0,
             subsection: 0,
             subsubsection: 0,
             current_section_number: None,
+            equation_counter: 0,
             labels: initial_labels,
+            citations: Vec::new(),
+            bibliography: initial_bibliography,
+            section_entries: Vec::new(),
+            initial_section_entries,
             has_unresolved_refs: false,
+            has_unresolved_toc: false,
         }
     }
 
@@ -257,6 +499,53 @@ impl ParserState {
         self.current_section_number = Some(number.clone());
         number
     }
+
+    fn citation_number(&mut self, key: &str) -> Option<usize> {
+        if !self.bibliography.contains_key(key) {
+            return None;
+        }
+
+        if let Some(index) = self.citations.iter().position(|citation| citation == key) {
+            Some(index + 1)
+        } else {
+            self.citations.push(key.to_string());
+            Some(self.citations.len())
+        }
+    }
+
+    fn register_bibliography_entry(&mut self, key: String, display_text: String) -> usize {
+        self.bibliography.insert(key.clone(), display_text);
+        self.citation_number(&key).unwrap_or_else(|| {
+            self.citations.push(key);
+            self.citations.len()
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenEnvironment {
+    name: String,
+    line: u32,
+    kind: OpenEnvironmentKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenEnvironmentKind {
+    UserDefined { end_tokens: Vec<Token> },
+    List(ListEnvironmentState),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListEnvironmentState {
+    kind: ListEnvironmentKind,
+    item_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListEnvironmentKind {
+    Itemize,
+    Enumerate,
+    Description,
 }
 
 #[derive(Debug)]
@@ -267,12 +556,15 @@ struct ParserDriver<'a> {
     registers: RegisterStore,
     conditionals: ConditionalState,
     pending_tokens: VecDeque<QueuedToken>,
+    environment_stack: Vec<OpenEnvironment>,
     runtime_group_stack: Vec<u32>,
     semisimple_group_stack: Vec<u32>,
     document_class: Option<String>,
     document_class_error: Option<ParseError>,
     errors: Vec<ParseError>,
     package_count: usize,
+    title: Option<String>,
+    author: Option<String>,
     body: String,
     begin_found: bool,
     end_found: bool,
@@ -291,20 +583,32 @@ struct QueuedToken {
 }
 
 impl<'a> ParserDriver<'a> {
-    fn new_with_labels(source: &'a str, initial_labels: BTreeMap<String, String>) -> Self {
+    fn new_with_context(
+        source: &'a str,
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+        initial_bibliography: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             tokenizer: Tokenizer::new(source.as_bytes()),
             macro_engine: MacroEngine::default(),
-            state: ParserState::new(initial_labels),
+            state: ParserState::new(
+                initial_labels,
+                initial_section_entries,
+                initial_bibliography,
+            ),
             registers: RegisterStore::default(),
             conditionals: ConditionalState::default(),
             pending_tokens: VecDeque::new(),
+            environment_stack: Vec::new(),
             runtime_group_stack: Vec::new(),
             semisimple_group_stack: Vec::new(),
             document_class: None,
             document_class_error: None,
             errors: Vec::new(),
             package_count: 0,
+            title: None,
+            author: None,
             body: String::new(),
             begin_found: false,
             end_found: false,
@@ -355,6 +659,13 @@ impl<'a> ParserDriver<'a> {
 
         if let Some(line) = self.conditionals.current_open_line() {
             return Err(ParseError::UnclosedConditional { line });
+        }
+
+        if let Some(open_environment) = self.environment_stack.last() {
+            return Err(ParseError::UnclosedEnvironment {
+                line: open_environment.line,
+                name: open_environment.name.clone(),
+            });
         }
 
         if !self.begin_found {
@@ -433,6 +744,13 @@ impl<'a> ParserDriver<'a> {
             self.record_error(ParseError::UnclosedConditional { line });
         }
 
+        for open_environment in self.environment_stack.clone() {
+            self.record_error(ParseError::UnclosedEnvironment {
+                line: open_environment.line,
+                name: open_environment.name,
+            });
+        }
+
         if !self.begin_found {
             self.record_error(ParseError::MissingBeginDocument {
                 line: self.eof_line,
@@ -484,6 +802,7 @@ impl<'a> ParserDriver<'a> {
             error,
             ParseError::UnexpectedClosingBrace { .. }
                 | ParseError::InvalidDocumentClass { .. }
+                | ParseError::UnclosedEnvironment { .. }
                 | ParseError::UnexpectedElse { .. }
                 | ParseError::UnexpectedFi { .. }
         )
@@ -497,7 +816,15 @@ impl<'a> ParserDriver<'a> {
                 .expect("document class presence checked above"),
             package_count: self.package_count,
             body: self.body.trim().to_string(),
-            labels: self.state.labels.clone(),
+            labels: DocumentLabels::with_metadata(
+                self.state.labels.clone(),
+                self.state.citations.clone(),
+                self.state.bibliography.clone(),
+                self.state.section_entries.clone(),
+                self.title.clone(),
+                self.author.clone(),
+                self.state.has_unresolved_toc,
+            ),
             has_unresolved_refs: self.state.has_unresolved_refs,
         }
     }
@@ -531,6 +858,18 @@ impl<'a> ParserDriver<'a> {
             }
             "usepackage" => {
                 self.package_count += 1;
+            }
+            "title" => {
+                self.title = self.read_required_braced_tokens()?.map(|tokens| {
+                    let text = tokens_to_text(&tokens);
+                    text.trim().to_string()
+                });
+            }
+            "author" => {
+                self.author = self.read_required_braced_tokens()?.map(|tokens| {
+                    let text = tokens_to_text(&tokens);
+                    text.trim().to_string()
+                });
             }
             "begin" => {
                 if self.read_environment_name()?.as_deref() == Some("document") {
@@ -584,6 +923,18 @@ impl<'a> ParserDriver<'a> {
                         let _ = self.take_global_prefix();
                         self.body.push(BODY_PAGE_BREAK_MARKER);
                     }
+                    "cite" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_cite_command()?;
+                    }
+                    "href" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_href_command()?;
+                    }
+                    "url" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_url_command()?;
+                    }
                     "section" => {
                         let _ = self.take_global_prefix();
                         self.parse_section_command(1)?;
@@ -630,9 +981,23 @@ impl<'a> ParserDriver<'a> {
                             self.body.push(end_marker);
                         }
                     }
-                    "end" if self.read_environment_name()?.as_deref() == Some("document") => {
-                        self.end_found = true;
-                        return Ok(true);
+                    "begin" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_begin_environment(token.line)?;
+                    }
+                    "end" => {
+                        let _ = self.take_global_prefix();
+                        if self.parse_end_environment()? {
+                            return Ok(true);
+                        }
+                    }
+                    "item" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_item_command()?;
+                    }
+                    "tableofcontents" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_table_of_contents();
                     }
                     _ => {
                         let _ = self.take_global_prefix();
@@ -713,6 +1078,11 @@ impl<'a> ParserDriver<'a> {
             "newcommand" | "renewcommand" => {
                 let _ = self.take_global_prefix();
                 self.parse_newcommand()?;
+                Ok(true)
+            }
+            "newenvironment" | "renewenvironment" => {
+                let _ = self.take_global_prefix();
+                self.parse_newenvironment()?;
                 Ok(true)
             }
             "catcode" => {
@@ -941,6 +1311,192 @@ impl<'a> ParserDriver<'a> {
         }
     }
 
+    fn parse_begin_environment(&mut self, line: u32) -> Result<(), ParseError> {
+        let Some(name) = self.read_environment_name()? else {
+            self.body.push_str("begin");
+            return Ok(());
+        };
+
+        if name == "document" {
+            self.body.push_str("document");
+            return Ok(());
+        }
+
+        if name == "thebibliography" {
+            self.parse_thebibliography_environment()?;
+            return Ok(());
+        }
+
+        if matches!(name.as_str(), "equation" | "equation*" | "align" | "align*") {
+            self.parse_math_environment(&name, line)?;
+            return Ok(());
+        }
+
+        if let Some(kind) = list_environment_kind(&name) {
+            self.emit_paragraph_break_before_block();
+            self.environment_stack.push(OpenEnvironment {
+                name,
+                line,
+                kind: OpenEnvironmentKind::List(ListEnvironmentState {
+                    kind,
+                    item_count: 0,
+                }),
+            });
+            return Ok(());
+        }
+
+        let Some(definition) = self.macro_engine.lookup_environment(&name).cloned() else {
+            self.body.push_str(&name);
+            return Ok(());
+        };
+
+        let arguments = self.collect_macro_arguments(definition.parameter_count)?;
+        let begin_tokens = expand_parameter_tokens(&definition.begin_tokens, &arguments);
+        let end_tokens = expand_parameter_tokens(&definition.end_tokens, &arguments);
+        self.macro_engine.push_group();
+        self.registers.push_group();
+        self.environment_stack.push(OpenEnvironment {
+            name,
+            line,
+            kind: OpenEnvironmentKind::UserDefined { end_tokens },
+        });
+        self.push_front_tokens(begin_tokens);
+        Ok(())
+    }
+
+    fn parse_end_environment(&mut self) -> Result<bool, ParseError> {
+        let Some(name) = self.read_environment_name()? else {
+            self.body.push_str("end");
+            return Ok(false);
+        };
+
+        if name == "document" {
+            self.end_found = true;
+            return Ok(true);
+        }
+
+        if list_environment_kind(&name).is_some() {
+            if matches!(
+                self.environment_stack.last(),
+                Some(OpenEnvironment {
+                    name: open_name,
+                    kind: OpenEnvironmentKind::List(_),
+                    ..
+                }) if open_name == &name
+            ) {
+                let _ = self.environment_stack.pop();
+                self.emit_paragraph_break_before_block();
+            } else {
+                self.body.push_str(&name);
+            }
+            return Ok(false);
+        }
+
+        let Some(open_environment) = self.environment_stack.last().cloned() else {
+            self.body.push_str(&name);
+            return Ok(false);
+        };
+
+        if open_environment.name != name {
+            self.body.push_str(&name);
+            return Ok(false);
+        }
+
+        match open_environment.kind {
+            OpenEnvironmentKind::UserDefined { end_tokens } => {
+                let _ = self.environment_stack.pop();
+                self.macro_engine.pop_group();
+                self.registers.pop_group();
+                self.sync_tokenizer_catcodes();
+                self.push_front_tokens(end_tokens);
+            }
+            OpenEnvironmentKind::List(_) => {
+                self.body.push_str(&name);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn parse_item_command(&mut self) -> Result<(), ParseError> {
+        enum Marker {
+            Bullet,
+            Numbered(usize),
+            Description,
+        }
+
+        let Some(marker) = ({
+            self.environment_stack
+                .iter_mut()
+                .rev()
+                .find_map(|environment| match &mut environment.kind {
+                    OpenEnvironmentKind::List(list_state) => Some(match list_state.kind {
+                        ListEnvironmentKind::Itemize => Marker::Bullet,
+                        ListEnvironmentKind::Enumerate => {
+                            list_state.item_count += 1;
+                            Marker::Numbered(list_state.item_count)
+                        }
+                        ListEnvironmentKind::Description => Marker::Description,
+                    }),
+                    OpenEnvironmentKind::UserDefined { .. } => None,
+                })
+        }) else {
+            self.body.push_str("item");
+            return Ok(());
+        };
+
+        self.emit_paragraph_break_before_block();
+        match marker {
+            Marker::Bullet => self.body.push_str("• "),
+            Marker::Numbered(number) => self.body.push_str(&format!("{number}. ")),
+            Marker::Description => {
+                if let Some(term_tokens) = self.read_optional_bracket_tokens()? {
+                    let term = tokens_to_text(&term_tokens).trim().to_string();
+                    if !term.is_empty() {
+                        self.body.push_str(&term);
+                        self.body.push_str(": ");
+                        if let Some(next) = self.next_raw_token() {
+                            if !matches!(
+                                next.kind,
+                                TokenKind::CharToken {
+                                    cat: CatCode::Space,
+                                    ..
+                                }
+                            ) {
+                                self.push_front_token(next);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_table_of_contents(&mut self) {
+        let entries = if self.state.initial_section_entries.is_empty() {
+            self.state.has_unresolved_toc = true;
+            self.state.section_entries.clone()
+        } else {
+            self.state.initial_section_entries.clone()
+        };
+
+        if entries.is_empty() {
+            return;
+        }
+
+        self.emit_paragraph_break_before_block();
+        for entry in entries {
+            self.body.push_str(&entry.number);
+            if !entry.title.is_empty() {
+                self.body.push_str("  ");
+                self.body.push_str(&entry.title);
+            }
+            self.body.push('\n');
+        }
+        self.body.push('\n');
+    }
+
     fn parse_section_command(&mut self, level: u8) -> Result<(), ParseError> {
         let Some(tokens) = self.read_required_braced_tokens()? else {
             return Ok(());
@@ -948,6 +1504,11 @@ impl<'a> ParserDriver<'a> {
 
         let title = tokens_to_text(&tokens).trim().to_string();
         let number = self.state.next_section_number(level);
+        self.state.section_entries.push(SectionEntry {
+            level,
+            number: number.clone(),
+            title: title.clone(),
+        });
         self.emit_paragraph_break_before_block();
         self.body.push_str(&number);
         if !title.is_empty() {
@@ -956,6 +1517,224 @@ impl<'a> ParserDriver<'a> {
         }
         self.body.push_str("\n\n");
         Ok(())
+    }
+
+    fn parse_cite_command(&mut self) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let rendered = tokens_to_text(&tokens)
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(|key| {
+                self.state.citation_number(key).map_or_else(
+                    || {
+                        self.state.has_unresolved_refs = true;
+                        "?".to_string()
+                    },
+                    |number| number.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if rendered.is_empty() {
+            return Ok(());
+        }
+
+        self.body.push('[');
+        self.body.push_str(&rendered.join(", "));
+        self.body.push(']');
+        Ok(())
+    }
+
+    fn parse_href_command(&mut self) -> Result<(), ParseError> {
+        let Some(url_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(display_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let url = tokens_to_text(&url_tokens).trim().to_string();
+        let display_text = encode_body_markers_in_text(&tokens_to_text(&display_tokens));
+        if url.is_empty() {
+            self.body.push_str(&display_text);
+            return Ok(());
+        }
+
+        self.body.push(BODY_HREF_START);
+        self.body.push_str(&url);
+        self.body.push(BODY_HREF_URL_END);
+        self.body.push_str(&display_text);
+        self.body.push(BODY_HREF_END);
+        Ok(())
+    }
+
+    fn parse_url_command(&mut self) -> Result<(), ParseError> {
+        let Some(url_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let url = tokens_to_text(&url_tokens).trim().to_string();
+        if url.is_empty() {
+            return Ok(());
+        }
+
+        self.body.push(BODY_URL_START);
+        self.body.push_str(&url);
+        self.body.push(BODY_URL_END);
+        Ok(())
+    }
+
+    fn parse_thebibliography_environment(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_required_braced_tokens()?;
+        let mut entries = Vec::new();
+        let mut current_key = None;
+        let mut current_tokens = Vec::new();
+
+        while let Some(token) = self.next_raw_token() {
+            match control_sequence_name(&token).as_deref() {
+                Some("bibitem") => {
+                    if let Some(key) = current_key.take() {
+                        self.finalize_bibliography_entry(key, &mut current_tokens, &mut entries);
+                    }
+                    current_key = self
+                        .read_required_braced_tokens()?
+                        .map(|tokens| tokens_to_text(&tokens).trim().to_string())
+                        .filter(|key| !key.is_empty());
+                }
+                Some("end") => match self.read_environment_name()?.as_deref() {
+                    Some("thebibliography") => {
+                        if let Some(key) = current_key.take() {
+                            self.finalize_bibliography_entry(
+                                key,
+                                &mut current_tokens,
+                                &mut entries,
+                            );
+                        }
+                        break;
+                    }
+                    Some(other) => {
+                        current_tokens
+                            .extend(tokens_from_text(&format!(r"\end{{{other}}}"), token.line));
+                    }
+                    None => current_tokens.push(token),
+                },
+                _ => current_tokens.push(token),
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        self.emit_paragraph_break_before_block();
+        self.body.push_str(&entries.join("\n\n"));
+        if !self.body.ends_with("\n\n") {
+            self.body.push_str("\n\n");
+        }
+        Ok(())
+    }
+
+    fn parse_math_environment(&mut self, name: &str, line: u32) -> Result<(), ParseError> {
+        let content = self.collect_environment_body(name, line)?;
+        let numbered = !name.ends_with('*');
+        let aligned = name.starts_with("align");
+        let lines = self.parse_math_environment_lines(&content, numbered);
+
+        self.body.push(BODY_EQUATION_ENV_START);
+        self.body
+            .push_str(&serialize_equation_env(numbered, aligned, &lines));
+        self.body.push(BODY_EQUATION_ENV_END);
+        Ok(())
+    }
+
+    fn collect_environment_body(&mut self, name: &str, line: u32) -> Result<String, ParseError> {
+        // NOTE: Tokens are collected raw (without macro expansion) for simplicity.
+        // User-defined macros (\newcommand etc.) are not expanded inside math environments.
+        // Future waves may introduce expanded token collection here.
+        let mut content = String::new();
+
+        while let Some(token) = self.next_raw_token() {
+            match control_sequence_name(&token).as_deref() {
+                Some("end") => match self.read_environment_name()?.as_deref() {
+                    Some(end_name) if end_name == name => return Ok(content),
+                    Some("document") => {
+                        self.push_front_plain_tokens(end_environment_tokens(
+                            "document", token.line,
+                        ));
+                        return Err(ParseError::UnclosedEnvironment {
+                            line,
+                            name: name.to_string(),
+                        });
+                    }
+                    Some(other) => content.push_str(&format!(r"\end{{{other}}}")),
+                    None => content.push_str(&render_token(&token)),
+                },
+                _ => content.push_str(&render_token(&token)),
+            }
+        }
+
+        Err(ParseError::UnclosedEnvironment {
+            line,
+            name: name.to_string(),
+        })
+    }
+
+    fn parse_math_environment_lines(&mut self, content: &str, numbered: bool) -> Vec<MathLine> {
+        split_math_environment_lines(content)
+            .into_iter()
+            .map(|line| self.parse_math_environment_line(&line, numbered))
+            .collect()
+    }
+
+    fn parse_math_environment_line(&mut self, line: &str, numbered: bool) -> MathLine {
+        let (without_labels, labels) = strip_math_line_labels(line);
+        let (without_tag, tag) = strip_math_line_tag(&without_labels);
+        let segments = split_math_line_segments(&without_tag)
+            .into_iter()
+            .map(|segment| parse_math_content(segment.trim()))
+            .collect::<Vec<_>>();
+        let display_tag = match &tag {
+            LineTag::Auto if numbered => {
+                self.state.equation_counter += 1;
+                Some(self.state.equation_counter.to_string())
+            }
+            LineTag::Custom(tag) => Some(tag.clone()),
+            LineTag::Auto | LineTag::Notag => None,
+        };
+
+        if let Some(display_tag) = display_tag.as_ref() {
+            for label in labels {
+                self.state.labels.insert(label, display_tag.clone());
+            }
+        }
+
+        MathLine {
+            segments,
+            tag,
+            display_tag,
+        }
+    }
+
+    fn finalize_bibliography_entry(
+        &mut self,
+        key: String,
+        current_tokens: &mut Vec<Token>,
+        entries: &mut Vec<String>,
+    ) {
+        let raw_text = tokens_to_text(current_tokens);
+        current_tokens.clear();
+        let display_text = encode_body_markers_in_text(raw_text.trim());
+        let number = self
+            .state
+            .register_bibliography_entry(key, display_text.clone());
+        if display_text.is_empty() {
+            entries.push(format!("[{number}]"));
+        } else {
+            entries.push(format!("[{number}] {display_text}"));
+        }
     }
 
     fn parse_label_command(&mut self) -> Result<(), ParseError> {
@@ -1573,6 +2352,42 @@ impl<'a> ParserDriver<'a> {
         Ok(())
     }
 
+    fn parse_newenvironment(&mut self) -> Result<(), ParseError> {
+        let Some(name_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let name = tokens_to_text(&name_tokens).trim().to_string();
+        if name.is_empty() {
+            return Ok(());
+        }
+
+        let parameter_count = self
+            .read_optional_bracket_tokens()?
+            .and_then(|tokens| tokens_to_text(&tokens).trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if parameter_count > 9 {
+            return Ok(());
+        }
+
+        let Some(begin_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(end_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        self.macro_engine.define_environment(
+            name.clone(),
+            EnvironmentDef {
+                name,
+                begin_tokens,
+                end_tokens,
+                parameter_count,
+            },
+        );
+        Ok(())
+    }
+
     fn parse_toks_assignment(&mut self, line: u32) -> Result<(), ParseError> {
         let index = self.parse_register_index(line)?;
         if let Some(token) = self.next_significant_token() {
@@ -1839,7 +2654,8 @@ impl<'a> ParserDriver<'a> {
     fn read_environment_name(&mut self) -> Result<Option<String>, ParseError> {
         Ok(self
             .read_required_braced_tokens()?
-            .map(|tokens| tokens_to_text(&tokens)))
+            .map(|tokens| tokens_to_text(&tokens).trim().to_string())
+            .filter(|name| !name.is_empty()))
     }
 
     fn read_required_braced_tokens(&mut self) -> Result<Option<Vec<Token>>, ParseError> {
@@ -2136,6 +2952,31 @@ fn macro_name_from_tokens(tokens: &[Token]) -> Option<String> {
     control_sequence_name(filtered[0])
 }
 
+fn list_environment_kind(name: &str) -> Option<ListEnvironmentKind> {
+    match name {
+        "itemize" => Some(ListEnvironmentKind::Itemize),
+        "enumerate" => Some(ListEnvironmentKind::Enumerate),
+        "description" => Some(ListEnvironmentKind::Description),
+        _ => None,
+    }
+}
+
+fn expand_parameter_tokens(tokens: &[Token], args: &[Vec<Token>]) -> Vec<Token> {
+    let mut expanded = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match token.kind {
+            TokenKind::Parameter(index) => {
+                let argument_index = usize::from(index.saturating_sub(1));
+                if let Some(argument) = args.get(argument_index) {
+                    expanded.extend(argument.clone());
+                }
+            }
+            _ => expanded.push(token.clone()),
+        }
+    }
+    expanded
+}
+
 fn tokens_to_text(tokens: &[Token]) -> String {
     let mut text = String::new();
     for token in tokens {
@@ -2217,6 +3058,42 @@ fn tokens_from_text(text: &str, line: u32) -> Vec<Token> {
             column: (offset + 1) as u32,
         })
         .collect()
+}
+
+fn end_environment_tokens(name: &str, line: u32) -> Vec<Token> {
+    let mut tokens = Vec::with_capacity(3 + name.chars().count());
+    tokens.push(Token {
+        kind: TokenKind::ControlWord("end".to_string()),
+        line,
+        column: 1,
+    });
+    tokens.push(Token {
+        kind: TokenKind::CharToken {
+            char: '{',
+            cat: CatCode::BeginGroup,
+        },
+        line,
+        column: 2,
+    });
+    for (offset, ch) in name.chars().enumerate() {
+        tokens.push(Token {
+            kind: TokenKind::CharToken {
+                char: ch,
+                cat: catcode_for_expanded_char(ch),
+            },
+            line,
+            column: (offset + 3) as u32,
+        });
+    }
+    tokens.push(Token {
+        kind: TokenKind::CharToken {
+            char: '}',
+            cat: CatCode::EndGroup,
+        },
+        line,
+        column: (name.chars().count() + 3) as u32,
+    });
+    tokens
 }
 
 fn register_alias_tokens(primitive: &str, index: u16, line: u32) -> Vec<Token> {
@@ -2353,7 +3230,7 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
 
     let normalized_body = normalize_body_par_breaks(body);
     let (body_with_placeholders, placeholders) =
-        replace_box_markers_with_placeholders(&normalized_body);
+        replace_body_markers_with_placeholders(&normalized_body);
     let segments = body_with_placeholders
         .split(BODY_PAGE_BREAK_MARKER)
         .collect::<Vec<_>>();
@@ -2403,7 +3280,7 @@ fn body_text_nodes(body: &str, placeholders: &[DocumentNode]) -> Vec<DocumentNod
     nodes
 }
 
-fn replace_box_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNode>) {
+fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNode>) {
     let mut text = String::with_capacity(body.len());
     let mut placeholders = Vec::new();
     let mut index = 0;
@@ -2425,6 +3302,34 @@ fn replace_box_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNod
                     DocumentNode::VBox(children)
                 };
                 placeholders.push(node);
+                text.push(placeholder);
+                index = next_index;
+            }
+            BODY_HREF_START => {
+                let (url, display_text, next_index) = extract_href_marker_content(body, index);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(DocumentNode::Link {
+                    url: url.to_string(),
+                    children: body_nodes_from_text(display_text),
+                });
+                text.push(placeholder);
+                index = next_index;
+            }
+            BODY_URL_START => {
+                let (url, next_index) = extract_single_marker_content(body, index, BODY_URL_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(DocumentNode::Link {
+                    url: url.to_string(),
+                    children: vec![DocumentNode::Text(url.to_string())],
+                });
+                text.push(placeholder);
+                index = next_index;
+            }
+            BODY_EQUATION_ENV_START => {
+                let (content, next_index) =
+                    extract_single_marker_content(body, index, BODY_EQUATION_ENV_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(deserialize_equation_env(content));
                 text.push(placeholder);
                 index = next_index;
             }
@@ -2494,6 +3399,72 @@ fn extract_math_marker_content(body: &str, start_index: usize) -> (&str, usize) 
     } else {
         BODY_DISPLAY_MATH_END
     };
+    let mut index = content_start;
+
+    while index < body.len() {
+        let ch = body[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+        if ch == end_marker {
+            return (&body[content_start..index], index + ch.len_utf8());
+        }
+        index += ch.len_utf8();
+    }
+
+    (&body[content_start..], body.len())
+}
+
+fn extract_href_marker_content(body: &str, start_index: usize) -> (&str, &str, usize) {
+    let start_char = body[start_index..]
+        .chars()
+        .next()
+        .expect("href marker should exist at start index");
+    let url_start = start_index + start_char.len_utf8();
+    let mut index = url_start;
+
+    while index < body.len() {
+        let ch = body[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+        if ch == BODY_HREF_URL_END {
+            let display_start = index + ch.len_utf8();
+            let mut display_end = display_start;
+
+            while display_end < body.len() {
+                let next = body[display_end..]
+                    .chars()
+                    .next()
+                    .expect("valid UTF-8 slice should yield a char");
+                if next == BODY_HREF_END {
+                    return (
+                        &body[url_start..index],
+                        &body[display_start..display_end],
+                        display_end + next.len_utf8(),
+                    );
+                }
+                display_end += next.len_utf8();
+            }
+
+            return (&body[url_start..index], &body[display_start..], body.len());
+        }
+        index += ch.len_utf8();
+    }
+
+    (&body[url_start..], "", body.len())
+}
+
+fn extract_single_marker_content(
+    body: &str,
+    start_index: usize,
+    end_marker: char,
+) -> (&str, usize) {
+    let start_char = body[start_index..]
+        .chars()
+        .next()
+        .expect("marker should exist at start index");
+    let content_start = start_index + start_char.len_utf8();
     let mut index = content_start;
 
     while index < body.len() {
@@ -2657,6 +3628,41 @@ fn encode_body_markers_in_text(text: &str) -> String {
                 encoded.push(BODY_PAGE_BREAK_MARKER);
                 index = command_end;
             }
+            "href" => {
+                let url_start = skip_optional_command_whitespace(text, command_end);
+                if let Some((url, after_url)) = extract_braced_text(text, url_start) {
+                    let display_start = skip_optional_command_whitespace(text, after_url);
+                    if let Some((display_text, next_index)) =
+                        extract_braced_text(text, display_start)
+                    {
+                        encoded.push(BODY_HREF_START);
+                        encoded.push_str(url);
+                        encoded.push(BODY_HREF_URL_END);
+                        encoded.push_str(&encode_body_markers_in_text(display_text));
+                        encoded.push(BODY_HREF_END);
+                        index = next_index;
+                        continue;
+                    }
+                }
+
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
+            "url" => {
+                let url_start = skip_optional_command_whitespace(text, command_end);
+                if let Some((url, next_index)) = extract_braced_text(text, url_start) {
+                    encoded.push(BODY_URL_START);
+                    encoded.push_str(url);
+                    encoded.push(BODY_URL_END);
+                    index = next_index;
+                    continue;
+                }
+
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
             _ => {
                 encoded.push(ch);
                 encoded.push_str(command);
@@ -2738,6 +3744,280 @@ fn extract_braced_text(text: &str, open_index: usize) -> Option<(&str, usize)> {
 
 fn parse_math_content(content: &str) -> Vec<MathNode> {
     MathParser::new(content).parse_all()
+}
+
+fn split_math_environment_lines(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut chars = content.chars().peekable();
+    let mut brace_depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '\\' if brace_depth == 0 && matches!(chars.peek(), Some('\\')) => {
+                let _ = chars.next();
+                lines.push(current.trim().to_string());
+                current.clear();
+                while matches!(chars.peek(), Some(next) if next.is_whitespace()) {
+                    let _ = chars.next();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.trim().is_empty() || lines.is_empty() {
+        lines.push(current.trim().to_string());
+    }
+
+    lines
+}
+
+fn strip_math_line_labels(line: &str) -> (String, Vec<String>) {
+    let mut output = String::new();
+    let mut labels = Vec::new();
+    let mut index = 0;
+
+    while index < line.len() {
+        if matches_control_word_at(line, index, "label") {
+            let brace_start = skip_optional_command_whitespace(line, index + r"\label".len());
+            if let Some((content, next_index)) = extract_braced_text(line, brace_start) {
+                let key = content.trim();
+                if !key.is_empty() {
+                    labels.push(key.to_string());
+                }
+                index = next_index;
+                continue;
+            }
+        }
+
+        let ch = line[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+
+    (output, labels)
+}
+
+fn strip_math_line_tag(line: &str) -> (String, LineTag) {
+    let mut current = line.trim_end().to_string();
+    let mut saw_notag = false;
+    let mut custom_tag = None;
+
+    loop {
+        if let Some((prefix, tag)) = strip_trailing_tag_command(&current) {
+            current = prefix;
+            custom_tag = Some(tag);
+            continue;
+        }
+
+        if let Some(prefix) = strip_trailing_notag_command(&current) {
+            current = prefix;
+            saw_notag = true;
+            continue;
+        }
+
+        break;
+    }
+
+    let tag = if let Some(tag) = custom_tag {
+        LineTag::Custom(tag)
+    } else if saw_notag {
+        LineTag::Notag
+    } else {
+        LineTag::Auto
+    };
+
+    (current.trim_end().to_string(), tag)
+}
+
+fn strip_trailing_tag_command(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_end();
+    let start = trimmed.rfind(r"\tag")?;
+    if !matches_control_word_at(trimmed, start, "tag") {
+        return None;
+    }
+    let brace_start = skip_optional_command_whitespace(trimmed, start + r"\tag".len());
+    let (content, next_index) = extract_braced_text(trimmed, brace_start)?;
+    if !trimmed[next_index..].trim().is_empty() {
+        return None;
+    }
+
+    Some((
+        trimmed[..start].trim_end().to_string(),
+        content.trim().to_string(),
+    ))
+}
+
+fn strip_trailing_notag_command(line: &str) -> Option<String> {
+    let trimmed = line.trim_end();
+    let start = trimmed.rfind(r"\notag")?;
+    if !matches_control_word_at(trimmed, start, "notag") {
+        return None;
+    }
+    let end = start + r"\notag".len();
+    if !trimmed[end..].trim().is_empty() {
+        return None;
+    }
+
+    Some(trimmed[..start].trim_end().to_string())
+}
+
+fn split_math_line_segments(line: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut brace_depth = 0usize;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            '\\' => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '&' if brace_depth == 0 => {
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    segments.push(current);
+    segments
+}
+
+fn matches_control_word_at(text: &str, index: usize, name: &str) -> bool {
+    let command = format!(r"\{name}");
+    if !text[index..].starts_with(&command) {
+        return false;
+    }
+
+    let next_index = index + command.len();
+    !matches!(
+        text[next_index..].chars().next(),
+        Some(ch) if ch.is_ascii_alphabetic()
+    )
+}
+
+fn serialize_equation_env(numbered: bool, aligned: bool, lines: &[MathLine]) -> String {
+    let mut encoded = String::new();
+    encoded.push(if numbered { 'n' } else { 'u' });
+    encoded.push(if aligned { 'a' } else { 'e' });
+
+    for line in lines {
+        encoded.push(EQUATION_ENV_ROW_SEPARATOR);
+        let line_tag = match &line.tag {
+            LineTag::Auto => "a".to_string(),
+            LineTag::Notag => "n".to_string(),
+            LineTag::Custom(tag) => format!("c{tag}"),
+        };
+        encoded.push_str(&line_tag);
+        encoded.push(EQUATION_ENV_FIELD_SEPARATOR);
+        encoded.push_str(line.display_tag.as_deref().unwrap_or_default());
+        encoded.push(EQUATION_ENV_FIELD_SEPARATOR);
+        let segment_text = line
+            .segments
+            .iter()
+            .map(|segment| render_math_nodes_for_encoding(segment))
+            .collect::<Vec<_>>()
+            .join(&EQUATION_ENV_SEGMENT_SEPARATOR.to_string());
+        encoded.push_str(&segment_text);
+    }
+
+    encoded
+}
+
+fn deserialize_equation_env(content: &str) -> DocumentNode {
+    let mut rows = content.split(EQUATION_ENV_ROW_SEPARATOR);
+    let header = rows.next().unwrap_or_default();
+    let numbered = header.starts_with('n');
+    let aligned = header.chars().nth(1) == Some('a');
+    let mut lines = Vec::new();
+
+    for row in rows {
+        let mut fields = row.splitn(3, EQUATION_ENV_FIELD_SEPARATOR);
+        let tag_field = fields.next().unwrap_or_default();
+        let display_tag = fields.next().unwrap_or_default();
+        let segments_field = fields.next().unwrap_or_default();
+        let tag = match tag_field.chars().next() {
+            Some('n') => LineTag::Notag,
+            Some('c') => LineTag::Custom(tag_field[1..].to_string()),
+            _ => LineTag::Auto,
+        };
+        let segments = if segments_field.is_empty() {
+            vec![Vec::new()]
+        } else {
+            segments_field
+                .split(EQUATION_ENV_SEGMENT_SEPARATOR)
+                .map(parse_math_content)
+                .collect::<Vec<_>>()
+        };
+
+        lines.push(MathLine {
+            segments,
+            tag,
+            display_tag: (!display_tag.is_empty()).then(|| display_tag.to_string()),
+        });
+    }
+
+    DocumentNode::EquationEnv {
+        lines,
+        numbered,
+        aligned,
+    }
+}
+
+fn render_math_nodes_for_encoding(nodes: &[MathNode]) -> String {
+    nodes
+        .iter()
+        .map(render_math_node_for_encoding)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_math_node_for_encoding(node: &MathNode) -> String {
+    match node {
+        MathNode::Ordinary(ch) => ch.to_string(),
+        MathNode::Superscript(node) => format!("^{}", render_math_attachment_for_encoding(node)),
+        MathNode::Subscript(node) => format!("_{}", render_math_attachment_for_encoding(node)),
+        MathNode::Frac { numer, denom } => {
+            format!(
+                r"\frac{{{}}}{{{}}}",
+                render_math_nodes_for_encoding(numer),
+                render_math_nodes_for_encoding(denom)
+            )
+        }
+        MathNode::Group(nodes) => format!("{{{}}}", render_math_nodes_for_encoding(nodes)),
+        MathNode::Text(text) => format!(r"\text{{{text}}}"),
+    }
+}
+
+fn render_math_attachment_for_encoding(node: &MathNode) -> String {
+    match node {
+        MathNode::Group(nodes) => format!("{{{}}}", render_math_nodes_for_encoding(nodes)),
+        _ => render_math_node_for_encoding(node),
+    }
 }
 
 struct MathParser<'a> {
@@ -2846,6 +4126,10 @@ impl<'a> MathParser<'a> {
                 return vec![MathNode::Frac { numer, denom }];
             }
 
+            if name == "text" {
+                return vec![MathNode::Text(self.parse_required_text_group())];
+            }
+
             return name.chars().map(MathNode::Ordinary).collect();
         }
 
@@ -2866,6 +4150,39 @@ impl<'a> MathParser<'a> {
         }
     }
 
+    fn parse_required_text_group(&mut self) -> String {
+        while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
+            let _ = self.take_char();
+        }
+
+        if self.peek_char() != Some('{') {
+            return String::new();
+        }
+
+        let _ = self.take_char();
+        let mut text = String::new();
+        let mut depth = 1usize;
+
+        while let Some(ch) = self.take_char() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    text.push(ch);
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    text.push(ch);
+                }
+                _ => text.push(ch),
+            }
+        }
+
+        text
+    }
+
     fn peek_char(&self) -> Option<char> {
         self.input[self.index..].chars().next()
     }
@@ -2883,7 +4200,10 @@ fn eof_line(source: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentNode, MathNode, MinimalLatexParser, ParseError, ParsedDocument, Parser};
+    use super::{
+        DocumentLabels, DocumentNode, LineTag, MathLine, MathNode, MinimalLatexParser, ParseError,
+        ParsedDocument, Parser, SectionEntry,
+    };
     use std::collections::BTreeMap;
 
     fn parsed_document(body: &str) -> ParsedDocument {
@@ -2891,7 +4211,7 @@ mod tests {
             document_class: "article".to_string(),
             package_count: 0,
             body: body.to_string(),
-            labels: BTreeMap::new(),
+            labels: DocumentLabels::default(),
             has_unresolved_refs: false,
         }
     }
@@ -2908,7 +4228,7 @@ mod tests {
                 document_class: "article".to_string(),
                 package_count: 0,
                 body: "Hello".to_string(),
-                labels: BTreeMap::new(),
+                labels: DocumentLabels::default(),
                 has_unresolved_refs: false,
             }
         );
@@ -2956,7 +4276,7 @@ mod tests {
                 document_class: "article".to_string(),
                 package_count: 0,
                 body: "AB".to_string(),
-                labels: BTreeMap::new(),
+                labels: DocumentLabels::default(),
                 has_unresolved_refs: false,
             })
         );
@@ -3137,6 +4457,110 @@ mod tests {
                 numer: vec![MathNode::Ordinary('a')],
                 denom: vec![MathNode::Ordinary('b')],
             }])]
+        );
+    }
+
+    #[test]
+    fn parses_text_command_inside_math() {
+        assert_eq!(
+            parse_document(r"$x+\text{units}$").body_nodes(),
+            vec![DocumentNode::InlineMath(vec![
+                MathNode::Ordinary('x'),
+                MathNode::Ordinary('+'),
+                MathNode::Text("units".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn parses_equation_environment_with_auto_number_and_label() {
+        let document = parse_document(
+            "\\begin{equation}a=b\\label{eq:test}\\end{equation}\nSee \\ref{eq:test}.",
+        );
+
+        let nodes = document.body_nodes();
+        assert_eq!(
+            nodes.first(),
+            Some(&DocumentNode::EquationEnv {
+                lines: vec![MathLine {
+                    segments: vec![vec![
+                        MathNode::Ordinary('a'),
+                        MathNode::Ordinary('='),
+                        MathNode::Ordinary('b'),
+                    ]],
+                    tag: LineTag::Auto,
+                    display_tag: Some("1".to_string()),
+                }],
+                numbered: true,
+                aligned: false,
+            })
+        );
+        assert_eq!(
+            nodes.get(1),
+            Some(&DocumentNode::Text(" See 1.".to_string()))
+        );
+        assert_eq!(
+            document.labels.get("eq:test").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn parses_align_environment_with_notag_and_custom_tag() {
+        let document = parse_document(
+            "\\begin{align}a&=&b\\notag\\\\c&=&\\text{done}\\tag{A}\\label{eq:done}\\end{align}",
+        );
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![DocumentNode::EquationEnv {
+                lines: vec![
+                    MathLine {
+                        segments: vec![
+                            vec![MathNode::Ordinary('a')],
+                            vec![MathNode::Ordinary('=')],
+                            vec![MathNode::Ordinary('b')],
+                        ],
+                        tag: LineTag::Notag,
+                        display_tag: None,
+                    },
+                    MathLine {
+                        segments: vec![
+                            vec![MathNode::Ordinary('c')],
+                            vec![MathNode::Ordinary('=')],
+                            vec![MathNode::Text("done".to_string())],
+                        ],
+                        tag: LineTag::Custom("A".to_string()),
+                        display_tag: Some("A".to_string()),
+                    },
+                ],
+                numbered: true,
+                aligned: true,
+            }]
+        );
+        assert_eq!(
+            document.labels.get("eq:done").map(String::as_str),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn parses_equation_star_as_unnumbered_environment() {
+        assert_eq!(
+            parse_document(r"\begin{equation*}x=y\end{equation*}").body_nodes(),
+            vec![DocumentNode::EquationEnv {
+                lines: vec![MathLine {
+                    segments: vec![vec![
+                        MathNode::Ordinary('x'),
+                        MathNode::Ordinary('='),
+                        MathNode::Ordinary('y'),
+                    ]],
+                    tag: LineTag::Auto,
+                    display_tag: None,
+                }],
+                numbered: false,
+                aligned: false,
+            }]
         );
     }
 
@@ -3790,5 +5214,233 @@ mod tests {
 
         assert_eq!(document.body, "See ??.");
         assert!(document.has_unresolved_refs);
+    }
+
+    #[test]
+    fn cite_resolves_when_bibitem_is_available() {
+        let document = parse_document(
+            "\\begin{thebibliography}{99}\\bibitem{key} Reference text\\end{thebibliography}\nSee \\cite{key}.",
+        );
+
+        assert!(document.body.contains("See [1]."));
+        assert_eq!(document.citations, vec!["key".to_string()]);
+        assert_eq!(
+            document.bibliography.get("key").map(String::as_str),
+            Some("Reference text")
+        );
+    }
+
+    #[test]
+    fn cite_supports_multiple_keys() {
+        let document = parse_document(
+            "\\begin{thebibliography}{99}\\bibitem{a} Alpha\\bibitem{b} Beta\\end{thebibliography}\nSee \\cite{a,b}.",
+        );
+
+        assert!(document.body.contains("See [1, 2]."));
+        assert_eq!(document.citations, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn unresolved_cite_emits_question_mark_placeholder() {
+        let document = parse_document("See \\cite{missing}.");
+
+        assert_eq!(document.body, "See [?].");
+        assert!(document.has_unresolved_refs);
+    }
+
+    #[test]
+    fn thebibliography_collects_multiple_entries() {
+        let document = parse_document(
+            "\\begin{thebibliography}{99}\\bibitem{a} Alpha\\bibitem{b} Beta\\end{thebibliography}",
+        );
+
+        assert_eq!(
+            document.bibliography,
+            BTreeMap::from([
+                ("a".to_string(), "Alpha".to_string()),
+                ("b".to_string(), "Beta".to_string()),
+            ])
+        );
+        assert!(document.body.contains("[1] Alpha"));
+        assert!(document.body.contains("[2] Beta"));
+    }
+
+    #[test]
+    fn cite_forward_reference_resolves_on_second_pass() {
+        let source = "\\documentclass{article}\n\\begin{document}\nSee \\cite{key}.\n\\begin{thebibliography}{99}\n\\bibitem{key} Reference text\n\\end{thebibliography}\n\\end{document}\n";
+        let first = MinimalLatexParser.parse(source).expect("parse first pass");
+        let second = MinimalLatexParser
+            .parse_with_context(
+                source,
+                first.labels.clone().into_inner(),
+                first.section_entries.clone(),
+                first.bibliography.clone(),
+            )
+            .expect("parse second pass");
+
+        assert_eq!(
+            first.body.lines().next().map(str::trim_end),
+            Some("See [?].")
+        );
+        assert!(first.has_unresolved_refs);
+        assert_eq!(
+            second.body.lines().next().map(str::trim_end),
+            Some("See [1].")
+        );
+        assert!(!second.has_unresolved_refs);
+    }
+
+    #[test]
+    fn href_body_nodes_preserve_link_structure() {
+        assert_eq!(
+            parse_document(r"\href{https://example.com}{Example}").body_nodes(),
+            vec![DocumentNode::Link {
+                url: "https://example.com".to_string(),
+                children: vec![DocumentNode::Text("Example".to_string())],
+            }]
+        );
+    }
+
+    #[test]
+    fn url_body_nodes_preserve_link_structure() {
+        assert_eq!(
+            parse_document(r"\url{https://example.com}").body_nodes(),
+            vec![DocumentNode::Link {
+                url: "https://example.com".to_string(),
+                children: vec![DocumentNode::Text("https://example.com".to_string())],
+            }]
+        );
+    }
+
+    #[test]
+    fn newenvironment_definition_and_begin_end_expand_with_arguments() {
+        let document = parse_document(
+            "\\newenvironment{wrap}[1]{<#1: }{>}\\begin{wrap}{boxed}content\\end{wrap}",
+        );
+
+        assert_eq!(document.body, "<boxed: content>");
+    }
+
+    #[test]
+    fn renewenvironment_overrides_existing_definition() {
+        let document = parse_document(
+            "\\newenvironment{wrap}{[}{]}\\renewenvironment{wrap}{(}{)}\\begin{wrap}x\\end{wrap}",
+        );
+
+        assert_eq!(document.body, "(x)");
+    }
+
+    #[test]
+    fn itemize_environment_emits_bulleted_items() {
+        let document = parse_document("\\begin{itemize}\\item First\\item Second\\end{itemize}");
+
+        assert_eq!(document.body, "• First\n\n• Second");
+    }
+
+    #[test]
+    fn enumerate_environment_emits_numbered_items() {
+        let document =
+            parse_document("\\begin{enumerate}\\item First\\item Second\\end{enumerate}");
+
+        assert_eq!(document.body, "1. First\n\n2. Second");
+    }
+
+    #[test]
+    fn description_environment_emits_term_prefixes() {
+        let document =
+            parse_document("\\begin{description}\\item[term] definition\\end{description}");
+
+        assert_eq!(document.body, "term: definition");
+    }
+
+    #[test]
+    fn nested_list_environments_keep_independent_item_counters() {
+        let document = parse_document(
+            "\\begin{itemize}\\item Outer\\begin{enumerate}\\item Inner\\end{enumerate}\\item Tail\\end{itemize}",
+        );
+
+        assert_eq!(document.body, "• Outer\n\n1. Inner\n\n• Tail");
+    }
+
+    #[test]
+    fn tableofcontents_emits_provided_section_entries() {
+        let document = MinimalLatexParser
+            .parse_with_state(
+                "\\documentclass{article}\n\\begin{document}\n\\tableofcontents\n\\end{document}\n",
+                BTreeMap::new(),
+                vec![
+                    SectionEntry {
+                        level: 1,
+                        number: "1".to_string(),
+                        title: "Intro".to_string(),
+                    },
+                    SectionEntry {
+                        level: 2,
+                        number: "1.1".to_string(),
+                        title: "Scope".to_string(),
+                    },
+                ],
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "1  Intro\n1.1  Scope");
+        assert!(!document.has_unresolved_toc);
+    }
+
+    #[test]
+    fn sections_are_collected_for_toc_resolution() {
+        let document = parse_document("\\section{Intro}\n\\subsection{Scope}");
+
+        assert_eq!(
+            document.section_entries,
+            vec![
+                SectionEntry {
+                    level: 1,
+                    number: "1".to_string(),
+                    title: "Intro".to_string(),
+                },
+                SectionEntry {
+                    level: 2,
+                    number: "1.1".to_string(),
+                    title: "Scope".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tableofcontents_without_seed_entries_requests_second_pass() {
+        let document = parse_document("\\tableofcontents\n\\section{Intro}");
+
+        assert_eq!(document.body, "1 Intro");
+        assert!(document.has_unresolved_toc);
+    }
+
+    #[test]
+    fn recovering_reports_unclosed_environment() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\n\\begin{itemize}\n\\item Open\n\\end{document}\n",
+        );
+
+        assert!(output.errors.contains(&ParseError::UnclosedEnvironment {
+            line: 3,
+            name: "itemize".to_string(),
+        }));
+        assert!(output.document.is_some());
+    }
+
+    #[test]
+    fn recovering_reports_unclosed_equation_environment() {
+        let source = "\\documentclass{article}\n\\begin{document}\nBefore\n\\begin{equation}\nx = 1\n\\end{document}\n";
+        let output = MinimalLatexParser.parse_recovering(source);
+        assert!(output.document.is_some());
+        let doc = output.document.unwrap();
+        assert!(doc.body.contains("Before"));
+        assert!(
+            output.errors.iter().any(
+                |e| matches!(e, ParseError::UnclosedEnvironment { name, .. } if name == "equation")
+            ),
+            "should report unclosed equation environment"
+        );
     }
 }

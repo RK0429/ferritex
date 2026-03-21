@@ -319,6 +319,9 @@ fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnosti
             ParseError::UnclosedConditional { .. } => {
                 Some("add the missing \\fi for the open conditional".to_string())
             }
+            ParseError::UnclosedEnvironment { name, .. } => {
+                Some(format!("add the matching \\end{{{name}}}"))
+            }
             ParseError::UnexpectedElse { .. } => {
                 Some("remove the stray \\else or add the matching \\if...".to_string())
             }

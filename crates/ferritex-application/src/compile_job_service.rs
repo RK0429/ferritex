@@ -468,16 +468,19 @@ impl<'a> CompileJobService<'a> {
             };
         };
 
-        if !document.has_unresolved_refs {
+        if !document.has_unresolved_refs && !document.has_unresolved_toc {
             return ParsePassResult {
                 output: first,
                 pass_count: 1,
             };
         }
 
-        let second = self
-            .parser
-            .parse_recovering_with_labels(source, document.labels.clone());
+        let second = self.parser.parse_recovering_with_context(
+            source,
+            document.labels.clone().into_inner(),
+            document.section_entries.clone(),
+            document.bibliography.clone(),
+        );
         if second.document.is_some() {
             ParsePassResult {
                 output: second,
@@ -655,6 +658,11 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         ParseError::UnclosedConditional { .. } => diagnostic
             .with_context("the parser reached EOF while a conditional branch was still open")
             .with_suggestion("add the missing \\fi for the open \\if... branch"),
+        ParseError::UnclosedEnvironment { name, .. } => diagnostic
+            .with_context(format!(
+                "the parser reached EOF while `{name}` was still open"
+            ))
+            .with_suggestion(format!("add the matching \\end{{{name}}}")),
         ParseError::UnexpectedElse { .. } => diagnostic
             .with_context("the parser found \\else without a matching open conditional")
             .with_suggestion("remove the stray \\else or add the matching \\if..."),
@@ -2220,6 +2228,36 @@ mod tests {
         assert_eq!(state.diagnostics.len(), 1);
         assert_eq!(state.diagnostics[0].message, "unexpected closing brace");
         assert_eq!(state.diagnostics[0].line, Some(3));
+    }
+
+    #[test]
+    fn compile_from_source_treats_unclosed_equation_as_recoverable_when_document_end_exists() {
+        let gate = MockFileAccessGate {
+            read_decision: PathAccessDecision::Allowed,
+            write_decision: PathAccessDecision::Allowed,
+            read_result: MockReadResult::Success(Vec::new()),
+            created_dirs: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+        };
+        let loader = MockAssetBundleLoader::valid();
+
+        let state = service(&gate, &loader).compile_from_source(
+            "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n\\end{document}\n",
+            "file:///tmp/main.tex",
+        );
+
+        assert!(state.success);
+        let messages = state
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("unclosed environment `equation`")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.contains("missing \\end{document}")));
     }
 
     #[test]

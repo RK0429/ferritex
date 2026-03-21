@@ -10,8 +10,17 @@ pub struct MacroDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentDef {
+    pub name: String,
+    pub begin_tokens: Vec<Token>,
+    pub end_tokens: Vec<Token>,
+    pub parameter_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroEngine {
     scope_stack: Vec<HashMap<String, MacroDef>>,
+    environment_scope_stack: Vec<HashMap<String, EnvironmentDef>>,
     catcode_stack: Vec<HashMap<u8, CatCode>>,
 }
 
@@ -19,6 +28,7 @@ impl Default for MacroEngine {
     fn default() -> Self {
         Self {
             scope_stack: vec![HashMap::new()],
+            environment_scope_stack: vec![HashMap::new()],
             catcode_stack: vec![HashMap::new()],
         }
     }
@@ -27,14 +37,23 @@ impl Default for MacroEngine {
 impl MacroEngine {
     pub fn push_group(&mut self) {
         let next_scope = self.scope_stack.last().cloned().unwrap_or_default();
+        let next_environment_scope = self
+            .environment_scope_stack
+            .last()
+            .cloned()
+            .unwrap_or_default();
         let next_catcodes = self.catcode_stack.last().cloned().unwrap_or_default();
         self.scope_stack.push(next_scope);
+        self.environment_scope_stack.push(next_environment_scope);
         self.catcode_stack.push(next_catcodes);
     }
 
     pub fn pop_group(&mut self) {
         if self.scope_stack.len() > 1 {
             let _ = self.scope_stack.pop();
+        }
+        if self.environment_scope_stack.len() > 1 {
+            let _ = self.environment_scope_stack.pop();
         }
         if self.catcode_stack.len() > 1 {
             let _ = self.catcode_stack.pop();
@@ -83,6 +102,19 @@ impl MacroEngine {
         self.scope_stack.last().and_then(|scope| scope.get(name))
     }
 
+    pub fn define_environment(&mut self, name: String, def: EnvironmentDef) {
+        self.environment_scope_stack
+            .last_mut()
+            .expect("macro engine always has at least one environment scope")
+            .insert(name, def);
+    }
+
+    pub fn lookup_environment(&self, name: &str) -> Option<&EnvironmentDef> {
+        self.environment_scope_stack
+            .last()
+            .and_then(|scope| scope.get(name))
+    }
+
     pub fn expand(&self, name: &str, args: &[Vec<Token>]) -> Vec<Token> {
         let Some(definition) = self.lookup(name) else {
             return Vec::new();
@@ -126,7 +158,7 @@ impl MacroEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{CatCode, MacroDef, MacroEngine, Token, TokenKind};
+    use super::{CatCode, EnvironmentDef, MacroDef, MacroEngine, Token, TokenKind};
 
     #[test]
     fn expands_macros_with_zero_one_and_two_arguments() {
@@ -218,11 +250,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn environment_storage_is_scoped() {
+        let mut engine = MacroEngine::default();
+        engine.define_environment(
+            "outer".to_string(),
+            environment_def("outer", 0, vec![char_token('a')], vec![char_token('z')]),
+        );
+
+        engine.push_group();
+        engine.define_environment(
+            "outer".to_string(),
+            environment_def("outer", 0, vec![char_token('b')], vec![char_token('y')]),
+        );
+        assert_eq!(
+            engine
+                .lookup_environment("outer")
+                .map(|definition| definition.begin_tokens.clone()),
+            Some(vec![char_token('b')])
+        );
+
+        engine.pop_group();
+        assert_eq!(
+            engine
+                .lookup_environment("outer")
+                .map(|definition| definition.begin_tokens.clone()),
+            Some(vec![char_token('a')])
+        );
+    }
+
     fn macro_def(name: &str, parameter_count: usize, body: Vec<Token>) -> MacroDef {
         MacroDef {
             name: name.to_string(),
             parameter_count,
             body,
+        }
+    }
+
+    fn environment_def(
+        name: &str,
+        parameter_count: usize,
+        begin_tokens: Vec<Token>,
+        end_tokens: Vec<Token>,
+    ) -> EnvironmentDef {
+        EnvironmentDef {
+            name: name.to_string(),
+            begin_tokens,
+            end_tokens,
+            parameter_count,
         }
     }
 

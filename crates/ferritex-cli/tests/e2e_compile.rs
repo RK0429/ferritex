@@ -75,6 +75,127 @@ fn compile_renders_inline_and_display_math_without_raw_tex_delimiters() {
 }
 
 #[test]
+fn compile_renders_multiline_math_environments_with_tags_and_text() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("multiline-math.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\nE=mc^2\\label{eq:e}\n\\end{equation}\nRef \\ref{eq:e}.\n\\begin{equation*}\nx=y\n\\end{equation*}\n\\begin{align}\na&=&b\\notag\\\\\nc&=&\\text{done}\\tag{A}\\label{eq:done}\n\\end{align}\nAlso \\ref{eq:done}.\n\\begin{align*}\nu&=&v\\\\\nw&=&z\n\\end{align*}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf =
+        std::fs::read_to_string(dir.path().join("multiline-math.pdf")).expect("read output pdf");
+    assert!(pdf.contains("E=mc^2 \\(1\\)"));
+    assert!(pdf.contains("Ref 1."));
+    assert!(pdf.contains("x=y"));
+    assert!(!pdf.contains("x=y \\("));
+    assert!(pdf.contains("a = b"));
+    assert!(!pdf.contains("a = b \\("));
+    assert!(pdf.contains("c = done \\(A\\)"));
+    assert!(pdf.contains("Also A."));
+    assert!(pdf.contains("u = v"));
+    assert!(pdf.contains("w = z"));
+    assert!(!pdf.contains("\\tag{A}"));
+    assert!(!pdf.contains("\\text{done}"));
+}
+
+#[test]
+fn compile_renders_equation_environment_with_numbering() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("equation.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\nx^2 + y^2 = z^2\n\\end{equation}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("equation.pdf")).expect("read output pdf");
+    assert!(pdf.contains("x^2+y^2=z^2"));
+    assert!(pdf.contains("\\(1\\)"));
+}
+
+#[test]
+fn compile_renders_equation_star_without_numbering() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("eqstar.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{equation*}\na + b = c\n\\end{equation*}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("eqstar.pdf")).expect("read output pdf");
+    assert!(pdf.contains("a+b=c"));
+    assert!(!pdf.contains("\\(1\\)"));
+}
+
+#[test]
+fn compile_renders_align_environment_with_numbering() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("align.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("align.pdf")).expect("read output pdf");
+    assert!(pdf.contains("a =b"));
+    assert!(pdf.contains("c =d"));
+    assert!(pdf.contains("\\(1\\)"));
+    assert!(pdf.contains("\\(2\\)"));
+}
+
+#[test]
+fn compile_renders_notag_and_tag_in_align_environment() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("tags.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{align}\na &= b \\notag \\\\\nc &= d \\tag{*}\n\\end{align}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("tags.pdf")).expect("read output pdf");
+    assert!(pdf.contains("a =b"));
+    assert!(pdf.contains("c =d"));
+    assert!(!pdf.contains("\\(1\\)"));
+    assert!(pdf.contains("\\(*\\)"));
+}
+
+#[test]
 fn compile_long_paragraph_produces_multi_page_pdf() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("long.tex");
@@ -192,6 +313,121 @@ fn compile_handles_conditionals_and_registers() {
     assert!(pdf.contains("Visible 50"));
     assert!(pdf.contains("Positive"));
     assert!(pdf.contains("2.0pt"));
+}
+
+#[test]
+fn compile_handles_ifdim_and_ifcase() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("ifdim-ifcase.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\ifdim1pt<2pt Smaller\\else Larger\\fi\n\\ifcase1 zero\\or one\\or two\\fi\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf =
+        std::fs::read_to_string(dir.path().join("ifdim-ifcase.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Smaller"));
+    assert!(pdf.contains("one"));
+}
+
+#[test]
+fn compile_renders_itemize_environment_as_bulleted_text() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("itemize.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{itemize}\n\\item First item\n\\item Second item\n\\end{itemize}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("itemize.pdf")).expect("read output pdf");
+    assert!(pdf.contains("• First item"));
+    assert!(pdf.contains("• Second item"));
+}
+
+#[test]
+fn compile_renders_tableofcontents_from_second_pass_entries() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("toc.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\tableofcontents\n\\section{Intro}\n\\subsection{Scope}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("toc.pdf")).expect("read output pdf");
+    assert!(pdf.match_indices("1 Intro").count() >= 2);
+    assert!(pdf.match_indices("1.1 Scope").count() >= 2);
+    assert!(!pdf.contains("??"));
+}
+
+#[test]
+fn compile_emits_citations_links_outlines_and_metadata() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("wave7.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\title{Ferritex Wave 7}\n\\author{Ada Lovelace}\n\\begin{document}\n\\section{Intro}\n\\subsection{Links}\nSee \\href{https://example.com}{Example Site} and \\url{https://openai.com}.\nReference \\cite{knuth}.\n\\begin{thebibliography}{99}\n\\bibitem{knuth} Donald Knuth.\n\\end{thebibliography}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read_to_string(dir.path().join("wave7.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Reference [1]."));
+    assert!(!pdf.contains("[?]"));
+    assert!(pdf.contains("/Subtype /Link"));
+    assert!(pdf.contains("/URI (https://example.com)"));
+    assert!(pdf.contains("/URI (https://openai.com)"));
+    assert!(pdf.contains("/Outlines"));
+    assert!(pdf.contains("/Title (1 Intro)"));
+    assert!(pdf.contains("/Title (1.1 Links)"));
+    assert!(pdf.contains("/Author (Ada Lovelace)"));
+    assert!(pdf.contains("/Title (Ferritex Wave 7)"));
+}
+
+#[test]
+fn compile_expands_newenvironment_usage_into_pdf_output() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("environment.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\newenvironment{boxenv}{BEGIN }{ END}\n\\begin{document}\n\\begin{boxenv}content\\end{boxenv}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("environment.pdf")).expect("read output pdf");
+    assert!(pdf.contains("BEGIN content END"));
 }
 
 #[test]

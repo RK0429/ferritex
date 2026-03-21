@@ -1,11 +1,24 @@
 use crate::kernel::api::DimensionValue;
 
 use super::{
-    api::{HListItem, PENALTY_FORBIDDEN, PENALTY_FORCED},
+    api::{HListItem, TextLineLink, PENALTY_FORBIDDEN, PENALTY_FORCED},
     knuth_plass::{self, BreakParams},
 };
 
 pub fn break_paragraph(hlist: &[HListItem], params: &BreakParams) -> Vec<String> {
+    break_paragraph_with_links(hlist, params)
+        .into_iter()
+        .map(|line| line.text)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrokenLine {
+    pub text: String,
+    pub links: Vec<TextLineLink>,
+}
+
+pub fn break_paragraph_with_links(hlist: &[HListItem], params: &BreakParams) -> Vec<BrokenLine> {
     if hlist.is_empty() {
         return Vec::new();
     }
@@ -79,7 +92,7 @@ fn skip_line_start(hlist: &[HListItem], mut index: usize) -> usize {
 }
 
 fn push_segment_lines(
-    lines: &mut Vec<String>,
+    lines: &mut Vec<BrokenLine>,
     segment: &[HListItem],
     line_width: DimensionValue,
     append_hyphen: bool,
@@ -87,7 +100,7 @@ fn push_segment_lines(
     let initial_len = lines.len();
 
     if segment.is_empty() {
-        lines.push(String::new());
+        lines.push(BrokenLine::default());
         return;
     }
 
@@ -96,7 +109,7 @@ fn push_segment_lines(
         .any(|item| matches!(item, HListItem::Glue { .. }))
         || segment_width(segment) <= line_width
     {
-        lines.push(render_text(segment));
+        lines.push(render_line(segment));
     } else {
         push_unbreakable_lines(lines, segment, line_width);
     }
@@ -104,8 +117,16 @@ fn push_segment_lines(
     if append_hyphen && lines.len() > initial_len {
         let last_index = lines.len() - 1;
         if let Some(line) = lines.get_mut(last_index) {
-            if !line.is_empty() {
-                line.push('-');
+            if !line.text.is_empty() {
+                let start_char = line.text.chars().count();
+                line.text.push('-');
+                if let Some(url) = line
+                    .links
+                    .last()
+                    .and_then(|link| (link.end_char == start_char).then(|| link.url.clone()))
+                {
+                    push_link_range(&mut line.links, &url, start_char, start_char + 1);
+                }
             }
         }
     }
@@ -125,48 +146,69 @@ fn item_width(item: &HListItem) -> DimensionValue {
     }
 }
 
-fn render_text(segment: &[HListItem]) -> String {
+fn render_line(segment: &[HListItem]) -> BrokenLine {
     let mut text = String::new();
+    let mut links = Vec::new();
     let mut pending_space = false;
+    let mut pending_space_link = None;
 
     for item in segment {
         match item {
-            HListItem::Char { codepoint, .. } => {
+            HListItem::Char {
+                codepoint, link, ..
+            } => {
                 if pending_space && !text.is_empty() {
+                    let start_char = text.chars().count();
                     text.push(' ');
+                    if let Some(url) = pending_space_link.as_deref() {
+                        push_link_range(&mut links, url, start_char, start_char + 1);
+                    }
                 }
+                let start_char = text.chars().count();
                 text.push(*codepoint);
+                if let Some(url) = link.as_deref() {
+                    push_link_range(&mut links, url, start_char, start_char + 1);
+                }
                 pending_space = false;
+                pending_space_link = None;
             }
-            HListItem::Glue { .. } => {
+            HListItem::Glue { link, .. } => {
                 if !text.is_empty() {
                     pending_space = true;
+                    pending_space_link = link.clone();
                 }
             }
             HListItem::Kern { .. } | HListItem::Penalty { .. } => {}
         }
     }
 
-    text
+    BrokenLine { text, links }
 }
 
 fn push_unbreakable_lines(
-    lines: &mut Vec<String>,
+    lines: &mut Vec<BrokenLine>,
     segment: &[HListItem],
     line_width: DimensionValue,
 ) {
-    let mut current_line = String::new();
+    let mut current_line = BrokenLine::default();
     let mut current_width = DimensionValue::zero();
 
     for item in segment {
         let width = item_width(item);
-        if !current_line.is_empty() && current_width + width > line_width {
+        if !current_line.text.is_empty() && current_width + width > line_width {
             lines.push(std::mem::take(&mut current_line));
             current_width = DimensionValue::zero();
         }
 
-        if let HListItem::Char { codepoint, .. } = item {
-            current_line.push(*codepoint);
+        if let HListItem::Char {
+            codepoint, link, ..
+        } = item
+        {
+            let start_char = current_line.text.chars().count();
+            current_line.text.push(*codepoint);
+            if let Some(url) = link.as_deref() {
+                push_link_range(&mut current_line.links, url, start_char, start_char + 1);
+            }
         }
         current_width = current_width + width;
 
@@ -176,9 +218,28 @@ fn push_unbreakable_lines(
         }
     }
 
-    if !current_line.is_empty() {
+    if !current_line.text.is_empty() {
         lines.push(current_line);
     }
+}
+
+fn push_link_range(links: &mut Vec<TextLineLink>, url: &str, start_char: usize, end_char: usize) {
+    if start_char >= end_char {
+        return;
+    }
+
+    if let Some(last) = links.last_mut() {
+        if last.url == url && last.end_char == start_char {
+            last.end_char = end_char;
+            return;
+        }
+    }
+
+    links.push(TextLineLink {
+        url: url.to_string(),
+        start_char,
+        end_char,
+    });
 }
 
 #[cfg(test)]
@@ -230,6 +291,7 @@ mod tests {
                         hlist.push(HListItem::Char {
                             codepoint,
                             width: provider.char_width(codepoint),
+                            link: None,
                         });
                     }
                 }
@@ -237,6 +299,7 @@ mod tests {
                     width: provider.space_width(),
                     stretch: GlueComponent::normal(stretch),
                     shrink: GlueComponent::normal(shrink),
+                    link: None,
                 }),
                 TestPart::ForcedBreak => hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
@@ -297,27 +360,33 @@ mod tests {
             HListItem::Char {
                 codepoint: 'b',
                 width: dim(10),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 'a',
                 width: dim(10),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 's',
                 width: dim(10),
+                link: None,
             },
             HListItem::Penalty { value: 50 },
             HListItem::Char {
                 codepoint: 'k',
                 width: dim(10),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 'e',
                 width: dim(10),
+                link: None,
             },
             HListItem::Char {
                 codepoint: 't',
                 width: dim(10),
+                link: None,
             },
         ];
 
@@ -330,11 +399,13 @@ mod tests {
             HListItem::Char {
                 codepoint: 'A',
                 width: dim(1),
+                link: None,
             },
             HListItem::Kern { width: dim(1) },
             HListItem::Char {
                 codepoint: 'B',
                 width: dim(1),
+                link: None,
             },
         ];
 
