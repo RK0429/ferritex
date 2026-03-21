@@ -6,7 +6,7 @@ use super::{
 
 use crate::font::api::TfmMetrics;
 use crate::kernel::api::DimensionValue;
-use crate::parser::api::{DocumentNode, ParsedDocument};
+use crate::parser::api::{DocumentNode, MathNode, ParsedDocument};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
@@ -328,6 +328,42 @@ fn document_nodes_to_hlist_with_config(
                     hyphen_penalty,
                 ));
             }
+            DocumentNode::InlineMath(nodes) => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+                append_literal_text_to_hlist(
+                    &mut hlist,
+                    &render_math_nodes(nodes),
+                    provider,
+                    space_width,
+                    stretch,
+                    shrink,
+                );
+            }
+            DocumentNode::DisplayMath(nodes) => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+                push_forced_break_if_needed(&mut hlist);
+                append_literal_text_to_hlist(
+                    &mut hlist,
+                    &render_math_nodes(nodes),
+                    provider,
+                    space_width,
+                    stretch,
+                    shrink,
+                );
+                push_forced_break_if_needed(&mut hlist);
+            }
             DocumentNode::ParBreak => {
                 flush_word(
                     &mut hlist,
@@ -424,6 +460,76 @@ fn append_nodes_segment_to_vlist(
 
     let wrapped_lines = line_breaker::break_paragraph(&hlist, params);
     vlist.extend(lines_to_vlist(&wrapped_lines));
+}
+
+fn render_math_nodes(nodes: &[MathNode]) -> String {
+    nodes
+        .iter()
+        .map(render_math_node)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_math_node(node: &MathNode) -> String {
+    match node {
+        MathNode::Ordinary(ch) => ch.to_string(),
+        MathNode::Superscript(node) => format!("^{}", render_math_attachment(node)),
+        MathNode::Subscript(node) => format!("_{}", render_math_attachment(node)),
+        MathNode::Frac { numer, denom } => {
+            format!(
+                "({})/({})",
+                render_math_nodes(numer),
+                render_math_nodes(denom)
+            )
+        }
+        MathNode::Group(nodes) => render_math_nodes(nodes),
+    }
+}
+
+fn render_math_attachment(node: &MathNode) -> String {
+    match node {
+        MathNode::Group(nodes) if nodes.len() > 1 => format!("({})", render_math_nodes(nodes)),
+        _ => render_math_node(node),
+    }
+}
+
+fn append_literal_text_to_hlist(
+    hlist: &mut Vec<HListItem>,
+    text: &str,
+    provider: &dyn CharWidthProvider,
+    space_width: DimensionValue,
+    stretch: GlueComponent,
+    shrink: GlueComponent,
+) {
+    for codepoint in text.chars() {
+        match codepoint {
+            '\n' => hlist.push(HListItem::Penalty {
+                value: PENALTY_FORCED,
+            }),
+            codepoint if codepoint.is_whitespace() => hlist.push(HListItem::Glue {
+                width: space_width,
+                stretch,
+                shrink,
+            }),
+            codepoint => hlist.push(HListItem::Char {
+                codepoint,
+                width: provider.char_width(codepoint),
+            }),
+        }
+    }
+}
+
+fn push_forced_break_if_needed(hlist: &mut Vec<HListItem>) {
+    if matches!(
+        hlist.last(),
+        Some(HListItem::Penalty { value }) if *value <= PENALTY_FORCED
+    ) {
+        return;
+    }
+
+    hlist.push(HListItem::Penalty {
+        value: PENALTY_FORCED,
+    });
 }
 
 fn flush_word(
@@ -900,7 +1006,7 @@ mod tests {
     };
     use crate::font::api::TfmMetrics;
     use crate::kernel::api::DimensionValue;
-    use crate::parser::api::{DocumentNode, MinimalLatexParser, ParsedDocument, Parser};
+    use crate::parser::api::{DocumentNode, MathNode, MinimalLatexParser, ParsedDocument, Parser};
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
     };
@@ -910,6 +1016,8 @@ mod tests {
             document_class: "article".to_string(),
             package_count: 0,
             body: body.to_string(),
+            labels: Default::default(),
+            has_unresolved_refs: false,
         }
     }
 
@@ -1258,6 +1366,61 @@ mod tests {
                     value: PENALTY_FORCED
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn document_nodes_to_hlist_renders_inline_math_readably() {
+        let hlist = document_nodes_to_hlist(
+            &[
+                DocumentNode::Text("Area ".to_string()),
+                DocumentNode::InlineMath(vec![
+                    MathNode::Ordinary('x'),
+                    MathNode::Superscript(Box::new(MathNode::Ordinary('2'))),
+                ]),
+            ],
+            &default_fixed_width_provider(),
+        );
+
+        assert_eq!(
+            wrap_hlist(&hlist, MAX_LINE_WIDTH),
+            vec!["Area x^2".to_string()]
+        );
+    }
+
+    #[test]
+    fn document_nodes_to_hlist_puts_display_math_on_separate_lines() {
+        let hlist = document_nodes_to_hlist(
+            &[
+                DocumentNode::Text("Before".to_string()),
+                DocumentNode::DisplayMath(vec![
+                    MathNode::Ordinary('a'),
+                    MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
+                ]),
+                DocumentNode::Text("After".to_string()),
+            ],
+            &default_fixed_width_provider(),
+        );
+
+        assert_eq!(
+            wrap_hlist(&hlist, MAX_LINE_WIDTH),
+            vec!["Before".to_string(), "a_1".to_string(), "After".to_string()]
+        );
+    }
+
+    #[test]
+    fn minimal_typesetter_renders_inline_and_display_math_lines() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(
+            "Inline $x^2$.\n\\[\\frac{a}{b}\\]\nAfter",
+        ));
+
+        assert_eq!(
+            document.pages[0]
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Inline x^2.", "(a)/(b)", "After"]
         );
     }
 

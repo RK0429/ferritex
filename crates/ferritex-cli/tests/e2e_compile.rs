@@ -49,6 +49,32 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 }
 
 #[test]
+fn compile_renders_inline_and_display_math_without_raw_tex_delimiters() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("math.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nInline $x^2$ here.\n\\[\\frac{a}{b}\\]\nDone.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read_to_string(dir.path().join("math.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Inline x^2 here."));
+    assert!(pdf.contains("\\(a\\)/\\(b\\)"));
+    assert!(pdf.contains("Done."));
+    assert!(!pdf.contains("$x^2$"));
+    assert!(!pdf.contains("\\frac{a}{b}"));
+    assert!(!pdf.contains("\\["));
+}
+
+#[test]
 fn compile_long_paragraph_produces_multi_page_pdf() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("long.tex");
@@ -196,6 +222,59 @@ fn compile_resolves_nested_input_files() {
     let pdf = std::fs::read_to_string(dir.path().join("main.pdf")).expect("read output pdf");
     assert!(pdf.contains("Intro line."));
     assert!(pdf.contains("Nested detail."));
+}
+
+#[test]
+fn compile_resolves_forward_refs_and_section_numbers_in_single_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("sections.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nSee Section \\ref{sec:later}.\n\\section{Later}\\label{sec:later}\nMore text.\n\\subsection{Details}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("sections.pdf")).expect("read output pdf");
+    assert!(pdf.contains("See Section 1."));
+    assert!(pdf.contains("1 Later"));
+    assert!(pdf.contains("1.1 Details"));
+    assert!(!pdf.contains("??"));
+}
+
+#[test]
+fn compile_resolves_refs_across_input_boundaries() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let main = dir.path().join("main.tex");
+    let chapter = dir.path().join("chapter.tex");
+    std::fs::write(
+        &main,
+        "\\documentclass{article}\n\\begin{document}\nMain sees input section \\ref{sec:input}.\n\\input{chapter}\n\\section{Main}\\label{sec:main}\nDone.\n\\end{document}\n",
+    )
+    .expect("write main");
+    std::fs::write(
+        &chapter,
+        "\\section{Input}\\label{sec:input}\nInput sees main section \\ref{sec:main}.\n",
+    )
+    .expect("write chapter");
+
+    let output = ferritex_bin()
+        .args(["compile", main.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("main.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Main sees input section 1."));
+    assert!(pdf.contains("1 Input"));
+    assert!(pdf.contains("Input sees main section 2."));
+    assert!(pdf.contains("2 Main"));
+    assert!(!pdf.contains("??"));
 }
 
 #[test]

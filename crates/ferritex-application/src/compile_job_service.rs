@@ -5,8 +5,8 @@ use ferritex_core::compilation::{
     CompilationJob, CompilationSnapshot, DocumentState, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
-use ferritex_core::font::{OpenTypeFont, TfmMetrics};
 use ferritex_core::font::api::OpenTypeWidthProvider;
+use ferritex_core::font::{OpenTypeFont, TfmMetrics};
 use ferritex_core::kernel::api::DimensionValue;
 use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
 use ferritex_core::pdf::{FontResource, PdfRenderer};
@@ -144,7 +144,10 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
-        let ParseOutput { document, errors } = self.parser.parse_recovering(&source_tree.source);
+        let ParsePassResult {
+            output: ParseOutput { document, errors },
+            pass_count,
+        } = self.parse_document_with_cross_references(&source_tree.source);
         let parse_diagnostics: Vec<Diagnostic> = errors
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
@@ -166,6 +169,7 @@ impl<'a> CompileJobService<'a> {
                     stable_compile_state: Some(stable_compile_state(
                         &compilation_job,
                         source_tree.document_state.clone(),
+                        pass_count,
                         0,
                         false,
                         parse_diagnostics,
@@ -280,6 +284,7 @@ impl<'a> CompileJobService<'a> {
         let stable_compile_state = stable_compile_state(
             &compilation_job,
             source_tree.document_state,
+            pass_count,
             pdf_document.page_count,
             true,
             diagnostics.clone(),
@@ -319,7 +324,10 @@ impl<'a> CompileJobService<'a> {
             });
 
         let primary_input_path = primary_input.to_string_lossy().into_owned();
-        let ParseOutput { document, errors } = self.parser.parse_recovering(&source_tree.source);
+        let ParsePassResult {
+            output: ParseOutput { document, errors },
+            pass_count,
+        } = self.parse_document_with_cross_references(&source_tree.source);
         let parse_diagnostics: Vec<Diagnostic> = errors
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, primary_input_path.clone()))
@@ -332,6 +340,7 @@ impl<'a> CompileJobService<'a> {
                 stable_compile_state(
                     &compilation_job,
                     source_tree.document_state,
+                    pass_count,
                     pdf_document.page_count,
                     true,
                     parse_diagnostics,
@@ -340,6 +349,7 @@ impl<'a> CompileJobService<'a> {
             None => stable_compile_state(
                 &compilation_job,
                 source_tree.document_state,
+                pass_count,
                 0,
                 false,
                 parse_diagnostics,
@@ -448,22 +458,60 @@ impl<'a> CompileJobService<'a> {
         visited.remove(&normalized_path);
         Ok(expanded)
     }
+
+    fn parse_document_with_cross_references(&self, source: &str) -> ParsePassResult {
+        let first = self.parser.parse_recovering(source);
+        let Some(document) = first.document.as_ref() else {
+            return ParsePassResult {
+                output: first,
+                pass_count: 1,
+            };
+        };
+
+        if !document.has_unresolved_refs {
+            return ParsePassResult {
+                output: first,
+                pass_count: 1,
+            };
+        }
+
+        let second = self
+            .parser
+            .parse_recovering_with_labels(source, document.labels.clone());
+        if second.document.is_some() {
+            ParsePassResult {
+                output: second,
+                pass_count: 2,
+            }
+        } else {
+            ParsePassResult {
+                output: first,
+                pass_count: 1,
+            }
+        }
+    }
 }
 
 fn stable_compile_state(
     compilation_job: &CompilationJob,
     document_state: DocumentState,
+    pass_count: u32,
     page_count: usize,
     success: bool,
     diagnostics: Vec<Diagnostic>,
 ) -> StableCompileState {
     StableCompileState {
-        snapshot: CompilationSnapshot::from_session(&compilation_job.begin_pass(1)),
+        snapshot: CompilationSnapshot::from_session(&compilation_job.begin_pass(pass_count)),
         document_state,
         page_count,
         success,
         diagnostics,
     }
+}
+
+struct ParsePassResult {
+    output: ParseOutput,
+    pass_count: u32,
 }
 
 fn project_root_for_policy(policy: &ExecutionPolicy, input_file: &Path) -> PathBuf {

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use thiserror::Error;
 
@@ -14,6 +14,10 @@ const BODY_HBOX_START: char = '\u{E001}';
 const BODY_HBOX_END: char = '\u{E002}';
 const BODY_VBOX_START: char = '\u{E003}';
 const BODY_VBOX_END: char = '\u{E004}';
+const BODY_INLINE_MATH_START: char = '\u{E005}';
+const BODY_INLINE_MATH_END: char = '\u{E006}';
+const BODY_DISPLAY_MATH_START: char = '\u{E007}';
+const BODY_DISPLAY_MATH_END: char = '\u{E008}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,6 +25,8 @@ pub struct ParsedDocument {
     pub document_class: String,
     pub package_count: usize,
     pub body: String,
+    pub labels: BTreeMap<String, String>,
+    pub has_unresolved_refs: bool,
 }
 
 /// Result of a parse-with-recovery attempt.
@@ -33,12 +39,26 @@ pub struct ParseOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MathNode {
+    Ordinary(char),
+    Superscript(Box<MathNode>),
+    Subscript(Box<MathNode>),
+    Frac {
+        numer: Vec<MathNode>,
+        denom: Vec<MathNode>,
+    },
+    Group(Vec<MathNode>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentNode {
     Text(String),
     ParBreak,
     PageBreak,
     HBox(Vec<DocumentNode>),
     VBox(Vec<DocumentNode>),
+    InlineMath(Vec<MathNode>),
+    DisplayMath(Vec<MathNode>),
 }
 
 impl ParsedDocument {
@@ -121,6 +141,22 @@ impl Parser for MinimalLatexParser {
 
 impl MinimalLatexParser {
     pub fn parse_recovering(&self, source: &str) -> ParseOutput {
+        self.parse_recovering_with_labels(source, BTreeMap::new())
+    }
+
+    pub fn parse_with_labels(
+        &self,
+        source: &str,
+        initial_labels: BTreeMap<String, String>,
+    ) -> Result<ParsedDocument, ParseError> {
+        parse_minimal_latex_with_labels(source, initial_labels)
+    }
+
+    pub fn parse_recovering_with_labels(
+        &self,
+        source: &str,
+        initial_labels: BTreeMap<String, String>,
+    ) -> ParseOutput {
         if source.trim().is_empty() {
             return ParseOutput {
                 document: None,
@@ -128,16 +164,23 @@ impl MinimalLatexParser {
             };
         }
 
-        ParserDriver::new(source).run_recovering()
+        ParserDriver::new_with_labels(source, initial_labels).run_recovering()
     }
 }
 
 fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
+    parse_minimal_latex_with_labels(source, BTreeMap::new())
+}
+
+fn parse_minimal_latex_with_labels(
+    source: &str,
+    initial_labels: BTreeMap<String, String>,
+) -> Result<ParsedDocument, ParseError> {
     if source.trim().is_empty() {
         return Err(ParseError::EmptyInput);
     }
 
-    ParserDriver::new(source).run()
+    ParserDriver::new_with_labels(source, initial_labels).run()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,10 +204,66 @@ enum ArithmeticOperation {
     Divide,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParserState {
+    section: u32,
+    subsection: u32,
+    subsubsection: u32,
+    current_section_number: Option<String>,
+    labels: BTreeMap<String, String>,
+    has_unresolved_refs: bool,
+}
+
+impl Default for ParserState {
+    fn default() -> Self {
+        Self::new(BTreeMap::new())
+    }
+}
+
+impl ParserState {
+    fn new(initial_labels: BTreeMap<String, String>) -> Self {
+        Self {
+            section: 0,
+            subsection: 0,
+            subsubsection: 0,
+            current_section_number: None,
+            labels: initial_labels,
+            has_unresolved_refs: false,
+        }
+    }
+
+    fn next_section_number(&mut self, level: u8) -> String {
+        let number = match level {
+            1 => {
+                self.section += 1;
+                self.subsection = 0;
+                self.subsubsection = 0;
+                self.section.to_string()
+            }
+            2 => {
+                self.subsection += 1;
+                self.subsubsection = 0;
+                format!("{}.{}", self.section, self.subsection)
+            }
+            3 => {
+                self.subsubsection += 1;
+                format!(
+                    "{}.{}.{}",
+                    self.section, self.subsection, self.subsubsection
+                )
+            }
+            _ => unreachable!("section levels are constrained by the caller"),
+        };
+        self.current_section_number = Some(number.clone());
+        number
+    }
+}
+
 #[derive(Debug)]
 struct ParserDriver<'a> {
     tokenizer: Tokenizer<'a>,
     macro_engine: MacroEngine,
+    state: ParserState,
     registers: RegisterStore,
     conditionals: ConditionalState,
     pending_tokens: VecDeque<QueuedToken>,
@@ -192,10 +291,11 @@ struct QueuedToken {
 }
 
 impl<'a> ParserDriver<'a> {
-    fn new(source: &'a str) -> Self {
+    fn new_with_labels(source: &'a str, initial_labels: BTreeMap<String, String>) -> Self {
         Self {
             tokenizer: Tokenizer::new(source.as_bytes()),
             macro_engine: MacroEngine::default(),
+            state: ParserState::new(initial_labels),
             registers: RegisterStore::default(),
             conditionals: ConditionalState::default(),
             pending_tokens: VecDeque::new(),
@@ -397,6 +497,8 @@ impl<'a> ParserDriver<'a> {
                 .expect("document class presence checked above"),
             package_count: self.package_count,
             body: self.body.trim().to_string(),
+            labels: self.state.labels.clone(),
+            has_unresolved_refs: self.state.has_unresolved_refs,
         }
     }
 
@@ -457,6 +559,14 @@ impl<'a> ParserDriver<'a> {
         }
 
         match &token.kind {
+            TokenKind::CharToken {
+                cat: CatCode::MathShift,
+                char: '$',
+            } => {
+                let _ = self.take_global_prefix();
+                self.parse_inline_math()?;
+                Ok(false)
+            }
             TokenKind::ControlWord(name) if name == "par" => {
                 let _ = self.take_global_prefix();
                 self.body.push_str("\n\n");
@@ -473,6 +583,38 @@ impl<'a> ParserDriver<'a> {
                     "pagebreak" | "newpage" | "clearpage" => {
                         let _ = self.take_global_prefix();
                         self.body.push(BODY_PAGE_BREAK_MARKER);
+                    }
+                    "section" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_section_command(1)?;
+                    }
+                    "subsection" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_section_command(2)?;
+                    }
+                    "subsubsection" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_section_command(3)?;
+                    }
+                    "label" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_label_command()?;
+                    }
+                    "ref" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_ref_command()?;
+                    }
+                    "pageref" => {
+                        let _ = self.take_global_prefix();
+                        let _ = self.read_required_braced_tokens()?;
+                        // Real page references need a post-pagination pass, so Wave 4 keeps a
+                        // placeholder until page-number-aware cross references are implemented.
+                        self.body.push_str("??");
+                        self.state.has_unresolved_refs = true;
+                    }
+                    "[" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_display_math()?;
                     }
                     "hbox" | "vbox" => {
                         let _ = self.take_global_prefix();
@@ -508,6 +650,9 @@ impl<'a> ParserDriver<'a> {
             }
             _ => {
                 let _ = self.take_global_prefix();
+                if self.should_skip_insignificant_space(&token) {
+                    return Ok(false);
+                }
                 self.body.push_str(&render_token(&token));
                 Ok(false)
             }
@@ -794,6 +939,143 @@ impl<'a> ParserDriver<'a> {
             }
             _ => Ok(false),
         }
+    }
+
+    fn parse_section_command(&mut self, level: u8) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let title = tokens_to_text(&tokens).trim().to_string();
+        let number = self.state.next_section_number(level);
+        self.emit_paragraph_break_before_block();
+        self.body.push_str(&number);
+        if !title.is_empty() {
+            self.body.push(' ');
+            self.body.push_str(&title);
+        }
+        self.body.push_str("\n\n");
+        Ok(())
+    }
+
+    fn parse_label_command(&mut self) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let key = tokens_to_text(&tokens).trim().to_string();
+        if key.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(number) = self.state.current_section_number.clone() {
+            self.state.labels.insert(key, number);
+        }
+        Ok(())
+    }
+
+    fn parse_ref_command(&mut self) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let key = tokens_to_text(&tokens).trim().to_string();
+        if key.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(number) = self
+            .state
+            .labels
+            .get(&key)
+            .filter(|number| !number.is_empty())
+            .cloned()
+        {
+            self.body.push_str(&number);
+        } else {
+            self.body.push_str("??");
+            self.state.has_unresolved_refs = true;
+        }
+        Ok(())
+    }
+
+    fn emit_paragraph_break_before_block(&mut self) {
+        if self.body.is_empty()
+            || self.body.ends_with("\n\n")
+            || self.body.ends_with(BODY_PAGE_BREAK_MARKER)
+        {
+            return;
+        }
+
+        if self.body.ends_with('\n') {
+            self.body.push('\n');
+        } else {
+            self.body.push_str("\n\n");
+        }
+    }
+
+    fn should_skip_insignificant_space(&self, token: &Token) -> bool {
+        matches!(
+            token.kind,
+            TokenKind::CharToken {
+                cat: CatCode::Space,
+                ..
+            }
+        ) && (self.body.is_empty()
+            || self.body.ends_with("\n\n")
+            || self.body.ends_with(BODY_PAGE_BREAK_MARKER))
+    }
+
+    fn parse_inline_math(&mut self) -> Result<(), ParseError> {
+        let Some(next) = self.next_raw_token() else {
+            self.body.push('$');
+            return Ok(());
+        };
+
+        if is_inline_math_end_token(&next) {
+            self.body.push('$');
+            self.body.push('$');
+            return Ok(());
+        }
+
+        self.push_front_token(next);
+        let (content, matched) = self.collect_math_body(is_inline_math_end_token)?;
+        if matched {
+            self.body.push(BODY_INLINE_MATH_START);
+            self.body.push_str(&content);
+            self.body.push(BODY_INLINE_MATH_END);
+        } else {
+            self.body.push('$');
+            self.body.push_str(&content);
+        }
+        Ok(())
+    }
+
+    fn parse_display_math(&mut self) -> Result<(), ParseError> {
+        let (content, matched) = self.collect_math_body(is_display_math_end_token)?;
+        if matched {
+            self.body.push(BODY_DISPLAY_MATH_START);
+            self.body.push_str(&content);
+            self.body.push(BODY_DISPLAY_MATH_END);
+        } else {
+            self.body.push_str(r"\[");
+            self.body.push_str(&content);
+        }
+        Ok(())
+    }
+
+    fn collect_math_body<F>(&mut self, is_end: F) -> Result<(String, bool), ParseError>
+    where
+        F: Fn(&Token) -> bool,
+    {
+        let mut content = String::new();
+
+        while let Some(token) = self.next_raw_token() {
+            if is_end(&token) {
+                return Ok((content, true));
+            }
+            content.push_str(&render_token(&token));
+        }
+
+        Ok((content, false))
     }
 
     fn parse_register_assignment(
@@ -1989,6 +2271,20 @@ fn cat_code_of(token: &Token) -> Option<CatCode> {
     }
 }
 
+fn is_inline_math_end_token(token: &Token) -> bool {
+    matches!(
+        token.kind,
+        TokenKind::CharToken {
+            char: '$',
+            cat: CatCode::MathShift,
+        }
+    )
+}
+
+fn is_display_math_end_token(token: &Token) -> bool {
+    matches!(token.kind, TokenKind::ControlSymbol(']'))
+}
+
 fn catcode_target_byte(token: &Token) -> Option<u8> {
     match token.kind {
         TokenKind::CharToken { char, .. } => u8::try_from(char).ok(),
@@ -2132,6 +2428,19 @@ fn replace_box_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNod
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_INLINE_MATH_START | BODY_DISPLAY_MATH_START => {
+                let (content, next_index) = extract_math_marker_content(body, index);
+                let placeholder = next_box_placeholder(placeholders.len());
+                let math = parse_math_content(content);
+                let node = if ch == BODY_INLINE_MATH_START {
+                    DocumentNode::InlineMath(math)
+                } else {
+                    DocumentNode::DisplayMath(math)
+                };
+                placeholders.push(node);
+                text.push(placeholder);
+                index = next_index;
+            }
             _ => {
                 text.push(ch);
                 index += ch.len_utf8();
@@ -2168,6 +2477,33 @@ fn extract_box_marker_content(body: &str, start_index: usize) -> (&str, usize) {
             _ => {}
         }
 
+        index += ch.len_utf8();
+    }
+
+    (&body[content_start..], body.len())
+}
+
+fn extract_math_marker_content(body: &str, start_index: usize) -> (&str, usize) {
+    let start_char = body[start_index..]
+        .chars()
+        .next()
+        .expect("math marker should exist at start index");
+    let content_start = start_index + start_char.len_utf8();
+    let end_marker = if start_char == BODY_INLINE_MATH_START {
+        BODY_INLINE_MATH_END
+    } else {
+        BODY_DISPLAY_MATH_END
+    };
+    let mut index = content_start;
+
+    while index < body.len() {
+        let ch = body[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+        if ch == end_marker {
+            return (&body[content_start..index], index + ch.len_utf8());
+        }
         index += ch.len_utf8();
     }
 
@@ -2232,6 +2568,21 @@ fn encode_body_markers_in_text(text: &str) -> String {
             .next()
             .expect("valid UTF-8 slice should yield a char");
 
+        if ch == '$' {
+            let delimiter_end = index + ch.len_utf8();
+            let Some(close_index) = find_inline_math_end(text, delimiter_end) else {
+                encoded.push(ch);
+                index = delimiter_end;
+                continue;
+            };
+            let content = &text[delimiter_end..close_index];
+            encoded.push(BODY_INLINE_MATH_START);
+            encoded.push_str(content);
+            encoded.push(BODY_INLINE_MATH_END);
+            index = close_index + ch.len_utf8();
+            continue;
+        }
+
         if ch != '\\' {
             encoded.push(ch);
             index += ch.len_utf8();
@@ -2243,6 +2594,23 @@ fn encode_body_markers_in_text(text: &str) -> String {
             encoded.push(ch);
             break;
         };
+
+        if next_char == '[' {
+            let command_end = command_start + next_char.len_utf8();
+            if let Some(close_index) = find_display_math_end(text, command_end) {
+                let content = &text[command_end..close_index];
+                encoded.push(BODY_DISPLAY_MATH_START);
+                encoded.push_str(content);
+                encoded.push(BODY_DISPLAY_MATH_END);
+                index = close_index + r"\]".len();
+                continue;
+            }
+
+            encoded.push(ch);
+            encoded.push(next_char);
+            index = command_end;
+            continue;
+        }
 
         if !next_char.is_ascii_alphabetic() {
             encoded.push(ch);
@@ -2300,6 +2668,28 @@ fn encode_body_markers_in_text(text: &str) -> String {
     encoded
 }
 
+fn find_inline_math_end(text: &str, mut index: usize) -> Option<usize> {
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if ch == '$' {
+            return Some(index);
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn find_display_math_end(text: &str, mut index: usize) -> Option<usize> {
+    while index < text.len() {
+        let ch = text[index..].chars().next()?;
+        if ch == '\\' && text[index..].starts_with(r"\]") {
+            return Some(index);
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
 fn skip_optional_command_whitespace(text: &str, mut index: usize) -> usize {
     while index < text.len() {
         let ch = text[index..]
@@ -2346,19 +2736,163 @@ fn extract_braced_text(text: &str, open_index: usize) -> Option<(&str, usize)> {
     None
 }
 
+fn parse_math_content(content: &str) -> Vec<MathNode> {
+    MathParser::new(content).parse_all()
+}
+
+struct MathParser<'a> {
+    input: &'a str,
+    index: usize,
+}
+
+impl<'a> MathParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input, index: 0 }
+    }
+
+    fn parse_all(&mut self) -> Vec<MathNode> {
+        self.parse_until(None)
+    }
+
+    fn parse_until(&mut self, end: Option<char>) -> Vec<MathNode> {
+        let mut nodes = Vec::new();
+
+        while let Some(ch) = self.peek_char() {
+            if Some(ch) == end {
+                let _ = self.take_char();
+                break;
+            }
+
+            if ch.is_whitespace() {
+                let _ = self.take_char();
+                continue;
+            }
+
+            match ch {
+                '^' => {
+                    let _ = self.take_char();
+                    if let Some(target) = self.parse_attachment() {
+                        nodes.push(MathNode::Superscript(Box::new(target)));
+                    }
+                }
+                '_' => {
+                    let _ = self.take_char();
+                    if let Some(target) = self.parse_attachment() {
+                        nodes.push(MathNode::Subscript(Box::new(target)));
+                    }
+                }
+                '{' => {
+                    let _ = self.take_char();
+                    nodes.push(MathNode::Group(self.parse_until(Some('}'))));
+                }
+                '\\' => {
+                    let _ = self.take_char();
+                    nodes.extend(self.parse_control_sequence());
+                }
+                _ => {
+                    let _ = self.take_char();
+                    nodes.push(MathNode::Ordinary(ch));
+                }
+            }
+        }
+
+        nodes
+    }
+
+    fn parse_attachment(&mut self) -> Option<MathNode> {
+        while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
+            let _ = self.take_char();
+        }
+
+        match self.peek_char()? {
+            '{' => {
+                let _ = self.take_char();
+                Some(MathNode::Group(self.parse_until(Some('}'))))
+            }
+            '\\' => {
+                let _ = self.take_char();
+                let mut nodes = self.parse_control_sequence();
+                if nodes.len() == 1 {
+                    Some(nodes.remove(0))
+                } else {
+                    Some(MathNode::Group(nodes))
+                }
+            }
+            ch => {
+                let _ = self.take_char();
+                Some(MathNode::Ordinary(ch))
+            }
+        }
+    }
+
+    fn parse_control_sequence(&mut self) -> Vec<MathNode> {
+        let Some(ch) = self.peek_char() else {
+            return vec![MathNode::Ordinary('\\')];
+        };
+
+        if ch.is_ascii_alphabetic() {
+            let mut name = String::new();
+            while let Some(next) = self.peek_char() {
+                if !next.is_ascii_alphabetic() {
+                    break;
+                }
+                name.push(next);
+                let _ = self.take_char();
+            }
+
+            if name == "frac" {
+                let numer = self.parse_required_group();
+                let denom = self.parse_required_group();
+                return vec![MathNode::Frac { numer, denom }];
+            }
+
+            return name.chars().map(MathNode::Ordinary).collect();
+        }
+
+        let symbol = self.take_char().expect("peek_char ensured a symbol exists");
+        vec![MathNode::Ordinary(symbol)]
+    }
+
+    fn parse_required_group(&mut self) -> Vec<MathNode> {
+        while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
+            let _ = self.take_char();
+        }
+
+        if self.peek_char() == Some('{') {
+            let _ = self.take_char();
+            self.parse_until(Some('}'))
+        } else {
+            self.parse_attachment().into_iter().collect()
+        }
+    }
+
+    fn peek_char(&self) -> Option<char> {
+        self.input[self.index..].chars().next()
+    }
+
+    fn take_char(&mut self) -> Option<char> {
+        let ch = self.peek_char()?;
+        self.index += ch.len_utf8();
+        Some(ch)
+    }
+}
+
 fn eof_line(source: &str) -> u32 {
     1 + source.bytes().filter(|byte| *byte == b'\n').count() as u32
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentNode, MinimalLatexParser, ParseError, ParsedDocument, Parser};
+    use super::{DocumentNode, MathNode, MinimalLatexParser, ParseError, ParsedDocument, Parser};
+    use std::collections::BTreeMap;
 
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
             document_class: "article".to_string(),
             package_count: 0,
             body: body.to_string(),
+            labels: BTreeMap::new(),
+            has_unresolved_refs: false,
         }
     }
 
@@ -2374,6 +2908,8 @@ mod tests {
                 document_class: "article".to_string(),
                 package_count: 0,
                 body: "Hello".to_string(),
+                labels: BTreeMap::new(),
+                has_unresolved_refs: false,
             }
         );
     }
@@ -2420,6 +2956,8 @@ mod tests {
                 document_class: "article".to_string(),
                 package_count: 0,
                 body: "AB".to_string(),
+                labels: BTreeMap::new(),
+                has_unresolved_refs: false,
             })
         );
     }
@@ -2566,6 +3104,39 @@ mod tests {
         assert_eq!(
             parse_document(r"\hbox{}").body_nodes(),
             vec![DocumentNode::HBox(vec![])]
+        );
+    }
+
+    #[test]
+    fn parses_inline_math_to_math_nodes() {
+        assert_eq!(
+            parse_document(r"$x^2$").body_nodes(),
+            vec![DocumentNode::InlineMath(vec![
+                MathNode::Ordinary('x'),
+                MathNode::Superscript(Box::new(MathNode::Ordinary('2'))),
+            ])]
+        );
+    }
+
+    #[test]
+    fn parses_display_math_to_math_nodes() {
+        assert_eq!(
+            parse_document(r"\[a_1\]").body_nodes(),
+            vec![DocumentNode::DisplayMath(vec![
+                MathNode::Ordinary('a'),
+                MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
+            ])]
+        );
+    }
+
+    #[test]
+    fn parses_frac_math_content() {
+        assert_eq!(
+            parse_document(r"$\frac{a}{b}$").body_nodes(),
+            vec![DocumentNode::InlineMath(vec![MathNode::Frac {
+                numer: vec![MathNode::Ordinary('a')],
+                denom: vec![MathNode::Ordinary('b')],
+            }])]
         );
     }
 
@@ -3177,5 +3748,47 @@ mod tests {
             .expect_err("parse should fail");
 
         assert_eq!(error, ParseError::UnclosedConditional { line: 3 });
+    }
+
+    #[test]
+    fn section_command_emits_numbered_title() {
+        let document = parse_document("\\section{Introduction}");
+
+        assert_eq!(document.body, "1 Introduction");
+    }
+
+    #[test]
+    fn subsection_command_uses_parent_section_number() {
+        let document = parse_document("\\section{Intro}\n\\subsection{Scope}");
+
+        assert_eq!(document.body, "1 Intro\n\n1.1 Scope");
+    }
+
+    #[test]
+    fn section_counters_reset_for_new_parent_sections() {
+        let document =
+            parse_document("\\section{One}\n\\subsection{A}\n\\section{Two}\n\\subsection{B}");
+
+        assert_eq!(document.body, "1 One\n\n1.1 A\n\n2 Two\n\n2.1 B");
+    }
+
+    #[test]
+    fn label_and_ref_resolve_within_same_file() {
+        let document = parse_document("\\section{Intro}\\label{sec:intro}\nSee \\ref{sec:intro}.");
+
+        assert_eq!(document.body, "1 Intro\n\nSee 1.");
+        assert_eq!(
+            document.labels,
+            BTreeMap::from([("sec:intro".to_string(), "1".to_string())])
+        );
+        assert!(!document.has_unresolved_refs);
+    }
+
+    #[test]
+    fn unresolved_ref_emits_placeholder() {
+        let document = parse_document("See \\ref{missing}.");
+
+        assert_eq!(document.body, "See ??.");
+        assert!(document.has_unresolved_refs);
     }
 }
