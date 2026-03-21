@@ -5,13 +5,14 @@ use ferritex_core::compilation::{
     CompilationJob, CompilationSnapshot, DocumentState, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
-use ferritex_core::font::TfmMetrics;
+use ferritex_core::font::{OpenTypeFont, TfmMetrics};
+use ferritex_core::font::api::OpenTypeWidthProvider;
 use ferritex_core::kernel::api::DimensionValue;
 use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
-use ferritex_core::pdf::PdfRenderer;
+use ferritex_core::pdf::{FontResource, PdfRenderer};
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
-use ferritex_core::typesetting::{MinimalTypesetter, TfmWidthProvider};
+use ferritex_core::typesetting::{MinimalTypesetter, TfmWidthProvider, TypesetDocument};
 
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::AssetBundleLoaderPort;
@@ -24,6 +25,12 @@ const CMR10_TFM_CANDIDATES: [&str; 4] = [
     "fonts/tfm/public/cm/cmr10.tfm",
     "texmf/cmr10.tfm",
     "cmr10.tfm",
+];
+const OPENTYPE_FONT_SEARCH_ROOTS: [&str; 4] = [
+    "texmf/fonts/truetype",
+    "fonts/truetype",
+    "texmf/fonts/opentype",
+    "fonts/opentype",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +53,11 @@ pub struct CompileJobService<'a> {
 struct LoadedSourceTree {
     source: String,
     document_state: DocumentState,
+}
+
+struct LoadedOpenTypeFont {
+    base_font: String,
+    font: OpenTypeFont,
 }
 
 impl<'a> CompileJobService<'a> {
@@ -211,19 +223,39 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
-        let typeset_document = if let Some(metrics) =
+        let (typeset_document, pdf_renderer) = if let Some(loaded_font) =
+            load_opentype_font(self.file_access_gate, options.asset_bundle.as_deref())
+        {
+            let provider = OpenTypeWidthProvider {
+                font: &loaded_font.font,
+                fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+            };
+            let typeset_document = self
+                .typesetter
+                .typeset_with_provider(&parsed_document, &provider);
+            let pdf_renderer = build_opentype_pdf_renderer(&loaded_font, &typeset_document)
+                .map(|font_resource| PdfRenderer::with_fonts(vec![font_resource]))
+                .unwrap_or_else(PdfRenderer::default);
+            (typeset_document, pdf_renderer)
+        } else if let Some(metrics) =
             load_cmr10_metrics(self.file_access_gate, options.asset_bundle.as_deref())
         {
             let provider = TfmWidthProvider {
                 metrics: &metrics,
                 fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
             };
-            self.typesetter
-                .typeset_with_provider(&parsed_document, &provider)
+            (
+                self.typesetter
+                    .typeset_with_provider(&parsed_document, &provider),
+                self.pdf_renderer.clone(),
+            )
         } else {
-            self.typesetter.typeset(&parsed_document)
+            (
+                self.typesetter.typeset(&parsed_document),
+                self.pdf_renderer.clone(),
+            )
         };
-        let pdf_document = self.pdf_renderer.render(&typeset_document);
+        let pdf_document = pdf_renderer.render(&typeset_document);
         let compilation_job = compilation_job(
             options.input_file.clone(),
             options.jobname.clone(),
@@ -810,6 +842,197 @@ fn load_cmr10_metrics(
     None
 }
 
+fn load_opentype_font(
+    file_access_gate: &dyn FileAccessGate,
+    asset_bundle_path: Option<&Path>,
+) -> Option<LoadedOpenTypeFont> {
+    let bundle_path = asset_bundle_path?;
+
+    for candidate in collect_ttf_candidates(bundle_path) {
+        if file_access_gate.check_read(&candidate) == PathAccessDecision::Denied {
+            tracing::warn!(
+                path = %candidate.display(),
+                "ttf access denied; falling back to other font paths"
+            );
+            continue;
+        }
+
+        let bytes = match file_access_gate.read_file(&candidate) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    %error,
+                    "failed to read TTF font; falling back to other font paths"
+                );
+                continue;
+            }
+        };
+
+        match OpenTypeFont::parse(&bytes) {
+            Ok(font) => {
+                let stem = candidate
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("FerritexOpenType");
+                return Some(LoadedOpenTypeFont {
+                    base_font: sanitize_pdf_font_name(stem),
+                    font,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    %error,
+                    "failed to parse TTF font; falling back to other font paths"
+                );
+            }
+        }
+    }
+
+    None
+}
+
+fn collect_ttf_candidates(bundle_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut visited = BTreeSet::new();
+
+    for root in OPENTYPE_FONT_SEARCH_ROOTS {
+        collect_ttf_candidates_in_dir(&bundle_path.join(root), &mut visited, &mut candidates);
+    }
+    collect_ttf_candidates_in_dir(bundle_path, &mut visited, &mut candidates);
+
+    candidates
+}
+
+fn collect_ttf_candidates_in_dir(
+    path: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    candidates: &mut Vec<PathBuf>,
+) {
+    let normalized = normalize_existing_path(path);
+    if !visited.insert(normalized.clone()) {
+        return;
+    }
+
+    if normalized.is_file() {
+        if is_ttf_path(&normalized) {
+            candidates.push(normalized);
+        }
+        return;
+    }
+    if !normalized.is_dir() {
+        return;
+    }
+
+    let Ok(read_dir) = std::fs::read_dir(&normalized) else {
+        return;
+    };
+    let mut entries = read_dir
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    for entry in entries {
+        if entry.is_dir() {
+            collect_ttf_candidates_in_dir(&entry, visited, candidates);
+        } else if is_ttf_path(&entry) {
+            candidates.push(entry);
+        }
+    }
+}
+
+fn is_ttf_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("ttf"))
+        .unwrap_or(false)
+}
+
+fn build_opentype_pdf_renderer(
+    loaded_font: &LoadedOpenTypeFont,
+    document: &TypesetDocument,
+) -> Option<FontResource> {
+    let mut used_characters = BTreeMap::new();
+    let mut used_glyph_ids = BTreeSet::new();
+
+    for page in &document.pages {
+        for line in &page.lines {
+            for codepoint in line.text.chars() {
+                let code = match u8::try_from(u32::from(codepoint)) {
+                    Ok(code) => code,
+                    Err(_) => continue,
+                };
+                let Some(glyph_id) = loaded_font.font.glyph_id(u32::from(codepoint)) else {
+                    continue;
+                };
+                used_characters.insert(code, codepoint);
+                used_glyph_ids.insert(glyph_id);
+            }
+        }
+    }
+
+    let (&first_char, &last_char) = match (
+        used_characters.keys().next(),
+        used_characters.keys().next_back(),
+    ) {
+        (Some(first_char), Some(last_char)) => (first_char, last_char),
+        _ => return None,
+    };
+
+    let widths = (first_char..=last_char)
+        .map(|code| {
+            let codepoint = char::from(code);
+            loaded_font
+                .font
+                .glyph_id(u32::from(codepoint))
+                .and_then(|glyph_id| loaded_font.font.advance_width(glyph_id))
+                .map(|advance_width| {
+                    u16::try_from(
+                        i64::from(advance_width) * 1000
+                            / i64::from(loaded_font.font.units_per_em()),
+                    )
+                    .expect("PDF width must fit in u16")
+                })
+                .unwrap_or(0)
+        })
+        .collect();
+    let to_unicode_map = used_characters
+        .into_iter()
+        .map(|(code, codepoint)| (u16::from(code), codepoint))
+        .collect();
+
+    Some(FontResource::EmbeddedTrueType {
+        base_font: format!("FerritexSubset+{}", loaded_font.base_font),
+        font_data: loaded_font.font.subset(&used_glyph_ids),
+        first_char,
+        last_char,
+        widths,
+        bbox: loaded_font.font.bounding_box(),
+        ascent: loaded_font.font.ascender(),
+        descent: loaded_font.font.descender(),
+        italic_angle: 0,
+        stem_v: 80,
+        cap_height: loaded_font.font.ascender(),
+        units_per_em: loaded_font.font.units_per_em(),
+        to_unicode_map: Some(to_unicode_map),
+    })
+}
+
+fn sanitize_pdf_font_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+
+    if sanitized.is_empty() {
+        "FerritexOpenType".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn resolve_input_path(
     base_dir: &Path,
     workspace_root: &Path,
@@ -1093,7 +1316,7 @@ fn diagnostic_for_nested_input_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -1101,6 +1324,7 @@ mod tests {
     use super::CompileJobService;
     use crate::ports::AssetBundleLoaderPort;
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
+    use ferritex_core::font::OpenTypeFont;
     use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
     use tempfile::tempdir;
 
@@ -1290,7 +1514,7 @@ mod tests {
     }
 
     fn read_pdf(path: &Path) -> String {
-        fs::read_to_string(path).expect("read output pdf")
+        String::from_utf8_lossy(&fs::read(path).expect("read output pdf")).into_owned()
     }
 
     fn build_test_tfm() -> Vec<u8> {
@@ -1324,6 +1548,302 @@ mod tests {
         data.extend_from_slice(&0i32.to_be_bytes());
 
         data
+    }
+
+    fn build_test_ttf() -> Vec<u8> {
+        let head = build_head_table(1000, 0, 1);
+        let hhea = build_hhea_table(800, -200, 200, 4);
+        let maxp = build_maxp_table(4);
+        let hmtx = build_hmtx_table(&[(500, 0), (550, 0), (600, 0), (650, 0)], &[]);
+        let cmap = build_cmap_table(
+            3,
+            1,
+            &[
+                TestCmapSegment {
+                    start_code: 32,
+                    end_code: 32,
+                    id_delta: 0,
+                    glyph_ids: &[1],
+                },
+                TestCmapSegment {
+                    start_code: 65,
+                    end_code: 66,
+                    id_delta: 0,
+                    glyph_ids: &[1, 2],
+                },
+            ],
+        );
+        let glyphs = build_default_glyphs(4);
+        let (loca, glyf) = build_glyph_tables(&glyphs, 1);
+
+        build_sfnt(
+            0x0001_0000,
+            &[
+                (*b"head", head),
+                (*b"hhea", hhea),
+                (*b"maxp", maxp),
+                (*b"hmtx", hmtx),
+                (*b"cmap", cmap),
+                (*b"loca", loca),
+                (*b"glyf", glyf),
+            ],
+        )
+    }
+
+    fn build_head_table(units_per_em: u16, flags: u16, index_to_loc_format: i16) -> Vec<u8> {
+        let mut data = vec![0; 54];
+        write_u32(&mut data, 0, 0x0001_0000);
+        write_u32(&mut data, 12, 0x5f0f_3cf5);
+        write_u16(&mut data, 16, flags);
+        write_u16(&mut data, 18, units_per_em);
+        write_i16(&mut data, 36, -50);
+        write_i16(&mut data, 38, -200);
+        write_i16(&mut data, 40, 1000);
+        write_i16(&mut data, 42, 800);
+        write_i16(&mut data, 50, index_to_loc_format);
+        data
+    }
+
+    fn build_hhea_table(
+        ascender: i16,
+        descender: i16,
+        line_gap: i16,
+        number_of_h_metrics: u16,
+    ) -> Vec<u8> {
+        let mut data = vec![0; 36];
+        write_u32(&mut data, 0, 0x0001_0000);
+        write_i16(&mut data, 4, ascender);
+        write_i16(&mut data, 6, descender);
+        write_i16(&mut data, 8, line_gap);
+        write_u16(&mut data, 34, number_of_h_metrics);
+        data
+    }
+
+    fn build_maxp_table(num_glyphs: u16) -> Vec<u8> {
+        let mut data = vec![0; 6];
+        write_u32(&mut data, 0, 0x0001_0000);
+        write_u16(&mut data, 4, num_glyphs);
+        data
+    }
+
+    fn build_hmtx_table(h_metrics: &[(u16, i16)], extra_lsbs: &[i16]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(h_metrics.len() * 4 + extra_lsbs.len() * 2);
+        for (advance_width, lsb) in h_metrics {
+            data.extend_from_slice(&advance_width.to_be_bytes());
+            data.extend_from_slice(&lsb.to_be_bytes());
+        }
+        for lsb in extra_lsbs {
+            data.extend_from_slice(&lsb.to_be_bytes());
+        }
+        data
+    }
+
+    fn build_default_glyphs(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|index| {
+                let mut glyph = vec![0; 10];
+                write_i16(&mut glyph, 0, if index == 0 { 0 } else { 1 });
+                write_i16(&mut glyph, 2, 0);
+                write_i16(&mut glyph, 4, 0);
+                write_i16(&mut glyph, 6, 50 + index as i16);
+                write_i16(&mut glyph, 8, 100 + index as i16);
+                glyph
+            })
+            .collect()
+    }
+
+    fn build_glyph_tables(glyphs: &[Vec<u8>], index_to_loc_format: i16) -> (Vec<u8>, Vec<u8>) {
+        let mut glyf = Vec::new();
+        let mut offsets = Vec::with_capacity(glyphs.len() + 1);
+
+        for glyph in glyphs {
+            offsets.push(u32::try_from(glyf.len()).expect("glyf offset"));
+            glyf.extend_from_slice(glyph);
+            if glyf.len() % 2 != 0 {
+                glyf.push(0);
+            }
+        }
+        offsets.push(u32::try_from(glyf.len()).expect("glyf offset"));
+
+        (build_loca_table(&offsets, index_to_loc_format), glyf)
+    }
+
+    fn build_loca_table(offsets: &[u32], index_to_loc_format: i16) -> Vec<u8> {
+        match index_to_loc_format {
+            0 => {
+                let mut data = Vec::with_capacity(offsets.len() * 2);
+                for offset in offsets {
+                    data.extend_from_slice(
+                        &u16::try_from(offset / 2)
+                            .expect("short loca offset")
+                            .to_be_bytes(),
+                    );
+                }
+                data
+            }
+            1 => {
+                let mut data = Vec::with_capacity(offsets.len() * 4);
+                for offset in offsets {
+                    data.extend_from_slice(&offset.to_be_bytes());
+                }
+                data
+            }
+            _ => panic!("unsupported indexToLocFormat"),
+        }
+    }
+
+    fn build_cmap_table(
+        platform_id: u16,
+        encoding_id: u16,
+        segments: &[TestCmapSegment<'_>],
+    ) -> Vec<u8> {
+        let format4 = build_cmap_format4(segments);
+
+        let mut data = Vec::with_capacity(12 + format4.len());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.extend_from_slice(&platform_id.to_be_bytes());
+        data.extend_from_slice(&encoding_id.to_be_bytes());
+        data.extend_from_slice(&12u32.to_be_bytes());
+        data.extend_from_slice(&format4);
+        data
+    }
+
+    fn build_cmap_format4(segments: &[TestCmapSegment<'_>]) -> Vec<u8> {
+        let mut all_segments = segments
+            .iter()
+            .map(|segment| TestCmapSegment {
+                start_code: segment.start_code,
+                end_code: segment.end_code,
+                id_delta: segment.id_delta,
+                glyph_ids: segment.glyph_ids,
+            })
+            .collect::<Vec<_>>();
+        all_segments.push(TestCmapSegment {
+            start_code: 0xffff,
+            end_code: 0xffff,
+            id_delta: 1,
+            glyph_ids: &[],
+        });
+
+        let seg_count = all_segments.len();
+        let mut end_codes = Vec::with_capacity(seg_count);
+        let mut start_codes = Vec::with_capacity(seg_count);
+        let mut id_deltas = Vec::with_capacity(seg_count);
+        let mut id_range_offsets = Vec::with_capacity(seg_count);
+        let mut glyph_id_array = Vec::new();
+
+        for (index, segment) in all_segments.iter().enumerate() {
+            if segment.glyph_ids.is_empty() {
+                id_range_offsets.push(0u16);
+            } else {
+                let offset_words = seg_count - index + glyph_id_array.len();
+                id_range_offsets.push(u16::try_from(offset_words * 2).expect("idRangeOffset"));
+                glyph_id_array.extend_from_slice(segment.glyph_ids);
+            }
+            end_codes.push(segment.end_code);
+            start_codes.push(segment.start_code);
+            id_deltas.push(segment.id_delta);
+        }
+
+        let seg_count_x2 = u16::try_from(seg_count * 2).expect("segCountX2");
+        let length = 16 + seg_count * 8 + glyph_id_array.len() * 2;
+        let mut data = Vec::with_capacity(length);
+        data.extend_from_slice(&4u16.to_be_bytes());
+        data.extend_from_slice(&u16::try_from(length).expect("format4 length").to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&seg_count_x2.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+
+        for value in end_codes {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        data.extend_from_slice(&0u16.to_be_bytes());
+        for value in start_codes {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in id_deltas {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in id_range_offsets {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in glyph_id_array {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+
+        data
+    }
+
+    fn build_sfnt(sf_version: u32, tables: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let directory_len = 12 + tables.len() * 16;
+        let mut offsets = Vec::with_capacity(tables.len());
+        let mut next_offset = directory_len;
+        for (_, table_data) in tables {
+            next_offset = align_to_four(next_offset);
+            offsets.push(next_offset);
+            next_offset += align_to_four(table_data.len());
+        }
+
+        let mut data = Vec::with_capacity(next_offset);
+        data.extend_from_slice(&sf_version.to_be_bytes());
+        data.extend_from_slice(&(u16::try_from(tables.len()).expect("table count")).to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+
+        for ((tag, table_data), offset) in tables.iter().zip(offsets.iter()) {
+            data.extend_from_slice(tag);
+            data.extend_from_slice(&0u32.to_be_bytes());
+            data.extend_from_slice(&u32::try_from(*offset).expect("table offset").to_be_bytes());
+            data.extend_from_slice(
+                &u32::try_from(table_data.len())
+                    .expect("table length")
+                    .to_be_bytes(),
+            );
+        }
+
+        let mut current_offset = directory_len;
+        for ((_, table_data), offset) in tables.iter().zip(offsets.iter()) {
+            while current_offset < *offset {
+                data.push(0);
+                current_offset += 1;
+            }
+            data.extend_from_slice(table_data);
+            current_offset += table_data.len();
+            while current_offset % 4 != 0 {
+                data.push(0);
+                current_offset += 1;
+            }
+        }
+
+        data
+    }
+
+    fn align_to_four(value: usize) -> usize {
+        (value + 3) & !3
+    }
+
+    fn write_u16(data: &mut [u8], offset: usize, value: u16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_i16(data: &mut [u8], offset: usize, value: i16) {
+        data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_u32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestCmapSegment<'a> {
+        start_code: u16,
+        end_code: u16,
+        id_delta: i16,
+        glyph_ids: &'a [u16],
     }
 
     #[test]
@@ -1458,6 +1978,66 @@ mod tests {
         assert_eq!(writes.len(), 1);
         let pdf = String::from_utf8_lossy(&writes[0].1);
         assert!(pdf.contains("AB"));
+    }
+
+    #[test]
+    fn embeds_truetype_font_with_tounicode_when_asset_bundle_contains_ttf() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
+        fs::create_dir_all(&font_dir).expect("create font dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(&input_file, document("AB")).expect("write input");
+        let font_bytes = build_test_ttf();
+        fs::write(font_dir.join("TestSans.ttf"), &font_bytes).expect("write font");
+
+        let mut options = runtime_options(input_file.clone(), output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+        let mut used_glyphs = BTreeSet::new();
+        used_glyphs.insert(1);
+        used_glyphs.insert(2);
+        let subset_len = OpenTypeFont::parse(&font_bytes)
+            .expect("parse font")
+            .subset(&used_glyphs)
+            .len();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("/Subtype /TrueType"));
+        assert!(pdf.contains("/ToUnicode"));
+        assert!(pdf.contains("/FontFile2"));
+        assert!(pdf.contains("/CMapName /Adobe-Identity-UCS"));
+        assert!(!pdf.contains("/BaseFont /Helvetica"));
+        assert!(subset_len < font_bytes.len());
+        assert!(pdf.contains(&format!("/Length1 {subset_len}")));
+    }
+
+    #[test]
+    fn falls_back_to_helvetica_when_asset_bundle_has_no_ttf() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        fs::create_dir_all(&bundle_path).expect("create bundle dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(&input_file, document("Hello")).expect("write input");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("/Subtype /Type1 /BaseFont /Helvetica"));
+        assert!(!pdf.contains("/Subtype /TrueType"));
     }
 
     #[test]

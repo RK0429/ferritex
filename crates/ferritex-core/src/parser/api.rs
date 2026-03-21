@@ -10,6 +10,11 @@ use super::{
 
 const MAX_CONSECUTIVE_MACRO_EXPANSIONS: usize = 1_000;
 const BODY_PAGE_BREAK_MARKER: char = '\u{E000}';
+const BODY_HBOX_START: char = '\u{E001}';
+const BODY_HBOX_END: char = '\u{E002}';
+const BODY_VBOX_START: char = '\u{E003}';
+const BODY_VBOX_END: char = '\u{E004}';
+const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedDocument {
@@ -32,28 +37,13 @@ pub enum DocumentNode {
     Text(String),
     ParBreak,
     PageBreak,
+    HBox(Vec<DocumentNode>),
+    VBox(Vec<DocumentNode>),
 }
 
 impl ParsedDocument {
     pub fn body_nodes(&self) -> Vec<DocumentNode> {
-        if self.body.trim().is_empty() {
-            return Vec::new();
-        }
-
-        let normalized_body = normalize_body_par_breaks(&self.body);
-        let segments = normalized_body
-            .split(BODY_PAGE_BREAK_MARKER)
-            .collect::<Vec<_>>();
-        let mut nodes = Vec::new();
-
-        for (index, segment) in segments.iter().enumerate() {
-            nodes.extend(body_text_nodes(segment));
-            if index + 1 < segments.len() {
-                nodes.push(DocumentNode::PageBreak);
-            }
-        }
-
-        nodes
+        body_nodes_from_text(&self.body)
     }
 }
 
@@ -483,6 +473,20 @@ impl<'a> ParserDriver<'a> {
                     "pagebreak" | "newpage" | "clearpage" => {
                         let _ = self.take_global_prefix();
                         self.body.push(BODY_PAGE_BREAK_MARKER);
+                    }
+                    "hbox" | "vbox" => {
+                        let _ = self.take_global_prefix();
+                        if let Some(tokens) = self.read_required_braced_tokens()? {
+                            let content = encode_body_markers_in_text(&tokens_to_text(&tokens));
+                            let (start_marker, end_marker) = if name == "hbox" {
+                                (BODY_HBOX_START, BODY_HBOX_END)
+                            } else {
+                                (BODY_VBOX_START, BODY_VBOX_END)
+                            };
+                            self.body.push(start_marker);
+                            self.body.push_str(&content);
+                            self.body.push(end_marker);
+                        }
                     }
                     "end" if self.read_environment_name()?.as_deref() == Some("document") => {
                         self.end_found = true;
@@ -2046,7 +2050,30 @@ fn normalize_body_par_breaks(body: &str) -> String {
     output
 }
 
-fn body_text_nodes(body: &str) -> Vec<DocumentNode> {
+fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let normalized_body = normalize_body_par_breaks(body);
+    let (body_with_placeholders, placeholders) =
+        replace_box_markers_with_placeholders(&normalized_body);
+    let segments = body_with_placeholders
+        .split(BODY_PAGE_BREAK_MARKER)
+        .collect::<Vec<_>>();
+    let mut nodes = Vec::new();
+
+    for (index, segment) in segments.iter().enumerate() {
+        nodes.extend(body_text_nodes(segment, &placeholders));
+        if index + 1 < segments.len() {
+            nodes.push(DocumentNode::PageBreak);
+        }
+    }
+
+    nodes
+}
+
+fn body_text_nodes(body: &str, placeholders: &[DocumentNode]) -> Vec<DocumentNode> {
     if body.trim().is_empty() {
         return Vec::new();
     }
@@ -2057,7 +2084,7 @@ fn body_text_nodes(body: &str) -> Vec<DocumentNode> {
 
     for line in body.split('\n') {
         if line.trim().is_empty() {
-            push_body_text_node(&mut nodes, &mut current_text);
+            push_body_text_node(&mut nodes, &mut current_text, placeholders);
             if !nodes.is_empty() && !in_break {
                 nodes.push(DocumentNode::ParBreak);
                 in_break = true;
@@ -2072,7 +2099,7 @@ fn body_text_nodes(body: &str) -> Vec<DocumentNode> {
         in_break = false;
     }
 
-    push_body_text_node(&mut nodes, &mut current_text);
+    push_body_text_node(&mut nodes, &mut current_text, placeholders);
     if matches!(nodes.last(), Some(DocumentNode::ParBreak)) {
         let _ = nodes.pop();
     }
@@ -2080,16 +2107,243 @@ fn body_text_nodes(body: &str) -> Vec<DocumentNode> {
     nodes
 }
 
-fn push_body_text_node(nodes: &mut Vec<DocumentNode>, current_text: &mut String) {
+fn replace_box_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNode>) {
+    let mut text = String::with_capacity(body.len());
+    let mut placeholders = Vec::new();
+    let mut index = 0;
+
+    while index < body.len() {
+        let ch = body[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+
+        match ch {
+            BODY_HBOX_START | BODY_VBOX_START => {
+                let (content, next_index) = extract_box_marker_content(body, index);
+                let placeholder = next_box_placeholder(placeholders.len());
+                let children = body_nodes_from_text(content);
+                let node = if ch == BODY_HBOX_START {
+                    DocumentNode::HBox(children)
+                } else {
+                    DocumentNode::VBox(children)
+                };
+                placeholders.push(node);
+                text.push(placeholder);
+                index = next_index;
+            }
+            _ => {
+                text.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+
+    (text, placeholders)
+}
+
+fn extract_box_marker_content(body: &str, start_index: usize) -> (&str, usize) {
+    let start_char = body[start_index..]
+        .chars()
+        .next()
+        .expect("box marker should exist at start index");
+    let content_start = start_index + start_char.len_utf8();
+    let mut index = content_start;
+    let mut depth = 1usize;
+
+    while index < body.len() {
+        let ch = body[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+
+        match ch {
+            BODY_HBOX_START | BODY_VBOX_START => depth += 1,
+            BODY_HBOX_END | BODY_VBOX_END => {
+                depth -= 1;
+                if depth == 0 {
+                    return (&body[content_start..index], index + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+
+        index += ch.len_utf8();
+    }
+
+    (&body[content_start..], body.len())
+}
+
+fn push_body_text_node(
+    nodes: &mut Vec<DocumentNode>,
+    current_text: &mut String,
+    placeholders: &[DocumentNode],
+) {
     if current_text.is_empty() {
         return;
     }
 
     let text = current_text.trim().to_string();
     current_text.clear();
-    if !text.is_empty() {
-        nodes.push(DocumentNode::Text(text));
+
+    if text.is_empty() {
+        return;
     }
+
+    let mut plain_text = String::new();
+    for ch in text.chars() {
+        if let Some(index) = box_placeholder_index(ch, placeholders.len()) {
+            if !plain_text.is_empty() {
+                nodes.push(DocumentNode::Text(std::mem::take(&mut plain_text)));
+            }
+            nodes.push(placeholders[index].clone());
+        } else {
+            plain_text.push(ch);
+        }
+    }
+
+    if !plain_text.is_empty() {
+        nodes.push(DocumentNode::Text(plain_text));
+    }
+}
+
+fn next_box_placeholder(index: usize) -> char {
+    char::from_u32(BODY_BOX_PLACEHOLDER_BASE + index as u32)
+        .expect("private-use placeholder codepoint should be valid")
+}
+
+fn box_placeholder_index(ch: char, placeholder_count: usize) -> Option<usize> {
+    let codepoint = ch as u32;
+    if codepoint < BODY_BOX_PLACEHOLDER_BASE {
+        return None;
+    }
+
+    let index = (codepoint - BODY_BOX_PLACEHOLDER_BASE) as usize;
+    (index < placeholder_count).then_some(index)
+}
+
+fn encode_body_markers_in_text(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    let mut index = 0;
+
+    while index < text.len() {
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+
+        if ch != '\\' {
+            encoded.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let command_start = index + ch.len_utf8();
+        let Some(next_char) = text[command_start..].chars().next() else {
+            encoded.push(ch);
+            break;
+        };
+
+        if !next_char.is_ascii_alphabetic() {
+            encoded.push(ch);
+            encoded.push(next_char);
+            index = command_start + next_char.len_utf8();
+            continue;
+        }
+
+        let mut command_end = command_start + next_char.len_utf8();
+        while command_end < text.len() {
+            let next = text[command_end..]
+                .chars()
+                .next()
+                .expect("valid UTF-8 slice should yield a char");
+            if !next.is_ascii_alphabetic() {
+                break;
+            }
+            command_end += next.len_utf8();
+        }
+
+        let command = &text[command_start..command_end];
+        match command {
+            "hbox" | "vbox" => {
+                let brace_start = skip_optional_command_whitespace(text, command_end);
+                if let Some((content, next_index)) = extract_braced_text(text, brace_start) {
+                    let encoded_content = encode_body_markers_in_text(content);
+                    let (start_marker, end_marker) = if command == "hbox" {
+                        (BODY_HBOX_START, BODY_HBOX_END)
+                    } else {
+                        (BODY_VBOX_START, BODY_VBOX_END)
+                    };
+                    encoded.push(start_marker);
+                    encoded.push_str(&encoded_content);
+                    encoded.push(end_marker);
+                    index = next_index;
+                    continue;
+                }
+
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
+            "pagebreak" | "newpage" | "clearpage" => {
+                encoded.push(BODY_PAGE_BREAK_MARKER);
+                index = command_end;
+            }
+            _ => {
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
+        }
+    }
+
+    encoded
+}
+
+fn skip_optional_command_whitespace(text: &str, mut index: usize) -> usize {
+    while index < text.len() {
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn extract_braced_text(text: &str, open_index: usize) -> Option<(&str, usize)> {
+    if open_index >= text.len() || !text[open_index..].starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut index = open_index;
+    let content_start = open_index + 1;
+
+    while index < text.len() {
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("valid UTF-8 slice should yield a char");
+
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&text[content_start..index], index + ch.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+
+        index += ch.len_utf8();
+    }
+
+    None
 }
 
 fn eof_line(source: &str) -> u32 {
@@ -2190,12 +2444,10 @@ mod tests {
         );
 
         assert!(output.document.is_none());
-        assert!(
-            output
-                .errors
-                .iter()
-                .any(|e| matches!(e, ParseError::UnclosedBrace { .. }))
-        );
+        assert!(output
+            .errors
+            .iter()
+            .any(|e| matches!(e, ParseError::UnclosedBrace { .. })));
     }
 
     #[test]
@@ -2276,6 +2528,44 @@ mod tests {
                 DocumentNode::PageBreak,
                 DocumentNode::Text("Second".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn hbox_parsed_to_hbox_node() {
+        assert_eq!(
+            parse_document(r"\hbox{hello}").body_nodes(),
+            vec![DocumentNode::HBox(vec![DocumentNode::Text(
+                "hello".to_string()
+            )])]
+        );
+    }
+
+    #[test]
+    fn vbox_parsed_to_vbox_node() {
+        assert_eq!(
+            parse_document(r"\vbox{hello}").body_nodes(),
+            vec![DocumentNode::VBox(vec![DocumentNode::Text(
+                "hello".to_string()
+            )])]
+        );
+    }
+
+    #[test]
+    fn nested_hbox_in_vbox() {
+        assert_eq!(
+            parse_document(r"\vbox{\hbox{inner}}").body_nodes(),
+            vec![DocumentNode::VBox(vec![DocumentNode::HBox(vec![
+                DocumentNode::Text("inner".to_string())
+            ])])]
+        );
+    }
+
+    #[test]
+    fn hbox_with_empty_content() {
+        assert_eq!(
+            parse_document(r"\hbox{}").body_nodes(),
+            vec![DocumentNode::HBox(vec![])]
         );
     }
 

@@ -39,6 +39,8 @@ pub enum FontResource {
         cap_height: i16,
         /// Units per em
         units_per_em: u16,
+        /// Optional char-code to Unicode mapping for searchable/selectable text
+        to_unicode_map: Option<Vec<(u16, char)>>,
     },
 }
 
@@ -201,11 +203,13 @@ fn build_font_objects(fonts: &[FontResource], start_object_id: usize) -> Vec<Fon
                 stem_v,
                 cap_height,
                 units_per_em: _,
+                to_unicode_map,
             } => {
                 let dictionary_object_id = next_object_id;
                 let descriptor_object_id = next_object_id + 1;
                 let font_file_object_id = next_object_id + 2;
-                next_object_id += 3;
+                let to_unicode_object_id = to_unicode_map.as_ref().map(|_| next_object_id + 3);
+                next_object_id += 3 + usize::from(to_unicode_object_id.is_some());
 
                 let mut font_file_object = format!(
                     "{font_file_object_id} 0 obj\n<< /Length {} /Length1 {} >>\nstream\n",
@@ -216,35 +220,54 @@ fn build_font_objects(fonts: &[FontResource], start_object_id: usize) -> Vec<Fon
                 font_file_object.extend_from_slice(font_data);
                 font_file_object.extend_from_slice(b"\nendstream\nendobj\n");
 
+                let to_unicode_reference = to_unicode_object_id
+                    .map(|object_id| format!(" /ToUnicode {object_id} 0 R"))
+                    .unwrap_or_default();
+                let mut objects = vec![
+                    format!(
+                        "{dictionary_object_id} 0 obj\n<< /Type /Font /Subtype /TrueType /BaseFont /{} /FirstChar {} /LastChar {} /Widths [{}] /FontDescriptor {} 0 R{} >>\nendobj\n",
+                        base_font,
+                        first_char,
+                        last_char,
+                        render_widths(widths),
+                        descriptor_object_id,
+                        to_unicode_reference
+                    )
+                    .into_bytes(),
+                    format!(
+                        "{descriptor_object_id} 0 obj\n<< /Type /FontDescriptor /FontName /{} /Flags 32 /FontBBox [{} {} {} {}] /Ascent {} /Descent {} /ItalicAngle {} /StemV {} /CapHeight {} /FontFile2 {} 0 R >>\nendobj\n",
+                        base_font,
+                        bbox[0],
+                        bbox[1],
+                        bbox[2],
+                        bbox[3],
+                        ascent,
+                        descent,
+                        italic_angle,
+                        stem_v,
+                        cap_height,
+                        font_file_object_id
+                    )
+                    .into_bytes(),
+                    font_file_object,
+                ];
+                if let (Some(object_id), Some(map)) =
+                    (to_unicode_object_id, to_unicode_map.as_ref())
+                {
+                    let cmap = build_to_unicode_cmap(map);
+                    objects.push(
+                        format!(
+                            "{object_id} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+                            cmap.len(),
+                            cmap
+                        )
+                        .into_bytes(),
+                    );
+                }
+
                 font_objects.push(FontObjectSet {
                     dictionary_object_id,
-                    objects: vec![
-                        format!(
-                            "{dictionary_object_id} 0 obj\n<< /Type /Font /Subtype /TrueType /BaseFont /{} /FirstChar {} /LastChar {} /Widths [{}] /FontDescriptor {} 0 R >>\nendobj\n",
-                            base_font,
-                            first_char,
-                            last_char,
-                            render_widths(widths),
-                            descriptor_object_id
-                        )
-                        .into_bytes(),
-                        format!(
-                            "{descriptor_object_id} 0 obj\n<< /Type /FontDescriptor /FontName /{} /Flags 32 /FontBBox [{} {} {} {}] /Ascent {} /Descent {} /ItalicAngle {} /StemV {} /CapHeight {} /FontFile2 {} 0 R >>\nendobj\n",
-                            base_font,
-                            bbox[0],
-                            bbox[1],
-                            bbox[2],
-                            bbox[3],
-                            ascent,
-                            descent,
-                            italic_angle,
-                            stem_v,
-                            cap_height,
-                            font_file_object_id
-                        )
-                        .into_bytes(),
-                        font_file_object,
-                    ],
+                    objects,
                 });
             }
         }
@@ -270,6 +293,36 @@ fn render_widths(widths: &[u16]) -> String {
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn build_to_unicode_cmap(mapping: &[(u16, char)]) -> String {
+    let mut map = mapping.to_vec();
+    map.sort_by_key(|(code, _)| *code);
+
+    let entries = map
+        .into_iter()
+        .filter(|(code, _)| *code <= 0xff)
+        .map(|(code, ch)| format!("<{code:02X}> <{}>", unicode_scalar_as_utf16_hex(ch)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let entry_count = if entries.is_empty() {
+        0
+    } else {
+        entries.lines().count()
+    };
+
+    format!(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<00> <FF>\nendcodespacerange\n{entry_count} beginbfchar\n{entries}\nendbfchar\nendcmap\nCMapVersion 1 def\nend\nend\n"
+    )
+}
+
+fn unicode_scalar_as_utf16_hex(value: char) -> String {
+    let mut buffer = [0u16; 2];
+    value
+        .encode_utf16(&mut buffer)
+        .iter()
+        .map(|unit| format!("{unit:04X}"))
+        .collect::<String>()
 }
 
 fn page_kids(page_count: usize, page_object_start: usize) -> String {
@@ -462,10 +515,46 @@ mod tests {
         assert!(content.contains("6 0 obj\n<< /Type /Font /Subtype /TrueType"));
     }
 
+    #[test]
+    fn emits_tounicode_cmap_for_embedded_truetype_fonts() {
+        let mut font = embedded_font_resource();
+        if let FontResource::EmbeddedTrueType { to_unicode_map, .. } = &mut font {
+            *to_unicode_map = Some(vec![(65, 'A'), (66, 'B')]);
+        }
+        let renderer = PdfRenderer::with_fonts(vec![font]);
+        let pdf = renderer.render(&single_page(&["AB"]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/ToUnicode 8 0 R"));
+        assert!(content.contains("/CMapName /Adobe-Identity-UCS"));
+        assert!(content.contains("<41> <0041>"));
+        assert!(content.contains("<42> <0042>"));
+    }
+
+    #[test]
+    fn renders_subsetted_font_stream_length() {
+        let original_font_data = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let subsetted_font_data = vec![0, 1, 2, 3];
+        let mut font = embedded_font_resource_with_data(original_font_data);
+        if let FontResource::EmbeddedTrueType { font_data, .. } = &mut font {
+            *font_data = subsetted_font_data.clone();
+        }
+        let renderer = PdfRenderer::with_fonts(vec![font]);
+        let pdf = renderer.render(&single_page(&["Hello"]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(subsetted_font_data.len() < 10);
+        assert!(content.contains("/Length1 4"));
+    }
+
     fn embedded_font_resource() -> FontResource {
+        embedded_font_resource_with_data(vec![1, 2, 3, 4, 5])
+    }
+
+    fn embedded_font_resource_with_data(font_data: Vec<u8>) -> FontResource {
         FontResource::EmbeddedTrueType {
             base_font: "DummySans".to_string(),
-            font_data: vec![1, 2, 3, 4, 5],
+            font_data,
             first_char: 32,
             last_char: 34,
             widths: vec![250, 300, 325],
@@ -476,6 +565,7 @@ mod tests {
             stem_v: 80,
             cap_height: 700,
             units_per_em: 1000,
+            to_unicode_map: None,
         }
     }
 }

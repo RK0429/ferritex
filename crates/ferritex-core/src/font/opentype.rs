@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use thiserror::Error;
 
 const SFNT_HEADER_LEN: usize = 12;
@@ -7,6 +9,7 @@ const OPENTYPE_CFF_MAGIC: u32 = 0x4f54_544f;
 const HEAD_MAGIC: u32 = 0x5f0f_3cf5;
 const HEAD_TABLE_LEN: usize = 54;
 const HHEA_TABLE_LEN: usize = 36;
+const MAXP_TABLE_MIN_LEN: usize = 6;
 const CMAP_HEADER_LEN: usize = 4;
 const CMAP_ENCODING_RECORD_LEN: usize = 8;
 const CMAP_FORMAT_4_HEADER_LEN: usize = 14;
@@ -31,6 +34,10 @@ pub struct HeadTable {
     pub units_per_em: u16,
     pub index_to_loc_format: i16,
     pub flags: u16,
+    pub x_min: i16,
+    pub y_min: i16,
+    pub x_max: i16,
+    pub y_max: i16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +46,11 @@ pub struct HheaTable {
     pub descender: i16,
     pub line_gap: i16,
     pub number_of_h_metrics: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaxpTable {
+    num_glyphs: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +105,13 @@ struct CmapTable {
     glyph_id_array: Vec<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlyphTable {
+    loca_record: TableRecord,
+    glyf_record: TableRecord,
+    loca_offsets: Vec<u32>,
+}
+
 impl CmapTable {
     fn lookup(&self, codepoint: u32) -> Option<u16> {
         let code = u16::try_from(codepoint).ok()?;
@@ -123,28 +142,47 @@ impl CmapTable {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenTypeFont {
+    sf_version: u32,
+    raw_data: Vec<u8>,
+    table_directory: TableDirectory,
     head: HeadTable,
     hhea: HheaTable,
+    maxp: MaxpTable,
     hmtx: HmtxTable,
     cmap: CmapTable,
+    glyph_table: Option<GlyphTable>,
 }
 
 impl OpenTypeFont {
     pub fn parse(data: &[u8]) -> Result<Self, OpenTypeError> {
         let table_directory = parse_table_directory(data)?;
+        let sf_version = read_u32(data, 0)?;
         let head = parse_head(table_directory.table_data(data, "head")?)?;
         let hhea = parse_hhea(table_directory.table_data(data, "hhea")?)?;
+        let maxp = parse_maxp(table_directory.table_data(data, "maxp")?)?;
         let hmtx = parse_hmtx(
             table_directory.table_data(data, "hmtx")?,
             hhea.number_of_h_metrics,
+            maxp.num_glyphs,
         )?;
         let cmap = parse_cmap(table_directory.table_data(data, "cmap")?)?;
+        let glyph_table = parse_glyph_table(
+            &table_directory,
+            data,
+            maxp.num_glyphs,
+            head.index_to_loc_format,
+        )?;
 
         Ok(Self {
+            sf_version,
+            raw_data: data.to_vec(),
+            table_directory,
             head,
             hhea,
+            maxp,
             hmtx,
             cmap,
+            glyph_table,
         })
     }
 
@@ -160,6 +198,10 @@ impl OpenTypeFont {
         self.head.units_per_em
     }
 
+    pub fn raw_data(&self) -> &[u8] {
+        &self.raw_data
+    }
+
     pub fn ascender(&self) -> i16 {
         self.hhea.ascender
     }
@@ -170,6 +212,59 @@ impl OpenTypeFont {
 
     pub fn line_gap(&self) -> i16 {
         self.hhea.line_gap
+    }
+
+    pub fn bounding_box(&self) -> [i16; 4] {
+        [
+            self.head.x_min,
+            self.head.y_min,
+            self.head.x_max,
+            self.head.y_max,
+        ]
+    }
+
+    pub fn subset(&self, used_glyph_ids: &BTreeSet<u16>) -> Vec<u8> {
+        self.try_subset(used_glyph_ids)
+            .unwrap_or_else(|_| self.raw_data.clone())
+    }
+
+    fn try_subset(&self, used_glyph_ids: &BTreeSet<u16>) -> Result<Vec<u8>, OpenTypeError> {
+        let glyph_table = match &self.glyph_table {
+            Some(glyph_table) => glyph_table,
+            None => return Ok(self.raw_data.clone()),
+        };
+
+        let glyf_data = self
+            .table_directory
+            .table_data(&self.raw_data, "glyf")
+            .expect("glyf table must exist when glyph data is parsed");
+        let (subset_glyf, subset_loca_offsets) =
+            build_subset_glyf(glyf_data, &glyph_table.loca_offsets, used_glyph_ids)?;
+        let subset_loca = build_loca_table(&subset_loca_offsets, self.head.index_to_loc_format)?;
+
+        let tables = self
+            .table_directory
+            .tables
+            .iter()
+            .map(|record| {
+                let data = if record.tag == *b"glyf" {
+                    subset_glyf.clone()
+                } else if record.tag == *b"loca" {
+                    subset_loca.clone()
+                } else {
+                    self.table_directory
+                        .table_data(
+                            &self.raw_data,
+                            std::str::from_utf8(&record.tag).expect("table tag must be ASCII"),
+                        )
+                        .expect("existing table must be readable")
+                        .to_vec()
+                };
+                (record.tag, data)
+            })
+            .collect::<Vec<_>>();
+
+        Ok(build_sfnt(self.sf_version, &tables))
     }
 }
 
@@ -187,15 +282,23 @@ struct TableDirectory {
 
 impl TableDirectory {
     fn table_data<'a>(&self, data: &'a [u8], tag: &str) -> Result<&'a [u8], OpenTypeError> {
+        let table = self.table_record(tag)?;
+        read_slice(data, table.offset, table.length)
+    }
+
+    fn table_record(&self, tag: &str) -> Result<&TableRecord, OpenTypeError> {
         let tag_bytes = tag_to_bytes(tag);
-        let table = self
-            .tables
+        self.tables
             .iter()
             .find(|record| record.tag == tag_bytes)
             .ok_or_else(|| OpenTypeError::TableNotFound {
                 tag: tag.to_string(),
-            })?;
-        read_slice(data, table.offset, table.length)
+            })
+    }
+
+    fn maybe_table_record(&self, tag: &str) -> Option<&TableRecord> {
+        let tag_bytes = tag_to_bytes(tag);
+        self.tables.iter().find(|record| record.tag == tag_bytes)
     }
 }
 
@@ -257,7 +360,24 @@ fn parse_head(data: &[u8]) -> Result<HeadTable, OpenTypeError> {
         flags: read_u16(data, 16)?,
         units_per_em,
         index_to_loc_format,
+        x_min: read_i16(data, 36)?,
+        y_min: read_i16(data, 38)?,
+        x_max: read_i16(data, 40)?,
+        y_max: read_i16(data, 42)?,
     })
+}
+
+fn parse_maxp(data: &[u8]) -> Result<MaxpTable, OpenTypeError> {
+    if data.len() < MAXP_TABLE_MIN_LEN {
+        return Err(OpenTypeError::Truncated);
+    }
+
+    let num_glyphs = read_u16(data, 4)?;
+    if num_glyphs == 0 {
+        return Err(invalid_table_data("maxp", "numGlyphs must be non-zero"));
+    }
+
+    Ok(MaxpTable { num_glyphs })
 }
 
 fn parse_hhea(data: &[u8]) -> Result<HheaTable, OpenTypeError> {
@@ -281,12 +401,22 @@ fn parse_hhea(data: &[u8]) -> Result<HheaTable, OpenTypeError> {
     })
 }
 
-fn parse_hmtx(data: &[u8], number_of_h_metrics: u16) -> Result<HmtxTable, OpenTypeError> {
+fn parse_hmtx(
+    data: &[u8],
+    number_of_h_metrics: u16,
+    num_glyphs: u16,
+) -> Result<HmtxTable, OpenTypeError> {
     let metric_count = usize::from(number_of_h_metrics);
     if metric_count == 0 {
         return Err(invalid_table_data(
             "hmtx",
             "numberOfHMetrics must be at least 1",
+        ));
+    }
+    if number_of_h_metrics > num_glyphs {
+        return Err(invalid_table_data(
+            "hmtx",
+            "numberOfHMetrics must not exceed numGlyphs",
         ));
     }
 
@@ -303,6 +433,17 @@ fn parse_hmtx(data: &[u8], number_of_h_metrics: u16) -> Result<HmtxTable, OpenTy
         .collect();
 
     let trailing_bytes = data.get(metrics_len..).ok_or(OpenTypeError::Truncated)?;
+    let expected_lsb_count = usize::from(num_glyphs - number_of_h_metrics);
+    if trailing_bytes.len() != expected_lsb_count * 2 {
+        return Err(invalid_table_data(
+            "hmtx",
+            format!(
+                "left side bearing count mismatch: expected {}, got {}",
+                expected_lsb_count,
+                trailing_bytes.len() / 2
+            ),
+        ));
+    }
     if trailing_bytes.len() % 2 != 0 {
         return Err(invalid_table_data(
             "hmtx",
@@ -319,6 +460,81 @@ fn parse_hmtx(data: &[u8], number_of_h_metrics: u16) -> Result<HmtxTable, OpenTy
         h_metrics,
         left_side_bearings,
     })
+}
+
+fn parse_glyph_table(
+    table_directory: &TableDirectory,
+    data: &[u8],
+    num_glyphs: u16,
+    index_to_loc_format: i16,
+) -> Result<Option<GlyphTable>, OpenTypeError> {
+    let Some(loca_record) = table_directory.maybe_table_record("loca").cloned() else {
+        return Ok(None);
+    };
+    let Some(glyf_record) = table_directory.maybe_table_record("glyf").cloned() else {
+        return Ok(None);
+    };
+
+    let loca_data = read_slice(data, loca_record.offset, loca_record.length)?;
+    let glyf_data = read_slice(data, glyf_record.offset, glyf_record.length)?;
+    let loca_offsets = parse_loca(loca_data, num_glyphs, index_to_loc_format, glyf_data.len())?;
+
+    Ok(Some(GlyphTable {
+        loca_record,
+        glyf_record,
+        loca_offsets,
+    }))
+}
+
+fn parse_loca(
+    data: &[u8],
+    num_glyphs: u16,
+    index_to_loc_format: i16,
+    glyf_len: usize,
+) -> Result<Vec<u32>, OpenTypeError> {
+    let entry_count = usize::from(num_glyphs) + 1;
+    let mut offsets = Vec::with_capacity(entry_count);
+    match index_to_loc_format {
+        0 => {
+            let entries = read_u16_vec(data, 0, entry_count)?;
+            offsets.extend(entries.into_iter().map(|value| u32::from(value) * 2));
+        }
+        1 => {
+            let bytes = read_slice(data, 0, entry_count * 4)?;
+            offsets.extend(
+                bytes
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
+            );
+        }
+        _ => {
+            return Err(invalid_table_data(
+                "loca",
+                format!("unsupported indexToLocFormat: {index_to_loc_format}"),
+            ));
+        }
+    }
+
+    for window in offsets.windows(2) {
+        if window[0] > window[1] {
+            return Err(invalid_table_data(
+                "loca",
+                "glyph offsets must be non-decreasing",
+            ));
+        }
+    }
+    if usize::try_from(*offsets.last().unwrap_or(&0))
+        .ok()
+        .unwrap_or(usize::MAX)
+        > glyf_len
+    {
+        return Err(invalid_table_data(
+            "loca",
+            "glyph offsets point outside the glyf table",
+        ));
+    }
+
+    Ok(offsets)
 }
 
 fn parse_cmap(data: &[u8]) -> Result<CmapTable, OpenTypeError> {
@@ -509,11 +725,168 @@ fn invalid_table_data(table: &'static str, description: impl Into<String>) -> Op
     }
 }
 
+fn build_subset_glyf(
+    glyf_data: &[u8],
+    loca_offsets: &[u32],
+    used_glyph_ids: &BTreeSet<u16>,
+) -> Result<(Vec<u8>, Vec<u32>), OpenTypeError> {
+    let mut retained_glyphs = used_glyph_ids.clone();
+    retained_glyphs.insert(0);
+
+    let mut subset_glyf = Vec::with_capacity(glyf_data.len());
+    let mut subset_loca_offsets = Vec::with_capacity(loca_offsets.len());
+
+    for glyph_index in 0..loca_offsets.len().saturating_sub(1) {
+        subset_loca_offsets
+            .push(u32::try_from(subset_glyf.len()).expect("subset glyf length must fit in u32"));
+
+        if !retained_glyphs
+            .contains(&u16::try_from(glyph_index).expect("glyph index must fit in u16"))
+        {
+            continue;
+        }
+
+        let start = usize::try_from(loca_offsets[glyph_index])
+            .map_err(|_| invalid_table_data("loca", "glyph offset overflow"))?;
+        let end = usize::try_from(loca_offsets[glyph_index + 1])
+            .map_err(|_| invalid_table_data("loca", "glyph offset overflow"))?;
+        subset_glyf.extend_from_slice(read_slice(glyf_data, start, end.saturating_sub(start))?);
+        if subset_glyf.len() % 2 != 0 {
+            subset_glyf.push(0);
+        }
+    }
+
+    subset_loca_offsets
+        .push(u32::try_from(subset_glyf.len()).expect("subset glyf length must fit in u32"));
+
+    Ok((subset_glyf, subset_loca_offsets))
+}
+
+fn build_loca_table(
+    loca_offsets: &[u32],
+    index_to_loc_format: i16,
+) -> Result<Vec<u8>, OpenTypeError> {
+    match index_to_loc_format {
+        0 => {
+            let mut data = Vec::with_capacity(loca_offsets.len() * 2);
+            for offset in loca_offsets {
+                if offset % 2 != 0 {
+                    return Err(invalid_table_data(
+                        "loca",
+                        "short loca offsets must be even",
+                    ));
+                }
+                let short_offset = u16::try_from(offset / 2).map_err(|_| {
+                    invalid_table_data("loca", "short loca offset exceeds u16 range")
+                })?;
+                data.extend_from_slice(&short_offset.to_be_bytes());
+            }
+            Ok(data)
+        }
+        1 => {
+            let mut data = Vec::with_capacity(loca_offsets.len() * 4);
+            for offset in loca_offsets {
+                data.extend_from_slice(&offset.to_be_bytes());
+            }
+            Ok(data)
+        }
+        _ => Err(invalid_table_data(
+            "loca",
+            format!("unsupported indexToLocFormat: {index_to_loc_format}"),
+        )),
+    }
+}
+
+fn build_sfnt(sf_version: u32, tables: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let directory_len = SFNT_HEADER_LEN + tables.len() * TABLE_RECORD_LEN;
+    let mut offsets = Vec::with_capacity(tables.len());
+    let mut next_offset = directory_len;
+    for (_, table_data) in tables {
+        next_offset = align_to_four(next_offset);
+        offsets.push(next_offset);
+        next_offset += align_to_four(table_data.len());
+    }
+
+    let mut data = Vec::with_capacity(next_offset);
+    data.extend_from_slice(&sf_version.to_be_bytes());
+    data.extend_from_slice(&(u16::try_from(tables.len()).expect("table count")).to_be_bytes());
+    data.extend_from_slice(&0u16.to_be_bytes());
+    data.extend_from_slice(&0u16.to_be_bytes());
+    data.extend_from_slice(&0u16.to_be_bytes());
+
+    for ((tag, table_data), offset) in tables.iter().zip(offsets.iter()) {
+        data.extend_from_slice(tag);
+        data.extend_from_slice(&table_checksum(table_data).to_be_bytes());
+        data.extend_from_slice(&u32::try_from(*offset).expect("table offset").to_be_bytes());
+        data.extend_from_slice(
+            &u32::try_from(table_data.len())
+                .expect("table length")
+                .to_be_bytes(),
+        );
+    }
+
+    let mut current_offset = directory_len;
+    for ((_, table_data), offset) in tables.iter().zip(offsets.iter()) {
+        while current_offset < *offset {
+            data.push(0);
+            current_offset += 1;
+        }
+        data.extend_from_slice(table_data);
+        current_offset += table_data.len();
+        while current_offset % 4 != 0 {
+            data.push(0);
+            current_offset += 1;
+        }
+    }
+
+    data
+}
+
+fn table_checksum(data: &[u8]) -> u32 {
+    let mut sum = 0u32;
+    let padded_len = align_to_four(data.len());
+    let mut buffer = vec![0u8; padded_len];
+    buffer[..data.len()].copy_from_slice(data);
+    for chunk in buffer.chunks_exact(4) {
+        sum = sum.wrapping_add(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    sum
+}
+
+fn align_to_four(value: usize) -> usize {
+    (value + 3) & !3
+}
+
+#[cfg(test)]
+fn write_u16(data: &mut [u8], offset: usize, value: u16) {
+    data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+fn write_i16(data: &mut [u8], offset: usize, value: i16) {
+    data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+fn write_u32(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::kernel::api::DimensionValue;
+    use crate::typesetting::api::CharWidthProvider;
+
+    use crate::font::api::OpenTypeWidthProvider;
+
     use super::{
-        parse_cmap, OpenTypeError, OpenTypeFont, HEAD_MAGIC, OPENTYPE_CFF_MAGIC, TRUETYPE_MAGIC,
+        build_loca_table, build_sfnt, parse_cmap, write_i16, write_u16, write_u32, OpenTypeError,
+        OpenTypeFont, HEAD_MAGIC, OPENTYPE_CFF_MAGIC, TRUETYPE_MAGIC,
     };
+
+    const SCALED_POINTS_PER_POINT: i64 = 65_536;
 
     #[test]
     fn parses_minimal_ttf_with_head_hhea_hmtx_cmap() {
@@ -545,6 +918,8 @@ mod tests {
         assert_eq!(font.ascender(), 800);
         assert_eq!(font.descender(), -200);
         assert_eq!(font.line_gap(), 200);
+        assert_eq!(font.bounding_box(), [-50, -200, 1000, 800]);
+        assert_eq!(font.raw_data(), data.as_slice());
     }
 
     #[test]
@@ -608,6 +983,81 @@ mod tests {
         assert_eq!(table.lookup(99), None);
     }
 
+    #[test]
+    fn opentype_width_provider_scales_character_widths() {
+        let data = build_test_font(TestFont {
+            sf_version: TRUETYPE_MAGIC,
+            units_per_em: 1000,
+            flags: 0,
+            index_to_loc_format: 1,
+            ascender: 800,
+            descender: -200,
+            line_gap: 200,
+            h_metrics: &[(400, 0), (250, 0), (500, 0)],
+            extra_lsbs: &[],
+            cmap_segments: &[
+                TestCmapSegment {
+                    start_code: 32,
+                    end_code: 32,
+                    id_delta: 0,
+                    glyph_ids: &[1],
+                },
+                TestCmapSegment {
+                    start_code: 65,
+                    end_code: 65,
+                    id_delta: 0,
+                    glyph_ids: &[2],
+                },
+            ],
+        });
+        let font = OpenTypeFont::parse(&data).expect("parse font");
+        let provider = OpenTypeWidthProvider {
+            font: &font,
+            fallback_width: DimensionValue(SCALED_POINTS_PER_POINT),
+        };
+
+        assert_eq!(provider.char_width('A'), DimensionValue(32_768));
+        assert_eq!(provider.space_width(), DimensionValue(16_384));
+        assert_eq!(
+            provider.char_width('Z'),
+            DimensionValue(SCALED_POINTS_PER_POINT)
+        );
+    }
+
+    #[test]
+    fn subsets_glyph_data_by_zeroing_unused_entries() {
+        let data = build_test_font(TestFont {
+            sf_version: TRUETYPE_MAGIC,
+            units_per_em: 1000,
+            flags: 0,
+            index_to_loc_format: 1,
+            ascender: 800,
+            descender: -200,
+            line_gap: 200,
+            h_metrics: &[(400, 0), (500, 0), (600, 0)],
+            extra_lsbs: &[],
+            cmap_segments: &[TestCmapSegment {
+                start_code: 65,
+                end_code: 66,
+                id_delta: 0,
+                glyph_ids: &[1, 2],
+            }],
+        });
+        let font = OpenTypeFont::parse(&data).expect("parse font");
+        let mut used_glyph_ids = BTreeSet::new();
+        used_glyph_ids.insert(2);
+
+        let subset = font.subset(&used_glyph_ids);
+        let subset_font = OpenTypeFont::parse(&subset).expect("parse subset");
+        let glyph_table = subset_font
+            .glyph_table
+            .as_ref()
+            .expect("subset glyph table should exist");
+
+        assert!(subset.len() < data.len());
+        assert_eq!(glyph_table.loca_offsets, vec![0, 10, 10, 20]);
+    }
+
     struct TestFont<'a> {
         sf_version: u32,
         units_per_em: u16,
@@ -629,6 +1079,7 @@ mod tests {
     }
 
     fn build_test_font(config: TestFont<'_>) -> Vec<u8> {
+        let glyph_count = config.h_metrics.len() + config.extra_lsbs.len();
         let head = build_head_table(
             config.units_per_em,
             config.flags,
@@ -640,63 +1091,24 @@ mod tests {
             config.line_gap,
             u16::try_from(config.h_metrics.len()).expect("h_metrics length"),
         );
+        let maxp = build_maxp_table(u16::try_from(glyph_count).expect("glyph count"));
         let hmtx = build_hmtx_table(config.h_metrics, config.extra_lsbs);
         let cmap = build_cmap_table(3, 1, config.cmap_segments);
+        let glyphs = build_default_glyphs(glyph_count);
+        let (loca, glyf) = build_glyph_tables(&glyphs, config.index_to_loc_format);
 
         build_sfnt(
             config.sf_version,
             &[
-                ("head", head),
-                ("hhea", hhea),
-                ("hmtx", hmtx),
-                ("cmap", cmap),
+                (*b"head", head),
+                (*b"hhea", hhea),
+                (*b"maxp", maxp),
+                (*b"hmtx", hmtx),
+                (*b"cmap", cmap),
+                (*b"loca", loca),
+                (*b"glyf", glyf),
             ],
         )
-    }
-
-    fn build_sfnt(sf_version: u32, tables: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let directory_len = 12 + tables.len() * 16;
-        let mut offsets = Vec::with_capacity(tables.len());
-        let mut next_offset = directory_len;
-        for (_, table_data) in tables {
-            next_offset = align_to_four(next_offset);
-            offsets.push(next_offset);
-            next_offset += align_to_four(table_data.len());
-        }
-
-        let mut data = Vec::with_capacity(next_offset);
-        data.extend_from_slice(&sf_version.to_be_bytes());
-        data.extend_from_slice(&(u16::try_from(tables.len()).expect("table count")).to_be_bytes());
-        data.extend_from_slice(&0u16.to_be_bytes());
-        data.extend_from_slice(&0u16.to_be_bytes());
-        data.extend_from_slice(&0u16.to_be_bytes());
-
-        for ((tag, table_data), offset) in tables.iter().zip(offsets.iter()) {
-            data.extend_from_slice(tag.as_bytes());
-            data.extend_from_slice(&0u32.to_be_bytes());
-            data.extend_from_slice(&u32::try_from(*offset).expect("table offset").to_be_bytes());
-            data.extend_from_slice(
-                &u32::try_from(table_data.len())
-                    .expect("table length")
-                    .to_be_bytes(),
-            );
-        }
-
-        let mut current_offset = directory_len;
-        for ((_, table_data), offset) in tables.iter().zip(offsets.iter()) {
-            while current_offset < *offset {
-                data.push(0);
-                current_offset += 1;
-            }
-            data.extend_from_slice(table_data);
-            current_offset += table_data.len();
-            while current_offset % 4 != 0 {
-                data.push(0);
-                current_offset += 1;
-            }
-        }
-
-        data
     }
 
     fn build_head_table(units_per_em: u16, flags: u16, index_to_loc_format: i16) -> Vec<u8> {
@@ -705,7 +1117,18 @@ mod tests {
         write_u32(&mut data, 12, HEAD_MAGIC);
         write_u16(&mut data, 16, flags);
         write_u16(&mut data, 18, units_per_em);
+        write_i16(&mut data, 36, -50);
+        write_i16(&mut data, 38, -200);
+        write_i16(&mut data, 40, 1000);
+        write_i16(&mut data, 42, 800);
         write_i16(&mut data, 50, index_to_loc_format);
+        data
+    }
+
+    fn build_maxp_table(num_glyphs: u16) -> Vec<u8> {
+        let mut data = vec![0; 6];
+        write_u32(&mut data, 0, 0x0001_0000);
+        write_u16(&mut data, 4, num_glyphs);
         data
     }
 
@@ -734,6 +1157,39 @@ mod tests {
             data.extend_from_slice(&lsb.to_be_bytes());
         }
         data
+    }
+
+    fn build_default_glyphs(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|index| {
+                let mut glyph = vec![0; 10];
+                write_i16(&mut glyph, 0, if index == 0 { 0 } else { 1 });
+                write_i16(&mut glyph, 2, 0);
+                write_i16(&mut glyph, 4, 0);
+                write_i16(&mut glyph, 6, 50 + index as i16);
+                write_i16(&mut glyph, 8, 100 + index as i16);
+                glyph
+            })
+            .collect()
+    }
+
+    fn build_glyph_tables(glyphs: &[Vec<u8>], index_to_loc_format: i16) -> (Vec<u8>, Vec<u8>) {
+        let mut glyf = Vec::new();
+        let mut offsets = Vec::with_capacity(glyphs.len() + 1);
+
+        for glyph in glyphs {
+            offsets.push(u32::try_from(glyf.len()).expect("glyf offset"));
+            glyf.extend_from_slice(glyph);
+            if glyf.len() % 2 != 0 {
+                glyf.push(0);
+            }
+        }
+        offsets.push(u32::try_from(glyf.len()).expect("glyf offset"));
+
+        (
+            build_loca_table(&offsets, index_to_loc_format).expect("build loca"),
+            glyf,
+        )
     }
 
     fn build_cmap_table(
@@ -824,21 +1280,5 @@ mod tests {
         }
 
         data
-    }
-
-    fn align_to_four(value: usize) -> usize {
-        (value + 3) & !3
-    }
-
-    fn write_u16(data: &mut [u8], offset: usize, value: u16) {
-        data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
-    }
-
-    fn write_i16(data: &mut [u8], offset: usize, value: i16) {
-        data[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
-    }
-
-    fn write_u32(data: &mut [u8], offset: usize, value: u32) {
-        data[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
 }

@@ -1,5 +1,5 @@
 use super::{
-    hyphenation::{Hyphenator, SimpleHyphenator},
+    hyphenation::{Hyphenator, TexPatternHyphenator},
     knuth_plass::BreakParams,
     line_breaker,
 };
@@ -197,7 +197,7 @@ impl MinimalTypesetter {
         let page_box = page_box_for_class(&document.document_class);
         let nodes = document.body_nodes();
         let params = break_params_for_provider(provider);
-        let hyphenator = SimpleHyphenator;
+        let hyphenator = TexPatternHyphenator::english();
         let vlist =
             document_nodes_to_vlist_with_config(&nodes, provider, Some(&hyphenator), &params);
         let pages = paginate_vlist(&vlist, &page_box);
@@ -312,6 +312,21 @@ fn document_nodes_to_hlist_with_config(
                         }
                     }
                 }
+            }
+            DocumentNode::HBox(children) | DocumentNode::VBox(children) => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+                hlist.extend(document_nodes_to_hlist_with_config(
+                    children,
+                    provider,
+                    hyphenator,
+                    hyphen_penalty,
+                ));
             }
             DocumentNode::ParBreak => {
                 flush_word(
@@ -471,6 +486,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
     let mut pages = Vec::new();
     let mut current_page = Vec::new();
     let mut current_height = DimensionValue::zero();
+    let mut best_break_candidate: Option<VListBreakCandidate> = None;
 
     for item in vlist {
         if matches!(
@@ -480,18 +496,37 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
             pages.push(typeset_page_from_vlist(&current_page, page_box));
             current_page.clear();
             current_height = DimensionValue::zero();
+            best_break_candidate = None;
             continue;
         }
 
         let item_height = vlist_item_height(item);
         if !current_page.is_empty() && current_height + item_height > content_height {
-            pages.push(typeset_page_from_vlist(&current_page, page_box));
-            current_page.clear();
-            current_height = DimensionValue::zero();
+            if let Some(candidate) = best_break_candidate {
+                let trailing_items = current_page.split_off(candidate.split_after);
+                pages.push(typeset_page_from_vlist(&current_page, page_box));
+                current_page = trailing_items;
+                current_height = vlist_total_height(&current_page);
+                best_break_candidate = find_best_break_candidate(&current_page);
+            } else {
+                pages.push(typeset_page_from_vlist(&current_page, page_box));
+                current_page.clear();
+                current_height = DimensionValue::zero();
+            }
+
+            if !current_page.is_empty() && current_height + item_height > content_height {
+                pages.push(typeset_page_from_vlist(&current_page, page_box));
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                best_break_candidate = None;
+            }
         }
 
         current_page.push(item.clone());
         current_height = current_height + item_height;
+        if let VListItem::Penalty { value } = item {
+            maybe_record_break_candidate(&mut best_break_candidate, current_page.len(), *value);
+        }
     }
 
     if current_page.is_empty() && !pages.is_empty() {
@@ -500,6 +535,50 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
 
     pages.push(typeset_page_from_vlist(&current_page, page_box));
     pages
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VListBreakCandidate {
+    split_after: usize,
+    penalty: i32,
+}
+
+fn maybe_record_break_candidate(
+    candidate: &mut Option<VListBreakCandidate>,
+    split_after: usize,
+    penalty: i32,
+) {
+    if penalty <= PENALTY_FORCED || penalty >= PENALTY_FORBIDDEN {
+        return;
+    }
+
+    let next_candidate = VListBreakCandidate {
+        split_after,
+        penalty,
+    };
+
+    if candidate.is_none_or(|current| {
+        penalty < current.penalty
+            || (penalty == current.penalty && split_after > current.split_after)
+    }) {
+        *candidate = Some(next_candidate);
+    }
+}
+
+fn find_best_break_candidate(items: &[VListItem]) -> Option<VListBreakCandidate> {
+    let mut candidate = None;
+    for (index, item) in items.iter().enumerate() {
+        if let VListItem::Penalty { value } = item {
+            maybe_record_break_candidate(&mut candidate, index + 1, *value);
+        }
+    }
+    candidate
+}
+
+fn vlist_total_height(items: &[VListItem]) -> DimensionValue {
+    items.iter().fold(DimensionValue::zero(), |height, item| {
+        height + vlist_item_height(item)
+    })
 }
 
 fn vlist_item_height(item: &VListItem) -> DimensionValue {
@@ -813,17 +892,17 @@ fn points(value: i64) -> DimensionValue {
 mod tests {
     use super::{
         default_fixed_width_provider, document_nodes_to_hlist,
-        document_nodes_to_hlist_with_hyphenation, page_box_for_class, paginate_vlist, points,
-        vlist_item_height, wrap_body, wrap_hlist, CharWidthProvider, GlueComponent, GlueOrder,
-        HBox, HListItem, MinimalTypesetter, TeXBox, TextLine, TfmWidthProvider, VBox, VListItem,
-        LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORCED,
-        TOP_MARGIN_PT,
+        document_nodes_to_hlist_with_hyphenation, document_nodes_to_vlist_with_config,
+        page_box_for_class, paginate_vlist, points, vlist_item_height, wrap_body, wrap_hlist,
+        CharWidthProvider, GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, TeXBox,
+        TextLine, TfmWidthProvider, VBox, VListItem, LINE_HEIGHT_PT, MAX_LINE_CHARS,
+        MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::font::api::TfmMetrics;
     use crate::kernel::api::DimensionValue;
     use crate::parser::api::{DocumentNode, MinimalLatexParser, ParsedDocument, Parser};
     use crate::typesetting::{
-        hyphenation::SimpleHyphenator, knuth_plass::BreakParams, line_breaker,
+        hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
     };
 
     fn parsed_document(body: &str) -> ParsedDocument {
@@ -982,6 +1061,59 @@ mod tests {
     }
 
     #[test]
+    fn penalty_candidate_is_used_when_page_overflows() {
+        let mut vlist = (1..=34)
+            .map(|index| VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                content: format!("Line {index}"),
+            })
+            .collect::<Vec<_>>();
+        vlist.push(VListItem::Penalty { value: 50 });
+        vlist.extend((35..=37).map(|index| VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: format!("Line {index}"),
+        }));
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].lines.len(), 34);
+        assert_eq!(pages[0].lines[33].text, "Line 34");
+        assert_eq!(
+            pages[1]
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Line 35", "Line 36", "Line 37"]
+        );
+    }
+
+    #[test]
+    fn forbidden_penalty_is_not_used_as_page_break_candidate() {
+        let mut vlist = (1..=34)
+            .map(|index| VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                content: format!("Line {index}"),
+            })
+            .collect::<Vec<_>>();
+        vlist.push(VListItem::Penalty {
+            value: PENALTY_FORBIDDEN,
+        });
+        vlist.extend((35..=37).map(|index| VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: format!("Line {index}"),
+        }));
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].lines.len(), 36);
+        assert_eq!(pages[1].lines.len(), 1);
+        assert_eq!(pages[1].lines[0].text, "Line 37");
+    }
+
+    #[test]
     fn tex_box_zero_has_all_zero_dimensions() {
         assert_eq!(
             TeXBox::zero(),
@@ -1131,10 +1263,11 @@ mod tests {
 
     #[test]
     fn document_nodes_to_hlist_with_hyphenation_inserts_penalties_inside_words() {
+        let hyphenator = TexPatternHyphenator::english();
         let hlist = document_nodes_to_hlist_with_hyphenation(
             &[DocumentNode::Text("basket".to_string())],
             &default_fixed_width_provider(),
-            &SimpleHyphenator,
+            &hyphenator,
         );
 
         assert_eq!(
@@ -1212,13 +1345,14 @@ mod tests {
     fn hyphenation_changes_line_break_output_for_long_word() {
         let nodes = parsed_document("basket").body_nodes();
         let provider = default_fixed_width_provider();
+        let hyphenator = TexPatternHyphenator::english();
         let params = BreakParams {
             line_width: points(3),
             ..BreakParams::default()
         };
         let plain_hlist = document_nodes_to_hlist(&nodes, &provider);
         let hyphenated_hlist =
-            document_nodes_to_hlist_with_hyphenation(&nodes, &provider, &SimpleHyphenator);
+            document_nodes_to_hlist_with_hyphenation(&nodes, &provider, &hyphenator);
 
         assert_eq!(
             line_breaker::break_paragraph(&plain_hlist, &params),
@@ -1234,19 +1368,48 @@ mod tests {
     fn short_word_wrapping_is_unchanged_with_hyphenation_enabled() {
         let nodes = parsed_document("ship yard").body_nodes();
         let provider = default_fixed_width_provider();
+        let hyphenator = TexPatternHyphenator::english();
         let params = BreakParams {
             line_width: points(9),
             ..BreakParams::default()
         };
         let plain_hlist = document_nodes_to_hlist(&nodes, &provider);
         let hyphenated_hlist =
-            document_nodes_to_hlist_with_hyphenation(&nodes, &provider, &SimpleHyphenator);
+            document_nodes_to_hlist_with_hyphenation(&nodes, &provider, &hyphenator);
 
         assert_eq!(hyphenated_hlist, plain_hlist);
         assert_eq!(
             line_breaker::break_paragraph(&hyphenated_hlist, &params),
             line_breaker::break_paragraph(&plain_hlist, &params)
         );
+    }
+
+    #[test]
+    fn minimal_typesetter_uses_tex_pattern_hyphenation_by_default() {
+        let body = "basket".repeat(12);
+        let parsed = parsed_document(&body);
+        let document = MinimalTypesetter.typeset(&parsed);
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let nodes = parsed.body_nodes();
+        let plain_vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params);
+        let plain_document = super::TypesetDocument {
+            pages: paginate_vlist(&plain_vlist, &page_box_for_class(&parsed.document_class)),
+        };
+        let hyphenated_lines = document.pages[0]
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        let plain_lines = plain_document.pages[0]
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_ne!(hyphenated_lines, plain_lines);
+        assert!(hyphenated_lines.iter().any(|line| line.ends_with('-')));
+        assert!(plain_lines.iter().all(|line| !line.ends_with('-')));
     }
 
     #[test]
@@ -1380,6 +1543,45 @@ mod tests {
         assert_eq!(document.pages.len(), 2);
         assert_eq!(document.pages[0].lines[0].text, "First");
         assert_eq!(document.pages[1].lines[0].text, "Second");
+    }
+
+    #[test]
+    fn hbox_content_appears_in_typeset_output() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(r"\hbox{hello}"));
+
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(
+            document.pages[0]
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hello"]
+        );
+    }
+
+    #[test]
+    fn vbox_content_appears_in_typeset_output() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(r"\vbox{content}"));
+
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(
+            document.pages[0]
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["content"]
+        );
+    }
+
+    #[test]
+    fn hbox_in_paragraph_flows_inline() {
+        let document =
+            MinimalTypesetter.typeset(&parsed_latex_document(r"Before \hbox{middle} after"));
+
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.pages[0].lines[0].text, "Before middle after");
     }
 
     #[test]
