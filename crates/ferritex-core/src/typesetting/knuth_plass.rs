@@ -291,6 +291,9 @@ fn adjustment_feasibility(
     };
 
     if adjustment <= 0 {
+        if line_delta > 0 {
+            return (false, MAX_BADNESS / 2);
+        }
         return (false, MAX_BADNESS);
     }
 

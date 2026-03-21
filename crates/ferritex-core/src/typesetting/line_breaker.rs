@@ -1,7 +1,7 @@
 use crate::kernel::api::DimensionValue;
 
 use super::{
-    api::{HListItem, PENALTY_FORCED},
+    api::{HListItem, PENALTY_FORBIDDEN, PENALTY_FORCED},
     knuth_plass::{self, BreakParams},
 };
 
@@ -16,16 +16,33 @@ pub fn break_paragraph(hlist: &[HListItem], params: &BreakParams) -> Vec<String>
 
     for break_index in breakpoints {
         let line_end = visible_break_end(hlist, line_start, break_index);
-        push_segment_lines(&mut lines, &hlist[line_start..line_end], params.line_width);
+        push_segment_lines(
+            &mut lines,
+            &hlist[line_start..line_end],
+            params.line_width,
+            is_discretionary_hyphen_break(hlist, break_index),
+        );
         line_start = skip_line_start(hlist, break_index + 1);
     }
 
     let tail_end = trim_visible_end(hlist, line_start, hlist.len());
     if line_start < tail_end {
-        push_segment_lines(&mut lines, &hlist[line_start..tail_end], params.line_width);
+        push_segment_lines(
+            &mut lines,
+            &hlist[line_start..tail_end],
+            params.line_width,
+            false,
+        );
     }
 
     lines
+}
+
+fn is_discretionary_hyphen_break(hlist: &[HListItem], break_index: usize) -> bool {
+    matches!(
+        hlist.get(break_index),
+        Some(HListItem::Penalty { value }) if *value > 0 && *value < PENALTY_FORBIDDEN
+    )
 }
 
 fn visible_break_end(hlist: &[HListItem], line_start: usize, break_index: usize) -> usize {
@@ -61,7 +78,14 @@ fn skip_line_start(hlist: &[HListItem], mut index: usize) -> usize {
     index
 }
 
-fn push_segment_lines(lines: &mut Vec<String>, segment: &[HListItem], line_width: DimensionValue) {
+fn push_segment_lines(
+    lines: &mut Vec<String>,
+    segment: &[HListItem],
+    line_width: DimensionValue,
+    append_hyphen: bool,
+) {
+    let initial_len = lines.len();
+
     if segment.is_empty() {
         lines.push(String::new());
         return;
@@ -73,10 +97,18 @@ fn push_segment_lines(lines: &mut Vec<String>, segment: &[HListItem], line_width
         || segment_width(segment) <= line_width
     {
         lines.push(render_text(segment));
-        return;
+    } else {
+        push_unbreakable_lines(lines, segment, line_width);
     }
 
-    push_unbreakable_lines(lines, segment, line_width);
+    if append_hyphen && lines.len() > initial_len {
+        let last_index = lines.len() - 1;
+        if let Some(line) = lines.get_mut(last_index) {
+            if !line.is_empty() {
+                line.push('-');
+            }
+        }
+    }
 }
 
 fn segment_width(segment: &[HListItem]) -> DimensionValue {
@@ -257,6 +289,39 @@ mod tests {
         );
 
         assert_eq!(break_paragraph(&hlist, &params(100)), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn discretionary_penalty_appends_visible_hyphen() {
+        let hlist = vec![
+            HListItem::Char {
+                codepoint: 'b',
+                width: dim(10),
+            },
+            HListItem::Char {
+                codepoint: 'a',
+                width: dim(10),
+            },
+            HListItem::Char {
+                codepoint: 's',
+                width: dim(10),
+            },
+            HListItem::Penalty { value: 50 },
+            HListItem::Char {
+                codepoint: 'k',
+                width: dim(10),
+            },
+            HListItem::Char {
+                codepoint: 'e',
+                width: dim(10),
+            },
+            HListItem::Char {
+                codepoint: 't',
+                width: dim(10),
+            },
+        ];
+
+        assert_eq!(break_paragraph(&hlist, &params(35)), vec!["bas-", "ket"]);
     }
 
     #[test]

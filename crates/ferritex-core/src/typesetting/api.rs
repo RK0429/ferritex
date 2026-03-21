@@ -1,4 +1,8 @@
-use super::{knuth_plass::BreakParams, line_breaker};
+use super::{
+    hyphenation::{Hyphenator, SimpleHyphenator},
+    knuth_plass::BreakParams,
+    line_breaker,
+};
 
 use crate::font::api::TfmMetrics;
 use crate::kernel::api::DimensionValue;
@@ -37,6 +41,35 @@ pub struct TypesetPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypesetDocument {
     pub pages: Vec<TypesetPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeXBox {
+    pub width: DimensionValue,
+    pub height: DimensionValue,
+    pub depth: DimensionValue,
+}
+
+impl TeXBox {
+    pub const fn zero() -> Self {
+        Self::new(
+            DimensionValue::zero(),
+            DimensionValue::zero(),
+            DimensionValue::zero(),
+        )
+    }
+
+    pub const fn with_height(height: DimensionValue) -> Self {
+        Self::new(DimensionValue::zero(), height, DimensionValue::zero())
+    }
+
+    pub const fn new(width: DimensionValue, height: DimensionValue, depth: DimensionValue) -> Self {
+        Self {
+            width,
+            height,
+            depth,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -84,17 +117,21 @@ pub enum HListItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VListItem {
-    Box {
-        content: String,
-        height: DimensionValue,
-        depth: DimensionValue,
-    },
-    Glue {
-        height: DimensionValue,
-    },
-    Penalty {
-        value: i32,
-    },
+    Box { tex_box: TeXBox, content: String },
+    Glue { height: DimensionValue },
+    Penalty { value: i32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HBox {
+    pub tex_box: TeXBox,
+    pub content: Vec<HListItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VBox {
+    pub tex_box: TeXBox,
+    pub content: Vec<VListItem>,
 }
 
 pub const PENALTY_FORBIDDEN: i32 = 10_000;
@@ -159,10 +196,10 @@ impl MinimalTypesetter {
     ) -> TypesetDocument {
         let page_box = page_box_for_class(&document.document_class);
         let nodes = document.body_nodes();
-        let hlist = document_nodes_to_hlist(&nodes, provider);
         let params = break_params_for_provider(provider);
-        let wrapped_lines = line_breaker::break_paragraph(&hlist, &params);
-        let vlist = lines_to_vlist(&wrapped_lines);
+        let hyphenator = SimpleHyphenator;
+        let vlist =
+            document_nodes_to_vlist_with_config(&nodes, provider, Some(&hyphenator), &params);
         let pages = paginate_vlist(&vlist, &page_box);
 
         TypesetDocument { pages }
@@ -181,6 +218,7 @@ fn break_params_for_provider(provider: &dyn CharWidthProvider) -> BreakParams {
 
     BreakParams {
         line_width: DimensionValue(average_char_width * MAX_LINE_CHARS as i64),
+        hyphen_penalty: BreakParams::default().hyphen_penalty,
         ..BreakParams::default()
     }
 }
@@ -203,35 +241,101 @@ pub fn document_nodes_to_hlist(
     nodes: &[DocumentNode],
     provider: &dyn CharWidthProvider,
 ) -> Vec<HListItem> {
+    document_nodes_to_hlist_with_config(
+        nodes,
+        provider,
+        None,
+        BreakParams::default().hyphen_penalty,
+    )
+}
+
+pub fn document_nodes_to_hlist_with_hyphenation(
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: &dyn Hyphenator,
+) -> Vec<HListItem> {
+    document_nodes_to_hlist_with_config(
+        nodes,
+        provider,
+        Some(hyphenator),
+        BreakParams::default().hyphen_penalty,
+    )
+}
+
+fn document_nodes_to_hlist_with_config(
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    hyphen_penalty: i32,
+) -> Vec<HListItem> {
     let space_width = provider.space_width();
     let stretch = GlueComponent::normal(DimensionValue(space_width.0 / 2));
     let shrink = GlueComponent::normal(DimensionValue(space_width.0 / 3));
     let mut hlist = Vec::new();
+    let mut current_word = String::new();
+    let mut current_word_items = Vec::new();
 
     for node in nodes {
         match node {
             DocumentNode::Text(text) => {
                 for codepoint in text.chars() {
                     match codepoint {
-                        '\n' => hlist.push(HListItem::Penalty {
-                            value: PENALTY_FORCED,
-                        }),
-                        codepoint if codepoint.is_whitespace() => hlist.push(HListItem::Glue {
-                            width: space_width,
-                            stretch,
-                            shrink,
-                        }),
-                        codepoint => hlist.push(HListItem::Char {
-                            codepoint,
-                            width: provider.char_width(codepoint),
-                        }),
+                        '\n' => {
+                            flush_word(
+                                &mut hlist,
+                                &mut current_word,
+                                &mut current_word_items,
+                                hyphenator,
+                                hyphen_penalty,
+                            );
+                            hlist.push(HListItem::Penalty {
+                                value: PENALTY_FORCED,
+                            });
+                        }
+                        codepoint if codepoint.is_whitespace() => {
+                            flush_word(
+                                &mut hlist,
+                                &mut current_word,
+                                &mut current_word_items,
+                                hyphenator,
+                                hyphen_penalty,
+                            );
+                            hlist.push(HListItem::Glue {
+                                width: space_width,
+                                stretch,
+                                shrink,
+                            });
+                        }
+                        codepoint => {
+                            current_word.push(codepoint);
+                            current_word_items.push((codepoint, provider.char_width(codepoint)));
+                        }
                     }
                 }
             }
             DocumentNode::ParBreak => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
                 hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
+                hlist.push(HListItem::Penalty {
+                    value: PENALTY_FORCED,
+                });
+            }
+            DocumentNode::PageBreak => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
                 hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
@@ -239,16 +343,117 @@ pub fn document_nodes_to_hlist(
         }
     }
 
+    flush_word(
+        &mut hlist,
+        &mut current_word,
+        &mut current_word_items,
+        hyphenator,
+        hyphen_penalty,
+    );
+
     hlist
+}
+
+fn document_nodes_to_vlist_with_config(
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    params: &BreakParams,
+) -> Vec<VListItem> {
+    let mut vlist = Vec::new();
+    let mut segment_start = 0;
+
+    for (index, node) in nodes.iter().enumerate() {
+        if matches!(node, DocumentNode::PageBreak) {
+            append_nodes_segment_to_vlist(
+                &mut vlist,
+                &nodes[segment_start..index],
+                provider,
+                hyphenator,
+                params,
+            );
+            vlist.push(VListItem::Penalty {
+                value: PENALTY_FORCED,
+            });
+            segment_start = index + 1;
+        }
+    }
+
+    append_nodes_segment_to_vlist(
+        &mut vlist,
+        &nodes[segment_start..],
+        provider,
+        hyphenator,
+        params,
+    );
+
+    vlist
+}
+
+fn append_nodes_segment_to_vlist(
+    vlist: &mut Vec<VListItem>,
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    params: &BreakParams,
+) {
+    if nodes.is_empty() {
+        return;
+    }
+
+    let hlist =
+        document_nodes_to_hlist_with_config(nodes, provider, hyphenator, params.hyphen_penalty);
+    if hlist.is_empty() {
+        return;
+    }
+
+    let wrapped_lines = line_breaker::break_paragraph(&hlist, params);
+    vlist.extend(lines_to_vlist(&wrapped_lines));
+}
+
+fn flush_word(
+    hlist: &mut Vec<HListItem>,
+    word: &mut String,
+    word_items: &mut Vec<(char, DimensionValue)>,
+    hyphenator: Option<&dyn Hyphenator>,
+    hyphen_penalty: i32,
+) {
+    if word_items.is_empty() {
+        return;
+    }
+
+    let hyphen_points = hyphenator
+        .map(|hyphenator| hyphenator.hyphenate(word))
+        .unwrap_or_default();
+    let mut next_hyphen = hyphen_points.iter().copied().peekable();
+    let mut byte_offset = 0;
+
+    for (index, (codepoint, width)) in word_items.iter().copied().enumerate() {
+        hlist.push(HListItem::Char { codepoint, width });
+        byte_offset += codepoint.len_utf8();
+
+        if index + 1 == word_items.len() {
+            continue;
+        }
+
+        if next_hyphen.peek().copied() == Some(byte_offset) {
+            hlist.push(HListItem::Penalty {
+                value: hyphen_penalty,
+            });
+            next_hyphen.next();
+        }
+    }
+
+    word.clear();
+    word_items.clear();
 }
 
 fn lines_to_vlist(lines: &[String]) -> Vec<VListItem> {
     lines
         .iter()
         .map(|line| VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: line.clone(),
-            height: points(LINE_HEIGHT_PT),
-            depth: DimensionValue::zero(),
         })
         .collect()
 }
@@ -299,7 +504,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
 
 fn vlist_item_height(item: &VListItem) -> DimensionValue {
     match item {
-        VListItem::Box { height, depth, .. } => *height + *depth,
+        VListItem::Box { tex_box, .. } => tex_box.height + tex_box.depth,
         VListItem::Glue { height } => *height,
         VListItem::Penalty { .. } => DimensionValue::zero(),
     }
@@ -311,16 +516,12 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
 
     for item in items {
         match item {
-            VListItem::Box {
-                content,
-                height,
-                depth,
-            } => {
+            VListItem::Box { tex_box, content } => {
                 lines.push(TextLine {
                     text: content.clone(),
                     y: page_box.height - points(TOP_MARGIN_PT) - consumed_height,
                 });
-                consumed_height = consumed_height + *height + *depth;
+                consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
             VListItem::Glue { height } => {
                 consumed_height = consumed_height + *height;
@@ -611,15 +812,19 @@ fn points(value: i64) -> DimensionValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_fixed_width_provider, document_nodes_to_hlist, page_box_for_class, paginate_vlist,
-        points, wrap_body, wrap_hlist, CharWidthProvider, GlueComponent, GlueOrder, HListItem,
-        MinimalTypesetter, TextLine, TfmWidthProvider, VListItem, LINE_HEIGHT_PT, MAX_LINE_CHARS,
-        MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORCED, TOP_MARGIN_PT,
+        default_fixed_width_provider, document_nodes_to_hlist,
+        document_nodes_to_hlist_with_hyphenation, page_box_for_class, paginate_vlist, points,
+        vlist_item_height, wrap_body, wrap_hlist, CharWidthProvider, GlueComponent, GlueOrder,
+        HBox, HListItem, MinimalTypesetter, TeXBox, TextLine, TfmWidthProvider, VBox, VListItem,
+        LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORCED,
+        TOP_MARGIN_PT,
     };
     use crate::font::api::TfmMetrics;
     use crate::kernel::api::DimensionValue;
-    use crate::parser::api::{DocumentNode, ParsedDocument};
-    use crate::typesetting::{knuth_plass::BreakParams, line_breaker};
+    use crate::parser::api::{DocumentNode, MinimalLatexParser, ParsedDocument, Parser};
+    use crate::typesetting::{
+        hyphenation::SimpleHyphenator, knuth_plass::BreakParams, line_breaker,
+    };
 
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
@@ -627,6 +832,14 @@ mod tests {
             package_count: 0,
             body: body.to_string(),
         }
+    }
+
+    fn parsed_latex_document(body: &str) -> ParsedDocument {
+        MinimalLatexParser
+            .parse(&format!(
+                "\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
+            ))
+            .expect("parse document")
     }
 
     struct SkewedWidthProvider;
@@ -699,18 +912,16 @@ mod tests {
     fn height_based_pagination_respects_content_area() {
         let mut vlist = (1..=35)
             .map(|index| VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: format!("Line {index}"),
-                height: points(LINE_HEIGHT_PT),
-                depth: DimensionValue::zero(),
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Glue {
             height: points(LINE_HEIGHT_PT),
         });
         vlist.push(VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: "Overflow".to_string(),
-            height: points(LINE_HEIGHT_PT),
-            depth: DimensionValue::zero(),
         });
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -725,15 +936,13 @@ mod tests {
     fn mixed_height_lines_break_by_accumulated_height() {
         let mut vlist = (1..=16)
             .map(|index| VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT * 2)),
                 content: format!("Tall {index}"),
-                height: points(LINE_HEIGHT_PT * 2),
-                depth: DimensionValue::zero(),
             })
             .collect::<Vec<_>>();
         vlist.extend((1..=5).map(|index| VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Short {index}"),
-            height: points(LINE_HEIGHT_PT),
-            depth: DimensionValue::zero(),
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -753,17 +962,15 @@ mod tests {
     fn vlist_penalty_forced_forces_page_break() {
         let vlist = vec![
             VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "First".to_string(),
-                height: points(LINE_HEIGHT_PT),
-                depth: DimensionValue::zero(),
             },
             VListItem::Penalty {
                 value: PENALTY_FORCED,
             },
             VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "Second".to_string(),
-                height: points(LINE_HEIGHT_PT),
-                depth: DimensionValue::zero(),
             },
         ];
 
@@ -772,6 +979,82 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].lines[0].text, "First");
         assert_eq!(pages[1].lines[0].text, "Second");
+    }
+
+    #[test]
+    fn tex_box_zero_has_all_zero_dimensions() {
+        assert_eq!(
+            TeXBox::zero(),
+            TeXBox::new(
+                DimensionValue::zero(),
+                DimensionValue::zero(),
+                DimensionValue::zero()
+            )
+        );
+    }
+
+    #[test]
+    fn tex_box_with_height_sets_only_height() {
+        assert_eq!(
+            TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            TeXBox::new(
+                DimensionValue::zero(),
+                points(LINE_HEIGHT_PT),
+                DimensionValue::zero()
+            )
+        );
+    }
+
+    #[test]
+    fn tex_box_new_sets_all_dimensions() {
+        assert_eq!(
+            TeXBox::new(points(10), points(11), points(12)),
+            TeXBox {
+                width: points(10),
+                height: points(11),
+                depth: points(12),
+            }
+        );
+    }
+
+    #[test]
+    fn hbox_stores_dimensions_and_content() {
+        let content = vec![HListItem::Char {
+            codepoint: 'A',
+            width: points(1),
+        }];
+        let hbox = HBox {
+            tex_box: TeXBox::new(points(10), points(11), points(12)),
+            content: content.clone(),
+        };
+
+        assert_eq!(hbox.tex_box.width, points(10));
+        assert_eq!(hbox.content, content);
+    }
+
+    #[test]
+    fn vbox_stores_dimensions_and_content() {
+        let content = vec![VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: "Line".to_string(),
+        }];
+        let vbox = VBox {
+            tex_box: TeXBox::new(points(10), points(11), points(12)),
+            content: content.clone(),
+        };
+
+        assert_eq!(vbox.tex_box.depth, points(12));
+        assert_eq!(vbox.content, content);
+    }
+
+    #[test]
+    fn vlist_box_item_uses_tex_box_dimensions() {
+        let item = VListItem::Box {
+            tex_box: TeXBox::new(points(10), points(11), points(12)),
+            content: "Line".to_string(),
+        };
+
+        assert_eq!(vlist_item_height(&item), points(23));
     }
 
     #[test]
@@ -847,6 +1130,46 @@ mod tests {
     }
 
     #[test]
+    fn document_nodes_to_hlist_with_hyphenation_inserts_penalties_inside_words() {
+        let hlist = document_nodes_to_hlist_with_hyphenation(
+            &[DocumentNode::Text("basket".to_string())],
+            &default_fixed_width_provider(),
+            &SimpleHyphenator,
+        );
+
+        assert_eq!(
+            hlist,
+            vec![
+                HListItem::Char {
+                    codepoint: 'b',
+                    width: points(1),
+                },
+                HListItem::Char {
+                    codepoint: 'a',
+                    width: points(1),
+                },
+                HListItem::Char {
+                    codepoint: 's',
+                    width: points(1),
+                },
+                HListItem::Penalty { value: 50 },
+                HListItem::Char {
+                    codepoint: 'k',
+                    width: points(1),
+                },
+                HListItem::Char {
+                    codepoint: 'e',
+                    width: points(1),
+                },
+                HListItem::Char {
+                    codepoint: 't',
+                    width: points(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn line_breaker_matches_char_counting_for_explicit_breaks() {
         let body = format!(
             "{}\n{}",
@@ -882,6 +1205,47 @@ mod tests {
                 String::new(),
                 "Second paragraph".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn hyphenation_changes_line_break_output_for_long_word() {
+        let nodes = parsed_document("basket").body_nodes();
+        let provider = default_fixed_width_provider();
+        let params = BreakParams {
+            line_width: points(3),
+            ..BreakParams::default()
+        };
+        let plain_hlist = document_nodes_to_hlist(&nodes, &provider);
+        let hyphenated_hlist =
+            document_nodes_to_hlist_with_hyphenation(&nodes, &provider, &SimpleHyphenator);
+
+        assert_eq!(
+            line_breaker::break_paragraph(&plain_hlist, &params),
+            vec!["bas".to_string(), "ket".to_string()]
+        );
+        assert_eq!(
+            line_breaker::break_paragraph(&hyphenated_hlist, &params),
+            vec!["bas-".to_string(), "ket".to_string()]
+        );
+    }
+
+    #[test]
+    fn short_word_wrapping_is_unchanged_with_hyphenation_enabled() {
+        let nodes = parsed_document("ship yard").body_nodes();
+        let provider = default_fixed_width_provider();
+        let params = BreakParams {
+            line_width: points(9),
+            ..BreakParams::default()
+        };
+        let plain_hlist = document_nodes_to_hlist(&nodes, &provider);
+        let hyphenated_hlist =
+            document_nodes_to_hlist_with_hyphenation(&nodes, &provider, &SimpleHyphenator);
+
+        assert_eq!(hyphenated_hlist, plain_hlist);
+        assert_eq!(
+            line_breaker::break_paragraph(&hyphenated_hlist, &params),
+            line_breaker::break_paragraph(&plain_hlist, &params)
         );
     }
 
@@ -986,6 +1350,57 @@ mod tests {
                 "Second paragraph".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn pagebreak_command_produces_page_break() {
+        let document =
+            MinimalTypesetter.typeset(&parsed_latex_document("First\n\\pagebreak\nSecond"));
+
+        assert_eq!(document.pages.len(), 2);
+        assert_eq!(document.pages[0].lines[0].text, "First");
+        assert_eq!(document.pages[1].lines[0].text, "Second");
+    }
+
+    #[test]
+    fn newpage_command_produces_page_break() {
+        let document =
+            MinimalTypesetter.typeset(&parsed_latex_document("First\n\\newpage\nSecond"));
+
+        assert_eq!(document.pages.len(), 2);
+        assert_eq!(document.pages[0].lines[0].text, "First");
+        assert_eq!(document.pages[1].lines[0].text, "Second");
+    }
+
+    #[test]
+    fn clearpage_command_produces_page_break() {
+        let document =
+            MinimalTypesetter.typeset(&parsed_latex_document("First\n\\clearpage\nSecond"));
+
+        assert_eq!(document.pages.len(), 2);
+        assert_eq!(document.pages[0].lines[0].text, "First");
+        assert_eq!(document.pages[1].lines[0].text, "Second");
+    }
+
+    #[test]
+    fn pagebreak_in_middle_of_content_splits_pages() {
+        let before = (1..=10)
+            .map(|index| format!("Before {index}"))
+            .collect::<Vec<_>>()
+            .join(r"\par ");
+        let after = (1..=10)
+            .map(|index| format!("After {index}"))
+            .collect::<Vec<_>>()
+            .join(r"\par ");
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(&format!(
+            "{before}\n\\pagebreak\n{after}"
+        )));
+
+        assert_eq!(document.pages.len(), 2);
+        assert!(document.pages[0].lines.len() > 1);
+        assert!(document.pages[1].lines.len() > 1);
+        assert_eq!(document.pages[0].lines[0].text, "Before 1");
+        assert_eq!(document.pages[1].lines[0].text, "After 1");
     }
 
     #[test]

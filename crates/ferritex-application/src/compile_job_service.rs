@@ -7,7 +7,7 @@ use ferritex_core::compilation::{
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::TfmMetrics;
 use ferritex_core::kernel::api::DimensionValue;
-use ferritex_core::parser::{MinimalLatexParser, ParseError, Parser};
+use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
 use ferritex_core::pdf::PdfRenderer;
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
@@ -58,7 +58,7 @@ impl<'a> CompileJobService<'a> {
             asset_bundle_loader,
             parser: MinimalLatexParser,
             typesetter: MinimalTypesetter,
-            pdf_renderer: PdfRenderer,
+            pdf_renderer: PdfRenderer::default(),
         }
     }
 
@@ -132,10 +132,15 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
-        let parsed_document = match self.parser.parse(&source_tree.source) {
-            Ok(document) => document,
-            Err(error) => {
-                let diagnostics = vec![diagnostic_for_parse_error(error, input_path)];
+        let ParseOutput { document, errors } = self.parser.parse_recovering(&source_tree.source);
+        let parse_diagnostics: Vec<Diagnostic> = errors
+            .into_iter()
+            .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
+            .collect();
+
+        let parsed_document = match document {
+            Some(document) => document,
+            None => {
                 let compilation_job = compilation_job(
                     options.input_file.clone(),
                     options.jobname.clone(),
@@ -143,15 +148,15 @@ impl<'a> CompileJobService<'a> {
                 );
 
                 return CompileResult {
-                    exit_code: exit_code_for(&diagnostics),
-                    diagnostics: diagnostics.clone(),
+                    exit_code: exit_code_for(&parse_diagnostics),
+                    diagnostics: parse_diagnostics.clone(),
                     output_pdf: None,
                     stable_compile_state: Some(stable_compile_state(
                         &compilation_job,
                         source_tree.document_state.clone(),
                         0,
                         false,
-                        diagnostics,
+                        parse_diagnostics,
                     )),
                 };
             }
@@ -239,12 +244,13 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
+        let diagnostics = parse_diagnostics;
         let stable_compile_state = stable_compile_state(
             &compilation_job,
             source_tree.document_state,
             pdf_document.page_count,
             true,
-            Vec::new(),
+            diagnostics.clone(),
         );
 
         tracing::info!(
@@ -259,8 +265,8 @@ impl<'a> CompileJobService<'a> {
         );
 
         CompileResult {
-            exit_code: 0,
-            diagnostics: Vec::new(),
+            exit_code: exit_code_for(&diagnostics),
+            diagnostics,
             output_pdf: Some(output_pdf),
             stable_compile_state: Some(stable_compile_state),
         }
@@ -280,8 +286,15 @@ impl<'a> CompileJobService<'a> {
                 document_state: DocumentState::default(),
             });
 
-        match self.parser.parse(&source_tree.source) {
-            Ok(parsed_document) => {
+        let primary_input_path = primary_input.to_string_lossy().into_owned();
+        let ParseOutput { document, errors } = self.parser.parse_recovering(&source_tree.source);
+        let parse_diagnostics: Vec<Diagnostic> = errors
+            .into_iter()
+            .map(|error| diagnostic_for_parse_error(error, primary_input_path.clone()))
+            .collect();
+
+        match document {
+            Some(parsed_document) => {
                 let typeset_document = self.typesetter.typeset(&parsed_document);
                 let pdf_document = self.pdf_renderer.render(&typeset_document);
                 stable_compile_state(
@@ -289,22 +302,16 @@ impl<'a> CompileJobService<'a> {
                     source_tree.document_state,
                     pdf_document.page_count,
                     true,
-                    Vec::new(),
+                    parse_diagnostics,
                 )
             }
-            Err(error) => {
-                let diagnostics = vec![diagnostic_for_parse_error(
-                    error,
-                    primary_input.to_string_lossy().into_owned(),
-                )];
-                stable_compile_state(
-                    &compilation_job,
-                    source_tree.document_state,
-                    0,
-                    false,
-                    diagnostics,
-                )
-            }
+            None => stable_compile_state(
+                &compilation_job,
+                source_tree.document_state,
+                0,
+                false,
+                parse_diagnostics,
+            ),
         }
     }
 
@@ -1418,6 +1425,42 @@ mod tests {
     }
 
     #[test]
+    fn writes_pdf_and_reports_recoverable_parse_diagnostics() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let gate = MockFileAccessGate {
+            read_decision: PathAccessDecision::Allowed,
+            write_decision: PathAccessDecision::Allowed,
+            read_result: MockReadResult::Success(
+                b"\\documentclass{article}\n\\begin{document}\nA}B\n\\end{document}\n".to_vec(),
+            ),
+            created_dirs: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+        };
+        let loader = MockAssetBundleLoader::valid();
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 2);
+        assert_eq!(result.output_pdf, Some(options.output_dir.join("main.pdf")));
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].message, "unexpected closing brace");
+        assert_eq!(result.diagnostics[0].line, Some(3));
+        let stable_state = result
+            .stable_compile_state
+            .as_ref()
+            .expect("stable compile state");
+        assert!(stable_state.success);
+        assert_eq!(stable_state.page_count, 1);
+        assert_eq!(stable_state.diagnostics, result.diagnostics);
+
+        let writes = gate.writes.lock().expect("lock writes");
+        assert_eq!(writes.len(), 1);
+        let pdf = String::from_utf8_lossy(&writes[0].1);
+        assert!(pdf.contains("AB"));
+    }
+
+    #[test]
     fn rejects_jobname_with_control_characters() {
         let dir = tempdir().expect("create tempdir");
         let mut options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
@@ -1446,7 +1489,8 @@ mod tests {
     #[test]
     fn returns_parse_diagnostic_for_unclosed_brace() {
         let dir = tempdir().expect("create tempdir");
-        let options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        let input_file = dir.path().join("main.tex");
+        let options = runtime_options(input_file, dir.path().join("out"));
         let gate = MockFileAccessGate {
             read_decision: PathAccessDecision::Allowed,
             write_decision: PathAccessDecision::Allowed,
@@ -1463,14 +1507,45 @@ mod tests {
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].message, "unclosed brace");
         assert_eq!(result.diagnostics[0].line, Some(3));
-        assert_eq!(result.output_pdf, None);
+        assert_eq!(result.output_pdf, Some(options.output_dir.join("main.pdf")));
         let stable_state = result
             .stable_compile_state
             .as_ref()
             .expect("stable compile state");
-        assert!(!stable_state.success);
-        assert_eq!(stable_state.page_count, 0);
+        assert!(stable_state.success);
+        assert_eq!(stable_state.page_count, 1);
         assert_eq!(stable_state.diagnostics, result.diagnostics);
+    }
+
+    #[test]
+    fn returns_multiple_parse_diagnostics_for_structural_errors() {
+        let dir = tempdir().expect("create tempdir");
+        let options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
+        let gate = MockFileAccessGate {
+            read_decision: PathAccessDecision::Allowed,
+            write_decision: PathAccessDecision::Allowed,
+            read_result: MockReadResult::Success(b"plain text".to_vec()),
+            created_dirs: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+        };
+        let loader = MockAssetBundleLoader::valid();
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 2);
+        assert_eq!(result.output_pdf, None);
+        assert_eq!(result.diagnostics.len(), 3);
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "missing \\begin{document}",
+                "missing \\end{document}",
+                "missing \\documentclass declaration",
+            ]
+        );
     }
 
     #[test]
@@ -1494,6 +1569,29 @@ mod tests {
         assert_eq!(state.page_count, 1);
         assert_eq!(state.snapshot.primary_input, PathBuf::from("/tmp/main.tex"));
         assert_eq!(state.snapshot.jobname, "main");
+    }
+
+    #[test]
+    fn compile_from_source_preserves_recoverable_parse_diagnostics() {
+        let gate = MockFileAccessGate {
+            read_decision: PathAccessDecision::Allowed,
+            write_decision: PathAccessDecision::Allowed,
+            read_result: MockReadResult::Success(Vec::new()),
+            created_dirs: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+        };
+        let loader = MockAssetBundleLoader::valid();
+
+        let state = service(&gate, &loader).compile_from_source(
+            "\\documentclass{article}\n\\begin{document}\nA}B\n\\end{document}\n",
+            "file:///tmp/main.tex",
+        );
+
+        assert!(state.success);
+        assert_eq!(state.page_count, 1);
+        assert_eq!(state.diagnostics.len(), 1);
+        assert_eq!(state.diagnostics[0].message, "unexpected closing brace");
+        assert_eq!(state.diagnostics[0].line, Some(3));
     }
 
     #[test]

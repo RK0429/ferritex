@@ -9,6 +9,7 @@ use super::{
 };
 
 const MAX_CONSECUTIVE_MACRO_EXPANSIONS: usize = 1_000;
+const BODY_PAGE_BREAK_MARKER: char = '\u{E000}';
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedDocument {
@@ -17,10 +18,20 @@ pub struct ParsedDocument {
     pub body: String,
 }
 
+/// Result of a parse-with-recovery attempt.
+/// Contains a best-effort document (if structural requirements were met)
+/// and all accumulated parse errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseOutput {
+    pub document: Option<ParsedDocument>,
+    pub errors: Vec<ParseError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentNode {
     Text(String),
     ParBreak,
+    PageBreak,
 }
 
 impl ParsedDocument {
@@ -30,30 +41,16 @@ impl ParsedDocument {
         }
 
         let normalized_body = normalize_body_par_breaks(&self.body);
+        let segments = normalized_body
+            .split(BODY_PAGE_BREAK_MARKER)
+            .collect::<Vec<_>>();
         let mut nodes = Vec::new();
-        let mut current_text = String::new();
-        let mut in_break = false;
 
-        for line in normalized_body.split('\n') {
-            if line.trim().is_empty() {
-                push_body_text_node(&mut nodes, &mut current_text);
-                if !nodes.is_empty() && !in_break {
-                    nodes.push(DocumentNode::ParBreak);
-                    in_break = true;
-                }
-                continue;
+        for (index, segment) in segments.iter().enumerate() {
+            nodes.extend(body_text_nodes(segment));
+            if index + 1 < segments.len() {
+                nodes.push(DocumentNode::PageBreak);
             }
-
-            if !current_text.is_empty() {
-                current_text.push('\n');
-            }
-            current_text.push_str(line);
-            in_break = false;
-        }
-
-        push_body_text_node(&mut nodes, &mut current_text);
-        if matches!(nodes.last(), Some(DocumentNode::ParBreak)) {
-            let _ = nodes.pop();
         }
 
         nodes
@@ -132,6 +129,19 @@ impl Parser for MinimalLatexParser {
     }
 }
 
+impl MinimalLatexParser {
+    pub fn parse_recovering(&self, source: &str) -> ParseOutput {
+        if source.trim().is_empty() {
+            return ParseOutput {
+                document: None,
+                errors: vec![ParseError::EmptyInput],
+            };
+        }
+
+        ParserDriver::new(source).run_recovering()
+    }
+}
+
 fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
     if source.trim().is_empty() {
         return Err(ParseError::EmptyInput);
@@ -150,6 +160,8 @@ enum Phase {
 enum RegisterKind {
     Count,
     Dimen,
+    Skip,
+    Muskip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +182,7 @@ struct ParserDriver<'a> {
     semisimple_group_stack: Vec<u32>,
     document_class: Option<String>,
     document_class_error: Option<ParseError>,
+    errors: Vec<ParseError>,
     package_count: usize,
     body: String,
     begin_found: bool,
@@ -179,6 +192,7 @@ struct ParserDriver<'a> {
     current_token_from_expansion: bool,
     consecutive_macro_expansions: usize,
     global_prefix: bool,
+    alloc_count: u32,
 }
 
 #[derive(Debug)]
@@ -199,6 +213,7 @@ impl<'a> ParserDriver<'a> {
             semisimple_group_stack: Vec::new(),
             document_class: None,
             document_class_error: None,
+            errors: Vec::new(),
             package_count: 0,
             body: String::new(),
             begin_found: false,
@@ -208,7 +223,12 @@ impl<'a> ParserDriver<'a> {
             current_token_from_expansion: false,
             consecutive_macro_expansions: 0,
             global_prefix: false,
+            alloc_count: 10,
         }
+    }
+
+    fn record_error(&mut self, error: ParseError) {
+        self.errors.push(error);
     }
 
     fn run(mut self) -> Result<ParsedDocument, ParseError> {
@@ -273,15 +293,121 @@ impl<'a> ParserDriver<'a> {
 
         self.validate_trailing_content()?;
 
-        let document_class = self
-            .document_class
-            .expect("document class presence checked above");
+        Ok(self.build_parsed_document())
+    }
 
-        Ok(ParsedDocument {
-            document_class,
+    fn run_recovering(mut self) -> ParseOutput {
+        let mut phase = Phase::Preamble;
+
+        while let Some(token) = self.next_raw_token() {
+            if self.conditionals.is_skipping() {
+                self.push_front_queued_token(token, self.current_token_from_expansion);
+                self.skip_current_false_branch();
+                continue;
+            }
+
+            let result = match phase {
+                Phase::Preamble => match self.process_preamble_token(token) {
+                    Ok(true) => {
+                        phase = Phase::Body;
+                        Ok(false)
+                    }
+                    Ok(false) => Ok(false),
+                    Err(error) => Err(error),
+                },
+                Phase::Body => self.process_body_token(token),
+            };
+
+            match result {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    let recoverable = Self::is_recoverable_main_loop_error(&error);
+                    self.record_error(error);
+                    if !recoverable {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(line) = self.runtime_group_stack.last().copied() {
+            self.record_error(ParseError::UnclosedBrace { line });
+        }
+
+        if let Some(line) = self.semisimple_group_stack.last().copied() {
+            self.record_error(ParseError::UnclosedBrace { line });
+        }
+
+        if let Some(line) = self.conditionals.current_open_line() {
+            self.record_error(ParseError::UnclosedConditional { line });
+        }
+
+        if !self.begin_found {
+            self.record_error(ParseError::MissingBeginDocument {
+                line: self.eof_line,
+            });
+        }
+
+        if let Some(line) = self.first_end_before_begin_line {
+            self.record_error(ParseError::UnexpectedEndDocument { line });
+        }
+
+        if !self.end_found {
+            self.record_error(ParseError::MissingEndDocument {
+                line: self.eof_line,
+            });
+        }
+
+        if let Some(error) = self.document_class_error.take() {
+            self.record_error(error);
+        }
+
+        if self.document_class.is_none() {
+            self.record_error(ParseError::MissingDocumentClass);
+        }
+
+        let trailing_valid = self.validate_trailing_content();
+        let has_trailing_error = trailing_valid.is_err();
+        if let Err(error) = trailing_valid {
+            self.record_error(error);
+        }
+
+        let document = if self.document_class.is_some()
+            && self.begin_found
+            && self.end_found
+            && !has_trailing_error
+        {
+            Some(self.build_parsed_document())
+        } else {
+            None
+        };
+
+        ParseOutput {
+            document,
+            errors: self.errors,
+        }
+    }
+
+    fn is_recoverable_main_loop_error(error: &ParseError) -> bool {
+        matches!(
+            error,
+            ParseError::UnexpectedClosingBrace { .. }
+                | ParseError::InvalidDocumentClass { .. }
+                | ParseError::UnexpectedElse { .. }
+                | ParseError::UnexpectedFi { .. }
+        )
+    }
+
+    fn build_parsed_document(&self) -> ParsedDocument {
+        ParsedDocument {
+            document_class: self
+                .document_class
+                .clone()
+                .expect("document class presence checked above"),
             package_count: self.package_count,
             body: self.body.trim().to_string(),
-        })
+        }
     }
 
     fn process_preamble_token(&mut self, token: Token) -> Result<bool, ParseError> {
@@ -354,6 +480,10 @@ impl<'a> ParserDriver<'a> {
                 }
 
                 match name.as_str() {
+                    "pagebreak" | "newpage" | "clearpage" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push(BODY_PAGE_BREAK_MARKER);
+                    }
                     "end" if self.read_environment_name()?.as_deref() == Some("document") => {
                         self.end_found = true;
                         return Ok(true);
@@ -491,6 +621,28 @@ impl<'a> ParserDriver<'a> {
                 self.parse_register_assignment(RegisterKind::Dimen, token.line)?;
                 Ok(true)
             }
+            "skip" => {
+                self.parse_register_assignment(RegisterKind::Skip, token.line)?;
+                Ok(true)
+            }
+            "muskip" => {
+                self.parse_register_assignment(RegisterKind::Muskip, token.line)?;
+                Ok(true)
+            }
+            "toks" => {
+                self.parse_toks_assignment(token.line)?;
+                Ok(true)
+            }
+            "newcount" => {
+                let is_global = self.take_global_prefix();
+                self.parse_newcount(is_global, token.line)?;
+                Ok(true)
+            }
+            "countdef" => {
+                let is_global = self.take_global_prefix();
+                self.parse_countdef(is_global, token.line)?;
+                Ok(true)
+            }
             "the" => {
                 let _ = self.take_global_prefix();
                 self.expand_the(token.line)?;
@@ -524,6 +676,56 @@ impl<'a> ParserDriver<'a> {
                 let left = self.parse_integer_value()?.unwrap_or(0);
                 let relation = self.parse_relation_token().unwrap_or('=');
                 let right = self.parse_integer_value()?.unwrap_or(0);
+                self.conditionals
+                    .process_if_at(evaluate_ifnum(left, relation, right), token.line);
+                if self.conditionals.is_skipping() {
+                    self.skip_current_false_branch();
+                }
+                Ok(true)
+            }
+            "if" => {
+                let _ = self.take_global_prefix();
+                let left = self.next_significant_token();
+                let right = self.next_significant_token();
+                let condition = match (left.as_ref(), right.as_ref()) {
+                    (Some(left), Some(right)) => {
+                        matches!(
+                            (char_code_of(left), char_code_of(right)),
+                            (Some(left_code), Some(right_code)) if left_code == right_code
+                        )
+                    }
+                    _ => false,
+                };
+                self.conditionals.process_if_at(condition, token.line);
+                if self.conditionals.is_skipping() {
+                    self.skip_current_false_branch();
+                }
+                Ok(true)
+            }
+            "ifcat" => {
+                let _ = self.take_global_prefix();
+                let left = self.next_significant_token();
+                let right = self.next_significant_token();
+                let condition = match (left.as_ref(), right.as_ref()) {
+                    (Some(left), Some(right)) => {
+                        matches!(
+                            (cat_code_of(left), cat_code_of(right)),
+                            (Some(left_cat), Some(right_cat)) if left_cat == right_cat
+                        )
+                    }
+                    _ => false,
+                };
+                self.conditionals.process_if_at(condition, token.line);
+                if self.conditionals.is_skipping() {
+                    self.skip_current_false_branch();
+                }
+                Ok(true)
+            }
+            "ifdim" => {
+                let _ = self.take_global_prefix();
+                let left = self.parse_dimension_value()?.unwrap_or(0);
+                let relation = self.parse_relation_token().unwrap_or('=');
+                let right = self.parse_dimension_value()?.unwrap_or(0);
                 self.conditionals
                     .process_if_at(evaluate_ifnum(left, relation, right), token.line);
                 if self.conditionals.is_skipping() {
@@ -612,6 +814,14 @@ impl<'a> ParserDriver<'a> {
                 let value = self.parse_dimension_value()?.unwrap_or(0);
                 self.registers.set_dimen(index, value, global);
             }
+            RegisterKind::Skip => {
+                let value = self.parse_dimension_value()?.unwrap_or(0);
+                self.registers.set_skip(index, value, global);
+            }
+            RegisterKind::Muskip => {
+                let value = self.parse_dimension_value()?.unwrap_or(0);
+                self.registers.set_muskip(index, value, global);
+            }
         }
 
         Ok(())
@@ -625,6 +835,8 @@ impl<'a> ParserDriver<'a> {
         let rendered = match kind {
             RegisterKind::Count => self.registers.get_count(index).to_string(),
             RegisterKind::Dimen => format_dimen(self.registers.get_dimen(index)),
+            RegisterKind::Skip => format_dimen(self.registers.get_skip(index)),
+            RegisterKind::Muskip => format_dimen(self.registers.get_muskip(index)),
         };
         self.push_front_tokens(tokens_from_text(&rendered, line));
         Ok(())
@@ -659,6 +871,28 @@ impl<'a> ParserDriver<'a> {
                 let value = apply_integer_arithmetic(current, operand, operation, line)?;
                 self.registers.set_dimen(index, value, global);
             }
+            RegisterKind::Skip => {
+                let current = self.registers.get_skip(index);
+                let operand = match operation {
+                    ArithmeticOperation::Advance => self.parse_dimension_value()?.unwrap_or(0),
+                    ArithmeticOperation::Multiply | ArithmeticOperation::Divide => {
+                        self.parse_integer_value()?.unwrap_or(0)
+                    }
+                };
+                let value = apply_integer_arithmetic(current, operand, operation, line)?;
+                self.registers.set_skip(index, value, global);
+            }
+            RegisterKind::Muskip => {
+                let current = self.registers.get_muskip(index);
+                let operand = match operation {
+                    ArithmeticOperation::Advance => self.parse_dimension_value()?.unwrap_or(0),
+                    ArithmeticOperation::Multiply | ArithmeticOperation::Divide => {
+                        self.parse_integer_value()?.unwrap_or(0)
+                    }
+                };
+                let value = apply_integer_arithmetic(current, operand, operation, line)?;
+                self.registers.set_muskip(index, value, global);
+            }
         }
 
         Ok(())
@@ -668,22 +902,42 @@ impl<'a> ParserDriver<'a> {
         &mut self,
         line: u32,
     ) -> Result<Option<(RegisterKind, u16)>, ParseError> {
-        let Some(token) = self.next_significant_token() else {
-            return Ok(None);
-        };
+        loop {
+            let Some(token) = self.next_significant_token() else {
+                return Ok(None);
+            };
 
-        match control_sequence_name(&token).as_deref() {
-            Some("count") => Ok(Some((
-                RegisterKind::Count,
-                self.parse_register_index(line)?,
-            ))),
-            Some("dimen") => Ok(Some((
-                RegisterKind::Dimen,
-                self.parse_register_index(line)?,
-            ))),
-            _ => {
-                self.push_front_token(token);
-                Ok(None)
+            match control_sequence_name(&token).as_deref() {
+                Some("count") => {
+                    return Ok(Some((
+                        RegisterKind::Count,
+                        self.parse_register_index(line)?,
+                    )));
+                }
+                Some("dimen") => {
+                    return Ok(Some((
+                        RegisterKind::Dimen,
+                        self.parse_register_index(line)?,
+                    )));
+                }
+                Some("skip") => {
+                    return Ok(Some((RegisterKind::Skip, self.parse_register_index(line)?)));
+                }
+                Some("muskip") => {
+                    return Ok(Some((
+                        RegisterKind::Muskip,
+                        self.parse_register_index(line)?,
+                    )));
+                }
+                _ => {
+                    if let Some(expansion) = self.expand_defined_control_sequence_token(&token)? {
+                        self.push_front_tokens(expansion);
+                        continue;
+                    }
+
+                    self.push_front_token(token);
+                    return Ok(None);
+                }
             }
         }
     }
@@ -727,86 +981,116 @@ impl<'a> ParserDriver<'a> {
     }
 
     fn parse_integer_value(&mut self) -> Result<Option<i32>, ParseError> {
-        let Some((sign, mut consumed, value_token)) = self.read_signed_value_token()? else {
-            return Ok(None);
-        };
+        loop {
+            let Some((sign, mut consumed, value_token)) = self.read_signed_value_token()? else {
+                return Ok(None);
+            };
 
-        match value_token.kind {
-            TokenKind::ControlWord(ref name) if name == "count" => {
-                let index = self.parse_register_index(value_token.line)?;
-                Ok(Some(sign * self.registers.get_count(index)))
-            }
-            TokenKind::ControlWord(ref name) if name == "dimen" => {
-                let index = self.parse_register_index(value_token.line)?;
-                Ok(Some(sign * self.registers.get_dimen(index)))
-            }
-            TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
-                let mut digits = String::new();
-                digits.push(char);
-                while let Some(token) = self.next_raw_token() {
-                    match token.kind {
-                        TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
-                            digits.push(char);
-                        }
-                        _ => {
-                            self.push_front_token(token);
-                            break;
+            match value_token.kind {
+                TokenKind::ControlWord(ref name) if name == "count" => {
+                    let index = self.parse_register_index(value_token.line)?;
+                    return Ok(Some(sign * self.registers.get_count(index)));
+                }
+                TokenKind::ControlWord(ref name) if name == "dimen" => {
+                    let index = self.parse_register_index(value_token.line)?;
+                    return Ok(Some(sign * self.registers.get_dimen(index)));
+                }
+                TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
+                    let mut digits = String::new();
+                    digits.push(char);
+                    while let Some(token) = self.next_raw_token() {
+                        match token.kind {
+                            TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
+                                digits.push(char);
+                            }
+                            _ => {
+                                self.push_front_token(token);
+                                break;
+                            }
                         }
                     }
-                }
 
-                Ok(digits.parse::<i32>().ok().map(|value| sign * value))
+                    return Ok(digits.parse::<i32>().ok().map(|value| sign * value));
+                }
+                TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => {
+                    if let Some(expansion) =
+                        self.expand_defined_control_sequence_token(&value_token)?
+                    {
+                        self.push_front_tokens(expansion);
+                        self.push_front_plain_tokens(consumed);
+                        continue;
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                consumed.push(value_token);
-                self.push_front_plain_tokens(consumed);
-                Ok(None)
-            }
+
+            consumed.push(value_token);
+            self.push_front_plain_tokens(consumed);
+            return Ok(None);
         }
     }
 
     fn parse_dimension_value(&mut self) -> Result<Option<i32>, ParseError> {
-        let Some((sign, mut consumed, value_token)) = self.read_signed_value_token()? else {
-            return Ok(None);
-        };
+        loop {
+            let Some((sign, mut consumed, value_token)) = self.read_signed_value_token()? else {
+                return Ok(None);
+            };
 
-        match value_token.kind {
-            TokenKind::ControlWord(ref name) if name == "dimen" => {
-                let index = self.parse_register_index(value_token.line)?;
-                Ok(Some(sign * self.registers.get_dimen(index)))
-            }
-            TokenKind::ControlWord(ref name) if name == "count" => {
-                let index = self.parse_register_index(value_token.line)?;
-                Ok(Some(sign * self.registers.get_count(index)))
-            }
-            TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
-                let mut digits = String::new();
-                digits.push(char);
-                while let Some(token) = self.next_raw_token() {
-                    match token.kind {
-                        TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
-                            digits.push(char);
-                        }
-                        _ => {
-                            self.push_front_token(token);
-                            break;
+            match value_token.kind {
+                TokenKind::ControlWord(ref name) if name == "dimen" => {
+                    let index = self.parse_register_index(value_token.line)?;
+                    return Ok(Some(sign * self.registers.get_dimen(index)));
+                }
+                TokenKind::ControlWord(ref name) if name == "count" => {
+                    let index = self.parse_register_index(value_token.line)?;
+                    return Ok(Some(sign * self.registers.get_count(index)));
+                }
+                TokenKind::ControlWord(ref name) if name == "skip" => {
+                    let index = self.parse_register_index(value_token.line)?;
+                    return Ok(Some(sign * self.registers.get_skip(index)));
+                }
+                TokenKind::ControlWord(ref name) if name == "muskip" => {
+                    let index = self.parse_register_index(value_token.line)?;
+                    return Ok(Some(sign * self.registers.get_muskip(index)));
+                }
+                TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
+                    let mut digits = String::new();
+                    digits.push(char);
+                    while let Some(token) = self.next_raw_token() {
+                        match token.kind {
+                            TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
+                                digits.push(char);
+                            }
+                            _ => {
+                                self.push_front_token(token);
+                                break;
+                            }
                         }
                     }
-                }
 
-                let Some(mut value) = digits.parse::<i32>().ok() else {
-                    return Ok(None);
-                };
-                if self.read_keyword("pt") {
-                    value = scale_points_to_sp(value);
+                    let Some(mut value) = digits.parse::<i32>().ok() else {
+                        return Ok(None);
+                    };
+                    if self.read_keyword("pt") {
+                        value = scale_points_to_sp(value);
+                    }
+                    return Ok(Some(sign * value));
                 }
-                Ok(Some(sign * value))
+                TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => {
+                    if let Some(expansion) =
+                        self.expand_defined_control_sequence_token(&value_token)?
+                    {
+                        self.push_front_tokens(expansion);
+                        self.push_front_plain_tokens(consumed);
+                        continue;
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                consumed.push(value_token);
-                self.push_front_plain_tokens(consumed);
-                Ok(None)
-            }
+
+            consumed.push(value_token);
+            self.push_front_plain_tokens(consumed);
+            return Ok(None);
         }
     }
 
@@ -985,7 +1269,7 @@ impl<'a> ParserDriver<'a> {
             .read_optional_bracket_tokens()?
             .and_then(|tokens| tokens_to_text(&tokens).trim().parse::<usize>().ok())
             .unwrap_or(0);
-        if parameter_count > 2 {
+        if parameter_count > 9 {
             return Ok(());
         }
 
@@ -1000,6 +1284,54 @@ impl<'a> ParserDriver<'a> {
                 body,
             },
         );
+        Ok(())
+    }
+
+    fn parse_toks_assignment(&mut self, line: u32) -> Result<(), ParseError> {
+        let index = self.parse_register_index(line)?;
+        if let Some(token) = self.next_significant_token() {
+            if !matches!(token.kind, TokenKind::CharToken { char: '=', .. }) {
+                self.push_front_token(token);
+            }
+        }
+
+        let global = self.take_global_prefix();
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        self.registers.set_toks(index, tokens, global);
+        Ok(())
+    }
+
+    fn parse_newcount(&mut self, is_global: bool, line: u32) -> Result<(), ParseError> {
+        let Some(name_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        let Some(name) = control_sequence_name(&name_token) else {
+            return Ok(());
+        };
+
+        let index = self.next_allocated_count(line)?;
+        self.define_register_alias(name, "count", index, is_global, line);
+        Ok(())
+    }
+
+    fn parse_countdef(&mut self, is_global: bool, line: u32) -> Result<(), ParseError> {
+        let Some(name_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        let Some(name) = control_sequence_name(&name_token) else {
+            return Ok(());
+        };
+
+        if let Some(token) = self.next_significant_token() {
+            if !matches!(token.kind, TokenKind::CharToken { char: '=', .. }) {
+                self.push_front_token(token);
+            }
+        }
+
+        let index = self.parse_register_index(line)?;
+        self.define_register_alias(name, "count", index, is_global, line);
         Ok(())
     }
 
@@ -1160,7 +1492,7 @@ impl<'a> ParserDriver<'a> {
                     cat: CatCode::BeginGroup,
                     ..
                 } => {
-                    if parameter_count > 2 {
+                    if parameter_count > 9 {
                         return Ok(None);
                     }
                     return Ok(Some((name, parameter_count, token.line)));
@@ -1288,6 +1620,32 @@ impl<'a> ParserDriver<'a> {
         } else {
             self.macro_engine.define_local(name, definition);
         }
+    }
+
+    fn define_register_alias(
+        &mut self,
+        name: String,
+        primitive: &str,
+        index: u16,
+        is_global: bool,
+        line: u32,
+    ) {
+        self.store_macro_definition(
+            name,
+            0,
+            register_alias_tokens(primitive, index, line),
+            is_global,
+        );
+    }
+
+    fn next_allocated_count(&mut self, line: u32) -> Result<u16, ParseError> {
+        if self.alloc_count > u32::from(MAX_REGISTER_INDEX) {
+            return Err(ParseError::InvalidRegisterIndex { line });
+        }
+
+        let index = self.alloc_count as u16;
+        self.alloc_count += 1;
+        Ok(index)
     }
 
     fn expand_defined_control_sequence_token(
@@ -1575,6 +1933,26 @@ fn tokens_from_text(text: &str, line: u32) -> Vec<Token> {
         .collect()
 }
 
+fn register_alias_tokens(primitive: &str, index: u16, line: u32) -> Vec<Token> {
+    let mut tokens = Vec::with_capacity(1 + index.to_string().len());
+    tokens.push(Token {
+        kind: TokenKind::ControlWord(primitive.to_string()),
+        line,
+        column: 1,
+    });
+    for (offset, char) in index.to_string().chars().enumerate() {
+        tokens.push(Token {
+            kind: TokenKind::CharToken {
+                char,
+                cat: CatCode::Other,
+            },
+            line,
+            column: (offset + 2) as u32,
+        });
+    }
+    tokens
+}
+
 fn catcode_for_expanded_char(char: char) -> CatCode {
     if char == ' ' {
         CatCode::Space
@@ -1588,6 +1966,21 @@ fn catcode_for_expanded_char(char: char) -> CatCode {
 fn token_as_char(token: &Token) -> Option<char> {
     match token.kind {
         TokenKind::CharToken { char, .. } => Some(char),
+        _ => None,
+    }
+}
+
+fn char_code_of(token: &Token) -> Option<u32> {
+    match &token.kind {
+        TokenKind::CharToken { char, .. } => Some(*char as u32),
+        _ => None,
+    }
+}
+
+fn cat_code_of(token: &Token) -> Option<CatCode> {
+    match &token.kind {
+        TokenKind::CharToken { cat, .. } => Some(*cat),
+        TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => None,
         _ => None,
     }
 }
@@ -1653,6 +2046,40 @@ fn normalize_body_par_breaks(body: &str) -> String {
     output
 }
 
+fn body_text_nodes(body: &str) -> Vec<DocumentNode> {
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut nodes = Vec::new();
+    let mut current_text = String::new();
+    let mut in_break = false;
+
+    for line in body.split('\n') {
+        if line.trim().is_empty() {
+            push_body_text_node(&mut nodes, &mut current_text);
+            if !nodes.is_empty() && !in_break {
+                nodes.push(DocumentNode::ParBreak);
+                in_break = true;
+            }
+            continue;
+        }
+
+        if !current_text.is_empty() {
+            current_text.push('\n');
+        }
+        current_text.push_str(line);
+        in_break = false;
+    }
+
+    push_body_text_node(&mut nodes, &mut current_text);
+    if matches!(nodes.last(), Some(DocumentNode::ParBreak)) {
+        let _ = nodes.pop();
+    }
+
+    nodes
+}
+
 fn push_body_text_node(nodes: &mut Vec<DocumentNode>, current_text: &mut String) {
     if current_text.is_empty() {
         return;
@@ -1698,6 +2125,80 @@ mod tests {
     }
 
     #[test]
+    fn parse_recovering_succeeds_for_valid_document() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+        );
+
+        assert!(output.errors.is_empty());
+        assert!(output.document.is_some());
+        assert_eq!(output.document.expect("parsed document").body, "Hello");
+    }
+
+    #[test]
+    fn parse_recovering_reports_multiple_structural_errors() {
+        let output = MinimalLatexParser.parse_recovering("some text with no document structure");
+
+        assert_eq!(
+            output.errors,
+            vec![
+                ParseError::MissingBeginDocument { line: 1 },
+                ParseError::MissingEndDocument { line: 1 },
+                ParseError::MissingDocumentClass,
+            ]
+        );
+        assert!(output.document.is_none());
+    }
+
+    #[test]
+    fn parse_recovering_recovers_from_unexpected_closing_brace() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\nA}B\n\\end{document}\n",
+        );
+
+        assert_eq!(
+            output.errors,
+            vec![ParseError::UnexpectedClosingBrace { line: 3 }]
+        );
+        assert_eq!(
+            output.document,
+            Some(ParsedDocument {
+                document_class: "article".to_string(),
+                package_count: 0,
+                body: "AB".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_recovering_rejects_trailing_content_after_end_document() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\nTrailing\n",
+        );
+
+        assert!(output.document.is_none());
+        assert_eq!(
+            output.errors,
+            vec![ParseError::TrailingContentAfterEndDocument { line: 5 }]
+        );
+    }
+
+    #[test]
+    fn parse_recovering_rejects_unclosed_brace_in_trailing_content() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n{stuff\n",
+        );
+
+        assert!(output.document.is_none());
+        assert!(
+            output
+                .errors
+                .iter()
+                .any(|e| matches!(e, ParseError::UnclosedBrace { .. }))
+        );
+    }
+
+    #[test]
     fn body_nodes_empty() {
         assert!(parsed_document("").body_nodes().is_empty());
     }
@@ -1730,6 +2231,50 @@ mod tests {
                 DocumentNode::Text("First paragraph".to_string()),
                 DocumentNode::ParBreak,
                 DocumentNode::Text("Second paragraph".to_string()),
+            ]
+        );
+    }
+
+    fn parse_document(source_body: &str) -> ParsedDocument {
+        MinimalLatexParser
+            .parse(&format!(
+                "\\documentclass{{article}}\n\\begin{{document}}\n{source_body}\n\\end{{document}}\n"
+            ))
+            .expect("parse document")
+    }
+
+    #[test]
+    fn pagebreak_parsed_to_page_break_node() {
+        assert_eq!(
+            parse_document("First\n\\pagebreak\nSecond").body_nodes(),
+            vec![
+                DocumentNode::Text("First".to_string()),
+                DocumentNode::PageBreak,
+                DocumentNode::Text("Second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn newpage_parsed_to_page_break_node() {
+        assert_eq!(
+            parse_document("First\n\\newpage\nSecond").body_nodes(),
+            vec![
+                DocumentNode::Text("First".to_string()),
+                DocumentNode::PageBreak,
+                DocumentNode::Text("Second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn clearpage_parsed_to_page_break_node() {
+        assert_eq!(
+            parse_document("First\n\\clearpage\nSecond").body_nodes(),
+            vec![
+                DocumentNode::Text("First".to_string()),
+                DocumentNode::PageBreak,
+                DocumentNode::Text("Second".to_string()),
             ]
         );
     }
@@ -1827,6 +2372,39 @@ mod tests {
             .expect("parse document");
 
         assert_eq!(document.body, "Hello Ferritex");
+    }
+
+    #[test]
+    fn expands_def_macro_with_three_arguments() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\triple#1#2#3{#1-#2-#3}\n\\begin{document}\n\\triple{A}{B}{C}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "A-B-C");
+    }
+
+    #[test]
+    fn expands_newcommand_with_five_arguments() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\newcommand{\\hello}[5]{#1#2#3#4#5}\n\\begin{document}\n\\hello{A}{B}{C}{D}{E}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "ABCDE");
+    }
+
+    #[test]
+    fn expands_def_macro_with_nine_arguments() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\def\\nine#1#2#3#4#5#6#7#8#9{#9#1#5}\n\\begin{document}\n\\nine123456789\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "915");
     }
 
     #[test]
@@ -2017,6 +2595,39 @@ mod tests {
     }
 
     #[test]
+    fn if_compares_character_codes() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\if aa same\\else diff\\fi/\\if ab same\\else diff\\fi\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "same/diff");
+    }
+
+    #[test]
+    fn ifcat_compares_character_categories() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\ifcat aa same\\else diff\\fi/\\ifcat a1 same\\else diff\\fi\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "same/diff");
+    }
+
+    #[test]
+    fn ifdim_compares_dimensions() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\ifdim1pt<2pt L\\else X\\fi\\ifdim2pt=2pt E\\else X\\fi\\ifdim3pt>2pt G\\else X\\fi\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "L E G");
+    }
+
+    #[test]
     fn ifx_compares_macro_meaning() {
         let document = MinimalLatexParser
             .parse(
@@ -2047,6 +2658,28 @@ mod tests {
             .expect("parse document");
 
         assert_eq!(document.body, "99");
+    }
+
+    #[test]
+    fn skip_register_supports_scope_global_arithmetic_and_the() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\skip0=1pt{\\skip0=4pt}\\the\\skip0/{\\global\\skip0=2pt}\\the\\skip0/\\advance\\skip0 by 1pt\\multiply\\skip0 by 3\\divide\\skip0 by 2\\the\\skip0\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "1.0pt/2.0pt/4.5pt");
+    }
+
+    #[test]
+    fn muskip_register_supports_scope_global_arithmetic_and_the() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\muskip0=2pt{\\muskip0=5pt}\\the\\muskip0/{\\global\\muskip0=3pt}\\the\\muskip0/\\advance\\muskip0 by 1pt\\multiply\\muskip0 by 2\\divide\\muskip0 by 4\\the\\muskip0\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "2.0pt/3.0pt/2.0pt");
     }
 
     #[test]
@@ -2102,6 +2735,28 @@ mod tests {
             .expect("parse document");
 
         assert_eq!(document.body, "2");
+    }
+
+    #[test]
+    fn newcount_allocates_count_aliases() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\newcount\\foo\n\\newcount\\bar\n\\begin{document}\n\\foo=7\\bar=11\\the\\count10/\\the\\count11/\\the\\foo/\\the\\bar\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "7/11/7/11");
+    }
+
+    #[test]
+    fn countdef_creates_named_count_aliases() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\countdef\\foo=12\n\\begin{document}\n\\foo=9\\advance\\foo by 1\\the\\foo/\\the\\count12\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "10/10");
     }
 
     #[test]
