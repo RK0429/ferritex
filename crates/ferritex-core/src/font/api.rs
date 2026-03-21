@@ -1,5 +1,7 @@
 use crate::kernel::api::{DimensionValue, StableId};
 
+pub use super::tfm::TfmMetrics;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoadedFont {
     pub id: StableId,

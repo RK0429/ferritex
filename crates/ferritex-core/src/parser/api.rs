@@ -17,6 +17,49 @@ pub struct ParsedDocument {
     pub body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocumentNode {
+    Text(String),
+    ParBreak,
+}
+
+impl ParsedDocument {
+    pub fn body_nodes(&self) -> Vec<DocumentNode> {
+        if self.body.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let normalized_body = normalize_body_par_breaks(&self.body);
+        let mut nodes = Vec::new();
+        let mut current_text = String::new();
+        let mut in_break = false;
+
+        for line in normalized_body.split('\n') {
+            if line.trim().is_empty() {
+                push_body_text_node(&mut nodes, &mut current_text);
+                if !nodes.is_empty() && !in_break {
+                    nodes.push(DocumentNode::ParBreak);
+                    in_break = true;
+                }
+                continue;
+            }
+
+            if !current_text.is_empty() {
+                current_text.push('\n');
+            }
+            current_text.push_str(line);
+            in_break = false;
+        }
+
+        push_body_text_node(&mut nodes, &mut current_text);
+        if matches!(nodes.last(), Some(DocumentNode::ParBreak)) {
+            let _ = nodes.pop();
+        }
+
+        nodes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ParseError {
     #[error("input is empty")]
@@ -1586,13 +1629,57 @@ fn is_valid_document_class(name: &str) -> bool {
     !name.chars().any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
+fn normalize_body_par_breaks(body: &str) -> String {
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let mut output = String::with_capacity(normalized.len());
+    let mut chars = normalized.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        if ch == '\\' && normalized[index..].starts_with(r"\par") {
+            let next_char = normalized[index + 4..].chars().next();
+            if !matches!(next_char, Some(next) if next.is_ascii_alphabetic()) {
+                output.push('\n');
+                output.push('\n');
+                let _ = chars.next();
+                let _ = chars.next();
+                let _ = chars.next();
+                continue;
+            }
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn push_body_text_node(nodes: &mut Vec<DocumentNode>, current_text: &mut String) {
+    if current_text.is_empty() {
+        return;
+    }
+
+    let text = current_text.trim().to_string();
+    current_text.clear();
+    if !text.is_empty() {
+        nodes.push(DocumentNode::Text(text));
+    }
+}
+
 fn eof_line(source: &str) -> u32 {
     1 + source.bytes().filter(|byte| *byte == b'\n').count() as u32
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MinimalLatexParser, ParseError, ParsedDocument, Parser};
+    use super::{DocumentNode, MinimalLatexParser, ParseError, ParsedDocument, Parser};
+
+    fn parsed_document(body: &str) -> ParsedDocument {
+        ParsedDocument {
+            document_class: "article".to_string(),
+            package_count: 0,
+            body: body.to_string(),
+        }
+    }
 
     #[test]
     fn parses_minimal_latex_document() {
@@ -1607,6 +1694,43 @@ mod tests {
                 package_count: 0,
                 body: "Hello".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn body_nodes_empty() {
+        assert!(parsed_document("").body_nodes().is_empty());
+    }
+
+    #[test]
+    fn body_nodes_single_paragraph() {
+        assert_eq!(
+            parsed_document("Hello Ferritex").body_nodes(),
+            vec![DocumentNode::Text("Hello Ferritex".to_string())]
+        );
+    }
+
+    #[test]
+    fn body_nodes_with_par_break() {
+        assert_eq!(
+            parsed_document("First paragraph\n\nSecond paragraph").body_nodes(),
+            vec![
+                DocumentNode::Text("First paragraph".to_string()),
+                DocumentNode::ParBreak,
+                DocumentNode::Text("Second paragraph".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn body_nodes_with_explicit_par_command() {
+        assert_eq!(
+            parsed_document(r"First paragraph\par Second paragraph").body_nodes(),
+            vec![
+                DocumentNode::Text("First paragraph".to_string()),
+                DocumentNode::ParBreak,
+                DocumentNode::Text("Second paragraph".to_string()),
+            ]
         );
     }
 
