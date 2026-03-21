@@ -5,6 +5,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+const PNG_1X1_RGB: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0,
+    0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0, 3, 1,
+    1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
 fn ferritex_bin() -> Command {
     let bin = env!("CARGO_BIN_EXE_ferritex");
     Command::new(bin)
@@ -46,6 +52,34 @@ fn compile_existing_file_writes_pdf_with_document_content() {
     assert!(pdf.starts_with("%PDF-1.4"));
     assert!(pdf.contains("Hello, Ferritex!"));
     assert!(!pdf.contains("Ferritex placeholder PDF"));
+}
+
+#[test]
+fn compile_includegraphics_embeds_image_xobject_into_pdf() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("image.tex");
+    let image_file = dir.path().join("pixel.png");
+    std::fs::write(&image_file, PNG_1X1_RGB).expect("write image file");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nBefore\n\\includegraphics[width=100pt]{pixel.png}\nAfter\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read(dir.path().join("image.pdf")).expect("read output pdf");
+    let content = String::from_utf8_lossy(&pdf);
+    assert!(content.starts_with("%PDF-1.4"));
+    assert!(content.contains("/Subtype /Image"));
+    assert!(content.contains("/Filter /FlateDecode"));
+    assert!(content.contains("/XObject << /Im1"));
+    assert!(content.contains("/Im1 Do"));
 }
 
 #[test]

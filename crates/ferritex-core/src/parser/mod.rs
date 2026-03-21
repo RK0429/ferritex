@@ -5,8 +5,8 @@ mod registers;
 mod tokenizer;
 
 pub use api::{
-    DocumentLabels, MinimalLatexParser, ParseError, ParseOutput, ParsedDocument, Parser,
-    SectionEntry,
+    DocumentLabels, IncludeGraphicsOptions, MinimalLatexParser, ParseError, ParseOutput,
+    ParsedDocument, Parser, SectionEntry,
 };
 pub use macro_engine::{EnvironmentDef, MacroDef, MacroEngine};
 pub use tokenizer::{

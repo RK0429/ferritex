@@ -7,12 +7,16 @@ use super::{
 };
 
 use crate::font::api::TfmMetrics;
+use crate::graphics::api::{
+    compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
+};
 use crate::kernel::api::DimensionValue;
 use crate::parser::api::{DocumentNode, MathNode, ParsedDocument};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
 const PAGE_HEIGHT_PT: i64 = 792;
+const LEFT_MARGIN_PT: i64 = 72;
 const TOP_MARGIN_PT: i64 = 72;
 const BOTTOM_MARGIN_PT: i64 = 72;
 const LINE_HEIGHT_PT: i64 = 18;
@@ -45,6 +49,7 @@ pub struct TextLine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypesetPage {
     pub lines: Vec<TextLine>,
+    pub images: Vec<TypesetImage>,
     pub page_box: PageBox,
 }
 
@@ -62,6 +67,15 @@ pub struct TypesetOutline {
     pub title: String,
     pub page_index: usize,
     pub y: DimensionValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypesetImage {
+    pub graphic: ExternalGraphic,
+    pub x: DimensionValue,
+    pub y: DimensionValue,
+    pub display_width: DimensionValue,
+    pub display_height: DimensionValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +159,9 @@ pub enum VListItem {
         content: String,
         links: Vec<TextLineLink>,
     },
+    Image {
+        graphics_box: GraphicsBox,
+    },
     Glue {
         height: DimensionValue,
     },
@@ -217,7 +234,20 @@ pub struct MinimalTypesetter;
 impl MinimalTypesetter {
     pub fn typeset(&self, document: &ParsedDocument) -> TypesetDocument {
         let provider = default_fixed_width_provider();
-        self.typeset_with_provider(document, &provider)
+        self.typeset_with_provider_and_graphics_resolver(document, &provider, None)
+    }
+
+    pub fn typeset_with_graphics_resolver(
+        &self,
+        document: &ParsedDocument,
+        graphics_resolver: &dyn GraphicAssetResolver,
+    ) -> TypesetDocument {
+        let provider = default_fixed_width_provider();
+        self.typeset_with_provider_and_graphics_resolver(
+            document,
+            &provider,
+            Some(graphics_resolver),
+        )
     }
 
     pub fn typeset_with_provider(
@@ -225,12 +255,26 @@ impl MinimalTypesetter {
         document: &ParsedDocument,
         provider: &dyn CharWidthProvider,
     ) -> TypesetDocument {
+        self.typeset_with_provider_and_graphics_resolver(document, provider, None)
+    }
+
+    pub fn typeset_with_provider_and_graphics_resolver(
+        &self,
+        document: &ParsedDocument,
+        provider: &dyn CharWidthProvider,
+        graphics_resolver: Option<&dyn GraphicAssetResolver>,
+    ) -> TypesetDocument {
         let page_box = page_box_for_class(&document.document_class);
         let nodes = document.body_nodes();
         let params = break_params_for_provider(provider);
         let hyphenator = TexPatternHyphenator::english();
-        let vlist =
-            document_nodes_to_vlist_with_config(&nodes, provider, Some(&hyphenator), &params);
+        let vlist = document_nodes_to_vlist_with_config(
+            &nodes,
+            provider,
+            Some(&hyphenator),
+            &params,
+            graphics_resolver,
+        );
         let pages = paginate_vlist(&vlist, &page_box);
         let outlines = collect_outlines(document, &pages);
 
@@ -479,6 +523,15 @@ fn document_nodes_to_hlist_with_config(
                     value: PENALTY_FORCED,
                 });
             }
+            DocumentNode::IncludeGraphics { .. } => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+            }
         }
     }
 
@@ -498,23 +551,42 @@ fn document_nodes_to_vlist_with_config(
     provider: &dyn CharWidthProvider,
     hyphenator: Option<&dyn Hyphenator>,
     params: &BreakParams,
+    graphics_resolver: Option<&dyn GraphicAssetResolver>,
 ) -> Vec<VListItem> {
     let mut vlist = Vec::new();
     let mut segment_start = 0;
 
     for (index, node) in nodes.iter().enumerate() {
-        if matches!(node, DocumentNode::PageBreak) {
-            append_nodes_segment_to_vlist(
-                &mut vlist,
-                &nodes[segment_start..index],
-                provider,
-                hyphenator,
-                params,
-            );
-            vlist.push(VListItem::Penalty {
-                value: PENALTY_FORCED,
-            });
-            segment_start = index + 1;
+        match node {
+            DocumentNode::PageBreak => {
+                append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                );
+                vlist.push(VListItem::Penalty {
+                    value: PENALTY_FORCED,
+                });
+                segment_start = index + 1;
+            }
+            DocumentNode::IncludeGraphics { path, options } => {
+                append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                );
+                if let Some(resolver) = graphics_resolver {
+                    if let Some(graphics_box) = compile_includegraphics(path, options, resolver) {
+                        vlist.push(VListItem::Image { graphics_box });
+                    }
+                }
+                segment_start = index + 1;
+            }
+            _ => {}
         }
     }
 
@@ -696,6 +768,14 @@ fn lines_to_vlist(lines: &[line_breaker::BrokenLine]) -> Vec<VListItem> {
         .collect()
 }
 
+fn graphics_box_external(graphics_box: &GraphicsBox) -> Option<ExternalGraphic> {
+    let scene = graphics_box.scene.as_ref()?;
+    let node = scene.nodes.first()?;
+    match node {
+        GraphicNode::External(graphic) => Some(graphic.clone()),
+    }
+}
+
 fn collect_outlines(document: &ParsedDocument, pages: &[TypesetPage]) -> Vec<TypesetOutline> {
     let mut anchors = Vec::new();
     let mut used = Vec::new();
@@ -769,6 +849,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
     if vlist.is_empty() {
         return vec![TypesetPage {
             lines: Vec::new(),
+            images: Vec::new(),
             page_box: page_box.clone(),
         }];
     }
@@ -874,6 +955,7 @@ fn vlist_total_height(items: &[VListItem]) -> DimensionValue {
 fn vlist_item_height(item: &VListItem) -> DimensionValue {
     match item {
         VListItem::Box { tex_box, .. } => tex_box.height + tex_box.depth,
+        VListItem::Image { graphics_box } => graphics_box.height,
         VListItem::Glue { height } => *height,
         VListItem::Penalty { .. } => DimensionValue::zero(),
     }
@@ -881,6 +963,7 @@ fn vlist_item_height(item: &VListItem) -> DimensionValue {
 
 fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPage {
     let mut lines = Vec::new();
+    let mut images = Vec::new();
     let mut consumed_height = DimensionValue::zero();
 
     for item in items {
@@ -897,6 +980,21 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
+            VListItem::Image { graphics_box } => {
+                if let Some(graphic) = graphics_box_external(graphics_box) {
+                    images.push(TypesetImage {
+                        graphic,
+                        x: points(LEFT_MARGIN_PT),
+                        y: page_box.height
+                            - points(TOP_MARGIN_PT)
+                            - consumed_height
+                            - graphics_box.height,
+                        display_width: graphics_box.width,
+                        display_height: graphics_box.height,
+                    });
+                }
+                consumed_height = consumed_height + graphics_box.height;
+            }
             VListItem::Glue { height } => {
                 consumed_height = consumed_height + *height;
             }
@@ -906,6 +1004,7 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
 
     TypesetPage {
         lines,
+        images,
         page_box: page_box.clone(),
     }
 }
@@ -1193,13 +1292,19 @@ mod tests {
         page_box_for_class, paginate_vlist, points, resolve_page_labels, vlist_item_height,
         wrap_body, wrap_hlist, CharWidthProvider, GlueComponent, GlueOrder, HBox, HListItem,
         MinimalTypesetter, TeXBox, TextLine, TfmWidthProvider, TypesetPage, VBox, VListItem,
-        LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN,
-        PENALTY_FORCED, TOP_MARGIN_PT,
+        LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
+        PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
     };
+    use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::font::api::TfmMetrics;
+    use crate::graphics::api::{
+        ExternalGraphic, GraphicAssetResolver, ImageColorSpace, ImageMetadata,
+    };
     use crate::kernel::api::DimensionValue;
+    use crate::kernel::api::StableId;
     use crate::parser::api::{
-        DocumentNode, LineTag, MathLine, MathNode, MinimalLatexParser, ParsedDocument, Parser,
+        DocumentNode, IncludeGraphicsOptions, LineTag, MathLine, MathNode, MinimalLatexParser,
+        ParsedDocument, Parser,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -1222,6 +1327,25 @@ mod tests {
                 "\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
             ))
             .expect("parse document")
+    }
+
+    struct StubGraphicResolver;
+
+    impl GraphicAssetResolver for StubGraphicResolver {
+        fn resolve(&self, path: &str) -> Option<ExternalGraphic> {
+            Some(ExternalGraphic {
+                path: path.to_string(),
+                asset_handle: AssetHandle {
+                    id: LogicalAssetId(StableId(11)),
+                },
+                metadata: ImageMetadata {
+                    width: 10,
+                    height: 20,
+                    color_space: ImageColorSpace::DeviceRGB,
+                    bits_per_component: 8,
+                },
+            })
+        }
     }
 
     struct SkewedWidthProvider;
@@ -1298,6 +1422,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                 }],
+                images: Vec::new(),
                 page_box: page_box.clone(),
             },
             TypesetPage {
@@ -1306,6 +1431,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                 }],
+                images: Vec::new(),
                 page_box,
             },
         ];
@@ -1348,6 +1474,42 @@ mod tests {
         assert_eq!(pages[0].lines.len(), 35);
         assert_eq!(pages[1].lines.len(), 1);
         assert_eq!(pages[1].lines[0].text, "Overflow");
+    }
+
+    #[test]
+    fn includegraphics_flows_through_typesetting_and_pagination() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let nodes = vec![
+            DocumentNode::Text("Before".to_string()),
+            DocumentNode::IncludeGraphics {
+                path: "figure.png".to_string(),
+                options: IncludeGraphicsOptions {
+                    width: Some(points(100)),
+                    height: None,
+                    scale: None,
+                },
+            },
+            DocumentNode::Text("After".to_string()),
+        ];
+
+        let vlist = document_nodes_to_vlist_with_config(
+            &nodes,
+            &provider,
+            None,
+            &params,
+            Some(&StubGraphicResolver),
+        );
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].lines[0].text, "Before");
+        assert_eq!(pages[0].lines[1].text, "After");
+        assert_eq!(pages[0].images.len(), 1);
+        assert_eq!(pages[0].images[0].display_width, points(100));
+        assert_eq!(pages[0].images[0].display_height, points(200));
+        assert_eq!(pages[0].images[0].x, points(LEFT_MARGIN_PT));
+        assert_eq!(pages[0].images[0].graphic.path, "figure.png".to_string());
     }
 
     #[test]
@@ -1873,7 +2035,8 @@ mod tests {
         let provider = default_fixed_width_provider();
         let params = super::break_params_for_provider(&provider);
         let nodes = parsed.body_nodes();
-        let plain_vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params);
+        let plain_vlist =
+            document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
         let plain_document = super::TypesetDocument {
             pages: paginate_vlist(&plain_vlist, &page_box_for_class(&parsed.document_class)),
             outlines: Vec::new(),

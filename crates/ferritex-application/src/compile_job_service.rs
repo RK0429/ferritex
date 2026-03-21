@@ -1,15 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use ferritex_core::assets::{AssetHandle, LogicalAssetId};
 use ferritex_core::compilation::{
     CompilationJob, CompilationSnapshot, DocumentState, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
 use ferritex_core::font::{OpenTypeFont, TfmMetrics};
+use ferritex_core::graphics::api::{
+    extract_png_image_data, parse_image_metadata, ExternalGraphic, GraphicAssetResolver,
+    ImageMetadata,
+};
 use ferritex_core::kernel::api::DimensionValue;
+use ferritex_core::kernel::StableId;
 use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
-use ferritex_core::pdf::{FontResource, PdfRenderer};
+use ferritex_core::pdf::{FontResource, ImageFilter, PdfImageXObject, PdfRenderer, PlacedImage};
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
 use ferritex_core::typesetting::{
@@ -60,6 +67,38 @@ struct LoadedSourceTree {
 struct LoadedOpenTypeFont {
     base_font: String,
     font: OpenTypeFont,
+}
+
+struct CompileGraphicAssetResolver<'a> {
+    file_access_gate: &'a dyn FileAccessGate,
+    input_dir: &'a Path,
+    project_root: &'a Path,
+    asset_bundle_path: Option<&'a Path>,
+}
+
+impl GraphicAssetResolver for CompileGraphicAssetResolver<'_> {
+    fn resolve(&self, path: &str) -> Option<ExternalGraphic> {
+        let resolved_path = resolve_graphic_path(
+            self.input_dir,
+            self.project_root,
+            path,
+            self.asset_bundle_path,
+        );
+        if self.file_access_gate.check_read(&resolved_path) == PathAccessDecision::Denied {
+            return None;
+        }
+
+        let bytes = self.file_access_gate.read_file(&resolved_path).ok()?;
+        let metadata = parse_image_metadata(&bytes)?;
+
+        Some(ExternalGraphic {
+            path: resolved_path.to_string_lossy().into_owned(),
+            asset_handle: AssetHandle {
+                id: LogicalAssetId(stable_id_for_path(&resolved_path)),
+            },
+            metadata,
+        })
+    }
 }
 
 impl<'a> CompileJobService<'a> {
@@ -195,6 +234,19 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
+        let input_dir = options
+            .input_file
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(normalize_existing_path)
+            .unwrap_or_else(|| project_root.clone());
+        let graphics_resolver = CompileGraphicAssetResolver {
+            file_access_gate: self.file_access_gate,
+            input_dir: &input_dir,
+            project_root: &project_root,
+            asset_bundle_path: options.asset_bundle.as_deref(),
+        };
+
         let (parse_pass_result, pdf_renderer) = if let Some(loaded_font) =
             load_opentype_font(self.file_access_gate, options.asset_bundle.as_deref())
         {
@@ -202,9 +254,13 @@ impl<'a> CompileJobService<'a> {
                 font: &loaded_font.font,
                 fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
             };
-            let parse_pass_result = self
-                .parse_document_with_cross_references(&source_tree.source, |document| {
-                    self.typesetter.typeset_with_provider(document, &provider)
+            let parse_pass_result =
+                self.parse_document_with_cross_references(&source_tree.source, |document| {
+                    self.typesetter.typeset_with_provider_and_graphics_resolver(
+                        document,
+                        &provider,
+                        Some(&graphics_resolver),
+                    )
                 });
             let pdf_renderer = parse_pass_result
                 .typeset_document
@@ -224,14 +280,19 @@ impl<'a> CompileJobService<'a> {
             };
             (
                 self.parse_document_with_cross_references(&source_tree.source, |document| {
-                    self.typesetter.typeset_with_provider(document, &provider)
+                    self.typesetter.typeset_with_provider_and_graphics_resolver(
+                        document,
+                        &provider,
+                        Some(&graphics_resolver),
+                    )
                 }),
                 self.pdf_renderer.clone(),
             )
         } else {
             (
                 self.parse_document_with_cross_references(&source_tree.source, |document| {
-                    self.typesetter.typeset(document)
+                    self.typesetter
+                        .typeset_with_graphics_resolver(document, &graphics_resolver)
                 }),
                 self.pdf_renderer.clone(),
             )
@@ -271,6 +332,23 @@ impl<'a> CompileJobService<'a> {
             }
         };
         let typeset_document = typeset_document.expect("parsed documents should always typeset");
+        let pdf_renderer = match build_pdf_renderer_with_images(
+            self.file_access_gate,
+            pdf_renderer,
+            &typeset_document,
+        ) {
+            Ok(renderer) => renderer,
+            Err(diagnostic) => {
+                let diagnostics = vec![diagnostic];
+
+                return CompileResult {
+                    exit_code: exit_code_for(&diagnostics),
+                    diagnostics,
+                    output_pdf: None,
+                    stable_compile_state: None,
+                };
+            }
+        };
         let pdf_document = pdf_renderer.render(&typeset_document);
         let compilation_job = compilation_job(
             options.input_file.clone(),
@@ -902,6 +980,90 @@ fn read_utf8_file(
     })
 }
 
+fn build_pdf_renderer_with_images(
+    file_access_gate: &dyn FileAccessGate,
+    renderer: PdfRenderer,
+    document: &TypesetDocument,
+) -> Result<PdfRenderer, Diagnostic> {
+    if document.pages.iter().all(|page| page.images.is_empty()) {
+        return Ok(renderer);
+    }
+
+    let mut images = Vec::new();
+    let mut image_indices = std::collections::HashMap::new();
+    let mut page_images = Vec::with_capacity(document.pages.len());
+
+    for page in &document.pages {
+        let mut placements = Vec::with_capacity(page.images.len());
+        for image in &page.images {
+            let xobject_index = if let Some(index) =
+                image_indices.get(&image.graphic.asset_handle.id)
+            {
+                *index
+            } else {
+                let path = Path::new(&image.graphic.path);
+                let bytes = file_access_gate.read_file(path).map_err(|error| {
+                    diagnostic_for_input_error(error, image.graphic.path.clone())
+                })?;
+                let xobject =
+                    build_pdf_image_xobject(&image.graphic.path, &image.graphic.metadata, &bytes)?;
+                let index = images.len();
+                images.push(xobject);
+                image_indices.insert(image.graphic.asset_handle.id.clone(), index);
+                index
+            };
+
+            placements.push(PlacedImage {
+                xobject_index,
+                x: image.x,
+                y: image.y,
+                display_width: image.display_width,
+                display_height: image.display_height,
+            });
+        }
+        page_images.push(placements);
+    }
+
+    Ok(renderer.with_images(images, page_images))
+}
+
+fn build_pdf_image_xobject(
+    path: &str,
+    metadata: &ImageMetadata,
+    bytes: &[u8],
+) -> Result<PdfImageXObject, Diagnostic> {
+    if let Some(image_data) = extract_png_image_data(bytes) {
+        return Ok(PdfImageXObject {
+            object_id: 0,
+            width: metadata.width,
+            height: metadata.height,
+            color_space: metadata.color_space,
+            bits_per_component: metadata.bits_per_component,
+            data: image_data,
+            filter: ImageFilter::FlateDecode,
+        });
+    }
+
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        return Ok(PdfImageXObject {
+            object_id: 0,
+            width: metadata.width,
+            height: metadata.height,
+            color_space: metadata.color_space,
+            bits_per_component: metadata.bits_per_component,
+            data: bytes.to_vec(),
+            filter: ImageFilter::DCTDecode,
+        });
+    }
+
+    Err(Diagnostic::new(
+        Severity::Error,
+        "unsupported image format for \\includegraphics",
+    )
+    .with_file(path.to_string())
+    .with_suggestion("use a non-interlaced PNG or a baseline/progressive JPEG"))
+}
+
 fn normalize_existing_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1174,6 +1336,32 @@ fn resolve_input_path(
     candidate
 }
 
+fn resolve_graphic_path(
+    base_dir: &Path,
+    workspace_root: &Path,
+    value: &str,
+    asset_bundle_path: Option<&Path>,
+) -> PathBuf {
+    let candidate = graphic_path_candidate(base_dir, value);
+    if candidate.exists() {
+        return normalize_existing_path(&candidate);
+    }
+
+    let workspace_candidate = graphic_path_candidate(workspace_root, value);
+    if workspace_candidate.exists() {
+        return normalize_existing_path(&workspace_candidate);
+    }
+
+    if let Some(bundle_path) = asset_bundle_path {
+        let bundle_candidate = graphic_path_candidate(bundle_path, value);
+        if bundle_candidate.exists() {
+            return normalize_existing_path(&bundle_candidate);
+        }
+    }
+
+    candidate
+}
+
 fn tex_path_candidate(base_dir: &Path, value: &str) -> PathBuf {
     let path = Path::new(value);
     let candidate = if path.is_absolute() {
@@ -1187,6 +1375,21 @@ fn tex_path_candidate(base_dir: &Path, value: &str) -> PathBuf {
     } else {
         candidate.with_extension("tex")
     }
+}
+
+fn graphic_path_candidate(base_dir: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn stable_id_for_path(path: &Path) -> StableId {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    StableId(hasher.finish())
 }
 
 fn tex_relative_candidate(path: &Path) -> PathBuf {

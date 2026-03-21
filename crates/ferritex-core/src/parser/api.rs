@@ -5,6 +5,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::kernel::api::DimensionValue;
+
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
     registers::{RegisterStore, MAX_REGISTER_INDEX},
@@ -30,6 +32,10 @@ const BODY_EQUATION_ENV_START: char = '\u{E00E}';
 const BODY_EQUATION_ENV_END: char = '\u{E00F}';
 const BODY_PAGEREF_START: char = '\u{E010}';
 const BODY_PAGEREF_END: char = '\u{E011}';
+const BODY_INCLUDEGRAPHICS_START: char = '\u{E012}';
+const BODY_INCLUDEGRAPHICS_END: char = '\u{E013}';
+const BODY_INCLUDEGRAPHICS_PATH_END: char = '\u{E014}';
+const BODY_INCLUDEGRAPHICS_FIELD_SEPARATOR: char = '\u{E015}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -187,7 +193,14 @@ pub struct MathLine {
     pub display_tag: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IncludeGraphicsOptions {
+    pub width: Option<DimensionValue>,
+    pub height: Option<DimensionValue>,
+    pub scale: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum DocumentNode {
     Text(String),
     Link {
@@ -204,6 +217,10 @@ pub enum DocumentNode {
         lines: Vec<MathLine>,
         numbered: bool,
         aligned: bool,
+    },
+    IncludeGraphics {
+        path: String,
+        options: IncludeGraphicsOptions,
     },
 }
 
@@ -1002,6 +1019,10 @@ impl<'a> ParserDriver<'a> {
                         let _ = self.take_global_prefix();
                         self.parse_url_command()?;
                     }
+                    "includegraphics" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_includegraphics_command()?;
+                    }
                     "section" => {
                         let _ = self.take_global_prefix();
                         self.parse_section_command(1)?;
@@ -1663,6 +1684,29 @@ impl<'a> ParserDriver<'a> {
         self.body.push(BODY_URL_START);
         self.body.push_str(&url);
         self.body.push(BODY_URL_END);
+        Ok(())
+    }
+
+    fn parse_includegraphics_command(&mut self) -> Result<(), ParseError> {
+        let option_tokens = self.read_optional_bracket_tokens()?;
+        let Some(path_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let path = tokens_to_text(&path_tokens).trim().to_string();
+        if path.is_empty() {
+            return Ok(());
+        }
+
+        let options = option_tokens
+            .as_deref()
+            .map(parse_includegraphics_options)
+            .unwrap_or_default();
+
+        self.body.push(BODY_INCLUDEGRAPHICS_START);
+        self.body
+            .push_str(&serialize_includegraphics_marker(&path, &options));
+        self.body.push(BODY_INCLUDEGRAPHICS_END);
         Ok(())
     }
 
@@ -3505,6 +3549,14 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_INCLUDEGRAPHICS_START => {
+                let (content, next_index) =
+                    extract_single_marker_content(body, index, BODY_INCLUDEGRAPHICS_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(deserialize_includegraphics_marker(content));
+                text.push(placeholder);
+                index = next_index;
+            }
             BODY_INLINE_MATH_START | BODY_DISPLAY_MATH_START => {
                 let (content, next_index) = extract_math_marker_content(body, index);
                 let placeholder = next_box_placeholder(placeholders.len());
@@ -3651,6 +3703,94 @@ fn extract_single_marker_content(
     }
 
     (&body[content_start..], body.len())
+}
+
+fn serialize_includegraphics_marker(path: &str, options: &IncludeGraphicsOptions) -> String {
+    let width = options
+        .width
+        .map(|value| value.0.to_string())
+        .unwrap_or_default();
+    let height = options
+        .height
+        .map(|value| value.0.to_string())
+        .unwrap_or_default();
+    let scale = options
+        .scale
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+
+    format!(
+        "{path}{BODY_INCLUDEGRAPHICS_PATH_END}{width}{BODY_INCLUDEGRAPHICS_FIELD_SEPARATOR}{height}{BODY_INCLUDEGRAPHICS_FIELD_SEPARATOR}{scale}"
+    )
+}
+
+fn deserialize_includegraphics_marker(content: &str) -> DocumentNode {
+    let (path, rest) = content
+        .split_once(BODY_INCLUDEGRAPHICS_PATH_END)
+        .unwrap_or((content, ""));
+    let mut fields = rest.split(BODY_INCLUDEGRAPHICS_FIELD_SEPARATOR);
+    let options = IncludeGraphicsOptions {
+        width: fields.next().and_then(parse_dimension_marker_field),
+        height: fields.next().and_then(parse_dimension_marker_field),
+        scale: fields.next().and_then(parse_scale_marker_field),
+    };
+
+    DocumentNode::IncludeGraphics {
+        path: path.to_string(),
+        options,
+    }
+}
+
+fn parse_dimension_marker_field(value: &str) -> Option<DimensionValue> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty())
+        .then(|| trimmed.parse::<i64>().ok().map(DimensionValue))
+        .flatten()
+}
+
+fn parse_scale_marker_field(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty())
+        .then(|| trimmed.parse::<f64>().ok())
+        .flatten()
+}
+
+fn parse_includegraphics_options(tokens: &[Token]) -> IncludeGraphicsOptions {
+    let mut options = IncludeGraphicsOptions::default();
+    let text = tokens_to_text(tokens);
+
+    for entry in text
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+
+        match key {
+            "width" => options.width = parse_dimension_option(value),
+            "height" => options.height = parse_dimension_option(value),
+            "scale" => options.scale = value.parse::<f64>().ok(),
+            _ => {}
+        }
+    }
+
+    options
+}
+
+fn parse_dimension_option(value: &str) -> Option<DimensionValue> {
+    let trimmed = value.trim();
+    let number = trimmed
+        .strip_suffix("pt")
+        .or_else(|| trimmed.strip_suffix("PT"))?
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+
+    Some(DimensionValue((number * 65_536.0).round() as i64))
 }
 
 fn push_body_text_node(
@@ -4373,9 +4513,10 @@ fn eof_line(source: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentLabels, DocumentNode, LineTag, MathLine, MathNode, MinimalLatexParser, ParseError,
-        ParsedDocument, Parser, SectionEntry,
+        DocumentLabels, DocumentNode, IncludeGraphicsOptions, LineTag, MathLine, MathNode,
+        MinimalLatexParser, ParseError, ParsedDocument, Parser, SectionEntry,
     };
+    use crate::kernel::api::DimensionValue;
     use std::collections::BTreeMap;
 
     fn parsed_document(body: &str) -> ParsedDocument {
@@ -4596,6 +4737,22 @@ mod tests {
         assert_eq!(
             parse_document(r"\hbox{}").body_nodes(),
             vec![DocumentNode::HBox(vec![])]
+        );
+    }
+
+    #[test]
+    fn includegraphics_parsed_to_document_node_with_options() {
+        assert_eq!(
+            parse_document(r"\includegraphics[width=100pt,height=50pt,scale=1.5]{images/test.png}")
+                .body_nodes(),
+            vec![DocumentNode::IncludeGraphics {
+                path: "images/test.png".to_string(),
+                options: IncludeGraphicsOptions {
+                    width: Some(DimensionValue(100 * 65_536)),
+                    height: Some(DimensionValue(50 * 65_536)),
+                    scale: Some(1.5),
+                },
+            }]
         );
     }
 

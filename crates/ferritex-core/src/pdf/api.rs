@@ -1,3 +1,4 @@
+pub use crate::graphics::api::ImageColorSpace;
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{TextLine, TypesetDocument, TypesetOutline, TypesetPage};
 
@@ -47,9 +48,37 @@ pub enum FontResource {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFilter {
+    DCTDecode,
+    FlateDecode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfImageXObject {
+    pub object_id: usize,
+    pub width: u32,
+    pub height: u32,
+    pub color_space: ImageColorSpace,
+    pub bits_per_component: u8,
+    pub data: Vec<u8>,
+    pub filter: ImageFilter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedImage {
+    pub xobject_index: usize,
+    pub x: DimensionValue,
+    pub y: DimensionValue,
+    pub display_width: DimensionValue,
+    pub display_height: DimensionValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdfRenderer {
     fonts: Vec<FontResource>,
+    images: Vec<PdfImageXObject>,
+    page_images: Vec<Vec<PlacedImage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +101,8 @@ impl PdfRenderer {
     pub fn new() -> Self {
         Self {
             fonts: default_font_resources(),
+            images: Vec::new(),
+            page_images: Vec::new(),
         }
     }
 
@@ -82,7 +113,19 @@ impl PdfRenderer {
             } else {
                 fonts
             },
+            images: Vec::new(),
+            page_images: Vec::new(),
         }
+    }
+
+    pub fn with_images(
+        mut self,
+        images: Vec<PdfImageXObject>,
+        page_images: Vec<Vec<PlacedImage>>,
+    ) -> Self {
+        self.images = images;
+        self.page_images = page_images;
+        self
     }
 
     pub fn render(&self, document: &TypesetDocument) -> PdfDocument {
@@ -93,6 +136,7 @@ impl PdfRenderer {
         let page_object_start = 3usize;
         let content_object_start = page_object_start + page_count;
         let annotation_object_start = content_object_start + page_count;
+        let mut image_objects = self.images.clone();
         let mut page_annotations = document
             .pages
             .iter()
@@ -118,8 +162,10 @@ impl PdfRenderer {
             .iter()
             .map(|font_object| font_object.objects.len())
             .sum::<usize>();
+        let image_object_start = font_object_start + font_object_count;
+        assign_image_object_ids(&mut image_objects, image_object_start);
         let info_object_id =
-            build_info_dictionary(document).map(|_| font_object_start + font_object_count);
+            build_info_dictionary(document).map(|_| image_object_start + image_objects.len());
         let page_font_resources = page_font_resources(&font_objects);
         let catalog_outlines = outline_root_object_id
             .map(|object_id| format!(" /Outlines {object_id} 0 R"))
@@ -148,26 +194,38 @@ impl PdfRenderer {
                 .iter()
                 .map(|annotation| format!("{} 0 R", annotation.object_id))
                 .collect::<Vec<_>>();
+            let page_images = self
+                .page_images
+                .get(page_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let annots_entry = if page_annots.is_empty() {
                 String::new()
             } else {
                 format!(" /Annots [{}]", page_annots.join(" "))
             };
+            let xobject_resources = page_xobject_resources(page_images, &image_objects);
             append_object(
                 &mut pdf,
                 &mut offsets,
                 &format!(
-                    "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >> >>{annots_entry} >>\nendobj\n",
+                    "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >>{} >>{annots_entry} >>\nendobj\n",
                     points_to_pdf_number(page.page_box.width),
                     points_to_pdf_number(page.page_box.height),
                     page_font_resources,
+                    xobject_resources,
                 ),
             );
         }
 
         for (page_index, page) in document.pages.iter().enumerate() {
             let content_object_id = content_object_start + page_index;
-            let stream = render_page_stream(page);
+            let page_images = self
+                .page_images
+                .get(page_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let stream = render_page_stream(page, page_images, &image_objects);
             append_object(
                 &mut pdf,
                 &mut offsets,
@@ -195,6 +253,10 @@ impl PdfRenderer {
                     ),
                 );
             }
+        }
+
+        for image in &image_objects {
+            append_image_xobject(&mut pdf, &mut offsets, image);
         }
 
         if let Some(root_object_id) = outline_root_object_id {
@@ -450,10 +512,15 @@ fn page_kids(page_count: usize, page_object_start: usize) -> String {
         .join(" ")
 }
 
-fn render_page_stream(page: &TypesetPage) -> String {
-    let mut stream = String::from("BT\n/F1 12 Tf\n");
+fn render_page_stream(
+    page: &TypesetPage,
+    placed_images: &[PlacedImage],
+    image_objects: &[PdfImageXObject],
+) -> String {
+    let mut stream = String::new();
 
     if let Some(first_line) = page.lines.first() {
+        stream.push_str("BT\n/F1 12 Tf\n");
         stream.push_str(&format!(
             "{} {} Td\n",
             LEFT_MARGIN_PT,
@@ -470,10 +537,106 @@ fn render_page_stream(page: &TypesetPage) -> String {
             stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
             previous_y = line.y;
         }
+        stream.push_str("ET\n");
     }
 
-    stream.push_str("ET\n");
+    for placement in placed_images {
+        if image_objects.get(placement.xobject_index).is_some() {
+            stream.push_str(&render_image_placement(placement));
+        }
+    }
+
     stream
+}
+
+fn render_image_placement(image: &PlacedImage) -> String {
+    format!(
+        "q {} 0 0 {} {} {} cm /Im{} Do Q\n",
+        points_to_pdf_number(image.display_width),
+        points_to_pdf_number(image.display_height),
+        points_to_pdf_number(image.x),
+        points_to_pdf_number(image.y),
+        image.xobject_index + 1,
+    )
+}
+
+fn assign_image_object_ids(images: &mut [PdfImageXObject], start_object_id: usize) {
+    for (index, image) in images.iter_mut().enumerate() {
+        image.object_id = start_object_id + index;
+    }
+}
+
+fn page_xobject_resources(
+    page_images: &[PlacedImage],
+    image_objects: &[PdfImageXObject],
+) -> String {
+    let resources = page_images
+        .iter()
+        .filter_map(|placement| {
+            image_objects
+                .get(placement.xobject_index)
+                .map(|image| format!("/Im{} {} 0 R", placement.xobject_index + 1, image.object_id))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if resources.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " /XObject << {} >>",
+            resources.into_iter().collect::<Vec<_>>().join(" ")
+        )
+    }
+}
+
+fn append_image_xobject(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, image: &PdfImageXObject) {
+    offsets.push(buffer.len());
+    buffer.extend_from_slice(
+        format!(
+            "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent {} /Filter /{}{} /Length {} >>\nstream\n",
+            image.object_id,
+            image.width,
+            image.height,
+            image_color_space_name(image.color_space),
+            image.bits_per_component,
+            image_filter_name(image.filter),
+            image_decode_params(image),
+            image.data.len(),
+        )
+        .as_bytes(),
+    );
+    buffer.extend_from_slice(&image.data);
+    buffer.extend_from_slice(b"\nendstream\nendobj\n");
+}
+
+fn image_color_space_name(color_space: ImageColorSpace) -> &'static str {
+    match color_space {
+        ImageColorSpace::DeviceRGB => "DeviceRGB",
+        ImageColorSpace::DeviceGray => "DeviceGray",
+    }
+}
+
+fn image_filter_name(filter: ImageFilter) -> &'static str {
+    match filter {
+        ImageFilter::DCTDecode => "DCTDecode",
+        ImageFilter::FlateDecode => "FlateDecode",
+    }
+}
+
+fn image_decode_params(image: &PdfImageXObject) -> String {
+    if image.filter != ImageFilter::FlateDecode {
+        return String::new();
+    }
+
+    let colors = match image.color_space {
+        ImageColorSpace::DeviceRGB => 3,
+        ImageColorSpace::DeviceGray => 1,
+    };
+
+    format!(
+        " /DecodeParms << /Predictor 15 /Colors {} /BitsPerComponent {} /Columns {} >>",
+        colors, image.bits_per_component, image.width
+    )
 }
 
 fn assign_annotation_object_ids(
@@ -592,7 +755,9 @@ fn escape_pdf_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FontResource, PdfRenderer};
+    use super::{
+        FontResource, ImageColorSpace, ImageFilter, PdfImageXObject, PdfRenderer, PlacedImage,
+    };
     use crate::kernel::api::DimensionValue;
     use crate::typesetting::api::{PageBox, TextLine, TypesetDocument, TypesetPage};
 
@@ -617,6 +782,7 @@ mod tests {
                     links: Vec::new(),
                 })
                 .collect(),
+            images: Vec::new(),
         }
     }
 
@@ -658,6 +824,38 @@ mod tests {
 
         assert_eq!(pdf.page_count, 2);
         assert!(content.contains("/Count 2"));
+    }
+
+    #[test]
+    fn emits_image_xobject_and_placement_commands() {
+        let document = single_page(&[]);
+        let renderer = PdfRenderer::default().with_images(
+            vec![PdfImageXObject {
+                object_id: 0,
+                width: 1,
+                height: 1,
+                color_space: ImageColorSpace::DeviceRGB,
+                bits_per_component: 8,
+                data: vec![120, 156, 99, 248, 207, 192, 0, 0, 3, 1, 1, 0],
+                filter: ImageFilter::FlateDecode,
+            }],
+            vec![vec![PlacedImage {
+                xobject_index: 0,
+                x: points(72),
+                y: points(600),
+                display_width: points(100),
+                display_height: points(100),
+            }]],
+        );
+        let pdf = renderer.render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/XObject << /Im1"));
+        assert!(content.contains("/Subtype /Image /Width 1 /Height 1"));
+        assert!(content.contains("/Filter /FlateDecode"));
+        assert!(content
+            .contains("/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns 1 >>"));
+        assert!(content.contains("q 100 0 0 100 72 600 cm /Im1 Do Q"));
     }
 
     #[test]
