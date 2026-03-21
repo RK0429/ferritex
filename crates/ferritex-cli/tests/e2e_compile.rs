@@ -514,6 +514,30 @@ fn compile_resolves_refs_across_input_boundaries() {
 }
 
 #[test]
+fn compile_resolves_pageref_across_page_boundaries() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("pageref.tex");
+    std::fs::write(
+        &tex_file,
+        format!(
+            "\\documentclass{{article}}\n\\begin{{document}}\nSee page \\pageref{{sec:later}}.\n\\newpage\n\\section{{Later}}\\label{{sec:later}}\nDone.\n\\end{{document}}\n"
+        ),
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("pageref.pdf")).expect("read output pdf");
+    assert!(pdf.contains("See page 2."));
+    assert!(pdf.contains("1 Later"));
+    assert!(!pdf.contains("??"));
+}
+
+#[test]
 fn compile_resolves_project_root_fallback_from_nested_input() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let project_root = dir.path().join("project");

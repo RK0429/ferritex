@@ -28,6 +28,8 @@ const BODY_URL_START: char = '\u{E00C}';
 const BODY_URL_END: char = '\u{E00D}';
 const BODY_EQUATION_ENV_START: char = '\u{E00E}';
 const BODY_EQUATION_ENV_END: char = '\u{E00F}';
+const BODY_PAGEREF_START: char = '\u{E010}';
+const BODY_PAGEREF_END: char = '\u{E011}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -57,6 +59,7 @@ pub struct DocumentLabels {
     pub citations: Vec<String>,
     pub bibliography: BTreeMap<String, String>,
     pub section_entries: Vec<SectionEntry>,
+    pub page_label_anchors: BTreeMap<String, String>,
     pub title: Option<String>,
     pub author: Option<String>,
     pub has_unresolved_toc: bool,
@@ -68,6 +71,7 @@ impl DocumentLabels {
         citations: Vec<String>,
         bibliography: BTreeMap<String, String>,
         section_entries: Vec<SectionEntry>,
+        page_label_anchors: BTreeMap<String, String>,
         title: Option<String>,
         author: Option<String>,
         has_unresolved_toc: bool,
@@ -77,6 +81,7 @@ impl DocumentLabels {
             citations,
             bibliography,
             section_entries,
+            page_label_anchors,
             title,
             author,
             has_unresolved_toc,
@@ -206,6 +211,10 @@ impl ParsedDocument {
     pub fn body_nodes(&self) -> Vec<DocumentNode> {
         body_nodes_from_text(&self.body)
     }
+
+    pub fn has_pageref_markers(&self) -> bool {
+        body_contains_pageref_markers(&self.body)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -285,15 +294,22 @@ impl Parser for MinimalLatexParser {
 
 impl MinimalLatexParser {
     pub fn parse_recovering(&self, source: &str) -> ParseOutput {
-        self.parse_recovering_with_context(source, BTreeMap::new(), Vec::new(), BTreeMap::new())
+        self.parse_recovering_with_context(
+            source,
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
     }
 
     pub fn parse_with_labels(
         &self,
         source: &str,
         initial_labels: BTreeMap<String, String>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> Result<ParsedDocument, ParseError> {
-        parse_minimal_latex_with_labels(source, initial_labels)
+        parse_minimal_latex_with_labels(source, initial_labels, initial_page_labels)
     }
 
     pub fn parse_with_state(
@@ -301,8 +317,14 @@ impl MinimalLatexParser {
         source: &str,
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> Result<ParsedDocument, ParseError> {
-        parse_minimal_latex_with_state(source, initial_labels, initial_section_entries)
+        parse_minimal_latex_with_state(
+            source,
+            initial_labels,
+            initial_section_entries,
+            initial_page_labels,
+        )
     }
 
     pub fn parse_with_context(
@@ -311,12 +333,14 @@ impl MinimalLatexParser {
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> Result<ParsedDocument, ParseError> {
         parse_minimal_latex_with_context(
             source,
             initial_labels,
             initial_section_entries,
             initial_bibliography,
+            initial_page_labels,
         )
     }
 
@@ -324,8 +348,15 @@ impl MinimalLatexParser {
         &self,
         source: &str,
         initial_labels: BTreeMap<String, String>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> ParseOutput {
-        self.parse_recovering_with_context(source, initial_labels, Vec::new(), BTreeMap::new())
+        self.parse_recovering_with_context(
+            source,
+            initial_labels,
+            Vec::new(),
+            BTreeMap::new(),
+            initial_page_labels,
+        )
     }
 
     pub fn parse_recovering_with_state(
@@ -333,12 +364,14 @@ impl MinimalLatexParser {
         source: &str,
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> ParseOutput {
         self.parse_recovering_with_context(
             source,
             initial_labels,
             initial_section_entries,
             BTreeMap::new(),
+            initial_page_labels,
         )
     }
 
@@ -348,6 +381,7 @@ impl MinimalLatexParser {
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> ParseOutput {
         if source.trim().is_empty() {
             return ParseOutput {
@@ -361,32 +395,48 @@ impl MinimalLatexParser {
             initial_labels,
             initial_section_entries,
             initial_bibliography,
+            initial_page_labels,
         )
         .run_recovering()
     }
 }
 
 fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
-    parse_minimal_latex_with_context(source, BTreeMap::new(), Vec::new(), BTreeMap::new())
+    parse_minimal_latex_with_context(
+        source,
+        BTreeMap::new(),
+        Vec::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
 }
 
 fn parse_minimal_latex_with_labels(
     source: &str,
     initial_labels: BTreeMap<String, String>,
+    initial_page_labels: BTreeMap<String, u32>,
 ) -> Result<ParsedDocument, ParseError> {
-    parse_minimal_latex_with_context(source, initial_labels, Vec::new(), BTreeMap::new())
+    parse_minimal_latex_with_context(
+        source,
+        initial_labels,
+        Vec::new(),
+        BTreeMap::new(),
+        initial_page_labels,
+    )
 }
 
 fn parse_minimal_latex_with_state(
     source: &str,
     initial_labels: BTreeMap<String, String>,
     initial_section_entries: Vec<SectionEntry>,
+    initial_page_labels: BTreeMap<String, u32>,
 ) -> Result<ParsedDocument, ParseError> {
     parse_minimal_latex_with_context(
         source,
         initial_labels,
         initial_section_entries,
         BTreeMap::new(),
+        initial_page_labels,
     )
 }
 
@@ -395,6 +445,7 @@ fn parse_minimal_latex_with_context(
     initial_labels: BTreeMap<String, String>,
     initial_section_entries: Vec<SectionEntry>,
     initial_bibliography: BTreeMap<String, String>,
+    initial_page_labels: BTreeMap<String, u32>,
 ) -> Result<ParsedDocument, ParseError> {
     if source.trim().is_empty() {
         return Err(ParseError::EmptyInput);
@@ -405,6 +456,7 @@ fn parse_minimal_latex_with_context(
         initial_labels,
         initial_section_entries,
         initial_bibliography,
+        initial_page_labels,
     )
     .run()
 }
@@ -436,8 +488,11 @@ struct ParserState {
     subsection: u32,
     subsubsection: u32,
     current_section_number: Option<String>,
+    current_label_anchor: Option<String>,
     equation_counter: u32,
     labels: BTreeMap<String, String>,
+    page_labels: BTreeMap<String, u32>,
+    page_label_anchors: BTreeMap<String, String>,
     citations: Vec<String>,
     bibliography: BTreeMap<String, String>,
     section_entries: Vec<SectionEntry>,
@@ -448,7 +503,12 @@ struct ParserState {
 
 impl Default for ParserState {
     fn default() -> Self {
-        Self::new(BTreeMap::new(), Vec::new(), BTreeMap::new())
+        Self::new(
+            BTreeMap::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
     }
 }
 
@@ -457,14 +517,18 @@ impl ParserState {
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> Self {
         Self {
             section: 0,
             subsection: 0,
             subsubsection: 0,
             current_section_number: None,
+            current_label_anchor: None,
             equation_counter: 0,
             labels: initial_labels,
+            page_labels: initial_page_labels,
+            page_label_anchors: BTreeMap::new(),
             citations: Vec::new(),
             bibliography: initial_bibliography,
             section_entries: Vec::new(),
@@ -588,6 +652,7 @@ impl<'a> ParserDriver<'a> {
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_page_labels: BTreeMap<String, u32>,
     ) -> Self {
         Self {
             tokenizer: Tokenizer::new(source.as_bytes()),
@@ -596,6 +661,7 @@ impl<'a> ParserDriver<'a> {
                 initial_labels,
                 initial_section_entries,
                 initial_bibliography,
+                initial_page_labels,
             ),
             registers: RegisterStore::default(),
             conditionals: ConditionalState::default(),
@@ -821,6 +887,7 @@ impl<'a> ParserDriver<'a> {
                 self.state.citations.clone(),
                 self.state.bibliography.clone(),
                 self.state.section_entries.clone(),
+                self.state.page_label_anchors.clone(),
                 self.title.clone(),
                 self.author.clone(),
                 self.state.has_unresolved_toc,
@@ -957,11 +1024,22 @@ impl<'a> ParserDriver<'a> {
                     }
                     "pageref" => {
                         let _ = self.take_global_prefix();
-                        let _ = self.read_required_braced_tokens()?;
-                        // Real page references need a post-pagination pass, so Wave 4 keeps a
-                        // placeholder until page-number-aware cross references are implemented.
-                        self.body.push_str("??");
-                        self.state.has_unresolved_refs = true;
+                        let Some(tokens) = self.read_required_braced_tokens()? else {
+                            return Ok(false);
+                        };
+                        let key = tokens_to_text(&tokens).trim().to_string();
+                        if key.is_empty() {
+                            return Ok(false);
+                        }
+
+                        if let Some(page_number) = self.state.page_labels.get(&key).copied() {
+                            self.body.push_str(&page_number.to_string());
+                        } else {
+                            self.body.push(BODY_PAGEREF_START);
+                            self.body.push_str(&key);
+                            self.body.push(BODY_PAGEREF_END);
+                            self.state.has_unresolved_refs = true;
+                        }
                     }
                     "[" => {
                         let _ = self.take_global_prefix();
@@ -1504,6 +1582,7 @@ impl<'a> ParserDriver<'a> {
 
         let title = tokens_to_text(&tokens).trim().to_string();
         let number = self.state.next_section_number(level);
+        self.state.current_label_anchor = Some(section_anchor_text(&number, &title));
         self.state.section_entries.push(SectionEntry {
             level,
             number: number.clone(),
@@ -1641,7 +1720,7 @@ impl<'a> ParserDriver<'a> {
         let content = self.collect_environment_body(name, line)?;
         let numbered = !name.ends_with('*');
         let aligned = name.starts_with("align");
-        let lines = self.parse_math_environment_lines(&content, numbered);
+        let lines = self.parse_math_environment_lines(&content, numbered, aligned);
 
         self.body.push(BODY_EQUATION_ENV_START);
         self.body
@@ -1682,14 +1761,24 @@ impl<'a> ParserDriver<'a> {
         })
     }
 
-    fn parse_math_environment_lines(&mut self, content: &str, numbered: bool) -> Vec<MathLine> {
+    fn parse_math_environment_lines(
+        &mut self,
+        content: &str,
+        numbered: bool,
+        aligned: bool,
+    ) -> Vec<MathLine> {
         split_math_environment_lines(content)
             .into_iter()
-            .map(|line| self.parse_math_environment_line(&line, numbered))
+            .map(|line| self.parse_math_environment_line(&line, numbered, aligned))
             .collect()
     }
 
-    fn parse_math_environment_line(&mut self, line: &str, numbered: bool) -> MathLine {
+    fn parse_math_environment_line(
+        &mut self,
+        line: &str,
+        numbered: bool,
+        aligned: bool,
+    ) -> MathLine {
         let (without_labels, labels) = strip_math_line_labels(line);
         let (without_tag, tag) = strip_math_line_tag(&without_labels);
         let segments = split_math_line_segments(&without_tag)
@@ -1706,8 +1795,12 @@ impl<'a> ParserDriver<'a> {
         };
 
         if let Some(display_tag) = display_tag.as_ref() {
+            let anchor_text = render_math_line_for_anchor(&segments, display_tag, aligned);
             for label in labels {
-                self.state.labels.insert(label, display_tag.clone());
+                self.state.labels.insert(label.clone(), display_tag.clone());
+                self.state
+                    .page_label_anchors
+                    .insert(label, anchor_text.clone());
             }
         }
 
@@ -1747,7 +1840,10 @@ impl<'a> ParserDriver<'a> {
         }
 
         if let Some(number) = self.state.current_section_number.clone() {
-            self.state.labels.insert(key, number);
+            self.state.labels.insert(key.clone(), number);
+        }
+        if let Some(anchor_text) = self.state.current_label_anchor.clone() {
+            self.state.page_label_anchors.insert(key, anchor_text);
         }
         Ok(())
     }
@@ -3223,6 +3319,75 @@ fn normalize_body_par_breaks(body: &str) -> String {
     output
 }
 
+fn body_contains_pageref_markers(body: &str) -> bool {
+    body.contains(BODY_PAGEREF_START)
+}
+
+fn section_anchor_text(number: &str, title: &str) -> String {
+    match (number.is_empty(), title.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => number.to_string(),
+        (true, false) => title.to_string(),
+        (false, false) => format!("{number} {title}"),
+    }
+}
+
+fn render_math_line_for_anchor(
+    segments: &[Vec<MathNode>],
+    display_tag: &str,
+    aligned: bool,
+) -> String {
+    let separator = if aligned { " " } else { "" };
+    let mut rendered = segments
+        .iter()
+        .map(|segment| render_math_nodes_for_anchor(segment))
+        .collect::<Vec<_>>()
+        .join(separator);
+
+    if !display_tag.is_empty() {
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push('(');
+        rendered.push_str(display_tag);
+        rendered.push(')');
+    }
+
+    rendered
+}
+
+fn render_math_nodes_for_anchor(nodes: &[MathNode]) -> String {
+    nodes
+        .iter()
+        .map(render_math_node_for_anchor)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_math_node_for_anchor(node: &MathNode) -> String {
+    match node {
+        MathNode::Ordinary(ch) => ch.to_string(),
+        MathNode::Superscript(node) => format!("^{}", render_math_attachment_for_anchor(node)),
+        MathNode::Subscript(node) => format!("_{}", render_math_attachment_for_anchor(node)),
+        MathNode::Frac { numer, denom } => format!(
+            "({})/({})",
+            render_math_nodes_for_anchor(numer),
+            render_math_nodes_for_anchor(denom)
+        ),
+        MathNode::Group(nodes) => render_math_nodes_for_anchor(nodes),
+        MathNode::Text(text) => text.clone(),
+    }
+}
+
+fn render_math_attachment_for_anchor(node: &MathNode) -> String {
+    match node {
+        MathNode::Group(nodes) if nodes.len() > 1 => {
+            format!("({})", render_math_nodes_for_anchor(nodes))
+        }
+        _ => render_math_node_for_anchor(node),
+    }
+}
+
 fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
     if body.trim().is_empty() {
         return Vec::new();
@@ -3330,6 +3495,13 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                     extract_single_marker_content(body, index, BODY_EQUATION_ENV_END);
                 let placeholder = next_box_placeholder(placeholders.len());
                 placeholders.push(deserialize_equation_env(content));
+                text.push(placeholder);
+                index = next_index;
+            }
+            BODY_PAGEREF_START => {
+                let (_, next_index) = extract_single_marker_content(body, index, BODY_PAGEREF_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(DocumentNode::Text("??".to_string()));
                 text.push(placeholder);
                 index = next_index;
             }
@@ -5217,6 +5389,39 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_pageref_emits_body_marker() {
+        let document = parse_document("See page \\pageref{sec:later}.");
+
+        assert_eq!(
+            document.body,
+            format!(
+                "See page {}sec:later{}.",
+                super::BODY_PAGEREF_START,
+                super::BODY_PAGEREF_END
+            )
+        );
+        assert!(document.has_pageref_markers());
+        assert!(document.has_unresolved_refs);
+    }
+
+    #[test]
+    fn pageref_resolves_when_page_labels_are_provided() {
+        let document = MinimalLatexParser
+            .parse_with_context(
+                "\\documentclass{article}\n\\begin{document}\nSee page \\pageref{sec:later}.\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                BTreeMap::from([("sec:later".to_string(), 5)]),
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "See page 5.");
+        assert!(!document.has_pageref_markers());
+        assert!(!document.has_unresolved_refs);
+    }
+
+    #[test]
     fn cite_resolves_when_bibitem_is_available() {
         let document = parse_document(
             "\\begin{thebibliography}{99}\\bibitem{key} Reference text\\end{thebibliography}\nSee \\cite{key}.",
@@ -5275,6 +5480,7 @@ mod tests {
                 first.labels.clone().into_inner(),
                 first.section_entries.clone(),
                 first.bibliography.clone(),
+                BTreeMap::new(),
             )
             .expect("parse second pass");
 
@@ -5380,6 +5586,7 @@ mod tests {
                         title: "Scope".to_string(),
                     },
                 ],
+                BTreeMap::new(),
             )
             .expect("parse document");
 

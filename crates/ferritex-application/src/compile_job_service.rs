@@ -12,7 +12,9 @@ use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
 use ferritex_core::pdf::{FontResource, PdfRenderer};
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
-use ferritex_core::typesetting::{MinimalTypesetter, TfmWidthProvider, TypesetDocument};
+use ferritex_core::typesetting::{
+    resolve_page_labels, MinimalTypesetter, TfmWidthProvider, TypesetDocument,
+};
 
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::AssetBundleLoaderPort;
@@ -144,40 +146,6 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
-        let ParsePassResult {
-            output: ParseOutput { document, errors },
-            pass_count,
-        } = self.parse_document_with_cross_references(&source_tree.source);
-        let parse_diagnostics: Vec<Diagnostic> = errors
-            .into_iter()
-            .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
-            .collect();
-
-        let parsed_document = match document {
-            Some(document) => document,
-            None => {
-                let compilation_job = compilation_job(
-                    options.input_file.clone(),
-                    options.jobname.clone(),
-                    execution_policy.clone(),
-                );
-
-                return CompileResult {
-                    exit_code: exit_code_for(&parse_diagnostics),
-                    diagnostics: parse_diagnostics.clone(),
-                    output_pdf: None,
-                    stable_compile_state: Some(stable_compile_state(
-                        &compilation_job,
-                        source_tree.document_state.clone(),
-                        pass_count,
-                        0,
-                        false,
-                        parse_diagnostics,
-                    )),
-                };
-            }
-        };
-
         if !is_valid_jobname(&options.jobname) {
             let diagnostics =
                 vec![
@@ -227,20 +195,26 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
-        let (typeset_document, pdf_renderer) = if let Some(loaded_font) =
+        let (parse_pass_result, pdf_renderer) = if let Some(loaded_font) =
             load_opentype_font(self.file_access_gate, options.asset_bundle.as_deref())
         {
             let provider = OpenTypeWidthProvider {
                 font: &loaded_font.font,
                 fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
             };
-            let typeset_document = self
-                .typesetter
-                .typeset_with_provider(&parsed_document, &provider);
-            let pdf_renderer = build_opentype_pdf_renderer(&loaded_font, &typeset_document)
-                .map(|font_resource| PdfRenderer::with_fonts(vec![font_resource]))
+            let parse_pass_result = self
+                .parse_document_with_cross_references(&source_tree.source, |document| {
+                    self.typesetter.typeset_with_provider(document, &provider)
+                });
+            let pdf_renderer = parse_pass_result
+                .typeset_document
+                .as_ref()
+                .and_then(|typeset_document| {
+                    build_opentype_pdf_renderer(&loaded_font, typeset_document)
+                        .map(|font_resource| PdfRenderer::with_fonts(vec![font_resource]))
+                })
                 .unwrap_or_else(PdfRenderer::default);
-            (typeset_document, pdf_renderer)
+            (parse_pass_result, pdf_renderer)
         } else if let Some(metrics) =
             load_cmr10_metrics(self.file_access_gate, options.asset_bundle.as_deref())
         {
@@ -249,16 +223,54 @@ impl<'a> CompileJobService<'a> {
                 fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
             };
             (
-                self.typesetter
-                    .typeset_with_provider(&parsed_document, &provider),
+                self.parse_document_with_cross_references(&source_tree.source, |document| {
+                    self.typesetter.typeset_with_provider(document, &provider)
+                }),
                 self.pdf_renderer.clone(),
             )
         } else {
             (
-                self.typesetter.typeset(&parsed_document),
+                self.parse_document_with_cross_references(&source_tree.source, |document| {
+                    self.typesetter.typeset(document)
+                }),
                 self.pdf_renderer.clone(),
             )
         };
+        let ParsePassResult {
+            output: ParseOutput { document, errors },
+            typeset_document,
+            pass_count,
+        } = parse_pass_result;
+        let parse_diagnostics: Vec<Diagnostic> = errors
+            .into_iter()
+            .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
+            .collect();
+
+        let parsed_document = match document {
+            Some(document) => document,
+            None => {
+                let compilation_job = compilation_job(
+                    options.input_file.clone(),
+                    options.jobname.clone(),
+                    execution_policy.clone(),
+                );
+
+                return CompileResult {
+                    exit_code: exit_code_for(&parse_diagnostics),
+                    diagnostics: parse_diagnostics.clone(),
+                    output_pdf: None,
+                    stable_compile_state: Some(stable_compile_state(
+                        &compilation_job,
+                        source_tree.document_state.clone(),
+                        pass_count,
+                        0,
+                        false,
+                        parse_diagnostics,
+                    )),
+                };
+            }
+        };
+        let typeset_document = typeset_document.expect("parsed documents should always typeset");
         let pdf_document = pdf_renderer.render(&typeset_document);
         let compilation_job = compilation_job(
             options.input_file.clone(),
@@ -326,16 +338,20 @@ impl<'a> CompileJobService<'a> {
         let primary_input_path = primary_input.to_string_lossy().into_owned();
         let ParsePassResult {
             output: ParseOutput { document, errors },
+            typeset_document,
             pass_count,
-        } = self.parse_document_with_cross_references(&source_tree.source);
+        } = self.parse_document_with_cross_references(&source_tree.source, |document| {
+            self.typesetter.typeset(document)
+        });
         let parse_diagnostics: Vec<Diagnostic> = errors
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, primary_input_path.clone()))
             .collect();
 
         match document {
-            Some(parsed_document) => {
-                let typeset_document = self.typesetter.typeset(&parsed_document);
+            Some(_) => {
+                let typeset_document =
+                    typeset_document.expect("parsed documents should always typeset");
                 let pdf_document = self.pdf_renderer.render(&typeset_document);
                 stable_compile_state(
                     &compilation_job,
@@ -459,38 +475,76 @@ impl<'a> CompileJobService<'a> {
         Ok(expanded)
     }
 
-    fn parse_document_with_cross_references(&self, source: &str) -> ParsePassResult {
-        let first = self.parser.parse_recovering(source);
-        let Some(document) = first.document.as_ref() else {
+    fn parse_document_with_cross_references<F>(
+        &self,
+        source: &str,
+        typeset_document_for: F,
+    ) -> ParsePassResult
+    where
+        F: Fn(&ferritex_core::parser::ParsedDocument) -> TypesetDocument,
+    {
+        let mut output = self.parser.parse_recovering(source);
+        let Some(mut document) = output.document.clone() else {
             return ParsePassResult {
-                output: first,
+                output,
+                typeset_document: None,
                 pass_count: 1,
             };
         };
+        let mut pass_count = 1;
 
-        if !document.has_unresolved_refs && !document.has_unresolved_toc {
-            return ParsePassResult {
-                output: first,
-                pass_count: 1,
-            };
+        if document.has_unresolved_refs || document.has_unresolved_toc {
+            let second = self.parser.parse_recovering_with_context(
+                source,
+                document.labels.clone().into_inner(),
+                document.section_entries.clone(),
+                document.bibliography.clone(),
+                BTreeMap::new(),
+            );
+            if let Some(next_document) = second.document.clone() {
+                output = second;
+                document = next_document;
+                pass_count = 2;
+            }
         }
 
-        let second = self.parser.parse_recovering_with_context(
-            source,
-            document.labels.clone().into_inner(),
-            document.section_entries.clone(),
-            document.bibliography.clone(),
-        );
-        if second.document.is_some() {
-            ParsePassResult {
-                output: second,
-                pass_count: 2,
+        let mut typeset_document = typeset_document_for(&document);
+
+        if document.has_pageref_markers() {
+            let mut page_labels = resolve_page_labels(&document, &typeset_document.pages);
+            while pass_count < 3 && !page_labels.is_empty() {
+                let next = self.parser.parse_recovering_with_context(
+                    source,
+                    document.labels.clone().into_inner(),
+                    document.section_entries.clone(),
+                    document.bibliography.clone(),
+                    page_labels.clone(),
+                );
+                let Some(next_document) = next.document.clone() else {
+                    break;
+                };
+
+                output = next;
+                document = next_document;
+                pass_count += 1;
+                typeset_document = typeset_document_for(&document);
+
+                if !document.has_pageref_markers() {
+                    break;
+                }
+
+                let next_page_labels = resolve_page_labels(&document, &typeset_document.pages);
+                if next_page_labels == page_labels {
+                    break;
+                }
+                page_labels = next_page_labels;
             }
-        } else {
-            ParsePassResult {
-                output: first,
-                pass_count: 1,
-            }
+        }
+
+        ParsePassResult {
+            output,
+            typeset_document: Some(typeset_document),
+            pass_count,
         }
     }
 }
@@ -514,6 +568,7 @@ fn stable_compile_state(
 
 struct ParsePassResult {
     output: ParseOutput,
+    typeset_document: Option<TypesetDocument>,
     pass_count: u32,
 }
 
@@ -2034,6 +2089,37 @@ mod tests {
         assert_eq!(writes.len(), 1);
         let pdf = String::from_utf8_lossy(&writes[0].1);
         assert!(pdf.contains("AB"));
+    }
+
+    #[test]
+    fn compile_uses_third_pass_to_resolve_pageref() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            document(&format!(
+                "See page \\pageref{{sec:later}}.\n\\newpage\n\\section{{Later}}\\label{{sec:later}}\nDone."
+            )),
+        )
+        .expect("write input");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See page 2."));
+        assert!(pdf.contains("1 Later"));
+        assert!(!pdf.contains("??"));
+        assert_eq!(
+            result
+                .stable_compile_state
+                .as_ref()
+                .map(|state| state.snapshot.pass_number),
+            Some(3)
+        );
     }
 
     #[test]

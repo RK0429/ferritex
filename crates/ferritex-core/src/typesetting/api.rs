@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::{
     hyphenation::{Hyphenator, TexPatternHyphenator},
     knuth_plass::BreakParams,
@@ -728,6 +730,26 @@ fn collect_outlines(document: &ParsedDocument, pages: &[TypesetPage]) -> Vec<Typ
     outlines
 }
 
+pub fn resolve_page_labels(
+    document: &ParsedDocument,
+    pages: &[TypesetPage],
+) -> BTreeMap<String, u32> {
+    document
+        .page_label_anchors
+        .iter()
+        .filter_map(|(label, anchor_text)| {
+            pages
+                .iter()
+                .position(|page| {
+                    page.lines
+                        .iter()
+                        .any(|line| line.text.trim() == anchor_text.trim())
+                })
+                .map(|page_index| (label.clone(), (page_index + 1) as u32))
+        })
+        .collect()
+}
+
 fn find_outline_anchor(
     anchors: &[(usize, &TextLine)],
     used: &[bool],
@@ -1168,10 +1190,11 @@ mod tests {
     use super::{
         default_fixed_width_provider, document_nodes_to_hlist,
         document_nodes_to_hlist_with_hyphenation, document_nodes_to_vlist_with_config,
-        page_box_for_class, paginate_vlist, points, vlist_item_height, wrap_body, wrap_hlist,
-        CharWidthProvider, GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, TeXBox,
-        TextLine, TfmWidthProvider, VBox, VListItem, LINE_HEIGHT_PT, MAX_LINE_CHARS,
-        MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
+        page_box_for_class, paginate_vlist, points, resolve_page_labels, vlist_item_height,
+        wrap_body, wrap_hlist, CharWidthProvider, GlueComponent, GlueOrder, HBox, HListItem,
+        MinimalTypesetter, TeXBox, TextLine, TfmWidthProvider, TypesetPage, VBox, VListItem,
+        LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN,
+        PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::font::api::TfmMetrics;
     use crate::kernel::api::DimensionValue;
@@ -1181,6 +1204,7 @@ mod tests {
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
     };
+    use std::collections::BTreeMap;
 
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
@@ -1258,6 +1282,38 @@ mod tests {
         assert_eq!(document.pages[0].lines.len(), 36);
         assert_eq!(document.pages[1].lines.len(), 1);
         assert_eq!(document.pages[1].lines[0].text, "Line 37");
+    }
+
+    #[test]
+    fn resolve_page_labels_maps_section_anchor_to_one_based_page_number() {
+        let mut parsed = parsed_document("");
+        parsed
+            .page_label_anchors
+            .insert("sec:later".to_string(), "1 Later".to_string());
+        let page_box = page_box_for_class("article");
+        let typeset = vec![
+            TypesetPage {
+                lines: vec![TextLine {
+                    text: "Line 1".to_string(),
+                    y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
+                    links: Vec::new(),
+                }],
+                page_box: page_box.clone(),
+            },
+            TypesetPage {
+                lines: vec![TextLine {
+                    text: "1 Later".to_string(),
+                    y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
+                    links: Vec::new(),
+                }],
+                page_box,
+            },
+        ];
+
+        assert_eq!(
+            resolve_page_labels(&parsed, &typeset),
+            BTreeMap::from([("sec:later".to_string(), 2)])
+        );
     }
 
     #[test]
