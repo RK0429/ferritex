@@ -9,6 +9,9 @@ use crate::kernel::api::DimensionValue;
 
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
+    package_loading::{
+        load_document_class, load_package, ClassRegistry, PackageInfo, PackageRegistry,
+    },
     registers::{RegisterStore, MAX_REGISTER_INDEX},
     CatCode, EnvironmentDef, MacroDef, MacroEngine, Token, TokenKind, Tokenizer,
 };
@@ -36,6 +39,11 @@ const BODY_INCLUDEGRAPHICS_START: char = '\u{E012}';
 const BODY_INCLUDEGRAPHICS_END: char = '\u{E013}';
 const BODY_INCLUDEGRAPHICS_PATH_END: char = '\u{E014}';
 const BODY_INCLUDEGRAPHICS_FIELD_SEPARATOR: char = '\u{E015}';
+const BODY_FLOAT_START: char = '\u{E016}';
+const BODY_FLOAT_END: char = '\u{E017}';
+const BODY_FLOAT_CAPTION_SEP: char = '\u{E018}';
+const BODY_FLOAT_LABEL_SEP: char = '\u{E019}';
+const BODY_FLOAT_TYPE_SEP: char = '\u{E01A}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -137,6 +145,8 @@ impl PartialEq<DocumentLabels> for BTreeMap<String, String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedDocument {
     pub document_class: String,
+    pub class_options: Vec<String>,
+    pub loaded_packages: Vec<PackageInfo>,
     pub package_count: usize,
     pub body: String,
     pub labels: DocumentLabels,
@@ -200,6 +210,12 @@ pub struct IncludeGraphicsOptions {
     pub scale: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatType {
+    Figure,
+    Table,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocumentNode {
     Text(String),
@@ -221,6 +237,12 @@ pub enum DocumentNode {
     IncludeGraphics {
         path: String,
         options: IncludeGraphicsOptions,
+    },
+    Float {
+        float_type: FloatType,
+        content: Vec<DocumentNode>,
+        caption: Option<String>,
+        label: Option<String>,
     },
 }
 
@@ -501,12 +523,15 @@ enum ArithmeticOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParserState {
+    chapter: u32,
     section: u32,
     subsection: u32,
     subsubsection: u32,
     current_section_number: Option<String>,
     current_label_anchor: Option<String>,
     equation_counter: u32,
+    figure_counter: u32,
+    table_counter: u32,
     labels: BTreeMap<String, String>,
     page_labels: BTreeMap<String, u32>,
     page_label_anchors: BTreeMap<String, String>,
@@ -537,12 +562,15 @@ impl ParserState {
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Self {
         Self {
+            chapter: 0,
             section: 0,
             subsection: 0,
             subsubsection: 0,
             current_section_number: None,
             current_label_anchor: None,
             equation_counter: 0,
+            figure_counter: 0,
+            table_counter: 0,
             labels: initial_labels,
             page_labels: initial_page_labels,
             page_label_anchors: BTreeMap::new(),
@@ -555,25 +583,50 @@ impl ParserState {
         }
     }
 
-    fn next_section_number(&mut self, level: u8) -> String {
+    fn next_chapter_number(&mut self) -> String {
+        self.chapter += 1;
+        self.section = 0;
+        self.subsection = 0;
+        self.subsubsection = 0;
+        let number = self.chapter.to_string();
+        self.current_section_number = Some(number.clone());
+        number
+    }
+
+    fn next_section_number(&mut self, level: u8, include_chapter: bool) -> String {
         let number = match level {
             1 => {
                 self.section += 1;
                 self.subsection = 0;
                 self.subsubsection = 0;
-                self.section.to_string()
+                if include_chapter {
+                    format!("{}.{}", self.chapter, self.section)
+                } else {
+                    self.section.to_string()
+                }
             }
             2 => {
                 self.subsection += 1;
                 self.subsubsection = 0;
-                format!("{}.{}", self.section, self.subsection)
+                if include_chapter {
+                    format!("{}.{}.{}", self.chapter, self.section, self.subsection)
+                } else {
+                    format!("{}.{}", self.section, self.subsection)
+                }
             }
             3 => {
                 self.subsubsection += 1;
-                format!(
-                    "{}.{}.{}",
-                    self.section, self.subsection, self.subsubsection
-                )
+                if include_chapter {
+                    format!(
+                        "{}.{}.{}.{}",
+                        self.chapter, self.section, self.subsection, self.subsubsection
+                    )
+                } else {
+                    format!(
+                        "{}.{}.{}",
+                        self.section, self.subsection, self.subsubsection
+                    )
+                }
             }
             _ => unreachable!("section levels are constrained by the caller"),
         };
@@ -614,6 +667,7 @@ struct OpenEnvironment {
 enum OpenEnvironmentKind {
     UserDefined { end_tokens: Vec<Token> },
     List(ListEnvironmentState),
+    Float(FloatEnvironmentState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -629,21 +683,28 @@ enum ListEnvironmentKind {
     Description,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FloatEnvironmentState {
+    float_type: FloatType,
+    caption: Option<String>,
+    label: Option<String>,
+}
+
 #[derive(Debug)]
 struct ParserDriver<'a> {
     tokenizer: Tokenizer<'a>,
     macro_engine: MacroEngine,
     state: ParserState,
+    package_registry: PackageRegistry,
+    class_registry: ClassRegistry,
     registers: RegisterStore,
     conditionals: ConditionalState,
     pending_tokens: VecDeque<QueuedToken>,
     environment_stack: Vec<OpenEnvironment>,
     runtime_group_stack: Vec<u32>,
     semisimple_group_stack: Vec<u32>,
-    document_class: Option<String>,
     document_class_error: Option<ParseError>,
     errors: Vec<ParseError>,
-    package_count: usize,
     title: Option<String>,
     author: Option<String>,
     body: String,
@@ -680,16 +741,16 @@ impl<'a> ParserDriver<'a> {
                 initial_bibliography,
                 initial_page_labels,
             ),
+            package_registry: PackageRegistry::default(),
+            class_registry: ClassRegistry::default(),
             registers: RegisterStore::default(),
             conditionals: ConditionalState::default(),
             pending_tokens: VecDeque::new(),
             environment_stack: Vec::new(),
             runtime_group_stack: Vec::new(),
             semisimple_group_stack: Vec::new(),
-            document_class: None,
             document_class_error: None,
             errors: Vec::new(),
-            package_count: 0,
             title: None,
             author: None,
             body: String::new(),
@@ -771,7 +832,7 @@ impl<'a> ParserDriver<'a> {
             return Err(error);
         }
 
-        if self.document_class.is_none() {
+        if self.class_registry.active_class().is_none() {
             return Err(ParseError::MissingDocumentClass);
         }
 
@@ -854,7 +915,7 @@ impl<'a> ParserDriver<'a> {
             self.record_error(error);
         }
 
-        if self.document_class.is_none() {
+        if self.class_registry.active_class().is_none() {
             self.record_error(ParseError::MissingDocumentClass);
         }
 
@@ -864,7 +925,7 @@ impl<'a> ParserDriver<'a> {
             self.record_error(error);
         }
 
-        let document = if self.document_class.is_some()
+        let document = if self.class_registry.active_class().is_some()
             && self.begin_found
             && self.end_found
             && !has_trailing_error
@@ -892,12 +953,16 @@ impl<'a> ParserDriver<'a> {
     }
 
     fn build_parsed_document(&self) -> ParsedDocument {
+        let active_class = self
+            .class_registry
+            .active_class()
+            .expect("document class presence checked above");
+
         ParsedDocument {
-            document_class: self
-                .document_class
-                .clone()
-                .expect("document class presence checked above"),
-            package_count: self.package_count,
+            document_class: active_class.name.clone(),
+            class_options: active_class.options.clone(),
+            loaded_packages: self.package_registry.loaded_packages().to_vec(),
+            package_count: self.package_registry.loaded_packages().len(),
             body: self.body.trim().to_string(),
             labels: DocumentLabels::with_metadata(
                 self.state.labels.clone(),
@@ -925,9 +990,23 @@ impl<'a> ParserDriver<'a> {
 
         match name.as_str() {
             "documentclass" => {
-                if self.document_class.is_none() && self.document_class_error.is_none() {
-                    match self.parse_document_class() {
-                        Ok(Some(class_name)) => self.document_class = Some(class_name),
+                if self.class_registry.active_class().is_none()
+                    && self.document_class_error.is_none()
+                {
+                    match self.parse_document_class_declaration() {
+                        Ok(Some((class_name, options))) => {
+                            if load_document_class(
+                                &class_name,
+                                &options,
+                                &mut self.class_registry,
+                                &mut self.macro_engine,
+                            )
+                            .is_err()
+                            {
+                                self.document_class_error =
+                                    Some(ParseError::InvalidDocumentClass { line: token.line });
+                            }
+                        }
                         Ok(None) => {
                             self.document_class_error =
                                 Some(ParseError::InvalidDocumentClass { line: token.line });
@@ -940,8 +1019,8 @@ impl<'a> ParserDriver<'a> {
                     }
                 }
             }
-            "usepackage" => {
-                self.package_count += 1;
+            "usepackage" | "RequirePackage" => {
+                self.parse_package_directive(token.line)?;
             }
             "title" => {
                 self.title = self.read_required_braced_tokens()?.map(|tokens| {
@@ -1023,6 +1102,26 @@ impl<'a> ParserDriver<'a> {
                         let _ = self.take_global_prefix();
                         self.parse_includegraphics_command()?;
                     }
+                    "color" if self.package_registry.is_loaded("xcolor") => {
+                        let _ = self.take_global_prefix();
+                        self.parse_color_command()?;
+                    }
+                    "textcolor" if self.package_registry.is_loaded("xcolor") => {
+                        let _ = self.take_global_prefix();
+                        self.parse_textcolor_command()?;
+                    }
+                    "definecolor" if self.package_registry.is_loaded("xcolor") => {
+                        let _ = self.take_global_prefix();
+                        self.parse_definecolor_command()?;
+                    }
+                    "geometry" if self.package_registry.is_loaded("geometry") => {
+                        let _ = self.take_global_prefix();
+                        self.parse_geometry_command()?;
+                    }
+                    "chapter" if self.class_supports_chapters() => {
+                        let _ = self.take_global_prefix();
+                        self.parse_chapter_command()?;
+                    }
                     "section" => {
                         let _ = self.take_global_prefix();
                         self.parse_section_command(1)?;
@@ -1038,6 +1137,10 @@ impl<'a> ParserDriver<'a> {
                     "label" => {
                         let _ = self.take_global_prefix();
                         self.parse_label_command()?;
+                    }
+                    "caption" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_caption_command()?;
                     }
                     "ref" => {
                         let _ = self.take_global_prefix();
@@ -1426,7 +1529,7 @@ impl<'a> ParserDriver<'a> {
             return Ok(());
         }
 
-        if matches!(name.as_str(), "equation" | "equation*" | "align" | "align*") {
+        if is_math_environment(&name) {
             self.parse_math_environment(&name, line)?;
             return Ok(());
         }
@@ -1439,6 +1542,30 @@ impl<'a> ParserDriver<'a> {
                 kind: OpenEnvironmentKind::List(ListEnvironmentState {
                     kind,
                     item_count: 0,
+                }),
+            });
+            return Ok(());
+        }
+
+        if name == "figure" || name == "table" {
+            let _ = self.read_optional_bracket_tokens()?;
+            let float_type = if name == "figure" {
+                FloatType::Figure
+            } else {
+                FloatType::Table
+            };
+
+            self.emit_paragraph_break_before_block();
+            self.body.push(BODY_FLOAT_START);
+            self.body.push(float_type_marker(float_type));
+            self.body.push(BODY_FLOAT_TYPE_SEP);
+            self.environment_stack.push(OpenEnvironment {
+                name,
+                line,
+                kind: OpenEnvironmentKind::Float(FloatEnvironmentState {
+                    float_type,
+                    caption: None,
+                    label: None,
                 }),
             });
             return Ok(());
@@ -1472,6 +1599,49 @@ impl<'a> ParserDriver<'a> {
         if name == "document" {
             self.end_found = true;
             return Ok(true);
+        }
+
+        if matches!(
+            self.environment_stack.last(),
+            Some(OpenEnvironment {
+                name: open_name,
+                kind: OpenEnvironmentKind::Float(_),
+                ..
+            }) if open_name == &name
+        ) {
+            let Some(open_environment) = self.environment_stack.pop() else {
+                return Ok(false);
+            };
+            let OpenEnvironmentKind::Float(float_state) = open_environment.kind else {
+                unreachable!("checked float environment before pop");
+            };
+
+            let number = match float_state.float_type {
+                FloatType::Figure => {
+                    self.state.figure_counter += 1;
+                    self.state.figure_counter.to_string()
+                }
+                FloatType::Table => {
+                    self.state.table_counter += 1;
+                    self.state.table_counter.to_string()
+                }
+            };
+
+            self.state.current_section_number = Some(number.clone());
+            self.state.current_label_anchor = None;
+            if let Some(label) = float_state.label.as_ref() {
+                self.state.labels.insert(label.clone(), number);
+            }
+
+            self.body.push(BODY_FLOAT_CAPTION_SEP);
+            self.body
+                .push_str(float_state.caption.as_deref().unwrap_or_default());
+            self.body.push(BODY_FLOAT_LABEL_SEP);
+            self.body
+                .push_str(float_state.label.as_deref().unwrap_or_default());
+            self.body.push(BODY_FLOAT_END);
+            self.emit_paragraph_break_before_block();
+            return Ok(false);
         }
 
         if list_environment_kind(&name).is_some() {
@@ -1512,6 +1682,9 @@ impl<'a> ParserDriver<'a> {
             OpenEnvironmentKind::List(_) => {
                 self.body.push_str(&name);
             }
+            OpenEnvironmentKind::Float(_) => {
+                self.body.push_str(&name);
+            }
         }
 
         Ok(false)
@@ -1537,7 +1710,7 @@ impl<'a> ParserDriver<'a> {
                         }
                         ListEnvironmentKind::Description => Marker::Description,
                     }),
-                    OpenEnvironmentKind::UserDefined { .. } => None,
+                    OpenEnvironmentKind::UserDefined { .. } | OpenEnvironmentKind::Float(_) => None,
                 })
         }) else {
             self.body.push_str("item");
@@ -1596,13 +1769,47 @@ impl<'a> ParserDriver<'a> {
         self.body.push('\n');
     }
 
+    fn class_supports_chapters(&self) -> bool {
+        matches!(
+            self.class_registry
+                .active_class()
+                .map(|info| info.name.as_str()),
+            Some("book" | "report")
+        )
+    }
+
+    fn parse_chapter_command(&mut self) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let title = tokens_to_text(&tokens).trim().to_string();
+        let number = self.state.next_chapter_number();
+        self.state.current_label_anchor = Some(section_anchor_text(&number, &title));
+        self.state.section_entries.push(SectionEntry {
+            level: 0,
+            number: number.clone(),
+            title: title.clone(),
+        });
+        self.emit_paragraph_break_before_block();
+        self.body.push_str(&number);
+        if !title.is_empty() {
+            self.body.push(' ');
+            self.body.push_str(&title);
+        }
+        self.body.push_str("\n\n");
+        Ok(())
+    }
+
     fn parse_section_command(&mut self, level: u8) -> Result<(), ParseError> {
         let Some(tokens) = self.read_required_braced_tokens()? else {
             return Ok(());
         };
 
         let title = tokens_to_text(&tokens).trim().to_string();
-        let number = self.state.next_section_number(level);
+        let number = self
+            .state
+            .next_section_number(level, self.class_supports_chapters());
         self.state.current_label_anchor = Some(section_anchor_text(&number, &title));
         self.state.section_entries.push(SectionEntry {
             level,
@@ -1616,6 +1823,33 @@ impl<'a> ParserDriver<'a> {
             self.body.push_str(&title);
         }
         self.body.push_str("\n\n");
+        Ok(())
+    }
+
+    fn parse_color_command(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_required_braced_tokens()?;
+        Ok(())
+    }
+
+    fn parse_textcolor_command(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_required_braced_tokens()?;
+        let Some(text_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        self.body
+            .push_str(&encode_body_markers_in_text(&tokens_to_text(&text_tokens)));
+        Ok(())
+    }
+
+    fn parse_definecolor_command(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_required_braced_tokens()?;
+        let _ = self.read_required_braced_tokens()?;
+        let _ = self.read_required_braced_tokens()?;
+        Ok(())
+    }
+
+    fn parse_geometry_command(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_required_braced_tokens()?;
         Ok(())
     }
 
@@ -1707,6 +1941,18 @@ impl<'a> ParserDriver<'a> {
         self.body
             .push_str(&serialize_includegraphics_marker(&path, &options));
         self.body.push(BODY_INCLUDEGRAPHICS_END);
+        Ok(())
+    }
+
+    fn parse_caption_command(&mut self) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let caption = tokens_to_text(&tokens).trim().to_string();
+
+        if let Some(float_state) = self.current_float_environment_mut() {
+            float_state.caption = (!caption.is_empty()).then_some(caption);
+        }
         Ok(())
     }
 
@@ -1883,6 +2129,11 @@ impl<'a> ParserDriver<'a> {
             return Ok(());
         }
 
+        if let Some(float_state) = self.current_float_environment_mut() {
+            float_state.label = Some(key);
+            return Ok(());
+        }
+
         if let Some(number) = self.state.current_section_number.clone() {
             self.state.labels.insert(key.clone(), number);
         }
@@ -1890,6 +2141,15 @@ impl<'a> ParserDriver<'a> {
             self.state.page_label_anchors.insert(key, anchor_text);
         }
         Ok(())
+    }
+
+    fn current_float_environment_mut(&mut self) -> Option<&mut FloatEnvironmentState> {
+        self.environment_stack
+            .last_mut()
+            .and_then(|environment| match &mut environment.kind {
+                OpenEnvironmentKind::Float(state) => Some(state),
+                OpenEnvironmentKind::UserDefined { .. } | OpenEnvironmentKind::List(_) => None,
+            })
     }
 
     fn parse_ref_command(&mut self) -> Result<(), ParseError> {
@@ -2400,8 +2660,13 @@ impl<'a> ParserDriver<'a> {
         global
     }
 
-    fn parse_document_class(&mut self) -> Result<Option<String>, ParseError> {
-        let _ = self.read_optional_bracket_tokens()?;
+    fn parse_document_class_declaration(
+        &mut self,
+    ) -> Result<Option<(String, Vec<String>)>, ParseError> {
+        let options = self
+            .read_optional_bracket_tokens()?
+            .map(|tokens| split_comma_separated_values(&tokens_to_text(&tokens)))
+            .unwrap_or_default();
         let Some(tokens) = self.read_required_braced_tokens()? else {
             return Ok(None);
         };
@@ -2409,7 +2674,29 @@ impl<'a> ParserDriver<'a> {
         if class_name.is_empty() || !is_valid_document_class(&class_name) {
             return Ok(None);
         }
-        Ok(Some(class_name))
+        Ok(Some((class_name, options)))
+    }
+
+    fn parse_package_directive(&mut self, line: u32) -> Result<(), ParseError> {
+        let options = self
+            .read_optional_bracket_tokens()?
+            .map(|tokens| split_comma_separated_values(&tokens_to_text(&tokens)))
+            .unwrap_or_default();
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        for package_name in split_comma_separated_values(&tokens_to_text(&tokens)) {
+            let _ = load_package(
+                &package_name,
+                &options,
+                &mut self.package_registry,
+                &mut self.macro_engine,
+            )
+            .map_err(|_| ParseError::InvalidDocumentClass { line })?;
+        }
+
+        Ok(())
     }
 
     fn parse_def(&mut self, is_global: bool) -> Result<(), ParseError> {
@@ -3101,6 +3388,20 @@ fn list_environment_kind(name: &str) -> Option<ListEnvironmentKind> {
     }
 }
 
+fn is_math_environment(name: &str) -> bool {
+    matches!(
+        name,
+        "align"
+            | "align*"
+            | "equation"
+            | "equation*"
+            | "gather"
+            | "gather*"
+            | "multline"
+            | "multline*"
+    )
+}
+
 fn expand_parameter_tokens(tokens: &[Token], args: &[Vec<Token>]) -> Vec<Token> {
     let mut expanded = Vec::with_capacity(tokens.len());
     for token in tokens {
@@ -3339,6 +3640,14 @@ fn is_valid_document_class(name: &str) -> bool {
     !name.chars().any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
+fn split_comma_separated_values(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn normalize_body_par_breaks(body: &str) -> String {
     let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
     let mut output = String::with_capacity(normalized.len());
@@ -3549,6 +3858,14 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_FLOAT_START => {
+                let (content, next_index) =
+                    extract_single_marker_content(body, index, BODY_FLOAT_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(deserialize_float_marker(content));
+                text.push(placeholder);
+                index = next_index;
+            }
             BODY_INCLUDEGRAPHICS_START => {
                 let (content, next_index) =
                     extract_single_marker_content(body, index, BODY_INCLUDEGRAPHICS_END);
@@ -3741,11 +4058,49 @@ fn deserialize_includegraphics_marker(content: &str) -> DocumentNode {
     }
 }
 
+fn float_type_marker(float_type: FloatType) -> char {
+    match float_type {
+        FloatType::Figure => 'f',
+        FloatType::Table => 't',
+    }
+}
+
+fn parse_float_type_marker(value: &str) -> FloatType {
+    match value.trim() {
+        "t" => FloatType::Table,
+        _ => FloatType::Figure,
+    }
+}
+
+fn deserialize_float_marker(content: &str) -> DocumentNode {
+    let (float_type_field, rest) = content
+        .split_once(BODY_FLOAT_TYPE_SEP)
+        .unwrap_or(("f", content));
+    let (body_content, metadata) = rest
+        .split_once(BODY_FLOAT_CAPTION_SEP)
+        .unwrap_or((rest, ""));
+    let (caption_field, label_field) = metadata
+        .split_once(BODY_FLOAT_LABEL_SEP)
+        .unwrap_or((metadata, ""));
+
+    DocumentNode::Float {
+        float_type: parse_float_type_marker(float_type_field),
+        content: body_nodes_from_text(body_content),
+        caption: marker_optional_string(caption_field),
+        label: marker_optional_string(label_field),
+    }
+}
+
 fn parse_dimension_marker_field(value: &str) -> Option<DimensionValue> {
     let trimmed = value.trim();
     (!trimmed.is_empty())
         .then(|| trimmed.parse::<i64>().ok().map(DimensionValue))
         .flatten()
+}
+
+fn marker_optional_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn parse_scale_marker_field(value: &str) -> Option<f64> {
@@ -4513,8 +4868,9 @@ fn eof_line(source: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentLabels, DocumentNode, IncludeGraphicsOptions, LineTag, MathLine, MathNode,
-        MinimalLatexParser, ParseError, ParsedDocument, Parser, SectionEntry,
+        DocumentLabels, DocumentNode, FloatType, IncludeGraphicsOptions, LineTag, MathLine,
+        MathNode, MinimalLatexParser, PackageInfo, ParseError, ParsedDocument, Parser,
+        SectionEntry,
     };
     use crate::kernel::api::DimensionValue;
     use std::collections::BTreeMap;
@@ -4522,6 +4878,8 @@ mod tests {
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
             document_class: "article".to_string(),
+            class_options: Vec::new(),
+            loaded_packages: Vec::new(),
             package_count: 0,
             body: body.to_string(),
             labels: DocumentLabels::default(),
@@ -4539,6 +4897,8 @@ mod tests {
             document,
             ParsedDocument {
                 document_class: "article".to_string(),
+                class_options: Vec::new(),
+                loaded_packages: Vec::new(),
                 package_count: 0,
                 body: "Hello".to_string(),
                 labels: DocumentLabels::default(),
@@ -4587,6 +4947,8 @@ mod tests {
             output.document,
             Some(ParsedDocument {
                 document_class: "article".to_string(),
+                class_options: Vec::new(),
+                loaded_packages: Vec::new(),
                 package_count: 0,
                 body: "AB".to_string(),
                 labels: DocumentLabels::default(),
@@ -4894,6 +5256,85 @@ mod tests {
     }
 
     #[test]
+    fn parses_figure_environment_with_caption_label_and_includegraphics() {
+        let document = parse_document(
+            "\\begin{figure}[h]\\includegraphics{img.png}\\caption{A figure}\\label{fig:test}\\end{figure}",
+        );
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![DocumentNode::Float {
+                float_type: FloatType::Figure,
+                content: vec![DocumentNode::IncludeGraphics {
+                    path: "img.png".to_string(),
+                    options: IncludeGraphicsOptions::default(),
+                }],
+                caption: Some("A figure".to_string()),
+                label: Some("fig:test".to_string()),
+            }]
+        );
+        assert_eq!(
+            document.labels.get("fig:test").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn parses_table_environment_as_table_float() {
+        let document = parse_document("\\begin{table}\\caption{A table}\\end{table}");
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![DocumentNode::Float {
+                float_type: FloatType::Table,
+                content: Vec::new(),
+                caption: Some("A table".to_string()),
+                label: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn figure_label_resolves_for_following_ref() {
+        let document = parse_document(
+            "\\begin{figure}\\caption{Fig}\\label{fig:1}\\end{figure}See \\ref{fig:1}.",
+        );
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![
+                DocumentNode::Float {
+                    float_type: FloatType::Figure,
+                    content: Vec::new(),
+                    caption: Some("Fig".to_string()),
+                    label: Some("fig:1".to_string()),
+                },
+                DocumentNode::ParBreak,
+                DocumentNode::Text("See 1.".to_string()),
+            ]
+        );
+        assert_eq!(document.labels.get("fig:1").map(String::as_str), Some("1"));
+        assert!(!document.has_unresolved_refs);
+    }
+
+    #[test]
+    fn figure_and_table_counters_increment_independently() {
+        let document = parse_document(
+            "\\begin{figure}\\label{fig:first}\\end{figure}\n\\begin{table}\\label{tab:first}\\end{table}\n\\begin{figure}\\label{fig:second}\\end{figure}\n\\begin{table}\\label{tab:second}\\end{table}",
+        );
+
+        assert_eq!(
+            document.labels,
+            BTreeMap::from([
+                ("fig:first".to_string(), "1".to_string()),
+                ("fig:second".to_string(), "2".to_string()),
+                ("tab:first".to_string(), "1".to_string()),
+                ("tab:second".to_string(), "2".to_string()),
+            ])
+        );
+    }
+
+    #[test]
     fn counts_preamble_packages() {
         let document = MinimalLatexParser
             .parse(
@@ -4902,7 +5343,89 @@ mod tests {
             .expect("parse document");
 
         assert_eq!(document.document_class, "report");
+        assert_eq!(document.class_options, vec!["11pt".to_string()]);
+        assert_eq!(
+            document.loaded_packages,
+            vec![
+                PackageInfo {
+                    name: "amsmath".to_string(),
+                    options: Vec::new(),
+                },
+                PackageInfo {
+                    name: "hyperref".to_string(),
+                    options: Vec::new(),
+                },
+            ]
+        );
         assert_eq!(document.package_count, 2);
+    }
+
+    #[test]
+    fn duplicate_package_load_is_a_no_op() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\usepackage{graphicx}\n\\usepackage{graphicx}\n\\begin{document}\nBody\n\\end{document}",
+            )
+            .expect("parse document");
+
+        assert_eq!(
+            document.loaded_packages,
+            vec![PackageInfo {
+                name: "graphicx".to_string(),
+                options: Vec::new(),
+            }]
+        );
+        assert_eq!(document.package_count, 1);
+    }
+
+    #[test]
+    fn usepackage_supports_comma_separated_names_and_requirepackage() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\usepackage[dvipsnames]{xcolor,graphicx}\n\\RequirePackage{geometry}\n\\begin{document}\nBody\n\\end{document}",
+            )
+            .expect("parse document");
+
+        assert_eq!(
+            document.loaded_packages,
+            vec![
+                PackageInfo {
+                    name: "xcolor".to_string(),
+                    options: vec!["dvipsnames".to_string()],
+                },
+                PackageInfo {
+                    name: "graphicx".to_string(),
+                    options: vec!["dvipsnames".to_string()],
+                },
+                PackageInfo {
+                    name: "geometry".to_string(),
+                    options: Vec::new(),
+                },
+            ]
+        );
+        assert_eq!(document.package_count, 3);
+    }
+
+    #[test]
+    fn report_class_enables_chapter_numbering() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{report}\n\\begin{document}\n\\chapter{Intro}\n\\section{Scope}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "1 Intro\n\n1.1 Scope");
+    }
+
+    #[test]
+    fn xcolor_stub_preserves_textcolor_body_content() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\usepackage{xcolor}\n\\begin{document}\n\\textcolor{red}{Alert}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "Alert");
     }
 
     #[test]

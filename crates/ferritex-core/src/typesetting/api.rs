@@ -11,7 +11,7 @@ use crate::graphics::api::{
     compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
 };
 use crate::kernel::api::DimensionValue;
-use crate::parser::api::{DocumentNode, MathNode, ParsedDocument};
+use crate::parser::api::{DocumentNode, FloatType, MathNode, ParsedDocument};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
@@ -168,6 +168,27 @@ pub enum VListItem {
     Penalty {
         value: i32,
     },
+}
+
+#[derive(Debug, Default)]
+struct FloatCounters {
+    figure: u32,
+    table: u32,
+}
+
+impl FloatCounters {
+    fn next(&mut self, float_type: FloatType) -> u32 {
+        match float_type {
+            FloatType::Figure => {
+                self.figure += 1;
+                self.figure
+            }
+            FloatType::Table => {
+                self.table += 1;
+                self.table
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +553,15 @@ fn document_nodes_to_hlist_with_config(
                     hyphen_penalty,
                 );
             }
+            DocumentNode::Float { .. } => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+            }
         }
     }
 
@@ -552,6 +582,25 @@ fn document_nodes_to_vlist_with_config(
     hyphenator: Option<&dyn Hyphenator>,
     params: &BreakParams,
     graphics_resolver: Option<&dyn GraphicAssetResolver>,
+) -> Vec<VListItem> {
+    let mut float_counters = FloatCounters::default();
+    document_nodes_to_vlist_with_state(
+        nodes,
+        provider,
+        hyphenator,
+        params,
+        graphics_resolver,
+        &mut float_counters,
+    )
+}
+
+fn document_nodes_to_vlist_with_state(
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    params: &BreakParams,
+    graphics_resolver: Option<&dyn GraphicAssetResolver>,
+    float_counters: &mut FloatCounters,
 ) -> Vec<VListItem> {
     let mut vlist = Vec::new();
     let mut segment_start = 0;
@@ -584,6 +633,48 @@ fn document_nodes_to_vlist_with_config(
                         vlist.push(VListItem::Image { graphics_box });
                     }
                 }
+                segment_start = index + 1;
+            }
+            DocumentNode::Float {
+                float_type,
+                content,
+                caption,
+                ..
+            } => {
+                append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                );
+
+                vlist.extend(document_nodes_to_vlist_with_state(
+                    content,
+                    provider,
+                    hyphenator,
+                    params,
+                    graphics_resolver,
+                    float_counters,
+                ));
+
+                let number = float_counters.next(*float_type);
+                if let Some(caption) = caption {
+                    let prefix = match float_type {
+                        FloatType::Figure => "Figure",
+                        FloatType::Table => "Table",
+                    };
+                    let caption_line = format!("{prefix} {number}: {caption}");
+                    let caption_nodes = [DocumentNode::Text(caption_line)];
+                    append_nodes_segment_to_vlist(
+                        &mut vlist,
+                        &caption_nodes,
+                        provider,
+                        hyphenator,
+                        params,
+                    );
+                }
+
                 segment_start = index + 1;
             }
             _ => {}
@@ -1303,8 +1394,8 @@ mod tests {
     use crate::kernel::api::DimensionValue;
     use crate::kernel::api::StableId;
     use crate::parser::api::{
-        DocumentNode, IncludeGraphicsOptions, LineTag, MathLine, MathNode, MinimalLatexParser,
-        ParsedDocument, Parser,
+        DocumentNode, FloatType, IncludeGraphicsOptions, LineTag, MathLine, MathNode,
+        MinimalLatexParser, ParsedDocument, Parser,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -1314,6 +1405,8 @@ mod tests {
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
             document_class: "article".to_string(),
+            class_options: Vec::new(),
+            loaded_packages: Vec::new(),
             package_count: 0,
             body: body.to_string(),
             labels: Default::default(),
@@ -1510,6 +1603,31 @@ mod tests {
         assert_eq!(pages[0].images[0].display_height, points(200));
         assert_eq!(pages[0].images[0].x, points(LEFT_MARGIN_PT));
         assert_eq!(pages[0].images[0].graphic.path, "figure.png".to_string());
+    }
+
+    #[test]
+    fn float_nodes_append_numbered_caption_text() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let nodes = vec![DocumentNode::Float {
+            float_type: FloatType::Figure,
+            content: vec![DocumentNode::Text("Body".to_string())],
+            caption: Some("A caption".to_string()),
+            label: Some("fig:test".to_string()),
+        }];
+
+        let vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
+        let rendered_lines = vlist
+            .iter()
+            .filter_map(|item| match item {
+                VListItem::Box { content, .. } => Some(content.as_str()),
+                VListItem::Image { .. } | VListItem::Glue { .. } | VListItem::Penalty { .. } => {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered_lines, vec!["Body", "Figure 1: A caption"]);
     }
 
     #[test]

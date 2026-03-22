@@ -83,6 +83,34 @@ fn compile_includegraphics_embeds_image_xobject_into_pdf() {
 }
 
 #[test]
+fn compile_figure_environment_renders_inline_caption_and_ref() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("figure.tex");
+    let image_file = dir.path().join("pixel.png");
+    std::fs::write(&image_file, PNG_1X1_RGB).expect("write image file");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nSee Figure \\ref{fig:pixel}.\n\\begin{figure}[h]\n\\includegraphics[width=100pt]{pixel.png}\n\\caption{Embedded pixel}\n\\label{fig:pixel}\n\\end{figure}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read(dir.path().join("figure.pdf")).expect("read output pdf");
+    let content = String::from_utf8_lossy(&pdf);
+    assert!(content.contains("See Figure 1."));
+    assert!(content.contains("Figure 1: Embedded pixel"));
+    assert!(content.contains("/Subtype /Image"));
+    assert!(content.contains("/Im1 Do"));
+    assert!(!content.contains("??"));
+}
+
+#[test]
 fn compile_renders_inline_and_display_math_without_raw_tex_delimiters() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("math.tex");

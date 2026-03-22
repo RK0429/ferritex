@@ -109,6 +109,12 @@ impl MacroEngine {
             .insert(name, def);
     }
 
+    pub fn define_global_environment(&mut self, name: String, def: EnvironmentDef) {
+        for scope in &mut self.environment_scope_stack {
+            scope.insert(name.clone(), def.clone());
+        }
+    }
+
     pub fn lookup_environment(&self, name: &str) -> Option<&EnvironmentDef> {
         self.environment_scope_stack
             .last()
@@ -277,6 +283,20 @@ mod tests {
                 .map(|definition| definition.begin_tokens.clone()),
             Some(vec![char_token('a')])
         );
+    }
+
+    #[test]
+    fn global_environment_definition_survives_group_pop() {
+        let mut engine = MacroEngine::default();
+
+        engine.push_group();
+        engine.define_global_environment(
+            "global".to_string(),
+            environment_def("global", 0, vec![char_token('a')], vec![char_token('z')]),
+        );
+        engine.pop_group();
+
+        assert!(engine.lookup_environment("global").is_some());
     }
 
     fn macro_def(name: &str, parameter_count: usize, body: Vec<Token>) -> MacroDef {
