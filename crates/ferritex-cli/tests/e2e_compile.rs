@@ -443,6 +443,28 @@ fn compile_renders_tableofcontents_from_second_pass_entries() {
 }
 
 #[test]
+fn compile_renders_lists_of_figures_and_tables_from_second_pass_entries() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("lists.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\listoffigures\n\\listoftables\n\\begin{figure}\\caption{Embedded pixel}\\end{figure}\n\\begin{table}\\caption{Metrics}\\end{table}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("lists.pdf")).expect("read output pdf");
+    assert!(pdf.match_indices("Figure 1: Embedded pixel").count() >= 2);
+    assert!(pdf.match_indices("Table 1: Metrics").count() >= 2);
+    assert!(!pdf.contains("??"));
+}
+
+#[test]
 fn compile_emits_citations_links_outlines_and_metadata() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("wave7.tex");

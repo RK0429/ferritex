@@ -18,6 +18,7 @@ use super::{
 
 const MAX_CONSECUTIVE_MACRO_EXPANSIONS: usize = 1_000;
 const BODY_PAGE_BREAK_MARKER: char = '\u{E000}';
+const BODY_CLEAR_PAGE_MARKER: char = '\u{E01B}';
 const BODY_HBOX_START: char = '\u{E001}';
 const BODY_HBOX_END: char = '\u{E002}';
 const BODY_VBOX_START: char = '\u{E003}';
@@ -44,6 +45,7 @@ const BODY_FLOAT_END: char = '\u{E017}';
 const BODY_FLOAT_CAPTION_SEP: char = '\u{E018}';
 const BODY_FLOAT_LABEL_SEP: char = '\u{E019}';
 const BODY_FLOAT_TYPE_SEP: char = '\u{E01A}';
+const BODY_FLOAT_SPECIFIER_SEP: char = '\u{E01C}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -67,16 +69,52 @@ impl SectionEntry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptionEntry {
+    pub kind: FloatType,
+    pub number: String,
+    pub caption: String,
+}
+
+impl CaptionEntry {
+    pub fn display_title(&self) -> String {
+        let prefix = match self.kind {
+            FloatType::Figure => "Figure",
+            FloatType::Table => "Table",
+        };
+
+        if self.caption.is_empty() {
+            format!("{prefix} {}", self.number)
+        } else {
+            format!("{prefix} {}: {}", self.number, self.caption)
+        }
+    }
+}
+
+impl Default for CaptionEntry {
+    fn default() -> Self {
+        Self {
+            kind: FloatType::Figure,
+            number: String::new(),
+            caption: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentLabels {
     entries: BTreeMap<String, String>,
     pub citations: Vec<String>,
     pub bibliography: BTreeMap<String, String>,
     pub section_entries: Vec<SectionEntry>,
+    pub figure_entries: Vec<CaptionEntry>,
+    pub table_entries: Vec<CaptionEntry>,
     pub page_label_anchors: BTreeMap<String, String>,
     pub title: Option<String>,
     pub author: Option<String>,
     pub has_unresolved_toc: bool,
+    pub has_unresolved_lof: bool,
+    pub has_unresolved_lot: bool,
 }
 
 impl DocumentLabels {
@@ -85,20 +123,28 @@ impl DocumentLabels {
         citations: Vec<String>,
         bibliography: BTreeMap<String, String>,
         section_entries: Vec<SectionEntry>,
+        figure_entries: Vec<CaptionEntry>,
+        table_entries: Vec<CaptionEntry>,
         page_label_anchors: BTreeMap<String, String>,
         title: Option<String>,
         author: Option<String>,
         has_unresolved_toc: bool,
+        has_unresolved_lof: bool,
+        has_unresolved_lot: bool,
     ) -> Self {
         Self {
             entries,
             citations,
             bibliography,
             section_entries,
+            figure_entries,
+            table_entries,
             page_label_anchors,
             title,
             author,
             has_unresolved_toc,
+            has_unresolved_lof,
+            has_unresolved_lot,
         }
     }
 
@@ -225,6 +271,7 @@ pub enum DocumentNode {
     },
     ParBreak,
     PageBreak,
+    ClearPage,
     HBox(Vec<DocumentNode>),
     VBox(Vec<DocumentNode>),
     InlineMath(Vec<MathNode>),
@@ -240,6 +287,7 @@ pub enum DocumentNode {
     },
     Float {
         float_type: FloatType,
+        specifier: Option<String>,
         content: Vec<DocumentNode>,
         caption: Option<String>,
         label: Option<String>,
@@ -337,6 +385,8 @@ impl MinimalLatexParser {
             source,
             BTreeMap::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             BTreeMap::new(),
             BTreeMap::new(),
         )
@@ -356,12 +406,16 @@ impl MinimalLatexParser {
         source: &str,
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Result<ParsedDocument, ParseError> {
         parse_minimal_latex_with_state(
             source,
             initial_labels,
             initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
             initial_page_labels,
         )
     }
@@ -371,6 +425,8 @@ impl MinimalLatexParser {
         source: &str,
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Result<ParsedDocument, ParseError> {
@@ -378,6 +434,8 @@ impl MinimalLatexParser {
             source,
             initial_labels,
             initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
             initial_bibliography,
             initial_page_labels,
         )
@@ -393,6 +451,8 @@ impl MinimalLatexParser {
             source,
             initial_labels,
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             BTreeMap::new(),
             initial_page_labels,
         )
@@ -403,12 +463,16 @@ impl MinimalLatexParser {
         source: &str,
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> ParseOutput {
         self.parse_recovering_with_context(
             source,
             initial_labels,
             initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
             BTreeMap::new(),
             initial_page_labels,
         )
@@ -419,6 +483,8 @@ impl MinimalLatexParser {
         source: &str,
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> ParseOutput {
@@ -433,6 +499,8 @@ impl MinimalLatexParser {
             source,
             initial_labels,
             initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
             initial_bibliography,
             initial_page_labels,
         )
@@ -444,6 +512,8 @@ fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
     parse_minimal_latex_with_context(
         source,
         BTreeMap::new(),
+        Vec::new(),
+        Vec::new(),
         Vec::new(),
         BTreeMap::new(),
         BTreeMap::new(),
@@ -459,6 +529,8 @@ fn parse_minimal_latex_with_labels(
         source,
         initial_labels,
         Vec::new(),
+        Vec::new(),
+        Vec::new(),
         BTreeMap::new(),
         initial_page_labels,
     )
@@ -468,12 +540,16 @@ fn parse_minimal_latex_with_state(
     source: &str,
     initial_labels: BTreeMap<String, String>,
     initial_section_entries: Vec<SectionEntry>,
+    initial_figure_entries: Vec<CaptionEntry>,
+    initial_table_entries: Vec<CaptionEntry>,
     initial_page_labels: BTreeMap<String, u32>,
 ) -> Result<ParsedDocument, ParseError> {
     parse_minimal_latex_with_context(
         source,
         initial_labels,
         initial_section_entries,
+        initial_figure_entries,
+        initial_table_entries,
         BTreeMap::new(),
         initial_page_labels,
     )
@@ -483,6 +559,8 @@ fn parse_minimal_latex_with_context(
     source: &str,
     initial_labels: BTreeMap<String, String>,
     initial_section_entries: Vec<SectionEntry>,
+    initial_figure_entries: Vec<CaptionEntry>,
+    initial_table_entries: Vec<CaptionEntry>,
     initial_bibliography: BTreeMap<String, String>,
     initial_page_labels: BTreeMap<String, u32>,
 ) -> Result<ParsedDocument, ParseError> {
@@ -494,6 +572,8 @@ fn parse_minimal_latex_with_context(
         source,
         initial_labels,
         initial_section_entries,
+        initial_figure_entries,
+        initial_table_entries,
         initial_bibliography,
         initial_page_labels,
     )
@@ -538,15 +618,23 @@ struct ParserState {
     citations: Vec<String>,
     bibliography: BTreeMap<String, String>,
     section_entries: Vec<SectionEntry>,
+    figure_entries: Vec<CaptionEntry>,
+    table_entries: Vec<CaptionEntry>,
     initial_section_entries: Vec<SectionEntry>,
+    initial_figure_entries: Vec<CaptionEntry>,
+    initial_table_entries: Vec<CaptionEntry>,
     has_unresolved_refs: bool,
     has_unresolved_toc: bool,
+    has_unresolved_lof: bool,
+    has_unresolved_lot: bool,
 }
 
 impl Default for ParserState {
     fn default() -> Self {
         Self::new(
             BTreeMap::new(),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -558,6 +646,8 @@ impl ParserState {
     fn new(
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Self {
@@ -577,9 +667,15 @@ impl ParserState {
             citations: Vec::new(),
             bibliography: initial_bibliography,
             section_entries: Vec::new(),
+            figure_entries: Vec::new(),
+            table_entries: Vec::new(),
             initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
             has_unresolved_refs: false,
             has_unresolved_toc: false,
+            has_unresolved_lof: false,
+            has_unresolved_lot: false,
         }
     }
 
@@ -729,6 +825,8 @@ impl<'a> ParserDriver<'a> {
         source: &'a str,
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Self {
@@ -738,6 +836,8 @@ impl<'a> ParserDriver<'a> {
             state: ParserState::new(
                 initial_labels,
                 initial_section_entries,
+                initial_figure_entries,
+                initial_table_entries,
                 initial_bibliography,
                 initial_page_labels,
             ),
@@ -969,10 +1069,14 @@ impl<'a> ParserDriver<'a> {
                 self.state.citations.clone(),
                 self.state.bibliography.clone(),
                 self.state.section_entries.clone(),
+                self.state.figure_entries.clone(),
+                self.state.table_entries.clone(),
                 self.state.page_label_anchors.clone(),
                 self.title.clone(),
                 self.author.clone(),
                 self.state.has_unresolved_toc,
+                self.state.has_unresolved_lof,
+                self.state.has_unresolved_lot,
             ),
             has_unresolved_refs: self.state.has_unresolved_refs,
         }
@@ -1082,9 +1186,13 @@ impl<'a> ParserDriver<'a> {
                 }
 
                 match name.as_str() {
-                    "pagebreak" | "newpage" | "clearpage" => {
+                    "pagebreak" | "newpage" => {
                         let _ = self.take_global_prefix();
                         self.body.push(BODY_PAGE_BREAK_MARKER);
+                    }
+                    "clearpage" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push(BODY_CLEAR_PAGE_MARKER);
                     }
                     "cite" => {
                         let _ = self.take_global_prefix();
@@ -1200,6 +1308,14 @@ impl<'a> ParserDriver<'a> {
                     "tableofcontents" => {
                         let _ = self.take_global_prefix();
                         self.parse_table_of_contents();
+                    }
+                    "listoffigures" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_list_of_figures();
+                    }
+                    "listoftables" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_list_of_tables();
                     }
                     _ => {
                         let _ = self.take_global_prefix();
@@ -1548,7 +1664,10 @@ impl<'a> ParserDriver<'a> {
         }
 
         if name == "figure" || name == "table" {
-            let _ = self.read_optional_bracket_tokens()?;
+            let specifier = self
+                .read_optional_bracket_tokens()?
+                .map(|tokens| tokens_to_text(&tokens))
+                .filter(|value| !value.is_empty());
             let float_type = if name == "figure" {
                 FloatType::Figure
             } else {
@@ -1559,6 +1678,8 @@ impl<'a> ParserDriver<'a> {
             self.body.push(BODY_FLOAT_START);
             self.body.push(float_type_marker(float_type));
             self.body.push(BODY_FLOAT_TYPE_SEP);
+            self.body.push_str(specifier.as_deref().unwrap_or_default());
+            self.body.push(BODY_FLOAT_SPECIFIER_SEP);
             self.environment_stack.push(OpenEnvironment {
                 name,
                 line,
@@ -1630,7 +1751,19 @@ impl<'a> ParserDriver<'a> {
             self.state.current_section_number = Some(number.clone());
             self.state.current_label_anchor = None;
             if let Some(label) = float_state.label.as_ref() {
-                self.state.labels.insert(label.clone(), number);
+                self.state.labels.insert(label.clone(), number.clone());
+            }
+
+            if float_state.caption.is_some() {
+                let caption_entry = CaptionEntry {
+                    kind: float_state.float_type,
+                    number,
+                    caption: float_state.caption.clone().unwrap_or_default(),
+                };
+                match float_state.float_type {
+                    FloatType::Figure => self.state.figure_entries.push(caption_entry),
+                    FloatType::Table => self.state.table_entries.push(caption_entry),
+                }
             }
 
             self.body.push(BODY_FLOAT_CAPTION_SEP);
@@ -1764,6 +1897,46 @@ impl<'a> ParserDriver<'a> {
                 self.body.push_str("  ");
                 self.body.push_str(&entry.title);
             }
+            self.body.push('\n');
+        }
+        self.body.push('\n');
+    }
+
+    fn parse_list_of_figures(&mut self) {
+        let entries = if self.state.initial_figure_entries.is_empty() {
+            self.state.has_unresolved_lof = true;
+            self.state.figure_entries.clone()
+        } else {
+            self.state.initial_figure_entries.clone()
+        };
+
+        if entries.is_empty() {
+            return;
+        }
+
+        self.emit_paragraph_break_before_block();
+        for entry in entries {
+            self.body.push_str(&entry.display_title());
+            self.body.push('\n');
+        }
+        self.body.push('\n');
+    }
+
+    fn parse_list_of_tables(&mut self) {
+        let entries = if self.state.initial_table_entries.is_empty() {
+            self.state.has_unresolved_lot = true;
+            self.state.table_entries.clone()
+        } else {
+            self.state.initial_table_entries.clone()
+        };
+
+        if entries.is_empty() {
+            return;
+        }
+
+        self.emit_paragraph_break_before_block();
+        for entry in entries {
+            self.body.push_str(&entry.display_title());
             self.body.push('\n');
         }
         self.body.push('\n');
@@ -2180,6 +2353,7 @@ impl<'a> ParserDriver<'a> {
         if self.body.is_empty()
             || self.body.ends_with("\n\n")
             || self.body.ends_with(BODY_PAGE_BREAK_MARKER)
+            || self.body.ends_with(BODY_CLEAR_PAGE_MARKER)
         {
             return;
         }
@@ -2200,7 +2374,8 @@ impl<'a> ParserDriver<'a> {
             }
         ) && (self.body.is_empty()
             || self.body.ends_with("\n\n")
-            || self.body.ends_with(BODY_PAGE_BREAK_MARKER))
+            || self.body.ends_with(BODY_PAGE_BREAK_MARKER)
+            || self.body.ends_with(BODY_CLEAR_PAGE_MARKER))
     }
 
     fn parse_inline_math(&mut self) -> Result<(), ParseError> {
@@ -3749,18 +3924,29 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
     let normalized_body = normalize_body_par_breaks(body);
     let (body_with_placeholders, placeholders) =
         replace_body_markers_with_placeholders(&normalized_body);
-    let segments = body_with_placeholders
-        .split(BODY_PAGE_BREAK_MARKER)
-        .collect::<Vec<_>>();
     let mut nodes = Vec::new();
+    let mut segment_start = 0;
 
-    for (index, segment) in segments.iter().enumerate() {
-        nodes.extend(body_text_nodes(segment, &placeholders));
-        if index + 1 < segments.len() {
-            nodes.push(DocumentNode::PageBreak);
-        }
+    for (index, marker) in body_with_placeholders
+        .char_indices()
+        .filter(|(_, ch)| *ch == BODY_PAGE_BREAK_MARKER || *ch == BODY_CLEAR_PAGE_MARKER)
+    {
+        nodes.extend(body_text_nodes(
+            &body_with_placeholders[segment_start..index],
+            &placeholders,
+        ));
+        nodes.push(if marker == BODY_PAGE_BREAK_MARKER {
+            DocumentNode::PageBreak
+        } else {
+            DocumentNode::ClearPage
+        });
+        segment_start = index + marker.len_utf8();
     }
 
+    nodes.extend(body_text_nodes(
+        &body_with_placeholders[segment_start..],
+        &placeholders,
+    ));
     nodes
 }
 
@@ -4076,6 +4262,9 @@ fn deserialize_float_marker(content: &str) -> DocumentNode {
     let (float_type_field, rest) = content
         .split_once(BODY_FLOAT_TYPE_SEP)
         .unwrap_or(("f", content));
+    let (specifier_field, rest) = rest
+        .split_once(BODY_FLOAT_SPECIFIER_SEP)
+        .unwrap_or(("", rest));
     let (body_content, metadata) = rest
         .split_once(BODY_FLOAT_CAPTION_SEP)
         .unwrap_or((rest, ""));
@@ -4085,6 +4274,7 @@ fn deserialize_float_marker(content: &str) -> DocumentNode {
 
     DocumentNode::Float {
         float_type: parse_float_type_marker(float_type_field),
+        specifier: marker_optional_raw_string(specifier_field),
         content: body_nodes_from_text(body_content),
         caption: marker_optional_string(caption_field),
         label: marker_optional_string(label_field),
@@ -4101,6 +4291,10 @@ fn parse_dimension_marker_field(value: &str) -> Option<DimensionValue> {
 fn marker_optional_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn marker_optional_raw_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn parse_scale_marker_field(value: &str) -> Option<f64> {
@@ -4291,8 +4485,12 @@ fn encode_body_markers_in_text(text: &str) -> String {
                 encoded.push_str(command);
                 index = command_end;
             }
-            "pagebreak" | "newpage" | "clearpage" => {
+            "pagebreak" | "newpage" => {
                 encoded.push(BODY_PAGE_BREAK_MARKER);
+                index = command_end;
+            }
+            "clearpage" => {
+                encoded.push(BODY_CLEAR_PAGE_MARKER);
                 index = command_end;
             }
             "href" => {
@@ -4868,8 +5066,8 @@ fn eof_line(source: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentLabels, DocumentNode, FloatType, IncludeGraphicsOptions, LineTag, MathLine,
-        MathNode, MinimalLatexParser, PackageInfo, ParseError, ParsedDocument, Parser,
+        CaptionEntry, DocumentLabels, DocumentNode, FloatType, IncludeGraphicsOptions, LineTag,
+        MathLine, MathNode, MinimalLatexParser, PackageInfo, ParseError, ParsedDocument, Parser,
         SectionEntry,
     };
     use crate::kernel::api::DimensionValue;
@@ -5053,12 +5251,12 @@ mod tests {
     }
 
     #[test]
-    fn clearpage_parsed_to_page_break_node() {
+    fn clearpage_parsed_to_clear_page_node() {
         assert_eq!(
             parse_document("First\n\\clearpage\nSecond").body_nodes(),
             vec![
                 DocumentNode::Text("First".to_string()),
-                DocumentNode::PageBreak,
+                DocumentNode::ClearPage,
                 DocumentNode::Text("Second".to_string()),
             ]
         );
@@ -5265,6 +5463,7 @@ mod tests {
             document.body_nodes(),
             vec![DocumentNode::Float {
                 float_type: FloatType::Figure,
+                specifier: Some("h".to_string()),
                 content: vec![DocumentNode::IncludeGraphics {
                     path: "img.png".to_string(),
                     options: IncludeGraphicsOptions::default(),
@@ -5287,6 +5486,7 @@ mod tests {
             document.body_nodes(),
             vec![DocumentNode::Float {
                 float_type: FloatType::Table,
+                specifier: None,
                 content: Vec::new(),
                 caption: Some("A table".to_string()),
                 label: None,
@@ -5305,6 +5505,7 @@ mod tests {
             vec![
                 DocumentNode::Float {
                     float_type: FloatType::Figure,
+                    specifier: None,
                     content: Vec::new(),
                     caption: Some("Fig".to_string()),
                     label: Some("fig:1".to_string()),
@@ -5315,6 +5516,22 @@ mod tests {
         );
         assert_eq!(document.labels.get("fig:1").map(String::as_str), Some("1"));
         assert!(!document.has_unresolved_refs);
+    }
+
+    #[test]
+    fn specifier_preserved_in_float_node() {
+        let document = parse_document("\\begin{figure}[htbp!]Body\\end{figure}");
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![DocumentNode::Float {
+                float_type: FloatType::Figure,
+                specifier: Some("htbp!".to_string()),
+                content: vec![DocumentNode::Text("Body".to_string())],
+                caption: None,
+                label: None,
+            }]
+        );
     }
 
     #[test]
@@ -6091,6 +6308,8 @@ mod tests {
                 "\\documentclass{article}\n\\begin{document}\nSee page \\pageref{sec:later}.\n\\end{document}\n",
                 BTreeMap::new(),
                 Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 BTreeMap::new(),
                 BTreeMap::from([("sec:later".to_string(), 5)]),
             )
@@ -6159,6 +6378,8 @@ mod tests {
                 source,
                 first.labels.clone().into_inner(),
                 first.section_entries.clone(),
+                first.figure_entries.clone(),
+                first.table_entries.clone(),
                 first.bibliography.clone(),
                 BTreeMap::new(),
             )
@@ -6266,6 +6487,8 @@ mod tests {
                         title: "Scope".to_string(),
                     },
                 ],
+                Vec::new(),
+                Vec::new(),
                 BTreeMap::new(),
             )
             .expect("parse document");
@@ -6296,11 +6519,127 @@ mod tests {
     }
 
     #[test]
+    fn float_captions_are_collected_for_lof_and_lot_resolution() {
+        let document = parse_document(
+            "\\begin{figure}\\caption{Overview}\\end{figure}\n\\begin{table}\\caption{Metrics}\\end{table}",
+        );
+
+        assert_eq!(
+            document.figure_entries,
+            vec![CaptionEntry {
+                kind: FloatType::Figure,
+                number: "1".to_string(),
+                caption: "Overview".to_string(),
+            }]
+        );
+        assert_eq!(
+            document.table_entries,
+            vec![CaptionEntry {
+                kind: FloatType::Table,
+                number: "1".to_string(),
+                caption: "Metrics".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn listoffigures_emits_provided_figure_entries() {
+        let document = MinimalLatexParser
+            .parse_with_state(
+                "\\documentclass{article}\n\\begin{document}\n\\listoffigures\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                vec![
+                    CaptionEntry {
+                        kind: FloatType::Figure,
+                        number: "1".to_string(),
+                        caption: "Overview".to_string(),
+                    },
+                    CaptionEntry {
+                        kind: FloatType::Figure,
+                        number: "2".to_string(),
+                        caption: String::new(),
+                    },
+                ],
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "Figure 1: Overview\nFigure 2");
+        assert!(!document.has_unresolved_lof);
+    }
+
+    #[test]
+    fn listoftables_emits_provided_table_entries() {
+        let document = MinimalLatexParser
+            .parse_with_state(
+                "\\documentclass{article}\n\\begin{document}\n\\listoftables\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![CaptionEntry {
+                    kind: FloatType::Table,
+                    number: "1".to_string(),
+                    caption: "Metrics".to_string(),
+                }],
+                BTreeMap::new(),
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "Table 1: Metrics");
+        assert!(!document.has_unresolved_lot);
+    }
+
+    #[test]
     fn tableofcontents_without_seed_entries_requests_second_pass() {
         let document = parse_document("\\tableofcontents\n\\section{Intro}");
 
         assert_eq!(document.body, "1 Intro");
         assert!(document.has_unresolved_toc);
+    }
+
+    #[test]
+    fn list_commands_without_seed_entries_request_second_pass() {
+        let document = parse_document(
+            "\\listoffigures\n\\listoftables\n\\begin{figure}\\caption{Overview}\\end{figure}\n\\begin{table}\\caption{Metrics}\\end{table}",
+        );
+
+        assert!(document.has_unresolved_lof);
+        assert!(document.has_unresolved_lot);
+        assert_eq!(
+            document.figure_entries,
+            vec![CaptionEntry {
+                kind: FloatType::Figure,
+                number: "1".to_string(),
+                caption: "Overview".to_string(),
+            }]
+        );
+        assert_eq!(
+            document.table_entries,
+            vec![CaptionEntry {
+                kind: FloatType::Table,
+                number: "1".to_string(),
+                caption: "Metrics".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn uncaptioned_floats_excluded_from_lof_lot_entries() {
+        let document = parse_document(
+            "\\begin{figure}Body only\\end{figure}\n\\begin{table}\\caption{Metrics}\\end{table}",
+        );
+
+        assert!(document.figure_entries.is_empty());
+        assert_eq!(
+            document.table_entries,
+            vec![CaptionEntry {
+                kind: FloatType::Table,
+                number: "1".to_string(),
+                caption: "Metrics".to_string(),
+            }]
+        );
     }
 
     #[test]

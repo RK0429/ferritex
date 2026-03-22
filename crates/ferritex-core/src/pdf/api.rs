@@ -1,6 +1,8 @@
 pub use crate::graphics::api::ImageColorSpace;
 use crate::kernel::api::DimensionValue;
-use crate::typesetting::api::{TextLine, TypesetDocument, TypesetOutline, TypesetPage};
+use crate::typesetting::api::{
+    FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage,
+};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const LEFT_MARGIN_PT: i64 = 72;
@@ -519,25 +521,10 @@ fn render_page_stream(
 ) -> String {
     let mut stream = String::new();
 
-    if let Some(first_line) = page.lines.first() {
-        stream.push_str("BT\n/F1 12 Tf\n");
-        stream.push_str(&format!(
-            "{} {} Td\n",
-            LEFT_MARGIN_PT,
-            points_to_pdf_number(first_line.y)
-        ));
-        stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&first_line.text)));
-
-        let mut previous_y = first_line.y;
-        for line in &page.lines[1..] {
-            stream.push_str(&format!(
-                "0 {} Td\n",
-                points_to_pdf_number(line.y - previous_y)
-            ));
-            stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
-            previous_y = line.y;
-        }
-        stream.push_str("ET\n");
+    stream.push_str(&render_text_lines(&page.lines));
+    for placement in &page.float_placements {
+        let lines = resolve_float_lines(placement);
+        stream.push_str(&render_text_lines(&lines));
     }
 
     for placement in placed_images {
@@ -547,6 +534,45 @@ fn render_page_stream(
     }
 
     stream
+}
+
+fn render_text_lines(lines: &[TextLine]) -> String {
+    let Some(first_line) = lines.first() else {
+        return String::new();
+    };
+
+    let mut stream = String::from("BT\n/F1 12 Tf\n");
+    stream.push_str(&format!(
+        "{} {} Td\n",
+        LEFT_MARGIN_PT,
+        points_to_pdf_number(first_line.y)
+    ));
+    stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&first_line.text)));
+
+    let mut previous_y = first_line.y;
+    for line in &lines[1..] {
+        stream.push_str(&format!(
+            "0 {} Td\n",
+            points_to_pdf_number(line.y - previous_y)
+        ));
+        stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
+        previous_y = line.y;
+    }
+    stream.push_str("ET\n");
+    stream
+}
+
+fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
+    placement
+        .content
+        .lines
+        .iter()
+        .map(|line| TextLine {
+            text: line.text.clone(),
+            y: placement.y_position - line.y,
+            links: line.links.clone(),
+        })
+        .collect()
 }
 
 fn render_image_placement(image: &PlacedImage) -> String {
@@ -654,7 +680,16 @@ fn assign_annotation_object_ids(
 }
 
 fn page_link_annotations(page: &TypesetPage) -> Vec<PdfLinkAnnotation> {
-    page.lines.iter().flat_map(line_link_annotations).collect()
+    page.lines
+        .iter()
+        .flat_map(line_link_annotations)
+        .chain(
+            page.float_placements
+                .iter()
+                .flat_map(resolve_float_lines)
+                .flat_map(|line| line_link_annotations(&line)),
+        )
+        .collect()
 }
 
 fn line_link_annotations(line: &TextLine) -> Vec<PdfLinkAnnotation> {
@@ -759,7 +794,9 @@ mod tests {
         FontResource, ImageColorSpace, ImageFilter, PdfImageXObject, PdfRenderer, PlacedImage,
     };
     use crate::kernel::api::DimensionValue;
-    use crate::typesetting::api::{PageBox, TextLine, TypesetDocument, TypesetPage};
+    use crate::typesetting::api::{
+        FloatPlacement, PageBox, TextLine, TypesetDocument, TypesetPage,
+    };
 
     const SCALED_POINTS_PER_POINT: i64 = 65_536;
 
@@ -783,6 +820,7 @@ mod tests {
                 })
                 .collect(),
             images: Vec::new(),
+            float_placements: Vec::new(),
         }
     }
 
@@ -809,6 +847,34 @@ mod tests {
 
         assert!(content.contains("Hello, Ferritex!"));
         assert!(!content.contains("Ferritex placeholder PDF"));
+    }
+
+    #[test]
+    fn renders_float_placement_text() {
+        let mut page = page(&["Main"]);
+        page.float_placements.push(FloatPlacement {
+            region: crate::typesetting::api::FloatRegion::Here,
+            content: crate::typesetting::api::FloatContent {
+                lines: vec![TextLine {
+                    text: "Float text".to_string(),
+                    y: points(0),
+                    links: Vec::new(),
+                }],
+                images: Vec::new(),
+                height: points(18),
+            },
+            y_position: points(680),
+        });
+
+        let pdf = PdfRenderer::default().render(&TypesetDocument {
+            pages: vec![page],
+            outlines: Vec::new(),
+            title: None,
+            author: None,
+        });
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("Float text"));
     }
 
     #[test]

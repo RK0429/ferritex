@@ -51,6 +51,7 @@ pub struct TypesetPage {
     pub lines: Vec<TextLine>,
     pub images: Vec<TypesetImage>,
     pub page_box: PageBox,
+    pub float_placements: Vec<FloatPlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,137 @@ pub struct TypesetImage {
     pub y: DimensionValue,
     pub display_width: DimensionValue,
     pub display_height: DimensionValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatRegion {
+    Here,
+    Top,
+    Bottom,
+    Page,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementSpec {
+    pub priority_order: Vec<FloatRegion>,
+    pub force: bool,
+}
+
+impl PlacementSpec {
+    pub fn parse(specifier: Option<&str>) -> Self {
+        let mut priority_order = Vec::new();
+        let mut force = false;
+
+        for ch in specifier.unwrap_or_default().chars() {
+            match ch {
+                'h' => push_float_region(&mut priority_order, FloatRegion::Here),
+                't' => push_float_region(&mut priority_order, FloatRegion::Top),
+                'b' => push_float_region(&mut priority_order, FloatRegion::Bottom),
+                'p' => push_float_region(&mut priority_order, FloatRegion::Page),
+                '!' => force = true,
+                _ => {}
+            }
+        }
+
+        if priority_order.is_empty() {
+            priority_order = vec![FloatRegion::Top, FloatRegion::Bottom, FloatRegion::Page];
+        }
+
+        Self {
+            priority_order,
+            force,
+        }
+    }
+}
+
+fn push_float_region(regions: &mut Vec<FloatRegion>, region: FloatRegion) {
+    if !regions.contains(&region) {
+        regions.push(region);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatContent {
+    pub lines: Vec<TextLine>,
+    pub images: Vec<TypesetImage>,
+    pub height: DimensionValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatItem {
+    pub spec: PlacementSpec,
+    pub content: FloatContent,
+    pub defer_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloatPlacement {
+    pub region: FloatRegion,
+    pub content: FloatContent,
+    pub y_position: DimensionValue,
+}
+
+#[derive(Debug, Default)]
+pub struct FloatQueue {
+    pending: Vec<FloatItem>,
+}
+
+impl FloatQueue {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn enqueue(&mut self, item: FloatItem) {
+        self.pending.push(item);
+    }
+
+    pub fn try_place_at(
+        &mut self,
+        region: FloatRegion,
+        available_height: DimensionValue,
+    ) -> Option<FloatPlacement> {
+        let item = self.pending.first()?;
+        if item.defer_count < 10 && !item.spec.priority_order.contains(&region) {
+            return None;
+        }
+        if item.content.height > available_height {
+            return None;
+        }
+
+        let item = self.pending.remove(0);
+        Some(FloatPlacement {
+            region,
+            content: item.content,
+            y_position: DimensionValue::zero(),
+        })
+    }
+
+    pub fn force_flush(&mut self) -> Vec<FloatPlacement> {
+        self.pending
+            .drain(..)
+            .map(|item| FloatPlacement {
+                region: FloatRegion::Page,
+                content: item.content,
+                y_position: DimensionValue::zero(),
+            })
+            .collect()
+    }
+
+    pub fn increment_defer_counts(&mut self) {
+        for item in &mut self.pending {
+            item.defer_count += 1;
+        }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +300,15 @@ pub enum VListItem {
     Penalty {
         value: i32,
     },
+    Float {
+        spec: PlacementSpec,
+        content: FloatContent,
+    },
+    PlacedFloat {
+        region: FloatRegion,
+        content: FloatContent,
+    },
+    ClearPage,
 }
 
 #[derive(Debug, Default)]
@@ -544,6 +685,18 @@ fn document_nodes_to_hlist_with_config(
                     value: PENALTY_FORCED,
                 });
             }
+            DocumentNode::ClearPage => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
+                hlist.push(HListItem::Penalty {
+                    value: PENALTY_FORCED,
+                });
+            }
             DocumentNode::IncludeGraphics { .. } => {
                 flush_word(
                     &mut hlist,
@@ -620,6 +773,17 @@ fn document_nodes_to_vlist_with_state(
                 });
                 segment_start = index + 1;
             }
+            DocumentNode::ClearPage => {
+                append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                );
+                vlist.push(VListItem::ClearPage);
+                segment_start = index + 1;
+            }
             DocumentNode::IncludeGraphics { path, options } => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
@@ -637,6 +801,7 @@ fn document_nodes_to_vlist_with_state(
             }
             DocumentNode::Float {
                 float_type,
+                specifier,
                 content,
                 caption,
                 ..
@@ -649,14 +814,14 @@ fn document_nodes_to_vlist_with_state(
                     params,
                 );
 
-                vlist.extend(document_nodes_to_vlist_with_state(
+                let mut float_vlist = document_nodes_to_vlist_with_state(
                     content,
                     provider,
                     hyphenator,
                     params,
                     graphics_resolver,
                     float_counters,
-                ));
+                );
 
                 let number = float_counters.next(*float_type);
                 if let Some(caption) = caption {
@@ -667,13 +832,18 @@ fn document_nodes_to_vlist_with_state(
                     let caption_line = format!("{prefix} {number}: {caption}");
                     let caption_nodes = [DocumentNode::Text(caption_line)];
                     append_nodes_segment_to_vlist(
-                        &mut vlist,
+                        &mut float_vlist,
                         &caption_nodes,
                         provider,
                         hyphenator,
                         params,
                     );
                 }
+
+                vlist.push(VListItem::Float {
+                    spec: PlacementSpec::parse(specifier.as_deref()),
+                    content: float_content_from_vlist(&float_vlist),
+                });
 
                 segment_start = index + 1;
             }
@@ -859,6 +1029,54 @@ fn lines_to_vlist(lines: &[line_breaker::BrokenLine]) -> Vec<VListItem> {
         .collect()
 }
 
+fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
+    let mut lines = Vec::new();
+    let mut images = Vec::new();
+    let mut consumed_height = DimensionValue::zero();
+
+    for item in items {
+        match item {
+            VListItem::Box {
+                tex_box,
+                content,
+                links,
+            } => {
+                lines.push(TextLine {
+                    text: content.clone(),
+                    y: consumed_height,
+                    links: links.clone(),
+                });
+                consumed_height = consumed_height + tex_box.height + tex_box.depth;
+            }
+            VListItem::Image { graphics_box } => {
+                if let Some(graphic) = graphics_box_external(graphics_box) {
+                    images.push(TypesetImage {
+                        graphic,
+                        x: points(LEFT_MARGIN_PT),
+                        y: consumed_height,
+                        display_width: graphics_box.width,
+                        display_height: graphics_box.height,
+                    });
+                }
+                consumed_height = consumed_height + graphics_box.height;
+            }
+            VListItem::Glue { height } => {
+                consumed_height = consumed_height + *height;
+            }
+            VListItem::Penalty { .. }
+            | VListItem::Float { .. }
+            | VListItem::PlacedFloat { .. }
+            | VListItem::ClearPage => {}
+        }
+    }
+
+    FloatContent {
+        lines,
+        images,
+        height: consumed_height,
+    }
+}
+
 fn graphics_box_external(graphics_box: &GraphicsBox) -> Option<ExternalGraphic> {
     let scene = graphics_box.scene.as_ref()?;
     let node = scene.nodes.first()?;
@@ -935,13 +1153,14 @@ fn find_outline_anchor(
 }
 
 fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
-    let content_height = page_box.height - points(TOP_MARGIN_PT) - points(BOTTOM_MARGIN_PT);
+    let content_height = page_content_height(page_box);
 
     if vlist.is_empty() {
         return vec![TypesetPage {
             lines: Vec::new(),
             images: Vec::new(),
             page_box: page_box.clone(),
+            float_placements: Vec::new(),
         }];
     }
 
@@ -949,38 +1168,151 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
     let mut current_page = Vec::new();
     let mut current_height = DimensionValue::zero();
     let mut best_break_candidate: Option<VListBreakCandidate> = None;
+    let mut float_queue = FloatQueue::new();
 
     for item in vlist {
-        if matches!(
-            item,
-            VListItem::Penalty { value } if *value <= PENALTY_FORCED
-        ) {
-            pages.push(typeset_page_from_vlist(&current_page, page_box));
-            current_page.clear();
-            current_height = DimensionValue::zero();
-            best_break_candidate = None;
-            continue;
+        match item {
+            VListItem::Float { spec, content } => {
+                if spec.priority_order.first() == Some(&FloatRegion::Here)
+                    && current_height + content.height <= content_height
+                {
+                    push_placed_float(&mut current_page, FloatRegion::Here, content.clone());
+                    current_height = current_height + content.height;
+                } else {
+                    float_queue.enqueue(FloatItem {
+                        spec: spec.clone(),
+                        content: content.clone(),
+                        defer_count: 0,
+                    });
+                }
+                continue;
+            }
+            VListItem::ClearPage => {
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
+                if page_has_renderable_content(&current_page)
+                    || (pages.is_empty() && float_queue.is_empty())
+                {
+                    pages.push(typeset_page_from_vlist(&current_page, page_box));
+                }
+
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                best_break_candidate = None;
+                pages.extend(flush_pending_float_pages(&mut float_queue, page_box));
+                continue;
+            }
+            VListItem::Penalty { value } if *value <= PENALTY_FORCED => {
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
+                if page_has_renderable_content(&current_page) || pages.is_empty() {
+                    pages.push(typeset_page_from_vlist(&current_page, page_box));
+                }
+                if !float_queue.is_empty() {
+                    float_queue.increment_defer_counts();
+                }
+
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                best_break_candidate = None;
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Top,
+                    content_height,
+                );
+                continue;
+            }
+            _ => {}
         }
 
         let item_height = vlist_item_height(item);
         if !current_page.is_empty() && current_height + item_height > content_height {
             if let Some(candidate) = best_break_candidate {
                 let trailing_items = current_page.split_off(candidate.split_after);
+                current_height = vlist_total_height(&current_page);
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
                 pages.push(typeset_page_from_vlist(&current_page, page_box));
-                current_page = trailing_items;
+                if !float_queue.is_empty() {
+                    float_queue.increment_defer_counts();
+                }
+
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Top,
+                    content_height,
+                );
+                current_page.extend(trailing_items);
                 current_height = vlist_total_height(&current_page);
                 best_break_candidate = find_best_break_candidate(&current_page);
             } else {
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
                 pages.push(typeset_page_from_vlist(&current_page, page_box));
+                if !float_queue.is_empty() {
+                    float_queue.increment_defer_counts();
+                }
+
                 current_page.clear();
                 current_height = DimensionValue::zero();
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Top,
+                    content_height,
+                );
             }
 
             if !current_page.is_empty() && current_height + item_height > content_height {
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
                 pages.push(typeset_page_from_vlist(&current_page, page_box));
+                if !float_queue.is_empty() {
+                    float_queue.increment_defer_counts();
+                }
+
                 current_page.clear();
                 current_height = DimensionValue::zero();
                 best_break_candidate = None;
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Top,
+                    content_height,
+                );
             }
         }
 
@@ -991,11 +1323,24 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
         }
     }
 
-    if current_page.is_empty() && !pages.is_empty() {
+    if current_page.is_empty() && !pages.is_empty() && float_queue.is_empty() {
         return pages;
     }
 
-    pages.push(typeset_page_from_vlist(&current_page, page_box));
+    place_pending_floats_in_region(
+        &mut current_page,
+        &mut current_height,
+        &mut float_queue,
+        FloatRegion::Bottom,
+        content_height,
+    );
+    if page_has_renderable_content(&current_page) || (pages.is_empty() && float_queue.is_empty()) {
+        pages.push(typeset_page_from_vlist(&current_page, page_box));
+    }
+    pages.extend(flush_pending_float_pages(&mut float_queue, page_box));
+    if pages.is_empty() {
+        pages.push(typeset_page_from_vlist(&[], page_box));
+    }
     pages
 }
 
@@ -1043,18 +1388,88 @@ fn vlist_total_height(items: &[VListItem]) -> DimensionValue {
     })
 }
 
+fn page_content_height(page_box: &PageBox) -> DimensionValue {
+    page_box.height - points(TOP_MARGIN_PT) - points(BOTTOM_MARGIN_PT)
+}
+
+fn page_content_top(page_box: &PageBox) -> DimensionValue {
+    page_box.height - points(TOP_MARGIN_PT)
+}
+
+fn page_has_renderable_content(items: &[VListItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            VListItem::Box { .. } | VListItem::Image { .. } | VListItem::PlacedFloat { .. }
+        )
+    })
+}
+
+fn push_placed_float(items: &mut Vec<VListItem>, region: FloatRegion, content: FloatContent) {
+    let height = content.height;
+    items.push(VListItem::PlacedFloat { region, content });
+    items.push(VListItem::Glue { height });
+}
+
+fn place_pending_floats_in_region(
+    items: &mut Vec<VListItem>,
+    current_height: &mut DimensionValue,
+    float_queue: &mut FloatQueue,
+    region: FloatRegion,
+    content_height: DimensionValue,
+) {
+    while *current_height < content_height {
+        let available_height = content_height - *current_height;
+        let Some(placement) = float_queue.try_place_at(region, available_height) else {
+            break;
+        };
+        let height = placement.content.height;
+        push_placed_float(items, placement.region, placement.content);
+        *current_height = *current_height + height;
+    }
+}
+
+fn flush_pending_float_pages(float_queue: &mut FloatQueue, page_box: &PageBox) -> Vec<TypesetPage> {
+    let mut pages = Vec::new();
+    let mut current_page = Vec::new();
+    let mut current_height = DimensionValue::zero();
+    let content_height = page_content_height(page_box);
+
+    for placement in float_queue.force_flush() {
+        let height = placement.content.height;
+        if !current_page.is_empty() && current_height + height > content_height {
+            pages.push(typeset_page_from_vlist(&current_page, page_box));
+            current_page.clear();
+            current_height = DimensionValue::zero();
+        }
+
+        push_placed_float(&mut current_page, FloatRegion::Page, placement.content);
+        current_height = current_height + height;
+    }
+
+    if page_has_renderable_content(&current_page) {
+        pages.push(typeset_page_from_vlist(&current_page, page_box));
+    }
+
+    pages
+}
+
 fn vlist_item_height(item: &VListItem) -> DimensionValue {
     match item {
         VListItem::Box { tex_box, .. } => tex_box.height + tex_box.depth,
         VListItem::Image { graphics_box } => graphics_box.height,
         VListItem::Glue { height } => *height,
-        VListItem::Penalty { .. } => DimensionValue::zero(),
+        VListItem::Penalty { .. }
+        | VListItem::Float { .. }
+        | VListItem::PlacedFloat { .. }
+        | VListItem::ClearPage => DimensionValue::zero(),
     }
 }
 
 fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPage {
     let mut lines = Vec::new();
     let mut images = Vec::new();
+    let mut float_placements = Vec::new();
     let mut consumed_height = DimensionValue::zero();
 
     for item in items {
@@ -1066,7 +1481,7 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
-                    y: page_box.height - points(TOP_MARGIN_PT) - consumed_height,
+                    y: page_content_top(page_box) - consumed_height,
                     links: links.clone(),
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
@@ -1076,20 +1491,32 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                     images.push(TypesetImage {
                         graphic,
                         x: points(LEFT_MARGIN_PT),
-                        y: page_box.height
-                            - points(TOP_MARGIN_PT)
-                            - consumed_height
-                            - graphics_box.height,
+                        y: page_content_top(page_box) - consumed_height - graphics_box.height,
                         display_width: graphics_box.width,
                         display_height: graphics_box.height,
                     });
                 }
                 consumed_height = consumed_height + graphics_box.height;
             }
+            VListItem::PlacedFloat { region, content } => {
+                let y_position = page_content_top(page_box) - consumed_height;
+                float_placements.push(FloatPlacement {
+                    region: *region,
+                    content: content.clone(),
+                    y_position,
+                });
+                images.extend(content.images.iter().map(|image| TypesetImage {
+                    graphic: image.graphic.clone(),
+                    x: image.x,
+                    y: y_position - image.y - image.display_height,
+                    display_width: image.display_width,
+                    display_height: image.display_height,
+                }));
+            }
             VListItem::Glue { height } => {
                 consumed_height = consumed_height + *height;
             }
-            VListItem::Penalty { .. } => {}
+            VListItem::Penalty { .. } | VListItem::Float { .. } | VListItem::ClearPage => {}
         }
     }
 
@@ -1097,6 +1524,7 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
         lines,
         images,
         page_box: page_box.clone(),
+        float_placements,
     }
 }
 
@@ -1381,10 +1809,11 @@ mod tests {
         default_fixed_width_provider, document_nodes_to_hlist,
         document_nodes_to_hlist_with_hyphenation, document_nodes_to_vlist_with_config,
         page_box_for_class, paginate_vlist, points, resolve_page_labels, vlist_item_height,
-        wrap_body, wrap_hlist, CharWidthProvider, GlueComponent, GlueOrder, HBox, HListItem,
-        MinimalTypesetter, TeXBox, TextLine, TfmWidthProvider, TypesetPage, VBox, VListItem,
-        LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
-        PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
+        wrap_body, wrap_hlist, CharWidthProvider, FloatContent, FloatItem, FloatQueue, FloatRegion,
+        GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PlacementSpec, TeXBox,
+        TextLine, TfmWidthProvider, TypesetPage, VBox, VListItem, LEFT_MARGIN_PT, LINE_HEIGHT_PT,
+        MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED,
+        TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::font::api::TfmMetrics;
@@ -1456,6 +1885,18 @@ mod tests {
         }
     }
 
+    fn sample_float_content(text: &str, height_pt: i64) -> FloatContent {
+        FloatContent {
+            lines: vec![TextLine {
+                text: text.to_string(),
+                y: DimensionValue::zero(),
+                links: Vec::new(),
+            }],
+            images: Vec::new(),
+            height: points(height_pt),
+        }
+    }
+
     #[test]
     fn empty_body_yields_single_empty_page() {
         let document = MinimalTypesetter.typeset(&parsed_document(""));
@@ -1517,6 +1958,7 @@ mod tests {
                 }],
                 images: Vec::new(),
                 page_box: page_box.clone(),
+                float_placements: Vec::new(),
             },
             TypesetPage {
                 lines: vec![TextLine {
@@ -1526,6 +1968,7 @@ mod tests {
                 }],
                 images: Vec::new(),
                 page_box,
+                float_placements: Vec::new(),
             },
         ];
 
@@ -1611,23 +2054,361 @@ mod tests {
         let params = super::break_params_for_provider(&provider);
         let nodes = vec![DocumentNode::Float {
             float_type: FloatType::Figure,
+            specifier: Some("h".to_string()),
             content: vec![DocumentNode::Text("Body".to_string())],
             caption: Some("A caption".to_string()),
             label: Some("fig:test".to_string()),
         }];
 
         let vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
-        let rendered_lines = vlist
-            .iter()
-            .filter_map(|item| match item {
-                VListItem::Box { content, .. } => Some(content.as_str()),
-                VListItem::Image { .. } | VListItem::Glue { .. } | VListItem::Penalty { .. } => {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        assert_eq!(
+            vlist,
+            vec![VListItem::Float {
+                spec: PlacementSpec::parse(Some("h")),
+                content: FloatContent {
+                    lines: vec![
+                        TextLine {
+                            text: "Body".to_string(),
+                            y: DimensionValue::zero(),
+                            links: Vec::new(),
+                        },
+                        TextLine {
+                            text: "Figure 1: A caption".to_string(),
+                            y: points(LINE_HEIGHT_PT),
+                            links: Vec::new(),
+                        },
+                    ],
+                    images: Vec::new(),
+                    height: points(LINE_HEIGHT_PT * 2),
+                },
+            }]
+        );
+    }
 
-        assert_eq!(rendered_lines, vec!["Body", "Figure 1: A caption"]);
+    #[test]
+    fn placement_spec_parse_default() {
+        assert_eq!(
+            PlacementSpec::parse(None),
+            PlacementSpec {
+                priority_order: vec![FloatRegion::Top, FloatRegion::Bottom, FloatRegion::Page],
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn placement_spec_parse_htbp() {
+        assert_eq!(
+            PlacementSpec::parse(Some("htbp")),
+            PlacementSpec {
+                priority_order: vec![
+                    FloatRegion::Here,
+                    FloatRegion::Top,
+                    FloatRegion::Bottom,
+                    FloatRegion::Page,
+                ],
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn placement_spec_parse_force() {
+        assert_eq!(
+            PlacementSpec::parse(Some("h!")),
+            PlacementSpec {
+                priority_order: vec![FloatRegion::Here],
+                force: true,
+            }
+        );
+    }
+
+    #[test]
+    fn placement_spec_parse_dedup() {
+        assert_eq!(
+            PlacementSpec::parse(Some("hht")),
+            PlacementSpec {
+                priority_order: vec![FloatRegion::Here, FloatRegion::Top],
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn placement_spec_parse_unknown_ignored() {
+        assert_eq!(
+            PlacementSpec::parse(Some("hxb")),
+            PlacementSpec {
+                priority_order: vec![FloatRegion::Here, FloatRegion::Bottom],
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn float_queue_enqueue_and_flush() {
+        let mut queue = FloatQueue::new();
+        queue.enqueue(FloatItem {
+            spec: PlacementSpec::parse(Some("t")),
+            content: sample_float_content("First", LINE_HEIGHT_PT),
+            defer_count: 0,
+        });
+        queue.enqueue(FloatItem {
+            spec: PlacementSpec::parse(Some("b")),
+            content: sample_float_content("Second", LINE_HEIGHT_PT * 2),
+            defer_count: 0,
+        });
+
+        let placements = queue.force_flush();
+
+        assert_eq!(placements.len(), 2);
+        assert!(queue.is_empty());
+        assert_eq!(placements[0].region, FloatRegion::Page);
+        assert_eq!(placements[1].content.lines[0].text, "Second");
+    }
+
+    #[test]
+    fn float_queue_try_place_fits() {
+        let mut queue = FloatQueue::new();
+        queue.enqueue(FloatItem {
+            spec: PlacementSpec::parse(Some("t")),
+            content: sample_float_content("Fit", LINE_HEIGHT_PT * 2),
+            defer_count: 0,
+        });
+
+        let placement = queue
+            .try_place_at(FloatRegion::Top, points(LINE_HEIGHT_PT * 3))
+            .expect("float should fit");
+
+        assert_eq!(placement.region, FloatRegion::Top);
+        assert_eq!(placement.content.lines[0].text, "Fit");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn float_queue_try_place_too_tall() {
+        let mut queue = FloatQueue::new();
+        queue.enqueue(FloatItem {
+            spec: PlacementSpec::parse(Some("t")),
+            content: sample_float_content("Tall", LINE_HEIGHT_PT * 3),
+            defer_count: 0,
+        });
+
+        assert!(queue
+            .try_place_at(FloatRegion::Top, points(LINE_HEIGHT_PT * 2))
+            .is_none());
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn float_queue_increment_defer_counts() {
+        let mut queue = FloatQueue::new();
+        queue.enqueue(FloatItem {
+            spec: PlacementSpec::parse(Some("t")),
+            content: sample_float_content("Deferred", LINE_HEIGHT_PT),
+            defer_count: 0,
+        });
+
+        queue.increment_defer_counts();
+
+        let placement = queue
+            .try_place_at(FloatRegion::Here, points(LINE_HEIGHT_PT))
+            .is_none();
+        assert!(placement);
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        queue.increment_defer_counts();
+        assert!(queue
+            .try_place_at(FloatRegion::Here, points(LINE_HEIGHT_PT))
+            .is_some());
+    }
+
+    #[test]
+    fn float_with_here_spec_placed_inline() {
+        let vlist = vec![
+            VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                content: "Before".to_string(),
+                links: Vec::new(),
+            },
+            VListItem::Float {
+                spec: PlacementSpec::parse(Some("h")),
+                content: sample_float_content("Float", LINE_HEIGHT_PT * 2),
+            },
+            VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                content: "After".to_string(),
+                links: Vec::new(),
+            },
+        ];
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0]
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Before", "After"]
+        );
+        assert_eq!(pages[0].float_placements.len(), 1);
+        assert_eq!(pages[0].float_placements[0].region, FloatRegion::Here);
+        assert_eq!(pages[0].float_placements[0].content.lines[0].text, "Float");
+        assert_eq!(
+            pages[0].lines[1].y,
+            points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - (LINE_HEIGHT_PT * 3))
+        );
+    }
+
+    #[test]
+    fn float_deferred_to_next_page_top() {
+        let mut vlist = vec![
+            VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                content: "Line 1".to_string(),
+                links: Vec::new(),
+            },
+            VListItem::Float {
+                spec: PlacementSpec::parse(Some("t")),
+                content: sample_float_content("Top float", LINE_HEIGHT_PT * 2),
+            },
+        ];
+        vlist.extend((2..=37).map(|index| VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: format!("Line {index}"),
+            links: Vec::new(),
+        }));
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].float_placements.is_empty());
+        assert_eq!(pages[1].float_placements.len(), 1);
+        assert_eq!(pages[1].float_placements[0].region, FloatRegion::Top);
+        assert_eq!(
+            pages[1].float_placements[0].content.lines[0].text,
+            "Top float"
+        );
+        assert_eq!(pages[1].lines[0].text, "Line 37");
+        assert_eq!(
+            pages[1].lines[0].y,
+            points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - (LINE_HEIGHT_PT * 2))
+        );
+    }
+
+    #[test]
+    fn clearpage_flushes_pending_floats() {
+        let vlist = vec![
+            VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                content: "Before".to_string(),
+                links: Vec::new(),
+            },
+            VListItem::Float {
+                spec: PlacementSpec::parse(Some("t")),
+                content: sample_float_content("Pending float", LINE_HEIGHT_PT * 2),
+            },
+            VListItem::ClearPage,
+            VListItem::Box {
+                tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                content: "After".to_string(),
+                links: Vec::new(),
+            },
+        ];
+
+        let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
+
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].lines[0].text, "Before");
+        assert!(pages[0].float_placements.is_empty());
+        assert_eq!(pages[1].float_placements.len(), 1);
+        assert_eq!(pages[1].float_placements[0].region, FloatRegion::Page);
+        assert_eq!(
+            pages[1].float_placements[0].content.lines[0].text,
+            "Pending float"
+        );
+        assert_eq!(pages[2].lines[0].text, "After");
+    }
+
+    #[test]
+    fn parsed_document_with_multiple_float_specifiers_typesets_across_pages() {
+        let body = [
+            "Intro",
+            "\\begin{figure}[h]Inline body\\caption{Inline}\\end{figure}",
+            "Line 2",
+            "Line 3",
+            "Line 4",
+            "Line 5",
+            "Line 6",
+            "Line 7",
+            "Line 8",
+            "Line 9",
+            "Line 10",
+            "Line 11",
+            "Line 12",
+            "Line 13",
+            "Line 14",
+            "Line 15",
+            "Line 16",
+            "Line 17",
+            "Line 18",
+            "Line 19",
+            "Line 20",
+            "Line 21",
+            "Line 22",
+            "Line 23",
+            "Line 24",
+            "Line 25",
+            "Line 26",
+            "Line 27",
+            "Line 28",
+            "Line 29",
+            "Line 30",
+            "Line 31",
+            "Line 32",
+            "Line 33",
+            "Line 34",
+            "Line 35",
+            "Line 36",
+            "\\begin{figure}[t]Top body\\caption{Top}\\end{figure}",
+            "Tail",
+            "\\clearpage",
+            "Done",
+        ]
+        .join("\n");
+
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(&body));
+
+        assert_eq!(document.pages.len(), 3);
+        assert!(document
+            .pages
+            .iter()
+            .flat_map(|page| page.float_placements.iter())
+            .any(|placement| placement.region == FloatRegion::Here
+                && placement
+                    .content
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("Inline body"))));
+        assert!(document
+            .pages
+            .iter()
+            .flat_map(|page| page.float_placements.iter())
+            .any(|placement| placement.region == FloatRegion::Page
+                && placement
+                    .content
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("Top body"))));
+        assert_eq!(document.pages[2].lines[0].text, "Done");
     }
 
     #[test]

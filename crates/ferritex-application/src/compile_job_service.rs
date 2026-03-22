@@ -571,11 +571,17 @@ impl<'a> CompileJobService<'a> {
         };
         let mut pass_count = 1;
 
-        if document.has_unresolved_refs || document.has_unresolved_toc {
+        if document.has_unresolved_refs
+            || document.has_unresolved_toc
+            || document.has_unresolved_lof
+            || document.has_unresolved_lot
+        {
             let second = self.parser.parse_recovering_with_context(
                 source,
                 document.labels.clone().into_inner(),
                 document.section_entries.clone(),
+                document.figure_entries.clone(),
+                document.table_entries.clone(),
                 document.bibliography.clone(),
                 BTreeMap::new(),
             );
@@ -595,6 +601,8 @@ impl<'a> CompileJobService<'a> {
                     source,
                     document.labels.clone().into_inner(),
                     document.section_entries.clone(),
+                    document.figure_entries.clone(),
+                    document.table_entries.clone(),
                     document.bibliography.clone(),
                     page_labels.clone(),
                 );
