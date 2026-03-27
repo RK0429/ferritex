@@ -127,7 +127,11 @@ fn collect_candidates(
                 if index > paragraph_start
                     && matches!(
                         hlist.get(index - 1),
-                        Some(HListItem::Char { .. } | HListItem::Kern { .. })
+                        Some(
+                            HListItem::Char { .. }
+                                | HListItem::Kern { .. }
+                                | HListItem::InlineBox { .. }
+                        )
                     ) =>
             {
                 candidates.push(BreakCandidate {
@@ -316,6 +320,9 @@ fn build_prefix_metrics(hlist: &[HListItem]) -> Vec<Metrics> {
                 next.width += width.0;
             }
             HListItem::Kern { width } => {
+                next.width += width.0;
+            }
+            HListItem::InlineBox { width, .. } => {
                 next.width += width.0;
             }
             HListItem::Glue {

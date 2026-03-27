@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::{
     hyphenation::{Hyphenator, TexPatternHyphenator},
     knuth_plass::BreakParams,
-    line_breaker,
+    line_breaker, math_layout,
 };
 
 use crate::compilation::{
@@ -14,7 +14,7 @@ use crate::graphics::api::{
     compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
 };
 use crate::kernel::api::DimensionValue;
-use crate::parser::api::{DocumentNode, FloatType, IndexRawEntry, MathNode, ParsedDocument};
+use crate::parser::api::{DocumentNode, FloatType, IndexRawEntry, ParsedDocument};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
@@ -286,6 +286,12 @@ pub enum HListItem {
     Kern {
         width: DimensionValue,
     },
+    InlineBox {
+        width: DimensionValue,
+        height: DimensionValue,
+        depth: DimensionValue,
+        content: String,
+    },
     Penalty {
         value: i32,
     },
@@ -531,11 +537,13 @@ pub fn document_nodes_to_hlist(
     nodes: &[DocumentNode],
     provider: &dyn CharWidthProvider,
 ) -> Vec<HListItem> {
+    let line_width = break_params_for_provider(provider).line_width;
     document_nodes_to_hlist_with_config(
         nodes,
         provider,
         None,
         BreakParams::default().hyphen_penalty,
+        line_width,
     )
 }
 
@@ -544,11 +552,13 @@ pub fn document_nodes_to_hlist_with_hyphenation(
     provider: &dyn CharWidthProvider,
     hyphenator: &dyn Hyphenator,
 ) -> Vec<HListItem> {
+    let line_width = break_params_for_provider(provider).line_width;
     document_nodes_to_hlist_with_config(
         nodes,
         provider,
         Some(hyphenator),
         BreakParams::default().hyphen_penalty,
+        line_width,
     )
 }
 
@@ -557,6 +567,7 @@ fn document_nodes_to_hlist_with_config(
     provider: &dyn CharWidthProvider,
     hyphenator: Option<&dyn Hyphenator>,
     hyphen_penalty: i32,
+    line_width: DimensionValue,
 ) -> Vec<HListItem> {
     let space_width = provider.space_width();
     let stretch = GlueComponent::normal(DimensionValue(space_width.0 / 2));
@@ -617,6 +628,7 @@ fn document_nodes_to_hlist_with_config(
                     provider,
                     hyphenator,
                     hyphen_penalty,
+                    line_width,
                 ));
             }
             DocumentNode::Link { url, children } => {
@@ -632,13 +644,16 @@ fn document_nodes_to_hlist_with_config(
                     provider,
                     hyphenator,
                     hyphen_penalty,
+                    line_width,
                 );
                 for item in &mut link_hlist {
                     match item {
                         HListItem::Char { link, .. } | HListItem::Glue { link, .. } => {
                             *link = Some(url.clone());
                         }
-                        HListItem::Kern { .. } | HListItem::Penalty { .. } => {}
+                        HListItem::Kern { .. }
+                        | HListItem::InlineBox { .. }
+                        | HListItem::Penalty { .. } => {}
                     }
                 }
                 hlist.extend(link_hlist);
@@ -660,14 +675,9 @@ fn document_nodes_to_hlist_with_config(
                     hyphenator,
                     hyphen_penalty,
                 );
-                append_literal_text_to_hlist(
-                    &mut hlist,
-                    &render_math_nodes(nodes),
-                    provider,
-                    space_width,
-                    stretch,
-                    shrink,
-                );
+                let math_hlist =
+                    math_layout::math_nodes_to_hlist(nodes, provider, math_layout::MathStyle::Text);
+                hlist.extend(math_hlist);
             }
             DocumentNode::DisplayMath(nodes) => {
                 flush_word(
@@ -678,17 +688,23 @@ fn document_nodes_to_hlist_with_config(
                     hyphen_penalty,
                 );
                 push_forced_break_if_needed(&mut hlist);
-                append_literal_text_to_hlist(
-                    &mut hlist,
-                    &render_math_nodes(nodes),
+                let math_hlist = math_layout::math_nodes_to_hlist(
+                    nodes,
                     provider,
-                    space_width,
-                    stretch,
-                    shrink,
+                    math_layout::MathStyle::Display,
                 );
+                let math_width = math_layout::hlist_total_width(&math_hlist);
+                let side_glue = DimensionValue((line_width.0 - math_width.0) / 2);
+                if side_glue.0 > 0 {
+                    hlist.push(HListItem::Kern { width: side_glue });
+                }
+                hlist.extend(math_hlist);
+                if side_glue.0 > 0 {
+                    hlist.push(HListItem::Kern { width: side_glue });
+                }
                 push_forced_break_if_needed(&mut hlist);
             }
-            DocumentNode::EquationEnv { lines, aligned, .. } => {
+            DocumentNode::EquationEnv { lines, .. } => {
                 flush_word(
                     &mut hlist,
                     &mut current_word,
@@ -699,19 +715,8 @@ fn document_nodes_to_hlist_with_config(
                 if !hlist.is_empty() {
                     push_forced_break_if_needed(&mut hlist);
                 }
-                for (index, line) in lines.iter().enumerate() {
-                    append_literal_text_to_hlist(
-                        &mut hlist,
-                        &render_math_line(line, *aligned),
-                        provider,
-                        space_width,
-                        stretch,
-                        shrink,
-                    );
-                    if index + 1 < lines.len() {
-                        push_forced_break_if_needed(&mut hlist);
-                    }
-                }
+                let eq_hlist = math_layout::typeset_equation_env(lines, provider, line_width);
+                hlist.extend(eq_hlist);
                 push_forced_break_if_needed(&mut hlist);
             }
             DocumentNode::ParBreak => {
@@ -942,8 +947,13 @@ fn append_nodes_segment_to_vlist(
         return;
     }
 
-    let hlist =
-        document_nodes_to_hlist_with_config(nodes, provider, hyphenator, params.hyphen_penalty);
+    let hlist = document_nodes_to_hlist_with_config(
+        nodes,
+        provider,
+        hyphenator,
+        params.hyphen_penalty,
+        params.line_width,
+    );
     if hlist.is_empty() {
         return;
     }
@@ -952,131 +962,7 @@ fn append_nodes_segment_to_vlist(
     vlist.extend(lines_to_vlist(&wrapped_lines));
 }
 
-fn render_math_nodes(nodes: &[MathNode]) -> String {
-    nodes
-        .iter()
-        .map(render_math_node)
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn visible_math_delimiter(delimiter: &str) -> &str {
-    if delimiter == "." {
-        ""
-    } else {
-        delimiter
-    }
-}
-
-fn render_math_annotation(nodes: &[MathNode]) -> String {
-    if nodes.len() > 1 {
-        format!("({})", render_math_nodes(nodes))
-    } else {
-        render_math_nodes(nodes)
-    }
-}
-
-fn render_math_node(node: &MathNode) -> String {
-    match node {
-        MathNode::Ordinary(ch) => ch.to_string(),
-        MathNode::Symbol(symbol) => symbol.clone(),
-        MathNode::Superscript(node) => format!("^{}", render_math_attachment(node)),
-        MathNode::Subscript(node) => format!("_{}", render_math_attachment(node)),
-        MathNode::Frac { numer, denom } => {
-            format!(
-                "({})/({})",
-                render_math_nodes(numer),
-                render_math_nodes(denom)
-            )
-        }
-        MathNode::Sqrt { radicand, index } => {
-            let body = render_math_nodes(radicand);
-            match index {
-                Some(index) => format!("√[{}]({body})", render_math_nodes(index)),
-                None => format!("√({body})"),
-            }
-        }
-        MathNode::MathFont { body, .. } => render_math_nodes(body),
-        MathNode::LeftRight { left, right, body } => format!(
-            "{}{}{}",
-            visible_math_delimiter(left),
-            render_math_nodes(body),
-            visible_math_delimiter(right)
-        ),
-        MathNode::OverUnder {
-            kind,
-            base,
-            annotation,
-        } => {
-            let base = render_math_nodes(base);
-            let annotation = render_math_annotation(annotation);
-            match kind {
-                crate::parser::api::OverUnderKind::Over => format!("{base}^{annotation}"),
-                crate::parser::api::OverUnderKind::Under => format!("{base}_{annotation}"),
-            }
-        }
-        MathNode::Group(nodes) => render_math_nodes(nodes),
-        MathNode::Text(text) => text.clone(),
-    }
-}
-
-fn render_math_attachment(node: &MathNode) -> String {
-    match node {
-        MathNode::Group(nodes) if nodes.len() > 1 => format!("({})", render_math_nodes(nodes)),
-        _ => render_math_node(node),
-    }
-}
-
-fn render_math_line(line: &crate::parser::api::MathLine, aligned: bool) -> String {
-    let separator = if aligned { " " } else { "" };
-    let mut rendered = line
-        .segments
-        .iter()
-        .map(|segment| render_math_nodes(segment))
-        .collect::<Vec<_>>()
-        .join(separator);
-
-    if let Some(display_tag) = line.display_tag.as_deref() {
-        if !rendered.is_empty() {
-            rendered.push(' ');
-        }
-        rendered.push('(');
-        rendered.push_str(display_tag);
-        rendered.push(')');
-    }
-
-    rendered
-}
-
-fn append_literal_text_to_hlist(
-    hlist: &mut Vec<HListItem>,
-    text: &str,
-    provider: &dyn CharWidthProvider,
-    space_width: DimensionValue,
-    stretch: GlueComponent,
-    shrink: GlueComponent,
-) {
-    for codepoint in text.chars() {
-        match codepoint {
-            '\n' => hlist.push(HListItem::Penalty {
-                value: PENALTY_FORCED,
-            }),
-            codepoint if codepoint.is_whitespace() => hlist.push(HListItem::Glue {
-                width: space_width,
-                stretch,
-                shrink,
-                link: None,
-            }),
-            codepoint => hlist.push(HListItem::Char {
-                codepoint,
-                width: provider.char_width(codepoint),
-                link: None,
-            }),
-        }
-    }
-}
-
-fn push_forced_break_if_needed(hlist: &mut Vec<HListItem>) {
+pub(crate) fn push_forced_break_if_needed(hlist: &mut Vec<HListItem>) {
     if matches!(
         hlist.last(),
         Some(HListItem::Penalty { value }) if *value <= PENALTY_FORCED
@@ -1686,6 +1572,13 @@ fn wrap_hlist(hlist: &[HListItem], max_line_width: DimensionValue) -> Vec<String
                 current_word.push(WordSegment::Kern { width: *width });
                 last_item_forced_break = false;
             }
+            HListItem::InlineBox { content, width, .. } => {
+                current_word.push(WordSegment::InlineBox {
+                    content: content.clone(),
+                    width: *width,
+                });
+                last_item_forced_break = false;
+            }
             HListItem::Glue { width, .. } => {
                 last_item_forced_break = false;
                 if !current_word.is_empty() {
@@ -1744,7 +1637,7 @@ fn wrap_hlist(hlist: &[HListItem], max_line_width: DimensionValue) -> Vec<String
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WordSegment {
     Char {
         codepoint: char,
@@ -1753,13 +1646,19 @@ enum WordSegment {
     Kern {
         width: DimensionValue,
     },
+    InlineBox {
+        content: String,
+        width: DimensionValue,
+    },
 }
 
 #[cfg(test)]
 impl WordSegment {
-    fn width(self) -> DimensionValue {
+    fn width(&self) -> DimensionValue {
         match self {
-            Self::Char { width, .. } | Self::Kern { width } => width,
+            Self::Char { width, .. } | Self::Kern { width } | Self::InlineBox { width, .. } => {
+                *width
+            }
         }
     }
 }
@@ -1897,8 +1796,10 @@ fn split_long_word_to_lines(
             chunk_width = DimensionValue::zero();
         }
 
-        if let WordSegment::Char { codepoint, .. } = segment {
-            chunk.push(*codepoint);
+        match segment {
+            WordSegment::Char { codepoint, .. } => chunk.push(*codepoint),
+            WordSegment::InlineBox { content, .. } => chunk.push_str(content),
+            WordSegment::Kern { .. } => {}
         }
         chunk_width = chunk_width + width;
 
@@ -1925,12 +1826,15 @@ fn word_width(word: &[WordSegment]) -> DimensionValue {
 
 #[cfg(test)]
 fn word_to_string(word: &[WordSegment]) -> String {
-    word.iter()
-        .filter_map(|segment| match segment {
-            WordSegment::Char { codepoint, .. } => Some(*codepoint),
-            WordSegment::Kern { .. } => None,
-        })
-        .collect()
+    let mut rendered = String::new();
+    for segment in word {
+        match segment {
+            WordSegment::Char { codepoint, .. } => rendered.push(*codepoint),
+            WordSegment::InlineBox { content, .. } => rendered.push_str(content),
+            WordSegment::Kern { .. } => {}
+        }
+    }
+    rendered
 }
 
 fn points(value: i64) -> DimensionValue {
@@ -2870,7 +2774,7 @@ mod tests {
 
         assert_eq!(
             wrap_hlist(&hlist, MAX_LINE_WIDTH),
-            vec!["Area x^2".to_string()]
+            vec!["Area x2".to_string()]
         );
     }
 
@@ -2911,7 +2815,26 @@ mod tests {
 
         assert_eq!(
             wrap_hlist(&hlist, MAX_LINE_WIDTH),
-            vec!["f = max(α)+√[3](x)+Y_n".to_string()]
+            vec!["f = max(α)+√3x+Y_n".to_string()]
+        );
+    }
+
+    #[test]
+    fn document_nodes_to_hlist_keeps_visible_inline_math_operator_chars() {
+        let hlist = document_nodes_to_hlist(
+            &[DocumentNode::InlineMath(vec![
+                MathNode::Ordinary('x'),
+                MathNode::Ordinary('+'),
+                MathNode::Ordinary('y'),
+                MathNode::Ordinary('='),
+                MathNode::Ordinary('z'),
+            ])],
+            &default_fixed_width_provider(),
+        );
+
+        assert_eq!(
+            wrap_hlist(&hlist, MAX_LINE_WIDTH),
+            vec!["x+y=z".to_string()]
         );
     }
 
@@ -2931,8 +2854,45 @@ mod tests {
 
         assert_eq!(
             wrap_hlist(&hlist, MAX_LINE_WIDTH),
-            vec!["Before".to_string(), "a_1".to_string(), "After".to_string()]
+            vec!["Before".to_string(), "a1".to_string(), "After".to_string()]
         );
+    }
+
+    #[test]
+    fn document_nodes_to_hlist_centers_display_math_with_invisible_kerns() {
+        let hlist = document_nodes_to_hlist(
+            &[
+                DocumentNode::Text("Before".to_string()),
+                DocumentNode::DisplayMath(vec![
+                    MathNode::Ordinary('x'),
+                    MathNode::Ordinary('+'),
+                    MathNode::Ordinary('y'),
+                ]),
+                DocumentNode::Text("After".to_string()),
+            ],
+            &default_fixed_width_provider(),
+        );
+
+        assert_eq!(
+            wrap_hlist(&hlist, MAX_LINE_WIDTH),
+            vec!["Before".to_string(), "x+y".to_string(), "After".to_string()]
+        );
+
+        let forced_breaks = hlist
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                HListItem::Penalty { value } if *value <= PENALTY_FORCED => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let display_slice = &hlist[forced_breaks[0] + 1..forced_breaks[1]];
+        assert!(matches!(
+            display_slice.first(),
+            Some(HListItem::Kern { .. })
+        ));
+        assert!(matches!(display_slice.last(), Some(HListItem::Kern { .. })));
     }
 
     #[test]
@@ -2974,9 +2934,34 @@ mod tests {
             vec![
                 "Before".to_string(),
                 "a=b (1)".to_string(),
-                "c = done (A)".to_string(),
+                "c=done (A)".to_string(),
                 "After".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn document_nodes_to_hlist_renders_equation_environment_tags() {
+        let hlist = document_nodes_to_hlist(
+            &[DocumentNode::EquationEnv {
+                lines: vec![MathLine {
+                    segments: vec![vec![
+                        MathNode::Ordinary('x'),
+                        MathNode::Ordinary('='),
+                        MathNode::Ordinary('y'),
+                    ]],
+                    tag: LineTag::Custom("7".to_string()),
+                    display_tag: Some("7".to_string()),
+                }],
+                numbered: true,
+                aligned: false,
+            }],
+            &default_fixed_width_provider(),
+        );
+
+        assert_eq!(
+            wrap_hlist(&hlist, MAX_LINE_WIDTH),
+            vec!["x=y (7)".to_string()]
         );
     }
 
@@ -2992,7 +2977,7 @@ mod tests {
                 .iter()
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Inline x^2.", "(a)/(b)", "After"]
+            vec!["Inline x2.", "a/b", "After"]
         );
     }
 
@@ -3014,7 +2999,7 @@ mod tests {
                 .iter()
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["E=mc^2 (1)", "Ref 1.", "a = b", "c = done (A)", "Also A."]
+            vec!["E=mc2 (1)", "Ref 1.", "a=b", "c=done (A)", "Also A."]
         );
     }
 

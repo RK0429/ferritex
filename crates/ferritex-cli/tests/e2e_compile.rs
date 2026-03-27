@@ -128,8 +128,8 @@ fn compile_renders_inline_and_display_math_without_raw_tex_delimiters() {
     assert_eq!(output.status.code(), Some(0));
 
     let pdf = std::fs::read_to_string(dir.path().join("math.pdf")).expect("read output pdf");
-    assert!(pdf.contains("Inline x^2 here."));
-    assert!(pdf.contains("\\(a\\)/\\(b\\)"));
+    assert!(pdf.contains("Inline x2 here."));
+    assert!(pdf.contains("a/b"));
     assert!(pdf.contains("Done."));
     assert!(!pdf.contains("$x^2$"));
     assert!(!pdf.contains("\\frac{a}{b}"));
@@ -155,16 +155,16 @@ fn compile_renders_multiline_math_environments_with_tags_and_text() {
 
     let pdf =
         std::fs::read_to_string(dir.path().join("multiline-math.pdf")).expect("read output pdf");
-    assert!(pdf.contains("E=mc^2 \\(1\\)"));
+    assert!(pdf.contains("E=mc2 \\(1\\)"));
     assert!(pdf.contains("Ref 1."));
     assert!(pdf.contains("x=y"));
     assert!(!pdf.contains("x=y \\("));
-    assert!(pdf.contains("a = b"));
-    assert!(!pdf.contains("a = b \\("));
-    assert!(pdf.contains("c = done \\(A\\)"));
+    assert!(pdf.contains("a=b"));
+    assert!(!pdf.contains("a=b \\("));
+    assert!(pdf.contains("c=done \\(A\\)"));
     assert!(pdf.contains("Also A."));
-    assert!(pdf.contains("u = v"));
-    assert!(pdf.contains("w = z"));
+    assert!(pdf.contains("u=v"));
+    assert!(pdf.contains("w=z"));
     assert!(!pdf.contains("\\tag{A}"));
     assert!(!pdf.contains("\\text{done}"));
 }
@@ -186,7 +186,7 @@ fn compile_renders_equation_environment_with_numbering() {
 
     assert_eq!(output.status.code(), Some(0));
     let pdf = std::fs::read_to_string(dir.path().join("equation.pdf")).expect("read output pdf");
-    assert!(pdf.contains("x^2+y^2=z^2"));
+    assert!(pdf.contains("x2+y2=z2"));
     assert!(pdf.contains("\\(1\\)"));
 }
 
@@ -228,8 +228,8 @@ fn compile_renders_align_environment_with_numbering() {
 
     assert_eq!(output.status.code(), Some(0));
     let pdf = std::fs::read_to_string(dir.path().join("align.pdf")).expect("read output pdf");
-    assert!(pdf.contains("a =b"));
-    assert!(pdf.contains("c =d"));
+    assert!(pdf.contains("a=b"));
+    assert!(pdf.contains("c=d"));
     assert!(pdf.contains("\\(1\\)"));
     assert!(pdf.contains("\\(2\\)"));
 }
@@ -251,8 +251,8 @@ fn compile_renders_notag_and_tag_in_align_environment() {
 
     assert_eq!(output.status.code(), Some(0));
     let pdf = std::fs::read_to_string(dir.path().join("tags.pdf")).expect("read output pdf");
-    assert!(pdf.contains("a =b"));
-    assert!(pdf.contains("c =d"));
+    assert!(pdf.contains("a=b"));
+    assert!(pdf.contains("c=d"));
     assert!(!pdf.contains("\\(1\\)"));
     assert!(pdf.contains("\\(*\\)"));
 }

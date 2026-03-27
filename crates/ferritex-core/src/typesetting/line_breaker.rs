@@ -140,7 +140,9 @@ fn segment_width(segment: &[HListItem]) -> DimensionValue {
 
 fn item_width(item: &HListItem) -> DimensionValue {
     match item {
-        HListItem::Char { width, .. } | HListItem::Kern { width } => *width,
+        HListItem::Char { width, .. }
+        | HListItem::Kern { width }
+        | HListItem::InlineBox { width, .. } => *width,
         HListItem::Glue { width, .. } => *width,
         HListItem::Penalty { .. } => DimensionValue::zero(),
     }
@@ -172,6 +174,14 @@ fn render_line(segment: &[HListItem]) -> BrokenLine {
                 pending_space = false;
                 pending_space_link = None;
             }
+            HListItem::InlineBox { content, .. } => {
+                if pending_space && !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(content);
+                pending_space = false;
+                pending_space_link = None;
+            }
             HListItem::Glue { link, .. } => {
                 if !text.is_empty() {
                     pending_space = true;
@@ -200,15 +210,20 @@ fn push_unbreakable_lines(
             current_width = DimensionValue::zero();
         }
 
-        if let HListItem::Char {
-            codepoint, link, ..
-        } = item
-        {
-            let start_char = current_line.text.chars().count();
-            current_line.text.push(*codepoint);
-            if let Some(url) = link.as_deref() {
-                push_link_range(&mut current_line.links, url, start_char, start_char + 1);
+        match item {
+            HListItem::Char {
+                codepoint, link, ..
+            } => {
+                let start_char = current_line.text.chars().count();
+                current_line.text.push(*codepoint);
+                if let Some(url) = link.as_deref() {
+                    push_link_range(&mut current_line.links, url, start_char, start_char + 1);
+                }
             }
+            HListItem::InlineBox { content, .. } => {
+                current_line.text.push_str(content);
+            }
+            _ => {}
         }
         current_width = current_width + width;
 
