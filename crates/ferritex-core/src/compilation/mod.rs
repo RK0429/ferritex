@@ -1,6 +1,7 @@
 mod commit_barrier;
 mod document_state;
 mod job;
+mod partition;
 mod session;
 mod snapshot;
 
@@ -10,5 +11,9 @@ pub use document_state::{
     OutlineDraftEntry, PdfMetadataDraft, SymbolLocation,
 };
 pub use job::CompilationJob;
+pub use partition::{
+    slugify_partition_title, DocumentPartitionPlan, DocumentWorkUnit, PartitionKind,
+    PartitionLocator, SectionOutlineEntry,
+};
 pub use session::{CompilationSession, JobContext};
 pub use snapshot::CompilationSnapshot;

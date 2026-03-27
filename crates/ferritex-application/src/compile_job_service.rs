@@ -10,7 +10,8 @@ use ferritex_core::bibliography::api::{
     BibliographyToolchain,
 };
 use ferritex_core::compilation::{
-    CompilationJob, CompilationSnapshot, DocumentState, IndexEntry, SymbolLocation,
+    CompilationJob, CompilationSnapshot, DocumentState, IndexEntry, SectionOutlineEntry,
+    SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
@@ -853,10 +854,15 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
+        let section_outline = parsed_document
+            .section_entries
+            .iter()
+            .map(SectionOutlineEntry::from)
+            .collect::<Vec<_>>();
         let partition_plan = DocumentPartitionPlanner::plan(
             &options.input_file,
             &parsed_document.document_class,
-            &parsed_document.section_entries,
+            &section_outline,
         );
         let pdf_document = pdf_renderer.render_with_partition_plan(
             &typeset_document,

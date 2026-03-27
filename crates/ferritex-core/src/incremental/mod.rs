@@ -1,6 +1,3 @@
 pub mod api;
 
-pub use api::{
-    DependencyGraph, DependencyNode, DocumentPartitionPlan, DocumentPartitionPlanner,
-    DocumentWorkUnit, PartitionKind, PartitionLocator, RecompilationScope,
-};
+pub use api::{DependencyGraph, DependencyNode, DocumentPartitionPlanner, RecompilationScope};

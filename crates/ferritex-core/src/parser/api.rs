@@ -7,7 +7,7 @@ use std::{
 use thiserror::Error;
 
 use crate::bibliography::api::{parse_bbl, BibliographyState};
-use crate::compilation::IndexEntry;
+use crate::compilation::{IndexEntry, SectionOutlineEntry};
 use crate::kernel::api::DimensionValue;
 
 use super::{
@@ -79,6 +79,16 @@ impl SectionEntry {
             (false, true) => self.number.clone(),
             (true, false) => self.title.clone(),
             (false, false) => format!("{} {}", self.number, self.title),
+        }
+    }
+}
+
+impl From<&SectionEntry> for SectionOutlineEntry {
+    fn from(value: &SectionEntry) -> Self {
+        Self {
+            level: value.level,
+            number: value.number.clone(),
+            title: value.title.clone(),
         }
     }
 }

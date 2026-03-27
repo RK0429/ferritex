@@ -1,8 +1,7 @@
 use std::thread;
 
-use crate::compilation::{CommitBarrier, LinkStyle, StageCommitPayload};
+use crate::compilation::{CommitBarrier, DocumentPartitionPlan, LinkStyle, StageCommitPayload};
 pub use crate::graphics::api::ImageColorSpace;
-use crate::incremental::DocumentPartitionPlan;
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
     FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage,
@@ -1202,16 +1201,14 @@ fn escape_pdf_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::{
         resolve_named_color, FontResource, ImageColorSpace, ImageFilter, PdfImageXObject,
         PdfRenderer, PlacedImage,
     };
-    use crate::compilation::LinkStyle;
-    use crate::incremental::DocumentPartitionPlanner;
+    use crate::compilation::{
+        DocumentPartitionPlan, DocumentWorkUnit, LinkStyle, PartitionKind, PartitionLocator,
+    };
     use crate::kernel::api::DimensionValue;
-    use crate::parser::SectionEntry;
     use crate::typesetting::api::{
         FloatPlacement, PageBox, TextLine, TextLineLink, TypesetDocument, TypesetNamedDestination,
         TypesetOutline, TypesetPage,
@@ -1457,22 +1454,33 @@ mod tests {
                 y: points(720),
             },
         ];
-        let plan = DocumentPartitionPlanner::plan(
-            Path::new("book.tex"),
-            "book",
-            &[
-                SectionEntry {
-                    level: 0,
-                    number: "1".to_string(),
-                    title: "Intro".to_string(),
+        let plan = DocumentPartitionPlan {
+            fallback_partition_id: "document:0000:book".to_string(),
+            work_units: vec![
+                DocumentWorkUnit {
+                    partition_id: "chapter:0001:1-intro".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 0,
+                        title: "1 Intro".to_string(),
+                    },
+                    title: "1 Intro".to_string(),
                 },
-                SectionEntry {
-                    level: 0,
-                    number: "2".to_string(),
-                    title: "Results".to_string(),
+                DocumentWorkUnit {
+                    partition_id: "chapter:0002:2-results".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 1,
+                        title: "2 Results".to_string(),
+                    },
+                    title: "2 Results".to_string(),
                 },
             ],
-        );
+        };
         let renderer = PdfRenderer::default();
 
         let sequential = renderer.render(&document);

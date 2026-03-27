@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::parser::SectionEntry;
+use crate::compilation::{
+    slugify_partition_title, DocumentPartitionPlan, DocumentWorkUnit, PartitionKind,
+    PartitionLocator, SectionOutlineEntry,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RecompilationScope {
@@ -21,44 +24,6 @@ pub struct DependencyNode {
 pub struct DependencyGraph {
     pub nodes: BTreeMap<PathBuf, DependencyNode>,
     pub edges: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PartitionKind {
-    Document,
-    Chapter,
-    Section,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PartitionLocator {
-    pub entry_file: PathBuf,
-    pub level: u8,
-    pub ordinal: usize,
-    pub title: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentWorkUnit {
-    pub partition_id: String,
-    pub kind: PartitionKind,
-    pub locator: PartitionLocator,
-    pub title: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentPartitionPlan {
-    pub fallback_partition_id: String,
-    pub work_units: Vec<DocumentWorkUnit>,
-}
-
-impl Default for DocumentPartitionPlan {
-    fn default() -> Self {
-        Self {
-            fallback_partition_id: "document:0000:root".to_string(),
-            work_units: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -114,9 +79,9 @@ impl DocumentPartitionPlanner {
     pub fn plan(
         primary_input: &Path,
         document_class: &str,
-        section_entries: &[SectionEntry],
+        section_entries: &[SectionOutlineEntry],
     ) -> DocumentPartitionPlan {
-        let fallback_partition_id = fallback_partition_id(primary_input);
+        let fallback_partition_id = DocumentPartitionPlan::fallback_partition_id_for(primary_input);
         let Some((level, kind)) = partition_strategy(document_class, section_entries) else {
             return DocumentPartitionPlan {
                 fallback_partition_id: fallback_partition_id.clone(),
@@ -170,7 +135,7 @@ impl DocumentPartitionPlanner {
 
 fn partition_strategy(
     document_class: &str,
-    section_entries: &[SectionEntry],
+    section_entries: &[SectionOutlineEntry],
 ) -> Option<(u8, PartitionKind)> {
     let prefers_chapters = matches!(document_class, "book" | "report");
     if prefers_chapters && section_entries.iter().any(|entry| entry.level == 0) {
@@ -185,42 +150,11 @@ fn partition_strategy(
     None
 }
 
-fn fallback_partition_id(primary_input: &Path) -> String {
-    let stem = primary_input
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.trim().is_empty())
-        .map(slugify_partition_title)
-        .unwrap_or_else(|| "root".to_string());
-    format!("document:0000:{stem}")
-}
-
-fn slugify_partition_title(value: &str) -> String {
-    let mut slug = String::new();
-    let mut last_was_dash = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            slug.push('-');
-            last_was_dash = true;
-        }
-    }
-
-    let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "untitled".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use crate::parser::SectionEntry;
+    use crate::compilation::SectionOutlineEntry;
 
     use super::{DependencyGraph, DocumentPartitionPlanner, PartitionKind};
 
@@ -249,17 +183,17 @@ mod tests {
             Path::new("book.tex"),
             "book",
             &[
-                SectionEntry {
+                SectionOutlineEntry {
                     level: 0,
                     number: "1".to_string(),
                     title: "Intro".to_string(),
                 },
-                SectionEntry {
+                SectionOutlineEntry {
                     level: 1,
                     number: "1.1".to_string(),
                     title: "Background".to_string(),
                 },
-                SectionEntry {
+                SectionOutlineEntry {
                     level: 0,
                     number: "2".to_string(),
                     title: "Results".to_string(),
@@ -279,17 +213,17 @@ mod tests {
             Path::new("paper.tex"),
             "article",
             &[
-                SectionEntry {
+                SectionOutlineEntry {
                     level: 1,
                     number: "1".to_string(),
                     title: "Intro".to_string(),
                 },
-                SectionEntry {
+                SectionOutlineEntry {
                     level: 2,
                     number: "1.1".to_string(),
                     title: "Motivation".to_string(),
                 },
-                SectionEntry {
+                SectionOutlineEntry {
                     level: 1,
                     number: "2".to_string(),
                     title: "Method".to_string(),
