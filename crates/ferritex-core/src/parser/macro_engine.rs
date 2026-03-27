@@ -7,6 +7,7 @@ pub struct MacroDef {
     pub name: String,
     pub parameter_count: usize,
     pub body: Vec<Token>,
+    pub protected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +305,7 @@ mod tests {
             name: name.to_string(),
             parameter_count,
             body,
+            protected: false,
         }
     }
 

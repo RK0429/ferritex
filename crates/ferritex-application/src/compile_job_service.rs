@@ -23,7 +23,7 @@ use ferritex_core::pdf::{FontResource, ImageFilter, PdfImageXObject, PdfRenderer
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
 use ferritex_core::typesetting::{
-    resolve_page_labels, MinimalTypesetter, TfmWidthProvider, TypesetDocument,
+    resolve_page_labels, MinimalTypesetter, TextLine, TfmWidthProvider, TypesetDocument,
 };
 
 use crate::execution_policy_factory::ExecutionPolicyFactory;
@@ -60,9 +60,28 @@ struct LoadedSourceTree {
     document_state: DocumentState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadedOpenTypeFont {
     base_font: String,
     font: OpenTypeFont,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FontFamilySelection {
+    main: Option<LoadedOpenTypeFont>,
+    sans: Option<LoadedOpenTypeFont>,
+    mono: Option<LoadedOpenTypeFont>,
+}
+
+impl FontFamilySelection {
+    fn font_for_role(&self, role: u8) -> Option<&LoadedOpenTypeFont> {
+        match role {
+            0 => self.main.as_ref(),
+            1 => self.sans.as_ref(),
+            2 => self.mono.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 enum CompileFontSelection {
@@ -260,24 +279,34 @@ impl<'a> CompileJobService<'a> {
             project_root: &project_root,
             asset_bundle_path: options.asset_bundle.as_deref(),
         };
-        let mut font_selection = None;
+        let mut compile_font_selection = None;
+        let mut font_family_selection = None;
         let mut font_diagnostics = Vec::new();
         let parse_pass_result = self.parse_document_with_cross_references(
             &source_tree.source,
+            &project_root,
+            options.asset_bundle.as_deref(),
             initial_bibliography_state.clone(),
             source_tree.document_state.index_state.entries.clone(),
             |document| {
-                let selection = font_selection.get_or_insert_with(|| {
-                    let (selection, diagnostics) = self.select_compile_font(
+                if compile_font_selection.is_none() {
+                    let (selection, families, diagnostics) = self.select_compile_fonts(
                         &input_path,
                         document.main_font_name.as_deref(),
+                        document.sans_font_name.as_deref(),
+                        document.mono_font_name.as_deref(),
                         &input_dir,
                         &project_root,
                         options.asset_bundle.as_deref(),
                     );
                     font_diagnostics.extend(diagnostics);
-                    selection
-                });
+                    compile_font_selection = Some(selection);
+                    font_family_selection = Some(families);
+                }
+
+                let selection = compile_font_selection
+                    .as_ref()
+                    .expect("font selection initialized");
 
                 match selection {
                     CompileFontSelection::OpenType(loaded_font) => {
@@ -309,13 +338,16 @@ impl<'a> CompileJobService<'a> {
             },
         );
         let pdf_renderer = match (
-            font_selection.as_ref(),
+            font_family_selection.as_ref(),
             parse_pass_result.typeset_document.as_ref(),
         ) {
-            (Some(CompileFontSelection::OpenType(loaded_font)), Some(typeset_document)) => {
-                build_opentype_pdf_renderer(loaded_font, typeset_document)
-                    .map(|font_resource| PdfRenderer::with_fonts(vec![font_resource]))
-                    .unwrap_or_else(PdfRenderer::default)
+            (Some(families), Some(typeset_document)) => {
+                let font_resources = build_multi_font_pdf_resources(families, typeset_document);
+                if font_resources.is_empty() {
+                    self.pdf_renderer.clone()
+                } else {
+                    PdfRenderer::with_fonts(font_resources)
+                }
             }
             _ => self.pdf_renderer.clone(),
         };
@@ -477,6 +509,8 @@ impl<'a> CompileJobService<'a> {
             pass_count,
         } = self.parse_document_with_cross_references(
             &source_tree.source,
+            &project_root,
+            None,
             source_tree.document_state.bibliography_state.clone().into(),
             source_tree.document_state.index_state.entries.clone(),
             |document| self.typesetter.typeset(document),
@@ -525,16 +559,18 @@ impl<'a> CompileJobService<'a> {
         self.load_source_tree_with_root_source(input_file, None, project_root, asset_bundle_path)
     }
 
-    fn select_compile_font(
+    fn select_compile_fonts(
         &self,
         input_path: &str,
         requested_main_font: Option<&str>,
+        requested_sans_font: Option<&str>,
+        requested_mono_font: Option<&str>,
         input_dir: &Path,
         project_root: &Path,
         asset_bundle_path: Option<&Path>,
-    ) -> (CompileFontSelection, Vec<Diagnostic>) {
+    ) -> (CompileFontSelection, FontFamilySelection, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
-        let opentype_font = if let Some(font_name) = requested_main_font {
+        let main = if let Some(font_name) = requested_main_font {
             match resolve_named_font(
                 font_name,
                 input_dir,
@@ -556,7 +592,7 @@ impl<'a> CompileJobService<'a> {
                         )
                         .with_file(input_path.to_string())
                         .with_suggestion(
-                            "place the font in the document directory, project fonts/, or asset bundle",
+                            "place the font in the document directory, project fonts/, or asset bundle; compile will fall back to another available main font until then",
                         ),
                     );
                     load_opentype_font(self.file_access_gate, asset_bundle_path)
@@ -566,15 +602,79 @@ impl<'a> CompileJobService<'a> {
             load_opentype_font(self.file_access_gate, asset_bundle_path)
         };
 
-        if let Some(loaded_font) = opentype_font {
-            return (CompileFontSelection::OpenType(loaded_font), diagnostics);
+        let sans = requested_sans_font.and_then(|font_name| {
+            resolve_named_font(
+                font_name,
+                input_dir,
+                project_root,
+                asset_bundle_path,
+                self.file_access_gate,
+            )
+            .map(|resolved_font| LoadedOpenTypeFont {
+                base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
+                font: resolved_font.font,
+            })
+            .or_else(|| {
+                diagnostics.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        format!(
+                            "Font \"{font_name}\" not found in project directory or asset bundle"
+                        ),
+                    )
+                    .with_file(input_path.to_string())
+                    .with_suggestion(
+                        "place the font in the document directory, project fonts/, or asset bundle; PDF output will fall back to a built-in sans font until then",
+                    ),
+                );
+                None
+            })
+        });
+
+        let mono = requested_mono_font.and_then(|font_name| {
+            resolve_named_font(
+                font_name,
+                input_dir,
+                project_root,
+                asset_bundle_path,
+                self.file_access_gate,
+            )
+            .map(|resolved_font| LoadedOpenTypeFont {
+                base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
+                font: resolved_font.font,
+            })
+            .or_else(|| {
+                diagnostics.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        format!(
+                            "Font \"{font_name}\" not found in project directory or asset bundle"
+                        ),
+                    )
+                    .with_file(input_path.to_string())
+                    .with_suggestion(
+                        "place the font in the document directory, project fonts/, or asset bundle; PDF output will fall back to a built-in mono font until then",
+                    ),
+                );
+                None
+            })
+        });
+
+        let families = FontFamilySelection { main, sans, mono };
+
+        if let Some(loaded_font) = families.main.clone() {
+            return (
+                CompileFontSelection::OpenType(loaded_font),
+                families,
+                diagnostics,
+            );
         }
 
         if let Some(metrics) = load_cmr10_metrics(self.file_access_gate, asset_bundle_path) {
-            return (CompileFontSelection::Tfm(metrics), diagnostics);
+            return (CompileFontSelection::Tfm(metrics), families, diagnostics);
         }
 
-        (CompileFontSelection::Basic, diagnostics)
+        (CompileFontSelection::Basic, families, diagnostics)
     }
 
     fn load_source_tree_with_root_source(
@@ -676,6 +776,8 @@ impl<'a> CompileJobService<'a> {
     fn parse_document_with_cross_references<F>(
         &self,
         source: &str,
+        project_root: &Path,
+        asset_bundle_path: Option<&Path>,
         initial_bibliography_state: Option<BibliographyState>,
         initial_index_entries: Vec<IndexEntry>,
         mut typeset_document_for: F,
@@ -683,17 +785,29 @@ impl<'a> CompileJobService<'a> {
     where
         F: FnMut(&ferritex_core::parser::ParsedDocument) -> TypesetDocument,
     {
-        let mut output = self.parser.parse_recovering_with_context(
-            source,
-            BTreeMap::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            BTreeMap::new(),
-            initial_bibliography_state.clone(),
-            BTreeMap::new(),
-            initial_index_entries.clone(),
-        );
+        let sty_resolver = |package_name: &str| {
+            load_package_source(
+                self.file_access_gate,
+                self.asset_bundle_loader,
+                project_root,
+                asset_bundle_path,
+                package_name,
+            )
+        };
+        let mut output = self
+            .parser
+            .parse_recovering_with_context_and_package_resolver(
+                source,
+                BTreeMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                initial_bibliography_state.clone(),
+                BTreeMap::new(),
+                initial_index_entries.clone(),
+                Some(&sty_resolver),
+            );
         let Some(mut document) = output.document.clone() else {
             return ParsePassResult {
                 output,
@@ -708,17 +822,20 @@ impl<'a> CompileJobService<'a> {
             || document.has_unresolved_lof
             || document.has_unresolved_lot
         {
-            let second = self.parser.parse_recovering_with_context(
-                source,
-                document.labels.clone().into_inner(),
-                document.section_entries.clone(),
-                document.figure_entries.clone(),
-                document.table_entries.clone(),
-                document.bibliography.clone(),
-                Some(document.bibliography_state.clone()),
-                BTreeMap::new(),
-                initial_index_entries,
-            );
+            let second = self
+                .parser
+                .parse_recovering_with_context_and_package_resolver(
+                    source,
+                    document.labels.clone().into_inner(),
+                    document.section_entries.clone(),
+                    document.figure_entries.clone(),
+                    document.table_entries.clone(),
+                    document.bibliography.clone(),
+                    Some(document.bibliography_state.clone()),
+                    BTreeMap::new(),
+                    initial_index_entries,
+                    Some(&sty_resolver),
+                );
             if let Some(next_document) = second.document.clone() {
                 output = second;
                 document = next_document;
@@ -742,17 +859,20 @@ impl<'a> CompileJobService<'a> {
                 break;
             }
 
-            let next = self.parser.parse_recovering_with_context(
-                source,
-                document.labels.clone().into_inner(),
-                document.section_entries.clone(),
-                document.figure_entries.clone(),
-                document.table_entries.clone(),
-                document.bibliography.clone(),
-                Some(document.bibliography_state.clone()),
-                page_labels,
-                index_entries,
-            );
+            let next = self
+                .parser
+                .parse_recovering_with_context_and_package_resolver(
+                    source,
+                    document.labels.clone().into_inner(),
+                    document.section_entries.clone(),
+                    document.figure_entries.clone(),
+                    document.table_entries.clone(),
+                    document.bibliography.clone(),
+                    Some(document.bibliography_state.clone()),
+                    page_labels,
+                    index_entries,
+                    Some(&sty_resolver),
+                );
             let Some(next_document) = next.document.clone() else {
                 break;
             };
@@ -1536,27 +1656,68 @@ fn is_ttf_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_opentype_pdf_renderer(
-    loaded_font: &LoadedOpenTypeFont,
+fn build_multi_font_pdf_resources(
+    selection: &FontFamilySelection,
     document: &TypesetDocument,
+) -> Vec<FontResource> {
+    let mut used_characters = vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
+    let mut used_roles = [false; 3];
+
+    for page in &document.pages {
+        collect_used_characters_for_lines(&page.lines, &mut used_characters, &mut used_roles);
+        for placement in &page.float_placements {
+            collect_used_characters_for_lines(
+                &placement.content.lines,
+                &mut used_characters,
+                &mut used_roles,
+            );
+        }
+    }
+
+    let Some(highest_used_role) = used_roles.iter().rposition(|used| *used) else {
+        return Vec::new();
+    };
+
+    (0..=highest_used_role)
+        .map(|role| {
+            selection
+                .font_for_role(role as u8)
+                .and_then(|font| build_opentype_font_resource(font, &used_characters[role]))
+                .unwrap_or_else(|| builtin_font_resource_for_role(role as u8))
+        })
+        .collect()
+}
+
+fn collect_used_characters_for_lines(
+    lines: &[TextLine],
+    used_characters: &mut [BTreeMap<u8, char>],
+    used_roles: &mut [bool; 3],
+) {
+    for line in lines {
+        let role = usize::from(line.font_index.min(2));
+        used_roles[role] = true;
+        for codepoint in line.text.chars() {
+            let Ok(code) = u8::try_from(u32::from(codepoint)) else {
+                continue;
+            };
+            used_characters[role].insert(code, codepoint);
+        }
+    }
+}
+
+fn build_opentype_font_resource(
+    loaded_font: &LoadedOpenTypeFont,
+    role_characters: &BTreeMap<u8, char>,
 ) -> Option<FontResource> {
     let mut used_characters = BTreeMap::new();
     let mut used_glyph_ids = BTreeSet::new();
 
-    for page in &document.pages {
-        for line in &page.lines {
-            for codepoint in line.text.chars() {
-                let code = match u8::try_from(u32::from(codepoint)) {
-                    Ok(code) => code,
-                    Err(_) => continue,
-                };
-                let Some(glyph_id) = loaded_font.font.glyph_id(u32::from(codepoint)) else {
-                    continue;
-                };
-                used_characters.insert(code, codepoint);
-                used_glyph_ids.insert(glyph_id);
-            }
-        }
+    for (&code, &codepoint) in role_characters {
+        let Some(glyph_id) = loaded_font.font.glyph_id(u32::from(codepoint)) else {
+            continue;
+        };
+        used_characters.insert(code, codepoint);
+        used_glyph_ids.insert(glyph_id);
     }
 
     let (&first_char, &last_char) = match (
@@ -1606,6 +1767,16 @@ fn build_opentype_pdf_renderer(
     })
 }
 
+fn builtin_font_resource_for_role(role: u8) -> FontResource {
+    let base_font = match role {
+        2 => "Courier",
+        _ => "Helvetica",
+    };
+    FontResource::BuiltinType1 {
+        base_font: base_font.to_string(),
+    }
+}
+
 fn sanitize_pdf_font_name(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -1647,6 +1818,43 @@ fn resolve_input_path(
     }
 
     candidate
+}
+
+fn load_package_source(
+    file_access_gate: &dyn FileAccessGate,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    project_root: &Path,
+    asset_bundle_path: Option<&Path>,
+    package_name: &str,
+) -> Option<String> {
+    let resolved_path = resolve_package_path(
+        asset_bundle_loader,
+        project_root,
+        asset_bundle_path,
+        package_name,
+    )?;
+    if file_access_gate.check_read(&resolved_path) == PathAccessDecision::Denied {
+        return None;
+    }
+
+    let bytes = file_access_gate.read_file(&resolved_path).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn resolve_package_path(
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    project_root: &Path,
+    asset_bundle_path: Option<&Path>,
+    package_name: &str,
+) -> Option<PathBuf> {
+    if let Some(bundle_path) = asset_bundle_path {
+        return asset_bundle_loader.resolve_package(bundle_path, package_name, Some(project_root));
+    }
+
+    let candidate = project_root.join(format!("{package_name}.sty"));
+    let resolved = candidate.canonicalize().ok()?;
+    let project_root = project_root.canonicalize().ok()?;
+    resolved.starts_with(&project_root).then_some(resolved)
 }
 
 fn resolve_graphic_path(
@@ -2086,6 +2294,7 @@ mod tests {
     struct MockAssetBundleLoader {
         result: Result<(), String>,
         tex_inputs: BTreeMap<String, PathBuf>,
+        package_paths: BTreeMap<String, PathBuf>,
     }
 
     impl MockAssetBundleLoader {
@@ -2093,6 +2302,7 @@ mod tests {
             Self {
                 result: Ok(()),
                 tex_inputs: BTreeMap::new(),
+                package_paths: BTreeMap::new(),
             }
         }
     }
@@ -2113,6 +2323,15 @@ mod tests {
             };
 
             self.tex_inputs.get(&lookup_key).cloned()
+        }
+
+        fn resolve_package(
+            &self,
+            _bundle_path: &Path,
+            package_name: &str,
+            _project_root: Option<&Path>,
+        ) -> Option<PathBuf> {
+            self.package_paths.get(package_name).cloned()
         }
     }
 
@@ -2879,6 +3098,100 @@ mod tests {
     }
 
     #[test]
+    fn compile_with_font_family_roles_embeds_multiple_font_resources() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
+        fs::create_dir_all(&font_dir).expect("create font dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{MainFace}\n\\setsansfont{SansFace}\n\\setmonofont{MonoFace}\n\\begin{document}\nAB\\par\n\\textsf{AB}\\par\n\\texttt{AB}\n\\end{document}\n",
+        )
+        .expect("write input");
+        fs::write(font_dir.join("MainFace.ttf"), build_test_ttf()).expect("write main font");
+        fs::write(font_dir.join("SansFace.ttf"), build_test_ttf()).expect("write sans font");
+        fs::write(font_dir.join("MonoFace.ttf"), build_test_ttf()).expect("write mono font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("FerritexSubset+MainFace"));
+        assert!(pdf.contains("FerritexSubset+SansFace"));
+        assert!(pdf.contains("FerritexSubset+MonoFace"));
+        assert!(pdf.contains("/F1 "));
+        assert!(pdf.contains("/F2 "));
+        assert!(pdf.contains("/F3 "));
+        assert!(pdf.contains("/F2 12 Tf"));
+        assert!(pdf.contains("/F3 12 Tf"));
+    }
+
+    #[test]
+    fn basic_mode_provides_builtin_font_slots_for_sans_and_mono_lines() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\begin{document}\nMain\\par\n\\textsf{Sans}\\par\n\\texttt{Mono}\n\\end{document}\n",
+        )
+        .expect("write input");
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader)
+            .compile(&runtime_options(input_file, output_dir.clone()));
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("/BaseFont /Helvetica"));
+        assert!(pdf.contains("/BaseFont /Courier"));
+        assert!(pdf.contains("/F2 12 Tf"));
+        assert!(pdf.contains("/F3 12 Tf"));
+    }
+
+    #[test]
+    fn tfm_mode_provides_builtin_font_slots_for_sans_and_mono_lines() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let tfm_path = bundle_path.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
+        fs::create_dir_all(
+            tfm_path
+                .parent()
+                .expect("cmr10.tfm path should have a parent directory"),
+        )
+        .expect("create tfm dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(&tfm_path, build_test_tfm()).expect("write tfm");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\begin{document}\nMain\\par\n\\textsf{Sans}\\par\n\\texttt{Mono}\n\\end{document}\n",
+        )
+        .expect("write input");
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("/BaseFont /Helvetica"));
+        assert!(pdf.contains("/BaseFont /Courier"));
+        assert!(pdf.contains("/F2 12 Tf"));
+        assert!(pdf.contains("/F3 12 Tf"));
+    }
+
+    #[test]
     fn compile_with_setmainfont_not_found_emits_diagnostic() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -3187,6 +3500,7 @@ mod tests {
         let loader = MockAssetBundleLoader {
             result: Err("bundle not found at /tmp/bundle".to_string()),
             tex_inputs: BTreeMap::new(),
+            package_paths: BTreeMap::new(),
         };
         let result = service(&gate, &loader).compile(&options);
 
@@ -3275,6 +3589,71 @@ mod tests {
     }
 
     #[test]
+    fn usepackage_loads_project_local_sty_and_recurses_requirepackage() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        fs::write(
+            project_root.join("mypkg.sty"),
+            "\\NeedsTeXFormat{LaTeX2e}\n\
+             \\ProvidesPackage{mypkg}[2024/01/01 Test package]\n\
+             \\RequirePackage{amsmath}\n\
+             \\DeclareOption{bold}{\\def\\mypkgstyle{bold}}\n\
+             \\DeclareOption*{}\n\
+             \\ProcessOptions*\n\
+             \\newcommand{\\mypkgcmd}[1]{[#1]}\n\
+             \\newenvironment{mypkgenv}{\\begin{center}}{\\end{center}}\n",
+        )
+        .expect("write package");
+
+        let source = "\\documentclass{article}\n\
+                      \\usepackage[bold]{mypkg}\n\
+                      \\usepackage{mypkg}\n\
+                      \\begin{document}\n\
+                      \\mypkgcmd{ok}\n\
+                      \\end{document}\n";
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+        let compile_service = service(&gate, &loader);
+        let parse_result = compile_service.parse_document_with_cross_references(
+            source,
+            &project_root,
+            None,
+            None,
+            Vec::new(),
+            |document| compile_service.typesetter.typeset(document),
+        );
+        let document = parse_result
+            .output
+            .document
+            .expect("document should parse with project-local package");
+
+        assert!(
+            parse_result.output.errors.is_empty(),
+            "{:?}",
+            parse_result.output.errors
+        );
+        assert_eq!(parse_result.pass_count, 1);
+        assert!(document.body.contains("[ok]"));
+        assert!(document
+            .loaded_packages
+            .iter()
+            .any(|package| package.name == "mypkg"));
+        assert!(document
+            .loaded_packages
+            .iter()
+            .any(|package| package.name == "amsmath"));
+        assert_eq!(
+            document
+                .loaded_packages
+                .iter()
+                .filter(|package| package.name == "mypkg")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn input_if_file_exists_uses_false_branch_when_missing() {
         let dir = tempdir().expect("create tempdir");
         fs::write(
@@ -3339,6 +3718,7 @@ mod tests {
         let loader = MockAssetBundleLoader {
             result: Ok(()),
             tex_inputs: BTreeMap::from([("bundled.tex".to_string(), bundled_file)]),
+            package_paths: BTreeMap::new(),
         };
 
         let result = service(&gate, &loader).compile(&options);
@@ -3367,6 +3747,7 @@ mod tests {
         let loader = MockAssetBundleLoader {
             result: Ok(()),
             tex_inputs: BTreeMap::from([("bundled.tex".to_string(), bundled_file)]),
+            package_paths: BTreeMap::new(),
         };
 
         let result = service(&gate, &loader).compile(&options);

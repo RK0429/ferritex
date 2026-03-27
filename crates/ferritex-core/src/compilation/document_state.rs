@@ -36,6 +36,7 @@ impl Default for LinkStyle {
 pub struct NavigationState {
     pub metadata: PdfMetadataDraft,
     pub outline_entries: Vec<OutlineDraftEntry>,
+    #[serde(default)]
     pub named_destinations: BTreeMap<String, DestinationAnchor>,
     pub default_link_style: LinkStyle,
 }

@@ -495,6 +495,38 @@ fn compile_emits_citations_links_outlines_and_metadata() {
 }
 
 #[test]
+fn compile_emits_internal_navigation_annotations_and_named_destinations() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hyperref-internal.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{hyperref}\n\\begin{document}\n\\tableofcontents\n\\section{Intro}\\label{sec:intro}\nSee \\hyperref[sec:intro]{intro}, Section \\ref{sec:intro}, page \\pageref{sec:intro}, and citation \\cite{knuth}.\nExternal \\href{https://example.com}{Example}.\n\\begin{thebibliography}{99}\n\\bibitem{knuth} Donald Knuth.\n\\end{thebibliography}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf =
+        std::fs::read_to_string(dir.path().join("hyperref-internal.pdf")).expect("read output pdf");
+    assert!(pdf.contains("/Subtype /Link"));
+    assert!(pdf.matches("/S /GoTo /D (sec:intro)").count() >= 3);
+    assert!(pdf.contains("/S /GoTo /D (bib:knuth)"));
+    assert!(pdf.contains("/S /GoTo /D (section:1 Intro)"));
+    assert!(pdf.contains("/Names << /Dests"));
+    assert!(pdf.contains("(sec:intro) ["));
+    assert!(pdf.contains("(bib:knuth) ["));
+    assert!(pdf.contains("(section:1 Intro) ["));
+    assert!(pdf.contains("/URI (https://example.com)"));
+    assert!(pdf.contains("/Outlines"));
+    assert!(!pdf.contains("??"));
+}
+
+#[test]
 fn compile_hypersetup_overrides_pdf_metadata() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hypersetup.tex");

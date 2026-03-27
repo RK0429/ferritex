@@ -435,6 +435,7 @@ mod tests {
                             codepoint,
                             width: provider.char_width(codepoint),
                             link: None,
+                            font_index: 0,
                         });
                     }
                 }
@@ -443,6 +444,7 @@ mod tests {
                     stretch: GlueComponent::normal(stretch),
                     shrink: GlueComponent::normal(shrink),
                     link: None,
+                    font_index: 0,
                 }),
                 TestPart::Penalty(value) => hlist.push(HListItem::Penalty { value: *value }),
             }

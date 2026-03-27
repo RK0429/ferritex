@@ -87,11 +87,17 @@ pub struct PdfRenderer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PdfLinkAnnotation {
     object_id: usize,
-    url: String,
+    target: PdfLinkTarget,
     x_start: DimensionValue,
     x_end: DimensionValue,
     y_bottom: DimensionValue,
     y_top: DimensionValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PdfLinkTarget {
+    Uri(String),
+    InternalDestination(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,10 +154,14 @@ impl PdfRenderer {
             .collect::<Vec<_>>();
         let next_object_after_annotations =
             assign_annotation_object_ids(&mut page_annotations, annotation_object_start);
-        let outline_root_object_id =
-            (!document.outlines.is_empty()).then_some(next_object_after_annotations);
-        let outline_item_object_start =
-            next_object_after_annotations + usize::from(outline_root_object_id.is_some());
+        let named_destination_object_id =
+            (!document.named_destinations.is_empty()).then_some(next_object_after_annotations);
+        let outline_root_object_id = (!document.outlines.is_empty()).then_some(
+            next_object_after_annotations + usize::from(named_destination_object_id.is_some()),
+        );
+        let outline_item_object_start = next_object_after_annotations
+            + usize::from(named_destination_object_id.is_some())
+            + usize::from(outline_root_object_id.is_some());
         let outline_objects = outline_root_object_id.map_or_else(Vec::new, |root_object_id| {
             build_outline_objects(
                 &document.outlines,
@@ -171,6 +181,9 @@ impl PdfRenderer {
         let info_object_id =
             build_info_dictionary(document).map(|_| image_object_start + image_objects.len());
         let page_font_resources = page_font_resources(&font_objects);
+        let catalog_named_destinations = named_destination_object_id
+            .map(|object_id| format!(" /Names << /Dests {object_id} 0 R >>"))
+            .unwrap_or_default();
         let catalog_outlines = outline_root_object_id
             .map(|object_id| format!(" /Outlines {object_id} 0 R"))
             .unwrap_or_default();
@@ -179,7 +192,9 @@ impl PdfRenderer {
         append_object(
             &mut pdf,
             &mut offsets,
-            &format!("1 0 obj\n<< /Type /Catalog /Pages 2 0 R{catalog_outlines} >>\nendobj\n"),
+            &format!(
+                "1 0 obj\n<< /Type /Catalog /Pages 2 0 R{catalog_named_destinations}{catalog_outlines} >>\nendobj\n"
+            ),
         );
         append_object(
             &mut pdf,
@@ -248,11 +263,21 @@ impl PdfRenderer {
                 } else {
                     ("[0 0 1]", " /C [0 0 1]")
                 };
+                let action = match &annotation.target {
+                    PdfLinkTarget::Uri(url) => format!(
+                        "/A << /Type /Action /S /URI /URI ({}) >>",
+                        escape_pdf_text(url)
+                    ),
+                    PdfLinkTarget::InternalDestination(name) => format!(
+                        "/A << /Type /Action /S /GoTo /D ({}) >>",
+                        escape_pdf_text(name)
+                    ),
+                };
                 append_object(
                     &mut pdf,
                     &mut offsets,
                     &format!(
-                        "{} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border {}{} /A << /Type /Action /S /URI /URI ({}) >> >>\nendobj\n",
+                        "{} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border {}{} {} >>\nendobj\n",
                         annotation.object_id,
                         points_to_pdf_number(annotation.x_start),
                         points_to_pdf_number(annotation.y_bottom),
@@ -260,7 +285,7 @@ impl PdfRenderer {
                         points_to_pdf_number(annotation.y_top),
                         border,
                         color,
-                        escape_pdf_text(&annotation.url),
+                        action,
                     ),
                 );
             }
@@ -268,6 +293,14 @@ impl PdfRenderer {
 
         for image in &image_objects {
             append_image_xobject(&mut pdf, &mut offsets, image);
+        }
+
+        if let Some(object_id) = named_destination_object_id {
+            append_object(
+                &mut pdf,
+                &mut offsets,
+                &build_named_destination_object(document, page_object_start, object_id),
+            );
         }
 
         if let Some(root_object_id) = outline_root_object_id {
@@ -551,7 +584,8 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
         return String::new();
     };
 
-    let mut stream = String::from("BT\n/F1 12 Tf\n");
+    let mut stream = format!("BT\n/F{} 12 Tf\n", first_line.font_index + 1);
+    let mut current_font = first_line.font_index;
     stream.push_str(&format!(
         "{} {} Td\n",
         LEFT_MARGIN_PT,
@@ -565,6 +599,10 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
             "0 {} Td\n",
             points_to_pdf_number(line.y - previous_y)
         ));
+        if line.font_index != current_font {
+            stream.push_str(&format!("/F{} 12 Tf\n", line.font_index + 1));
+            current_font = line.font_index;
+        }
         render_text_line(&mut stream, line, link_style);
         previous_y = line.y;
     }
@@ -630,6 +668,7 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
             text: line.text.clone(),
             y: placement.y_position - line.y,
             links: line.links.clone(),
+            font_index: line.font_index,
         })
         .collect()
 }
@@ -805,16 +844,26 @@ fn page_link_annotations(page: &TypesetPage) -> Vec<PdfLinkAnnotation> {
 fn line_link_annotations(line: &TextLine) -> Vec<PdfLinkAnnotation> {
     line.links
         .iter()
-        .filter(|link| !link.url.is_empty() && link.start_char < link.end_char)
-        .map(|link| PdfLinkAnnotation {
-            object_id: 0,
-            url: link.url.clone(),
-            x_start: points(LEFT_MARGIN_PT + LINK_CHAR_WIDTH_PT * link.start_char as i64),
-            x_end: points(LEFT_MARGIN_PT + LINK_CHAR_WIDTH_PT * link.end_char as i64),
-            y_bottom: line.y - points(LINK_DESCENT_PT),
-            y_top: line.y + points(LINK_HEIGHT_PT - LINK_DESCENT_PT),
+        .filter_map(|link| {
+            let target = pdf_link_target(&link.url)?;
+            (link.start_char < link.end_char).then_some(PdfLinkAnnotation {
+                object_id: 0,
+                target,
+                x_start: points(LEFT_MARGIN_PT + LINK_CHAR_WIDTH_PT * link.start_char as i64),
+                x_end: points(LEFT_MARGIN_PT + LINK_CHAR_WIDTH_PT * link.end_char as i64),
+                y_bottom: line.y - points(LINK_DESCENT_PT),
+                y_top: line.y + points(LINK_HEIGHT_PT - LINK_DESCENT_PT),
+            })
         })
         .collect()
+}
+
+fn pdf_link_target(url: &str) -> Option<PdfLinkTarget> {
+    if let Some(name) = url.strip_prefix('#') {
+        return (!name.is_empty()).then_some(PdfLinkTarget::InternalDestination(name.to_string()));
+    }
+
+    (!url.is_empty()).then_some(PdfLinkTarget::Uri(url.to_string()))
 }
 
 fn build_outline_objects(
@@ -848,6 +897,29 @@ fn build_outline_objects(
             }
         })
         .collect()
+}
+
+fn build_named_destination_object(
+    document: &TypesetDocument,
+    page_object_start: usize,
+    object_id: usize,
+) -> String {
+    let names = document
+        .named_destinations
+        .iter()
+        .map(|destination| {
+            format!(
+                "({}) [{} 0 R /XYZ {} {} 0]",
+                escape_pdf_text(&destination.name),
+                page_object_start + destination.page_index,
+                LEFT_MARGIN_PT,
+                points_to_pdf_number(destination.y),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!("{object_id} 0 obj\n<< /Names [{names}] >>\nendobj\n")
 }
 
 fn build_info_dictionary(document: &TypesetDocument) -> Option<String> {
@@ -915,7 +987,8 @@ mod tests {
     use crate::compilation::LinkStyle;
     use crate::kernel::api::DimensionValue;
     use crate::typesetting::api::{
-        FloatPlacement, PageBox, TextLine, TextLineLink, TypesetDocument, TypesetPage,
+        FloatPlacement, PageBox, TextLine, TextLineLink, TypesetDocument, TypesetNamedDestination,
+        TypesetPage,
     };
 
     const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -937,6 +1010,7 @@ mod tests {
                     text: (*text).to_string(),
                     y: points(720 - (index as i64 * 18)),
                     links: Vec::new(),
+                    font_index: 0,
                 })
                 .collect(),
             images: Vec::new(),
@@ -949,6 +1023,7 @@ mod tests {
         TypesetDocument {
             pages: vec![page(lines)],
             outlines: Vec::new(),
+            named_destinations: Vec::new(),
             title: None,
             author: None,
             navigation: Default::default(),
@@ -966,6 +1041,7 @@ mod tests {
                 start_char,
                 end_char,
             }],
+            font_index: 0,
         }
     }
 
@@ -995,6 +1071,7 @@ mod tests {
                     text: "Float text".to_string(),
                     y: points(0),
                     links: Vec::new(),
+                    font_index: 0,
                 }],
                 images: Vec::new(),
                 height: points(18),
@@ -1005,6 +1082,7 @@ mod tests {
         let pdf = PdfRenderer::default().render(&TypesetDocument {
             pages: vec![page],
             outlines: Vec::new(),
+            named_destinations: Vec::new(),
             title: None,
             author: None,
             navigation: Default::default(),
@@ -1021,6 +1099,7 @@ mod tests {
         let document = TypesetDocument {
             pages: vec![page(&["Page 1"]), page(&["Page 2"])],
             outlines: Vec::new(),
+            named_destinations: Vec::new(),
             title: None,
             author: None,
             navigation: Default::default(),
@@ -1173,6 +1252,28 @@ mod tests {
     }
 
     #[test]
+    fn internal_links_emit_goto_actions_and_named_destinations() {
+        let mut document = single_page(&["see intro", "1 Intro"]);
+        document.pages[0].lines[0].links = vec![TextLineLink {
+            url: "#sec:intro".to_string(),
+            start_char: 0,
+            end_char: 9,
+        }];
+        document.named_destinations = vec![TypesetNamedDestination {
+            name: "sec:intro".to_string(),
+            page_index: 0,
+            y: points(702),
+        }];
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/S /GoTo /D (sec:intro)"));
+        assert!(content.contains("/Names << /Dests"));
+        assert!(content.contains("(sec:intro) [3 0 R /XYZ 72 702 0]"));
+    }
+
+    #[test]
     fn colorlinks_without_named_color_fall_back_to_blue_text() {
         let mut document = single_page(&[]);
         document.pages[0].lines = vec![linked_line(
@@ -1230,6 +1331,7 @@ mod tests {
                     end_char: 11,
                 },
             ],
+            font_index: 0,
         }];
         document.navigation.default_link_style = LinkStyle {
             color_links: true,
@@ -1284,6 +1386,49 @@ mod tests {
         assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>"));
         assert!(content.contains("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"));
         assert!(content.contains("6 0 obj\n<< /Type /Font /Subtype /TrueType"));
+    }
+
+    #[test]
+    fn switches_font_resources_when_line_font_changes() {
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![
+            TextLine {
+                text: "Main".to_string(),
+                y: points(720),
+                links: Vec::new(),
+                font_index: 0,
+            },
+            TextLine {
+                text: "Sans".to_string(),
+                y: points(702),
+                links: Vec::new(),
+                font_index: 1,
+            },
+            TextLine {
+                text: "Mono".to_string(),
+                y: points(684),
+                links: Vec::new(),
+                font_index: 2,
+            },
+        ];
+        let renderer = PdfRenderer::with_fonts(vec![
+            FontResource::BuiltinType1 {
+                base_font: "Helvetica".to_string(),
+            },
+            FontResource::BuiltinType1 {
+                base_font: "Times-Roman".to_string(),
+            },
+            FontResource::BuiltinType1 {
+                base_font: "Courier".to_string(),
+            },
+        ]);
+
+        let pdf = renderer.render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("BT\n/F1 12 Tf\n72 720 Td\n(Main) Tj"));
+        assert!(content.contains("0 -18 Td\n/F2 12 Tf\n(Sans) Tj"));
+        assert!(content.contains("0 -18 Td\n/F3 12 Tf\n(Mono) Tj"));
     }
 
     #[test]

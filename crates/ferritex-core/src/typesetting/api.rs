@@ -7,14 +7,14 @@ use super::{
 };
 
 use crate::compilation::{
-    IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
+    DestinationAnchor, IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
 };
 use crate::font::api::TfmMetrics;
 use crate::graphics::api::{
     compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
 };
 use crate::kernel::api::DimensionValue;
-use crate::parser::api::{DocumentNode, FloatType, IndexRawEntry, ParsedDocument};
+use crate::parser::api::{DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
@@ -47,6 +47,7 @@ pub struct TextLine {
     pub text: String,
     pub y: DimensionValue,
     pub links: Vec<TextLineLink>,
+    pub font_index: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +63,7 @@ pub struct TypesetPage {
 pub struct TypesetDocument {
     pub pages: Vec<TypesetPage>,
     pub outlines: Vec<TypesetOutline>,
+    pub named_destinations: Vec<TypesetNamedDestination>,
     pub title: Option<String>,
     pub author: Option<String>,
     pub navigation: NavigationState,
@@ -73,6 +75,13 @@ pub struct TypesetDocument {
 pub struct TypesetOutline {
     pub level: u8,
     pub title: String,
+    pub page_index: usize,
+    pub y: DimensionValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypesetNamedDestination {
+    pub name: String,
     pub page_index: usize,
     pub y: DimensionValue,
 }
@@ -276,12 +285,14 @@ pub enum HListItem {
         codepoint: char,
         width: DimensionValue,
         link: Option<String>,
+        font_index: u8,
     },
     Glue {
         width: DimensionValue,
         stretch: GlueComponent,
         shrink: GlueComponent,
         link: Option<String>,
+        font_index: u8,
     },
     Kern {
         width: DimensionValue,
@@ -303,6 +314,7 @@ pub enum VListItem {
         tex_box: TeXBox,
         content: String,
         links: Vec<TextLineLink>,
+        font_index: u8,
     },
     Image {
         graphics_box: GraphicsBox,
@@ -455,11 +467,13 @@ impl MinimalTypesetter {
         );
         let pages = paginate_vlist(&vlist, &page_box);
         let outlines = collect_outlines(document, &pages);
+        let named_destinations = collect_named_destinations(document, &pages);
         let index_entries = resolve_index_entries(&pages);
 
         TypesetDocument {
             pages,
             outlines,
+            named_destinations,
             title: document.title.clone(),
             author: document.author.clone(),
             navigation: build_navigation_state(document),
@@ -494,12 +508,40 @@ fn build_navigation_state(document: &ParsedDocument) -> NavigationState {
                 })
             })
             .collect(),
-        named_destinations: BTreeMap::new(),
+        named_destinations: navigation_named_destinations(document),
         default_link_style: LinkStyle {
             color_links: document.labels.color_links.unwrap_or(false),
             link_color: document.labels.link_color.clone(),
         },
     }
+}
+
+fn navigation_named_destinations(document: &ParsedDocument) -> BTreeMap<String, DestinationAnchor> {
+    let mut destinations = document
+        .labels
+        .keys()
+        .map(|name| (name.clone(), DestinationAnchor { name: name.clone() }))
+        .collect::<BTreeMap<_, _>>();
+
+    for entry in &document.section_entries {
+        let name = section_destination_name(&entry.display_title());
+        if !name.is_empty() {
+            destinations
+                .entry(name.clone())
+                .or_insert_with(|| DestinationAnchor { name });
+        }
+    }
+
+    if let Some(snapshot) = document.bibliography_state.bbl.as_ref() {
+        for entry in &snapshot.entries {
+            let name = bibliography_destination_name(&entry.key);
+            destinations
+                .entry(name.clone())
+                .or_insert_with(|| DestinationAnchor { name });
+        }
+    }
+
+    destinations
 }
 
 fn break_params_for_provider(provider: &dyn CharWidthProvider) -> BreakParams {
@@ -569,6 +611,24 @@ fn document_nodes_to_hlist_with_config(
     hyphen_penalty: i32,
     line_width: DimensionValue,
 ) -> Vec<HListItem> {
+    document_nodes_to_hlist_with_font_config(
+        nodes,
+        provider,
+        hyphenator,
+        hyphen_penalty,
+        line_width,
+        0,
+    )
+}
+
+fn document_nodes_to_hlist_with_font_config(
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    hyphen_penalty: i32,
+    line_width: DimensionValue,
+    current_font_index: u8,
+) -> Vec<HListItem> {
     let space_width = provider.space_width();
     let stretch = GlueComponent::normal(DimensionValue(space_width.0 / 2));
     let shrink = GlueComponent::normal(DimensionValue(space_width.0 / 3));
@@ -588,6 +648,7 @@ fn document_nodes_to_hlist_with_config(
                                 &mut current_word_items,
                                 hyphenator,
                                 hyphen_penalty,
+                                current_font_index,
                             );
                             hlist.push(HListItem::Penalty {
                                 value: PENALTY_FORCED,
@@ -600,12 +661,14 @@ fn document_nodes_to_hlist_with_config(
                                 &mut current_word_items,
                                 hyphenator,
                                 hyphen_penalty,
+                                current_font_index,
                             );
                             hlist.push(HListItem::Glue {
                                 width: space_width,
                                 stretch,
                                 shrink,
                                 link: None,
+                                font_index: current_font_index,
                             });
                         }
                         codepoint => {
@@ -615,6 +678,24 @@ fn document_nodes_to_hlist_with_config(
                     }
                 }
             }
+            DocumentNode::FontFamily { role, children } => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                    current_font_index,
+                );
+                hlist.extend(document_nodes_to_hlist_with_font_config(
+                    children,
+                    provider,
+                    hyphenator,
+                    hyphen_penalty,
+                    line_width,
+                    font_index_for_role(*role),
+                ));
+            }
             DocumentNode::HBox(children) | DocumentNode::VBox(children) => {
                 flush_word(
                     &mut hlist,
@@ -622,13 +703,15 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
-                hlist.extend(document_nodes_to_hlist_with_config(
+                hlist.extend(document_nodes_to_hlist_with_font_config(
                     children,
                     provider,
                     hyphenator,
                     hyphen_penalty,
                     line_width,
+                    current_font_index,
                 ));
             }
             DocumentNode::Link { url, children } => {
@@ -638,13 +721,15 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
-                let mut link_hlist = document_nodes_to_hlist_with_config(
+                let mut link_hlist = document_nodes_to_hlist_with_font_config(
                     children,
                     provider,
                     hyphenator,
                     hyphen_penalty,
                     line_width,
+                    current_font_index,
                 );
                 for item in &mut link_hlist {
                     match item {
@@ -665,6 +750,7 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
             }
             DocumentNode::InlineMath(nodes) => {
@@ -674,9 +760,11 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
-                let math_hlist =
+                let mut math_hlist =
                     math_layout::math_nodes_to_hlist(nodes, provider, math_layout::MathStyle::Text);
+                set_hlist_font_index(&mut math_hlist, current_font_index);
                 hlist.extend(math_hlist);
             }
             DocumentNode::DisplayMath(nodes) => {
@@ -686,13 +774,15 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
                 push_forced_break_if_needed(&mut hlist);
-                let math_hlist = math_layout::math_nodes_to_hlist(
+                let mut math_hlist = math_layout::math_nodes_to_hlist(
                     nodes,
                     provider,
                     math_layout::MathStyle::Display,
                 );
+                set_hlist_font_index(&mut math_hlist, current_font_index);
                 let math_width = math_layout::hlist_total_width(&math_hlist);
                 let side_glue = DimensionValue((line_width.0 - math_width.0) / 2);
                 if side_glue.0 > 0 {
@@ -711,11 +801,13 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
                 if !hlist.is_empty() {
                     push_forced_break_if_needed(&mut hlist);
                 }
-                let eq_hlist = math_layout::typeset_equation_env(lines, provider, line_width);
+                let mut eq_hlist = math_layout::typeset_equation_env(lines, provider, line_width);
+                set_hlist_font_index(&mut eq_hlist, current_font_index);
                 hlist.extend(eq_hlist);
                 push_forced_break_if_needed(&mut hlist);
             }
@@ -726,6 +818,7 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
                 hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
@@ -741,6 +834,7 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
                 hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
@@ -753,6 +847,7 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
                 hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
@@ -765,6 +860,7 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
             }
             DocumentNode::Float { .. } => {
@@ -774,6 +870,7 @@ fn document_nodes_to_hlist_with_config(
                     &mut current_word_items,
                     hyphenator,
                     hyphen_penalty,
+                    current_font_index,
                 );
             }
         }
@@ -785,6 +882,7 @@ fn document_nodes_to_hlist_with_config(
         &mut current_word_items,
         hyphenator,
         hyphen_penalty,
+        current_font_index,
     );
 
     hlist
@@ -981,6 +1079,7 @@ fn flush_word(
     word_items: &mut Vec<(char, DimensionValue)>,
     hyphenator: Option<&dyn Hyphenator>,
     hyphen_penalty: i32,
+    font_index: u8,
 ) {
     if word_items.is_empty() {
         return;
@@ -997,6 +1096,7 @@ fn flush_word(
             codepoint,
             width,
             link: None,
+            font_index,
         });
         byte_offset += codepoint.len_utf8();
 
@@ -1023,8 +1123,33 @@ fn lines_to_vlist(lines: &[line_breaker::BrokenLine]) -> Vec<VListItem> {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: line.text.clone(),
             links: line.links.clone(),
+            font_index: line.font_index,
         })
         .collect()
+}
+
+fn font_index_for_role(role: FontFamilyRole) -> u8 {
+    match role {
+        FontFamilyRole::Main => 0,
+        FontFamilyRole::Sans => 1,
+        FontFamilyRole::Mono => 2,
+    }
+}
+
+fn set_hlist_font_index(items: &mut [HListItem], font_index: u8) {
+    for item in items {
+        match item {
+            HListItem::Char {
+                font_index: item_font_index,
+                ..
+            }
+            | HListItem::Glue {
+                font_index: item_font_index,
+                ..
+            } => *item_font_index = font_index,
+            HListItem::Kern { .. } | HListItem::InlineBox { .. } | HListItem::Penalty { .. } => {}
+        }
+    }
 }
 
 fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
@@ -1038,11 +1163,13 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                 tex_box,
                 content,
                 links,
+                font_index,
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
                     y: consumed_height,
                     links: links.clone(),
+                    font_index: *font_index,
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
@@ -1118,6 +1245,69 @@ fn collect_outlines(document: &ParsedDocument, pages: &[TypesetPage]) -> Vec<Typ
     outlines
 }
 
+fn collect_named_destinations(
+    document: &ParsedDocument,
+    pages: &[TypesetPage],
+) -> Vec<TypesetNamedDestination> {
+    let mut destinations = BTreeMap::new();
+
+    for (label, anchor_text) in &document.page_label_anchors {
+        if let Some((page_index, y)) = resolve_destination_anchor(pages, anchor_text, false) {
+            destinations.insert(
+                label.clone(),
+                TypesetNamedDestination {
+                    name: label.clone(),
+                    page_index,
+                    y,
+                },
+            );
+        }
+    }
+
+    for entry in &document.section_entries {
+        let title = entry.display_title();
+        let name = section_destination_name(&title);
+        if name.is_empty() || destinations.contains_key(&name) {
+            continue;
+        }
+        if let Some((page_index, y)) = resolve_destination_anchor(pages, &title, false) {
+            destinations.insert(
+                name.clone(),
+                TypesetNamedDestination {
+                    name,
+                    page_index,
+                    y,
+                },
+            );
+        }
+    }
+
+    if let Some(snapshot) = document.bibliography_state.bbl.as_ref() {
+        for entry in &snapshot.entries {
+            let anchor_text = bibliography_anchor_text(&entry.rendered_block);
+            if anchor_text.is_empty() {
+                continue;
+            }
+            let name = bibliography_destination_name(&entry.key);
+            if destinations.contains_key(&name) {
+                continue;
+            }
+            if let Some((page_index, y)) = resolve_destination_anchor(pages, &anchor_text, true) {
+                destinations.insert(
+                    name.clone(),
+                    TypesetNamedDestination {
+                        name,
+                        page_index,
+                        y,
+                    },
+                );
+            }
+        }
+    }
+
+    destinations.into_values().collect()
+}
+
 pub fn resolve_page_labels(
     document: &ParsedDocument,
     pages: &[TypesetPage],
@@ -1126,16 +1316,68 @@ pub fn resolve_page_labels(
         .page_label_anchors
         .iter()
         .filter_map(|(label, anchor_text)| {
-            pages
-                .iter()
-                .position(|page| {
-                    page.lines
-                        .iter()
-                        .any(|line| line.text.trim() == anchor_text.trim())
-                })
-                .map(|page_index| (label.clone(), (page_index + 1) as u32))
+            resolve_destination_anchor(pages, anchor_text, false)
+                .map(|(page_index, _)| (label.clone(), (page_index + 1) as u32))
         })
         .collect()
+}
+
+fn resolve_destination_anchor(
+    pages: &[TypesetPage],
+    anchor_text: &str,
+    prefix_match: bool,
+) -> Option<(usize, DimensionValue)> {
+    let anchor_text = anchor_text.trim();
+    if anchor_text.is_empty() {
+        return None;
+    }
+
+    pages.iter().enumerate().find_map(|(page_index, page)| {
+        page.lines
+            .iter()
+            .find_map(|line| {
+                destination_anchor_matches(line.text.trim(), anchor_text, prefix_match)
+                    .then_some((page_index, line.y))
+            })
+            .or_else(|| {
+                page.float_placements
+                    .iter()
+                    .flat_map(resolve_float_lines)
+                    .find_map(|line| {
+                        destination_anchor_matches(line.text.trim(), anchor_text, prefix_match)
+                            .then_some((page_index, line.y))
+                    })
+            })
+    })
+}
+
+fn destination_anchor_matches(text: &str, anchor_text: &str, prefix_match: bool) -> bool {
+    if prefix_match {
+        text.starts_with(anchor_text)
+    } else {
+        text == anchor_text
+    }
+}
+
+fn bibliography_destination_name(key: &str) -> String {
+    format!("bib:{key}")
+}
+
+fn bibliography_anchor_text(rendered_block: &str) -> String {
+    rendered_block
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn section_destination_name(display_title: &str) -> String {
+    if display_title.trim().is_empty() {
+        String::new()
+    } else {
+        format!("section:{display_title}")
+    }
 }
 
 fn resolve_index_entries(pages: &[TypesetPage]) -> Vec<IndexEntry> {
@@ -1163,6 +1405,20 @@ fn find_outline_anchor(
         .rev()
         .find(|(index, (_, line))| !used[*index] && line.text.trim() == title)
         .map(|(index, _)| index)
+}
+
+fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
+    placement
+        .content
+        .lines
+        .iter()
+        .map(|line| TextLine {
+            text: line.text.clone(),
+            y: placement.y_position - line.y,
+            links: line.links.clone(),
+            font_index: line.font_index,
+        })
+        .collect()
 }
 
 fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
@@ -1494,11 +1750,13 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                 tex_box,
                 content,
                 links,
+                font_index,
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
                     y: page_content_top(page_box) - consumed_height,
                     links: links.clone(),
+                    font_index: *font_index,
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
@@ -1854,7 +2112,7 @@ mod tests {
         TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
-    use crate::bibliography::api::BibliographyState;
+    use crate::bibliography::api::{parse_bbl, BibliographyState};
     use crate::compilation::IndexEntry;
     use crate::font::api::TfmMetrics;
     use crate::graphics::api::{
@@ -1864,7 +2122,7 @@ mod tests {
     use crate::kernel::api::StableId;
     use crate::parser::api::{
         DocumentNode, FloatType, IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine,
-        MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser,
+        MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser, SectionEntry,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -1878,6 +2136,8 @@ mod tests {
             loaded_packages: Vec::new(),
             package_count: 0,
             main_font_name: None,
+            sans_font_name: None,
+            mono_font_name: None,
             body: body.to_string(),
             labels: Default::default(),
             bibliography_state: BibliographyState::default(),
@@ -1933,6 +2193,7 @@ mod tests {
                 text: text.to_string(),
                 y: DimensionValue::zero(),
                 links: Vec::new(),
+                font_index: 0,
             }],
             images: Vec::new(),
             height: points(height_pt),
@@ -1959,14 +2220,34 @@ mod tests {
                     text: "Hello".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
+                    font_index: 0,
                 },
                 TextLine {
                     text: "Ferritex".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
                     links: Vec::new(),
+                    font_index: 0,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn textsf_produces_lines_with_sans_font_index() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(r"\textsf{Sans body}"));
+
+        assert_eq!(document.pages[0].lines.len(), 1);
+        assert_eq!(document.pages[0].lines[0].text, "Sans body");
+        assert_eq!(document.pages[0].lines[0].font_index, 1);
+    }
+
+    #[test]
+    fn texttt_produces_lines_with_mono_font_index() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(r"\texttt{Mono body}"));
+
+        assert_eq!(document.pages[0].lines.len(), 1);
+        assert_eq!(document.pages[0].lines[0].text, "Mono body");
+        assert_eq!(document.pages[0].lines[0].font_index, 2);
     }
 
     #[test]
@@ -1997,6 +2278,7 @@ mod tests {
                     text: "Line 1".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
+                    font_index: 0,
                 }],
                 images: Vec::new(),
                 page_box: page_box.clone(),
@@ -2008,6 +2290,7 @@ mod tests {
                     text: "1 Later".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
+                    font_index: 0,
                 }],
                 images: Vec::new(),
                 page_box,
@@ -2020,6 +2303,58 @@ mod tests {
             resolve_page_labels(&parsed, &typeset),
             BTreeMap::from([("sec:later".to_string(), 2)])
         );
+    }
+
+    #[test]
+    fn collect_named_destinations_resolves_labels_sections_and_bibliography() {
+        let mut parsed = parsed_document("");
+        parsed
+            .labels
+            .insert("sec:intro".to_string(), "1".to_string());
+        parsed
+            .page_label_anchors
+            .insert("sec:intro".to_string(), "1 Intro".to_string());
+        parsed.section_entries.push(SectionEntry {
+            level: 1,
+            number: "1".to_string(),
+            title: "Intro".to_string(),
+        });
+        parsed.bibliography_state = BibliographyState::from_snapshot(parse_bbl(
+            "\\begin{thebibliography}{99}\\bibitem{knuth} Donald Knuth\\end{thebibliography}",
+        ));
+        let page_box = page_box_for_class("article");
+        let pages = vec![TypesetPage {
+            lines: vec![
+                TextLine {
+                    text: "1 Intro".to_string(),
+                    y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
+                    links: Vec::new(),
+                    font_index: 0,
+                },
+                TextLine {
+                    text: "[1] Donald Knuth".to_string(),
+                    y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
+                    links: Vec::new(),
+                    font_index: 0,
+                },
+            ],
+            images: Vec::new(),
+            page_box,
+            float_placements: Vec::new(),
+            index_entries: Vec::new(),
+        }];
+
+        let destinations = super::collect_named_destinations(&parsed, &pages);
+
+        assert!(destinations
+            .iter()
+            .any(|destination| { destination.name == "sec:intro" && destination.page_index == 0 }));
+        assert!(destinations.iter().any(|destination| {
+            destination.name == "section:1 Intro" && destination.page_index == 0
+        }));
+        assert!(destinations
+            .iter()
+            .any(|destination| { destination.name == "bib:knuth" && destination.page_index == 0 }));
     }
 
     #[test]
@@ -2078,6 +2413,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: format!("Line {index}"),
                 links: Vec::new(),
+                font_index: 0,
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Glue {
@@ -2087,6 +2423,7 @@ mod tests {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: "Overflow".to_string(),
             links: Vec::new(),
+            font_index: 0,
         });
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2156,11 +2493,13 @@ mod tests {
                             text: "Body".to_string(),
                             y: DimensionValue::zero(),
                             links: Vec::new(),
+                            font_index: 0,
                         },
                         TextLine {
                             text: "Figure 1: A caption".to_string(),
                             y: points(LINE_HEIGHT_PT),
                             links: Vec::new(),
+                            font_index: 0,
                         },
                     ],
                     images: Vec::new(),
@@ -2321,6 +2660,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "Before".to_string(),
                 links: Vec::new(),
+                font_index: 0,
             },
             VListItem::Float {
                 spec: PlacementSpec::parse(Some("h")),
@@ -2330,6 +2670,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "After".to_string(),
                 links: Vec::new(),
+                font_index: 0,
             },
         ];
 
@@ -2360,6 +2701,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "Line 1".to_string(),
                 links: Vec::new(),
+                font_index: 0,
             },
             VListItem::Float {
                 spec: PlacementSpec::parse(Some("t")),
@@ -2370,6 +2712,7 @@ mod tests {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Line {index}"),
             links: Vec::new(),
+            font_index: 0,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2396,6 +2739,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "Before".to_string(),
                 links: Vec::new(),
+                font_index: 0,
             },
             VListItem::Float {
                 spec: PlacementSpec::parse(Some("t")),
@@ -2406,6 +2750,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "After".to_string(),
                 links: Vec::new(),
+                font_index: 0,
             },
         ];
 
@@ -2503,12 +2848,14 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT * 2)),
                 content: format!("Tall {index}"),
                 links: Vec::new(),
+                font_index: 0,
             })
             .collect::<Vec<_>>();
         vlist.extend((1..=5).map(|index| VListItem::Box {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Short {index}"),
             links: Vec::new(),
+            font_index: 0,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2531,6 +2878,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "First".to_string(),
                 links: Vec::new(),
+                font_index: 0,
             },
             VListItem::Penalty {
                 value: PENALTY_FORCED,
@@ -2539,6 +2887,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: "Second".to_string(),
                 links: Vec::new(),
+                font_index: 0,
             },
         ];
 
@@ -2556,6 +2905,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: format!("Line {index}"),
                 links: Vec::new(),
+                font_index: 0,
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Penalty { value: 50 });
@@ -2563,6 +2913,7 @@ mod tests {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Line {index}"),
             links: Vec::new(),
+            font_index: 0,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2587,6 +2938,7 @@ mod tests {
                 tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
                 content: format!("Line {index}"),
                 links: Vec::new(),
+                font_index: 0,
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Penalty {
@@ -2596,6 +2948,7 @@ mod tests {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: format!("Line {index}"),
             links: Vec::new(),
+            font_index: 0,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2648,6 +3001,7 @@ mod tests {
             codepoint: 'A',
             width: points(1),
             link: None,
+            font_index: 0,
         }];
         let hbox = HBox {
             tex_box: TeXBox::new(points(10), points(11), points(12)),
@@ -2664,6 +3018,7 @@ mod tests {
             tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
             content: "Line".to_string(),
             links: Vec::new(),
+            font_index: 0,
         }];
         let vbox = VBox {
             tex_box: TeXBox::new(points(10), points(11), points(12)),
@@ -2680,6 +3035,7 @@ mod tests {
             tex_box: TeXBox::new(points(10), points(11), points(12)),
             content: "Line".to_string(),
             links: Vec::new(),
+            font_index: 0,
         };
 
         assert_eq!(vlist_item_height(&item), points(23));
@@ -2726,17 +3082,20 @@ mod tests {
                     codepoint: 'A',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
                 HListItem::Glue {
                     width: points(1),
                     stretch: GlueComponent::normal(DimensionValue(points(1).0 / 2)),
                     shrink: GlueComponent::normal(DimensionValue(points(1).0 / 3)),
                     link: None,
+                    font_index: 0,
                 },
                 HListItem::Char {
                     codepoint: 'B',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
             ]
         );
@@ -3020,32 +3379,38 @@ mod tests {
                     codepoint: 'b',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
                 HListItem::Char {
                     codepoint: 'a',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
                 HListItem::Char {
                     codepoint: 's',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
                 HListItem::Penalty { value: 50 },
                 HListItem::Char {
                     codepoint: 'k',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
                 HListItem::Char {
                     codepoint: 'e',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
                 HListItem::Char {
                     codepoint: 't',
                     width: points(1),
                     link: None,
+                    font_index: 0,
                 },
             ]
         );
@@ -3146,6 +3511,7 @@ mod tests {
         let plain_document = super::TypesetDocument {
             pages: paginate_vlist(&plain_vlist, &page_box_for_class(&parsed.document_class)),
             outlines: Vec::new(),
+            named_destinations: Vec::new(),
             title: None,
             author: None,
             navigation: Default::default(),
@@ -3190,6 +3556,41 @@ mod tests {
             document.navigation.default_link_style.link_color.as_deref(),
             Some("red")
         );
+    }
+
+    #[test]
+    fn minimal_typesetter_populates_named_destinations() {
+        let parsed = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\section{Intro}\\label{sec:intro}\n\\begin{thebibliography}{99}\\bibitem{knuth} Donald Knuth\\end{thebibliography}\n\\end{document}\n",
+            )
+            .expect("parse document");
+        let document = MinimalTypesetter.typeset(&parsed);
+
+        assert!(document
+            .navigation
+            .named_destinations
+            .contains_key("sec:intro"));
+        assert!(document
+            .navigation
+            .named_destinations
+            .contains_key("section:1 Intro"));
+        assert!(document
+            .navigation
+            .named_destinations
+            .contains_key("bib:knuth"));
+        assert!(document
+            .named_destinations
+            .iter()
+            .any(|destination| destination.name == "sec:intro"));
+        assert!(document
+            .named_destinations
+            .iter()
+            .any(|destination| destination.name == "section:1 Intro"));
+        assert!(document
+            .named_destinations
+            .iter()
+            .any(|destination| destination.name == "bib:knuth"));
     }
 
     #[test]
@@ -3242,28 +3643,33 @@ mod tests {
                 codepoint: 'a',
                 width: points(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 'b',
                 width: points(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 'c',
                 width: points(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Penalty { value: 100 },
             HListItem::Glue {
@@ -3271,22 +3677,26 @@ mod tests {
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 'd',
                 width: points(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(60)),
                 shrink: GlueComponent::normal(points(1)),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 'e',
                 width: points(10),
                 link: None,
+                font_index: 0,
             },
         ];
         let params = BreakParams {
@@ -3458,23 +3868,27 @@ mod tests {
                 codepoint: 'A',
                 width: points(1),
                 link: None,
+                font_index: 0,
             },
             HListItem::Kern { width: points(1) },
             HListItem::Char {
                 codepoint: 'B',
                 width: points(1),
                 link: None,
+                font_index: 0,
             },
             HListItem::Glue {
                 width: points(1),
                 stretch: GlueComponent::normal(points(0)),
                 shrink: GlueComponent::normal(points(0)),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 'C',
                 width: points(1),
                 link: None,
+                font_index: 0,
             },
         ];
 
@@ -3491,12 +3905,14 @@ mod tests {
                 codepoint: 'A',
                 width: points(1),
                 link: None,
+                font_index: 0,
             },
             HListItem::Kern { width: points(1) },
             HListItem::Char {
                 codepoint: 'B',
                 width: points(1),
                 link: None,
+                font_index: 0,
             },
         ];
 

@@ -309,6 +309,7 @@ pub fn typeset_equation_env(
                 },
                 shrink: GlueComponent::normal(DimensionValue::zero()),
                 link: None,
+                font_index: 0,
             });
             hlist.extend(tag_items);
         }
@@ -337,6 +338,7 @@ fn extend_math_nodes(
                     codepoint: *ch,
                     width: scaled_char_width(provider, *ch, style),
                     link: None,
+                    font_index: 0,
                 });
                 *prev_kind = Some(kind);
             }
@@ -351,6 +353,7 @@ fn extend_math_nodes(
                         codepoint: ch,
                         width: scaled_char_width(provider, ch, style),
                         link: None,
+                        font_index: 0,
                     });
                 }
                 *prev_kind = Some(kind);
@@ -414,6 +417,7 @@ fn extend_math_nodes(
                         codepoint: ch,
                         width: scaled_char_width(provider, ch, style),
                         link: None,
+                        font_index: 0,
                     });
                 }
 
@@ -428,6 +432,7 @@ fn extend_math_nodes(
                         codepoint: ch,
                         width: scaled_char_width(provider, ch, style),
                         link: None,
+                        font_index: 0,
                     });
                 }
                 *prev_kind = Some(MathAtomKind::Inner);
@@ -471,6 +476,7 @@ fn extend_math_nodes(
                         codepoint: ch,
                         width: provider.char_width(ch),
                         link: None,
+                        font_index: 0,
                     });
                 }
                 *prev_kind = Some(MathAtomKind::Ord);
@@ -514,11 +520,13 @@ fn text_to_hlist(text: &str, provider: &dyn CharWidthProvider) -> Vec<HListItem>
                 stretch: GlueComponent::normal(DimensionValue::zero()),
                 shrink: GlueComponent::normal(DimensionValue::zero()),
                 link: None,
+                font_index: 0,
             }),
             _ => items.push(HListItem::Char {
                 codepoint: ch,
                 width: provider.char_width(ch),
                 link: None,
+                font_index: 0,
             }),
         }
     }
@@ -756,12 +764,14 @@ mod tests {
                 codepoint: 'x',
                 width: DimensionValue(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Glue {
                 width: DimensionValue(10),
                 stretch: crate::typesetting::api::GlueComponent::normal(DimensionValue::zero()),
                 shrink: crate::typesetting::api::GlueComponent::normal(DimensionValue::zero()),
                 link: None,
+                font_index: 0,
             },
             HListItem::InlineBox {
                 width: DimensionValue(10),
@@ -784,6 +794,7 @@ mod tests {
                 codepoint: 'x',
                 width: DimensionValue(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Kern {
                 width: DimensionValue(2),

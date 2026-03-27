@@ -16,6 +16,7 @@ pub fn break_paragraph(hlist: &[HListItem], params: &BreakParams) -> Vec<String>
 pub struct BrokenLine {
     pub text: String,
     pub links: Vec<TextLineLink>,
+    pub font_index: u8,
 }
 
 pub fn break_paragraph_with_links(hlist: &[HListItem], params: &BreakParams) -> Vec<BrokenLine> {
@@ -153,6 +154,7 @@ fn render_line(segment: &[HListItem]) -> BrokenLine {
     let mut links = Vec::new();
     let mut pending_space = false;
     let mut pending_space_link = None;
+    let font_index = line_font_index(segment);
 
     for item in segment {
         match item {
@@ -192,7 +194,11 @@ fn render_line(segment: &[HListItem]) -> BrokenLine {
         }
     }
 
-    BrokenLine { text, links }
+    BrokenLine {
+        text,
+        links,
+        font_index,
+    }
 }
 
 fn push_unbreakable_lines(
@@ -212,8 +218,14 @@ fn push_unbreakable_lines(
 
         match item {
             HListItem::Char {
-                codepoint, link, ..
+                codepoint,
+                link,
+                font_index,
+                ..
             } => {
+                if current_line.text.is_empty() {
+                    current_line.font_index = *font_index;
+                }
                 let start_char = current_line.text.chars().count();
                 current_line.text.push(*codepoint);
                 if let Some(url) = link.as_deref() {
@@ -236,6 +248,20 @@ fn push_unbreakable_lines(
     if !current_line.text.is_empty() {
         lines.push(current_line);
     }
+}
+
+fn line_font_index(segment: &[HListItem]) -> u8 {
+    segment
+        .iter()
+        .find_map(|item| match item {
+            HListItem::Char { font_index, .. } | HListItem::Glue { font_index, .. } => {
+                Some(*font_index)
+            }
+            HListItem::Kern { .. } | HListItem::InlineBox { .. } | HListItem::Penalty { .. } => {
+                None
+            }
+        })
+        .unwrap_or(0)
 }
 
 fn push_link_range(links: &mut Vec<TextLineLink>, url: &str, start_char: usize, end_char: usize) {
@@ -307,6 +333,7 @@ mod tests {
                             codepoint,
                             width: provider.char_width(codepoint),
                             link: None,
+                            font_index: 0,
                         });
                     }
                 }
@@ -315,6 +342,7 @@ mod tests {
                     stretch: GlueComponent::normal(stretch),
                     shrink: GlueComponent::normal(shrink),
                     link: None,
+                    font_index: 0,
                 }),
                 TestPart::ForcedBreak => hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
@@ -376,32 +404,38 @@ mod tests {
                 codepoint: 'b',
                 width: dim(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 'a',
                 width: dim(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 's',
                 width: dim(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Penalty { value: 50 },
             HListItem::Char {
                 codepoint: 'k',
                 width: dim(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 'e',
                 width: dim(10),
                 link: None,
+                font_index: 0,
             },
             HListItem::Char {
                 codepoint: 't',
                 width: dim(10),
                 link: None,
+                font_index: 0,
             },
         ];
 
@@ -415,12 +449,14 @@ mod tests {
                 codepoint: 'A',
                 width: dim(1),
                 link: None,
+                font_index: 0,
             },
             HListItem::Kern { width: dim(1) },
             HListItem::Char {
                 codepoint: 'B',
                 width: dim(1),
                 link: None,
+                font_index: 0,
             },
         ];
 

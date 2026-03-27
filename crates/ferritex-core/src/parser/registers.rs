@@ -1,8 +1,23 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
 use super::Token;
 
 pub const MAX_REGISTER_INDEX: u16 = 32_767;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompatIntRegister {
+    PdfOutput,
+    PdfTexVersion,
+}
+
+impl CompatIntRegister {
+    fn default_value(self) -> i32 {
+        match self {
+            Self::PdfOutput => 1,
+            Self::PdfTexVersion => 140,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegisterStore {
@@ -11,6 +26,7 @@ pub struct RegisterStore {
     skips: HashMap<u16, i32>,
     muskips: HashMap<u16, i32>,
     toks: HashMap<u16, Vec<Token>>,
+    compat_ints: HashMap<CompatIntRegister, i32>,
     save_stack: Vec<GroupSave>,
 }
 
@@ -21,6 +37,7 @@ struct GroupSave {
     skips: HashMap<u16, Option<i32>>,
     muskips: HashMap<u16, Option<i32>>,
     toks: HashMap<u16, Option<Vec<Token>>>,
+    compat_ints: HashMap<CompatIntRegister, Option<i32>>,
 }
 
 impl RegisterStore {
@@ -47,6 +64,9 @@ impl RegisterStore {
         }
         for (index, previous) in group_save.toks {
             restore_register(&mut self.toks, index, previous);
+        }
+        for (register, previous) in group_save.compat_ints {
+            restore_register(&mut self.compat_ints, register, previous);
         }
     }
 
@@ -103,6 +123,31 @@ impl RegisterStore {
                 .or_insert_with(|| self.toks.get(&index).cloned());
         }
         set_sparse_tokens_register(&mut self.toks, index, value);
+    }
+
+    pub fn get_compat_int(&self, register: CompatIntRegister) -> i32 {
+        self.compat_ints
+            .get(&register)
+            .copied()
+            .unwrap_or_else(|| register.default_value())
+    }
+
+    pub fn set_compat_int(&mut self, register: CompatIntRegister, value: i32, global: bool) {
+        if global {
+            set_sparse_compat_register(&mut self.compat_ints, register, value);
+            for group_save in &mut self.save_stack {
+                let _ = group_save.compat_ints.remove(&register);
+            }
+            return;
+        }
+
+        if let Some(group_save) = self.save_stack.last_mut() {
+            group_save
+                .compat_ints
+                .entry(register)
+                .or_insert_with(|| self.compat_ints.get(&register).copied());
+        }
+        set_sparse_compat_register(&mut self.compat_ints, register, value);
     }
 
     fn set_register(&mut self, index: u16, value: i32, global: bool, kind: RegisterKind) {
@@ -189,7 +234,10 @@ enum RegisterKind {
     Toks,
 }
 
-fn restore_register<T>(registers: &mut HashMap<u16, T>, index: u16, previous: Option<T>) {
+fn restore_register<K, T>(registers: &mut HashMap<K, T>, index: K, previous: Option<T>)
+where
+    K: Eq + Hash,
+{
     match previous {
         Some(value) => {
             let _ = registers.insert(index, value);
@@ -220,11 +268,23 @@ fn set_sparse_tokens_register(
     }
 }
 
+fn set_sparse_compat_register(
+    registers: &mut HashMap<CompatIntRegister, i32>,
+    register: CompatIntRegister,
+    value: i32,
+) {
+    if value == register.default_value() {
+        let _ = registers.remove(&register);
+    } else {
+        let _ = registers.insert(register, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parser::{CatCode, Token, TokenKind};
 
-    use super::{RegisterStore, MAX_REGISTER_INDEX};
+    use super::{CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX};
 
     #[test]
     fn register_families_default_to_zero_or_empty() {
@@ -235,6 +295,11 @@ mod tests {
         assert_eq!(registers.get_skip(0), 0);
         assert_eq!(registers.get_muskip(0), 0);
         assert!(registers.get_toks(0).is_empty());
+        assert_eq!(registers.get_compat_int(CompatIntRegister::PdfOutput), 1);
+        assert_eq!(
+            registers.get_compat_int(CompatIntRegister::PdfTexVersion),
+            140
+        );
     }
 
     #[test]
@@ -251,6 +316,29 @@ mod tests {
         assert_eq!(registers.get_skip(90), 12);
         assert_eq!(registers.get_muskip(91), 34);
         assert_eq!(registers.get_toks(92), vec![char_token('x')]);
+    }
+
+    #[test]
+    fn compat_registers_are_scoped_and_default_backed() {
+        let mut registers = RegisterStore::default();
+
+        registers.push_group();
+        registers.set_compat_int(CompatIntRegister::PdfOutput, 0, false);
+        registers.set_compat_int(CompatIntRegister::PdfTexVersion, 150, false);
+
+        assert_eq!(registers.get_compat_int(CompatIntRegister::PdfOutput), 0);
+        assert_eq!(
+            registers.get_compat_int(CompatIntRegister::PdfTexVersion),
+            150
+        );
+
+        registers.pop_group();
+
+        assert_eq!(registers.get_compat_int(CompatIntRegister::PdfOutput), 1);
+        assert_eq!(
+            registers.get_compat_int(CompatIntRegister::PdfTexVersion),
+            140
+        );
     }
 
     #[test]

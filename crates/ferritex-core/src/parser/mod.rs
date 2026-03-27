@@ -12,8 +12,8 @@ pub use api::{
 pub use macro_engine::{EnvironmentDef, MacroDef, MacroEngine};
 pub use package_loading::{
     load_document_class, load_package, AmsmathExtension, ClassInfo, ClassRegistry,
-    FontspecExtension, GeometryExtension, GraphicxExtension, PackageExtension, PackageInfo,
-    PackageRegistry, XcolorExtension,
+    FontspecExtension, GeometryExtension, GraphicxExtension, OptionRegistry, PackageExtension,
+    PackageInfo, PackageRegistry, XcolorExtension,
 };
 pub use tokenizer::{
     default_catcode_table, CatCode, Token, TokenKind, Tokenizer, TokenizerDiagnostic,

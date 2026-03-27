@@ -24,15 +24,26 @@ impl AssetBundleLoaderPort for AssetBundleLoader {
     fn resolve_tex_input(&self, bundle_path: &Path, relative_path: &str) -> Option<PathBuf> {
         let bundle_relative = tex_relative_candidate(Path::new(relative_path));
         let texmf_root = bundle_path.join("texmf");
-        let tex_input_path = texmf_root.join(bundle_relative);
+        resolve_guarded(&texmf_root, &texmf_root.join(bundle_relative))
+    }
 
-        let resolved = tex_input_path.canonicalize().ok()?;
-        let texmf_resolved = texmf_root.canonicalize().ok()?;
-        if !resolved.starts_with(&texmf_resolved) {
-            return None;
+    fn resolve_package(
+        &self,
+        bundle_path: &Path,
+        package_name: &str,
+        project_root: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let package_relative = package_relative_candidate(package_name);
+
+        if let Some(project_root) = project_root {
+            let project_candidate = project_root.join(&package_relative);
+            if let Some(resolved) = resolve_guarded(project_root, &project_candidate) {
+                return Some(resolved);
+            }
         }
 
-        Some(resolved)
+        let texmf_root = bundle_path.join("texmf");
+        resolve_guarded(&texmf_root, &texmf_root.join(package_relative))
     }
 }
 
@@ -151,6 +162,16 @@ fn tex_relative_candidate(relative_path: &Path) -> PathBuf {
     } else {
         relative_path.with_extension("tex")
     }
+}
+
+fn package_relative_candidate(package_name: &str) -> PathBuf {
+    PathBuf::from(package_name).with_extension("sty")
+}
+
+fn resolve_guarded(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let resolved = candidate.canonicalize().ok()?;
+    let root_resolved = root.canonicalize().ok()?;
+    resolved.starts_with(&root_resolved).then_some(resolved)
 }
 
 #[cfg(test)]
@@ -294,5 +315,94 @@ mod tests {
         let resolved = AssetBundleLoader.resolve_tex_input(&bundle_root, "../secret");
 
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolves_package_from_bundle_texmf_directory() {
+        let bundle_root = fixture_root();
+        write_manifest(
+            &bundle_root,
+            &AssetBundleManifest {
+                name: "default".to_string(),
+                version: "2026.03.18".to_string(),
+                min_ferritex_version: "0.1.0".to_string(),
+            },
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(bundle_root.join("texmf")).expect("create texmf");
+        std::fs::write(bundle_root.join("texmf/mypkg.sty"), "% bundle package\n")
+            .expect("write bundled package");
+
+        let resolved = AssetBundleLoader.resolve_package(&bundle_root, "mypkg", None);
+
+        assert_eq!(
+            resolved,
+            Some(
+                bundle_root
+                    .join("texmf/mypkg.sty")
+                    .canonicalize()
+                    .expect("canonicalize bundled package"),
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_package_prefers_project_root_over_bundle() {
+        let bundle_root = fixture_root();
+        let project_root = fixture_root();
+        write_manifest(
+            &bundle_root,
+            &AssetBundleManifest {
+                name: "default".to_string(),
+                version: "2026.03.18".to_string(),
+                min_ferritex_version: "0.1.0".to_string(),
+            },
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(bundle_root.join("texmf")).expect("create texmf");
+        std::fs::write(bundle_root.join("texmf/mypkg.sty"), "% bundle package\n")
+            .expect("write bundled package");
+        std::fs::write(project_root.join("mypkg.sty"), "% project package\n")
+            .expect("write project package");
+
+        let resolved =
+            AssetBundleLoader.resolve_package(&bundle_root, "mypkg", Some(&project_root));
+
+        assert_eq!(
+            resolved,
+            Some(
+                project_root
+                    .join("mypkg.sty")
+                    .canonicalize()
+                    .expect("canonicalize project package"),
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_package_resolution() {
+        let bundle_root = fixture_root();
+        let project_root = fixture_root();
+        write_manifest(
+            &bundle_root,
+            &AssetBundleManifest {
+                name: "default".to_string(),
+                version: "2026.03.18".to_string(),
+                min_ferritex_version: "0.1.0".to_string(),
+            },
+        )
+        .expect("write manifest");
+        std::fs::create_dir_all(bundle_root.join("texmf")).expect("create texmf");
+        std::fs::write(bundle_root.join("secret.sty"), "% secret\n").expect("write secret");
+        std::fs::write(project_root.join("secret.sty"), "% project secret\n")
+            .expect("write project secret");
+
+        let bundle_escape =
+            AssetBundleLoader.resolve_package(&bundle_root, "../secret", Some(&project_root));
+        let project_escape =
+            AssetBundleLoader.resolve_package(&bundle_root, "../../secret", Some(&project_root));
+
+        assert_eq!(bundle_escape, None);
+        assert_eq!(project_escape, None);
     }
 }

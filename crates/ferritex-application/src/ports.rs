@@ -3,6 +3,14 @@ use std::path::{Path, PathBuf};
 pub trait AssetBundleLoaderPort: Send + Sync {
     fn validate(&self, bundle_path: &Path) -> Result<(), String>;
     fn resolve_tex_input(&self, bundle_path: &Path, relative_path: &str) -> Option<PathBuf>;
+    fn resolve_package(
+        &self,
+        _bundle_path: &Path,
+        _package_name: &str,
+        _project_root: Option<&Path>,
+    ) -> Option<PathBuf> {
+        None
+    }
 }
 
 pub trait PreviewTransportPort: Send + Sync {

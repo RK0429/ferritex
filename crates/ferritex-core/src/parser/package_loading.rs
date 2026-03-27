@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use super::{EnvironmentDef, MacroDef, MacroEngine, Token, TokenKind};
 
 /// Metadata for a loaded package
@@ -37,6 +39,10 @@ impl PackageRegistry {
     pub fn loaded_packages(&self) -> &[PackageInfo] {
         &self.packages
     }
+
+    fn unload(&mut self, name: &str) {
+        self.packages.retain(|package| package.name != name);
+    }
 }
 
 /// Registry tracking active document class
@@ -55,11 +61,78 @@ impl ClassRegistry {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OptionRegistry {
+    pub options: HashMap<String, Vec<Token>>,
+    pub default_handler: Option<Vec<Token>>,
+    declaration_order: Vec<String>,
+}
+
+impl OptionRegistry {
+    pub fn clear(&mut self) {
+        self.options.clear();
+        self.default_handler = None;
+        self.declaration_order.clear();
+    }
+
+    pub fn declare_option(&mut self, name: String, code: Vec<Token>) {
+        if !self.options.contains_key(&name) {
+            self.declaration_order.push(name.clone());
+        }
+        let _ = self.options.insert(name, code);
+    }
+
+    pub fn declare_default(&mut self, code: Vec<Token>) {
+        self.default_handler = Some(code);
+    }
+
+    pub fn process_options(&self, options: &[String]) -> Vec<Token> {
+        let mut handled = HashSet::new();
+        let mut expanded = Vec::new();
+
+        for name in &self.declaration_order {
+            if options.iter().any(|option| option == name) {
+                handled.insert(name.clone());
+                if let Some(code) = self.options.get(name) {
+                    expanded.extend(code.clone());
+                }
+            }
+        }
+
+        for option in options {
+            if handled.contains(option) {
+                continue;
+            }
+            if let Some(default_handler) = &self.default_handler {
+                expanded.extend(default_handler.clone());
+            }
+        }
+
+        expanded
+    }
+
+    pub fn execute_options(&self, options: &[String]) -> Vec<Token> {
+        let mut expanded = Vec::new();
+
+        for option in options {
+            if let Some(code) = self.options.get(option) {
+                expanded.extend(code.clone());
+            } else if let Some(default_handler) = &self.default_handler {
+                expanded.extend(default_handler.clone());
+            }
+        }
+
+        expanded
+    }
+}
+
 /// Trait for native package extensions that register commands/environments
 pub trait PackageExtension {
     fn name(&self) -> &str;
     fn register(&self, engine: &mut MacroEngine);
 }
+
+pub type StyPackageResolver<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AmsmathExtension;
@@ -75,6 +148,42 @@ pub struct GeometryExtension;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FontspecExtension;
+
+pub struct StyInterpreter<'a, 'resolver> {
+    source: &'a str,
+    options: &'a [String],
+    registry: &'a mut PackageRegistry,
+    engine: &'a mut MacroEngine,
+    sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
+}
+
+impl<'a, 'resolver> StyInterpreter<'a, 'resolver> {
+    pub fn new(
+        source: &'a str,
+        options: &'a [String],
+        registry: &'a mut PackageRegistry,
+        engine: &'a mut MacroEngine,
+        sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
+    ) -> Self {
+        Self {
+            source,
+            options,
+            registry,
+            engine,
+            sty_resolver,
+        }
+    }
+
+    pub fn interpret(self) -> Result<(), String> {
+        super::api::interpret_sty_package_source(
+            self.source,
+            self.options,
+            self.registry,
+            self.engine,
+            self.sty_resolver,
+        )
+    }
+}
 
 impl PackageExtension for AmsmathExtension {
     fn name(&self) -> &str {
@@ -135,6 +244,8 @@ impl PackageExtension for FontspecExtension {
 
     fn register(&self, engine: &mut MacroEngine) {
         register_noop_command(engine, "setmainfont", 1);
+        register_noop_command(engine, "setsansfont", 1);
+        register_noop_command(engine, "setmonofont", 1);
     }
 }
 
@@ -206,6 +317,8 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
     register_noop_command(engine, "author", 1);
     register_noop_command(engine, "maketitle", 0);
     register_noop_command(engine, "title", 1);
+    register_noop_command(engine, "textsf", 1);
+    register_noop_command(engine, "texttt", 1);
 }
 
 pub fn load_package(
@@ -213,19 +326,37 @@ pub fn load_package(
     options: &[String],
     registry: &mut PackageRegistry,
     engine: &mut MacroEngine,
+    sty_resolver: Option<&StyPackageResolver<'_>>,
 ) -> Result<bool, String> {
     if registry.is_loaded(name) {
         return Ok(false);
     }
 
-    if let Some(extension) = get_native_extension(name) {
-        extension.register(engine);
-    }
-
-    Ok(registry.load(PackageInfo {
+    let registered = registry.load(PackageInfo {
         name: name.to_string(),
         options: options.to_vec(),
-    }))
+    });
+    debug_assert!(registered);
+
+    let result = if let Some(extension) = get_native_extension(name) {
+        extension.register(engine);
+        Ok(())
+    } else if let Some(resolve_sty) = sty_resolver {
+        if let Some(source) = resolve_sty(name) {
+            StyInterpreter::new(&source, options, registry, engine, sty_resolver).interpret()
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    };
+
+    if let Err(error) = result {
+        registry.unload(name);
+        return Err(error);
+    }
+
+    Ok(true)
 }
 
 fn get_native_extension(name: &str) -> Option<&'static dyn PackageExtension> {
@@ -264,6 +395,7 @@ fn register_noop_command(engine: &mut MacroEngine, name: &str, parameter_count: 
             name: name.to_string(),
             parameter_count,
             body: Vec::new(),
+            protected: false,
         },
     );
 }
@@ -284,6 +416,7 @@ fn register_passthrough_command(
                 line: 0,
                 column: 0,
             }],
+            protected: false,
         },
     );
 }
@@ -291,9 +424,10 @@ fn register_passthrough_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_document_class, load_package, ClassInfo, ClassRegistry, PackageInfo, PackageRegistry,
+        load_document_class, load_package, ClassInfo, ClassRegistry, OptionRegistry, PackageInfo,
+        PackageRegistry,
     };
-    use crate::parser::MacroEngine;
+    use crate::parser::{CatCode, MacroDef, MacroEngine, Token, TokenKind};
 
     #[test]
     fn package_registry_prevents_duplicate_loads() {
@@ -358,12 +492,15 @@ mod tests {
         let mut registry = PackageRegistry::default();
         let mut engine = MacroEngine::default();
 
-        assert!(load_package("xcolor", &[], &mut registry, &mut engine).expect("load xcolor"));
+        assert!(
+            load_package("xcolor", &[], &mut registry, &mut engine, None).expect("load xcolor")
+        );
         assert!(!load_package(
             "xcolor",
             &["dvipsnames".to_string()],
             &mut registry,
-            &mut engine
+            &mut engine,
+            None,
         )
         .expect("duplicate xcolor load"));
 
@@ -373,12 +510,174 @@ mod tests {
     }
 
     #[test]
-    fn fontspec_extension_registers_setmainfont() {
+    fn fontspec_extension_registers_all_font_commands() {
         let mut registry = PackageRegistry::default();
         let mut engine = MacroEngine::default();
 
-        assert!(load_package("fontspec", &[], &mut registry, &mut engine).expect("load fontspec"));
+        assert!(
+            load_package("fontspec", &[], &mut registry, &mut engine, None).expect("load fontspec")
+        );
 
         assert!(engine.lookup("setmainfont").is_some());
+        assert!(engine.lookup("setsansfont").is_some());
+        assert!(engine.lookup("setmonofont").is_some());
+    }
+
+    #[test]
+    fn load_package_interprets_sty_fallback_and_recurses_requirepackage() {
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+        let resolver = |name: &str| match name {
+            "mypkg" => Some(
+                "\\NeedsTeXFormat{LaTeX2e}\n\
+                 \\ProvidesPackage{mypkg}[2024/01/01 Test package]\n\
+                 \\newif\\ifmypkgbold\n\
+                 \\RequirePackage{amsmath}\n\
+                 \\DeclareOption{bold}{\\mypkgboldtrue}\n\
+                 \\DeclareOption*{}\n\
+                 \\ProcessOptions*\n\
+                 \\@ifpackageloaded{amsmath}{\\def\\amsloaded{yes}}{\\def\\amsloaded{no}}\n\
+                 \\makeatletter\n\
+                 \\@namedef{mypkg@flag}{set}\n\
+                 \\@ifundefined{mypkg@missing}{\\def\\mypkgmissing{yes}}{\\def\\mypkgmissing{no}}\n\
+                 \\makeatother\n\
+                 \\ifmypkgbold\\def\\mypkgstyle{bold}\\else\\def\\mypkgstyle{plain}\\fi\n\
+                 \\newcommand{\\mypkgcmd}[1]{[#1]}\n\
+                 \\newenvironment{mypkgenv}{\\begin{center}}{\\end{center}}\n\
+                 \\input{ignored}\n"
+                    .to_string(),
+            ),
+            _ => None,
+        };
+
+        assert!(load_package(
+            "mypkg",
+            &["bold".to_string()],
+            &mut registry,
+            &mut engine,
+            Some(&resolver),
+        )
+        .expect("load mypkg"));
+        assert!(
+            !load_package("mypkg", &[], &mut registry, &mut engine, Some(&resolver))
+                .expect("duplicate mypkg load")
+        );
+
+        assert!(registry.is_loaded("mypkg"));
+        assert!(registry.is_loaded("amsmath"));
+        assert!(engine.lookup("mypkgcmd").is_some());
+        assert!(engine.lookup_environment("mypkgenv").is_some());
+        assert_eq!(
+            engine
+                .lookup("mypkgstyle")
+                .map(|definition| token_text(&definition.body)),
+            Some("bold".to_string())
+        );
+        assert_eq!(
+            engine
+                .lookup("amsloaded")
+                .map(|definition| token_text(&definition.body)),
+            Some("yes".to_string())
+        );
+        assert_eq!(
+            engine
+                .lookup("mypkgmissing")
+                .map(|definition| token_text(&definition.body)),
+            Some("yes".to_string())
+        );
+        assert!(engine.lookup("ifmypkgbold").is_some());
+        assert!(engine.lookup("mypkgboldtrue").is_some());
+        assert!(engine.lookup("mypkgboldfalse").is_some());
+        assert!(engine.lookup("mypkg@flag").is_some());
+    }
+
+    #[test]
+    fn load_package_rolls_back_failed_sty_without_losing_existing_state() {
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+        let resolver = |name: &str| match name {
+            "brokenpkg" => Some("\\def\\broken{X".to_string()),
+            _ => None,
+        };
+
+        assert!(
+            load_package("xcolor", &[], &mut registry, &mut engine, None).expect("load xcolor")
+        );
+        engine.define_global(
+            "survivor".to_string(),
+            MacroDef {
+                name: "survivor".to_string(),
+                parameter_count: 0,
+                body: token_code("S"),
+                protected: false,
+            },
+        );
+
+        let error = load_package(
+            "brokenpkg",
+            &[],
+            &mut registry,
+            &mut engine,
+            Some(&resolver),
+        )
+        .expect_err("broken .sty should fail");
+
+        assert!(error.contains("brace") || error.contains("Brace"));
+        assert!(registry.is_loaded("xcolor"));
+        assert!(!registry.is_loaded("brokenpkg"));
+        assert!(engine.lookup("color").is_some());
+        assert!(engine.lookup("survivor").is_some());
+        assert!(engine.lookup("broken").is_none());
+    }
+
+    #[test]
+    fn option_registry_processes_options_in_declaration_order() {
+        let mut registry = OptionRegistry::default();
+        registry.declare_option("beta".to_string(), token_code("B"));
+        registry.declare_option("alpha".to_string(), token_code("A"));
+
+        assert_eq!(
+            token_text(&registry.process_options(&["alpha".to_string(), "beta".to_string()])),
+            "BA"
+        );
+    }
+
+    #[test]
+    fn option_registry_uses_default_handler_for_unknown_execute_option() {
+        let mut registry = OptionRegistry::default();
+        registry.declare_default(token_code("D"));
+
+        assert_eq!(
+            token_text(&registry.execute_options(&["unknown".to_string()])),
+            "D"
+        );
+    }
+
+    fn token_code(text: &str) -> Vec<Token> {
+        text.chars()
+            .enumerate()
+            .map(|(index, char)| Token {
+                kind: TokenKind::CharToken {
+                    char,
+                    cat: if char.is_ascii_alphabetic() {
+                        CatCode::Letter
+                    } else {
+                        CatCode::Other
+                    },
+                },
+                line: 1,
+                column: (index + 1) as u32,
+            })
+            .collect()
+    }
+
+    fn token_text(tokens: &[Token]) -> String {
+        tokens
+            .iter()
+            .filter_map(|token| match token.kind {
+                TokenKind::CharToken { char, .. } => Some(char),
+                _ => None,
+            })
+            .collect()
     }
 }
