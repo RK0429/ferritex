@@ -1,3 +1,4 @@
+pub mod compile_cache;
 pub mod compile_job_service;
 pub mod execution_policy_factory;
 pub mod live_analysis_snapshot;

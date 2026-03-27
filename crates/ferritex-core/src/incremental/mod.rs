@@ -1,3 +1,3 @@
 pub mod api;
 
-pub use api::RecompilationScope;
+pub use api::{DependencyGraph, DependencyNode, RecompilationScope};

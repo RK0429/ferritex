@@ -10,13 +10,18 @@ impl ExecutionPolicyFactory {
     pub fn create(options: &RuntimeOptions) -> ExecutionPolicy {
         let project_root = project_root_for_input(&options.input_file);
         let mut allowed_read_paths = vec![project_root];
-        allowed_read_paths.extend(options.overlay_roots.iter().cloned());
+        for overlay_root in &options.overlay_roots {
+            push_read_path_if_needed(&mut allowed_read_paths, overlay_root.clone());
+        }
         if let Some(bundle_path) = &options.asset_bundle {
-            allowed_read_paths.push(bundle_path.clone());
+            push_read_path_if_needed(&mut allowed_read_paths, bundle_path.clone());
         }
         if options.host_font_fallback {
-            allowed_read_paths.extend(options.host_font_roots.iter().cloned());
+            for host_root in &options.host_font_roots {
+                push_read_path_if_needed(&mut allowed_read_paths, host_root.clone());
+            }
         }
+        push_read_path_if_needed(&mut allowed_read_paths, options.output_dir.clone());
 
         ExecutionPolicy {
             shell_escape_allowed: matches!(options.shell_escape, ShellEscapeMode::Enabled),
@@ -30,6 +35,18 @@ impl ExecutionPolicyFactory {
             }),
         }
     }
+}
+
+fn push_read_path_if_needed(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    let normalized_candidate = absolute_normalized_path(&candidate);
+    if paths
+        .iter()
+        .map(|path| absolute_normalized_path(path))
+        .any(|existing| normalized_candidate.starts_with(&existing))
+    {
+        return;
+    }
+    paths.push(candidate);
 }
 
 fn project_root_for_input(input_file: &Path) -> PathBuf {
@@ -58,11 +75,15 @@ fn project_root_for_input(input_file: &Path) -> PathBuf {
 }
 
 fn absolute_input_path(input_file: &Path) -> PathBuf {
-    if input_file.is_absolute() {
-        normalize_path(input_file)
+    absolute_normalized_path(input_file)
+}
+
+fn absolute_normalized_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        normalize_path(path)
     } else {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        normalize_path(&cwd.join(input_file))
+        normalize_path(&cwd.join(path))
     }
 }
 
@@ -191,9 +212,10 @@ mod tests {
     fn falls_back_to_input_parent_when_input_is_outside_known_project_root() {
         let dir = tempdir().expect("create tempdir");
         let input_dir = dir.path().join("src");
+        let output_dir = dir.path().join("build");
         let options = RuntimeOptions {
             input_file: input_dir.join("main.tex"),
-            output_dir: dir.path().join("build"),
+            output_dir: output_dir.clone(),
             jobname: "main".to_string(),
             parallelism: 1,
             overlay_roots: Vec::new(),
@@ -209,7 +231,7 @@ mod tests {
 
         let policy = ExecutionPolicyFactory::create(&options);
 
-        assert_eq!(policy.allowed_read_paths, vec![input_dir]);
+        assert_eq!(policy.allowed_read_paths, vec![input_dir, output_dir]);
     }
 
     #[test]

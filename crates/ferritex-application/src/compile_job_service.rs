@@ -18,6 +18,7 @@ use ferritex_core::graphics::api::{
     extract_png_image_data, parse_image_metadata, ExternalGraphic, GraphicAssetResolver,
     ImageMetadata,
 };
+use ferritex_core::incremental::DependencyGraph;
 use ferritex_core::kernel::api::DimensionValue;
 use ferritex_core::kernel::StableId;
 use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
@@ -30,6 +31,7 @@ use ferritex_core::typesetting::{
 };
 use serde_json::json;
 
+use crate::compile_cache::{fingerprint_bytes, CompileCache};
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::AssetBundleLoaderPort;
 use crate::runtime_options::RuntimeOptions;
@@ -63,6 +65,7 @@ struct LoadedSourceTree {
     source: String,
     source_lines: Vec<SourceLineTrace>,
     document_state: DocumentState,
+    dependency_graph: DependencyGraph,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -285,37 +288,6 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
-        let mut source_tree = match self.load_source_tree(
-            &options.input_file,
-            &project_root,
-            &options.overlay_roots,
-            options.asset_bundle.as_deref(),
-        ) {
-            Ok(tree) => tree,
-            Err(diagnostic) => {
-                let diagnostics = vec![diagnostic];
-
-                return CompileResult {
-                    exit_code: exit_code_for(&diagnostics),
-                    diagnostics,
-                    output_pdf: None,
-                    stable_compile_state: None,
-                };
-            }
-        };
-        let loaded_bibliography_state = load_bibliography_state(
-            self.file_access_gate,
-            &project_root,
-            &options.overlay_roots,
-            &options.output_dir,
-            &options.jobname,
-        );
-        let initial_bibliography_state = loaded_bibliography_state
-            .as_ref()
-            .map(|loaded| loaded.state.clone());
-        if let Some(bibliography_state) = &initial_bibliography_state {
-            source_tree.document_state.bibliography_state = bibliography_state.clone();
-        }
         if !is_valid_jobname(&options.jobname) {
             let diagnostics =
                 vec![
@@ -363,6 +335,76 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
             };
+        }
+
+        let compile_cache = CompileCache::new(
+            self.file_access_gate,
+            &options.output_dir,
+            &options.input_file,
+            &options.jobname,
+        );
+        let mut cache_diagnostics = Vec::new();
+        if !options.no_cache {
+            let lookup = compile_cache.lookup();
+            if let Some(cached_artifact) = lookup.artifact {
+                tracing::info!(
+                    jobname = %options.jobname,
+                    input = %options.input_file.display(),
+                    output = %cached_artifact.output_pdf.display(),
+                    "compile cache hit"
+                );
+                let diagnostics = cached_artifact.stable_compile_state.diagnostics.clone();
+                return CompileResult {
+                    exit_code: exit_code_for(&diagnostics),
+                    diagnostics,
+                    output_pdf: Some(cached_artifact.output_pdf),
+                    stable_compile_state: Some(cached_artifact.stable_compile_state),
+                };
+            }
+
+            if let Some(scope) = lookup.scope {
+                tracing::info!(
+                    jobname = %options.jobname,
+                    input = %options.input_file.display(),
+                    changed_paths = ?lookup.changed_paths,
+                    ?scope,
+                    "compile cache miss due to changed dependencies"
+                );
+            }
+            cache_diagnostics.extend(lookup.diagnostics);
+        }
+
+        let mut source_tree = match self.load_source_tree(
+            &options.input_file,
+            &project_root,
+            &options.overlay_roots,
+            options.asset_bundle.as_deref(),
+        ) {
+            Ok(tree) => tree,
+            Err(diagnostic) => {
+                let mut diagnostics = cache_diagnostics;
+                diagnostics.push(diagnostic);
+
+                return CompileResult {
+                    exit_code: exit_code_for(&diagnostics),
+                    diagnostics,
+                    output_pdf: None,
+                    stable_compile_state: None,
+                };
+            }
+        };
+        let loaded_bibliography_state = load_bibliography_state(
+            self.file_access_gate,
+            &project_root,
+            &options.overlay_roots,
+            &options.output_dir,
+            &options.jobname,
+        );
+        let initial_bibliography_state = loaded_bibliography_state
+            .as_ref()
+            .map(|loaded| loaded.state.clone());
+        if let Some(bibliography_state) = &initial_bibliography_state {
+            source_tree.document_state.bibliography_state = bibliography_state.clone();
         }
 
         let input_dir = options
@@ -518,10 +560,12 @@ impl<'a> CompileJobService<'a> {
                     options.jobname.clone(),
                     execution_policy.clone(),
                 );
+                let mut diagnostics = cache_diagnostics.clone();
+                diagnostics.extend(parse_diagnostics.clone());
 
                 return CompileResult {
-                    exit_code: exit_code_for(&parse_diagnostics),
-                    diagnostics: parse_diagnostics.clone(),
+                    exit_code: exit_code_for(&diagnostics),
+                    diagnostics: diagnostics.clone(),
                     output_pdf: None,
                     stable_compile_state: Some(stable_compile_state(
                         &compilation_job,
@@ -529,7 +573,7 @@ impl<'a> CompileJobService<'a> {
                         pass_count,
                         0,
                         false,
-                        parse_diagnostics,
+                        diagnostics,
                     )),
                 };
             }
@@ -547,7 +591,9 @@ impl<'a> CompileJobService<'a> {
         ) {
             Ok(renderer) => renderer,
             Err(diagnostic) => {
-                let diagnostics = vec![diagnostic];
+                let mut diagnostics = cache_diagnostics.clone();
+                diagnostics.extend(parse_diagnostics.clone());
+                diagnostics.push(diagnostic);
 
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -563,13 +609,15 @@ impl<'a> CompileJobService<'a> {
             options.jobname.clone(),
             execution_policy,
         );
-        let mut diagnostics = parse_diagnostics;
+        let cacheable_diagnostics = parse_diagnostics;
+        let mut diagnostics = cache_diagnostics;
+        diagnostics.extend(cacheable_diagnostics.clone());
 
         if let Err(error) = self
             .file_access_gate
             .write_file(&output_pdf, &pdf_document.bytes)
         {
-            let diagnostics = vec![diagnostic_for_output_error(error, &output_pdf)];
+            diagnostics.push(diagnostic_for_output_error(error, &output_pdf));
 
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
@@ -600,6 +648,25 @@ impl<'a> CompileJobService<'a> {
                     )
                     .with_file(synctex_path.to_string_lossy().into_owned()),
                 ),
+            }
+        }
+
+        let output_pdf_hash = fingerprint_bytes(&pdf_document.bytes);
+        let provisional_stable_state = stable_compile_state(
+            &compilation_job,
+            source_tree.document_state.clone(),
+            pass_count,
+            pdf_document.page_count,
+            true,
+            cacheable_diagnostics.clone(),
+        );
+        if !options.no_cache {
+            if let Some(diagnostic) = compile_cache.store(
+                &source_tree.dependency_graph,
+                &provisional_stable_state,
+                output_pdf_hash,
+            ) {
+                diagnostics.push(diagnostic);
             }
         }
 
@@ -654,6 +721,7 @@ impl<'a> CompileJobService<'a> {
                     text: source.to_string(),
                 }],
                 document_state: DocumentState::default(),
+                dependency_graph: DependencyGraph::default(),
             });
 
         let primary_input_path = primary_input.to_string_lossy().into_owned();
@@ -878,6 +946,7 @@ impl<'a> CompileJobService<'a> {
         let mut source_files = BTreeSet::new();
         let mut labels = BTreeMap::new();
         let mut citations = BTreeMap::new();
+        let mut dependency_graph = DependencyGraph::default();
         let source = self.load_source_file(
             &root_input,
             &project_root,
@@ -889,6 +958,7 @@ impl<'a> CompileJobService<'a> {
             &mut source_files,
             &mut labels,
             &mut citations,
+            &mut dependency_graph,
         )?;
 
         Ok(LoadedSourceTree {
@@ -907,6 +977,7 @@ impl<'a> CompileJobService<'a> {
                 navigation: Default::default(),
                 index_state: Default::default(),
             },
+            dependency_graph,
         })
     }
 
@@ -923,6 +994,7 @@ impl<'a> CompileJobService<'a> {
         source_files: &mut BTreeSet<PathBuf>,
         labels: &mut BTreeMap<String, SymbolLocation>,
         citations: &mut BTreeMap<String, SymbolLocation>,
+        dependency_graph: &mut DependencyGraph,
     ) -> Result<ExpandedSource, Diagnostic> {
         let normalized_path = normalize_existing_path(path);
         if !visited.insert(normalized_path.clone()) {
@@ -939,6 +1011,10 @@ impl<'a> CompileJobService<'a> {
             Some(source) => source.to_string(),
             None => read_utf8_file(self.file_access_gate, &normalized_path)?,
         };
+        dependency_graph.record_node(
+            normalized_path.clone(),
+            fingerprint_bytes(source.as_bytes()),
+        );
         collect_symbol_locations(&source, &normalized_path, "label", labels);
         collect_symbol_locations(&source, &normalized_path, "bibitem", citations);
 
@@ -959,6 +1035,7 @@ impl<'a> CompileJobService<'a> {
             source_files,
             labels,
             citations,
+            dependency_graph,
         )?;
         visited.remove(&normalized_path);
         Ok(expanded)
@@ -1527,6 +1604,7 @@ fn expand_inputs(
     source_files: &mut BTreeSet<PathBuf>,
     labels: &mut BTreeMap<String, SymbolLocation>,
     citations: &mut BTreeMap<String, SymbolLocation>,
+    dependency_graph: &mut DependencyGraph,
 ) -> Result<ExpandedSource, Diagnostic> {
     let mut expanded = ExpandedSourceBuilder::default();
     let source_file = source_path.to_string_lossy().into_owned();
@@ -1555,6 +1633,7 @@ fn expand_inputs(
 
             match &command.kind {
                 InlineCommandKind::Input => {
+                    dependency_graph.record_edge(source_path.to_path_buf(), resolved.clone());
                     let nested = service
                         .load_source_file(
                             &resolved,
@@ -1567,6 +1646,7 @@ fn expand_inputs(
                             source_files,
                             labels,
                             citations,
+                            dependency_graph,
                         )
                         .map_err(|diagnostic| {
                             diagnostic_for_nested_input_error(
@@ -1579,6 +1659,7 @@ fn expand_inputs(
                     expanded.append_expanded(&nested);
                 }
                 InlineCommandKind::Include => {
+                    dependency_graph.record_edge(source_path.to_path_buf(), resolved.clone());
                     if !include_guard.insert(resolved.clone()) {
                         cursor = command.end;
                         continue;
@@ -1596,6 +1677,7 @@ fn expand_inputs(
                             source_files,
                             labels,
                             citations,
+                            dependency_graph,
                         )
                         .map_err(|diagnostic| {
                             diagnostic_for_nested_input_error(
@@ -1612,6 +1694,7 @@ fn expand_inputs(
                     false_branch,
                 } => {
                     if resolved.exists() {
+                        dependency_graph.record_edge(source_path.to_path_buf(), resolved.clone());
                         let nested = service
                             .load_source_file(
                                 &resolved,
@@ -1624,6 +1707,7 @@ fn expand_inputs(
                                 source_files,
                                 labels,
                                 citations,
+                                dependency_graph,
                             )
                             .map_err(|diagnostic| {
                                 diagnostic_for_nested_input_error(
@@ -2957,7 +3041,7 @@ mod tests {
             jobname: "main".to_string(),
             parallelism: 1,
             overlay_roots: Vec::new(),
-            no_cache: false,
+            no_cache: true,
             asset_bundle: None,
             host_font_fallback: false,
             host_font_roots: Vec::new(),
@@ -3329,7 +3413,7 @@ mod tests {
         let options = runtime_options(dir.path().join("missing.tex"), dir.path().join("out"));
         let gate = MockFileAccessGate {
             read_decision: PathAccessDecision::Allowed,
-            write_decision: PathAccessDecision::Denied,
+            write_decision: PathAccessDecision::Allowed,
             read_result: MockReadResult::NotFound,
             created_dirs: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
@@ -3457,6 +3541,86 @@ mod tests {
         });
         assert!(!positions.is_empty());
         assert_eq!(positions[0].page, 1);
+    }
+
+    #[test]
+    fn reuses_cached_pdf_when_inputs_are_unchanged() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("Hello cache reuse")).expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 0);
+        let pdf_path = options.output_dir.join("main.pdf");
+        let first_modified = fs::metadata(&pdf_path)
+            .expect("pdf metadata")
+            .modified()
+            .expect("pdf modified time");
+        assert!(options.output_dir.join(".ferritex-cache").exists());
+
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let second = service(&FsTestFileAccessGate, &loader).compile(&options);
+        let second_modified = fs::metadata(&pdf_path)
+            .expect("pdf metadata")
+            .modified()
+            .expect("pdf modified time");
+
+        assert_eq!(second.exit_code, 0);
+        assert!(second.diagnostics.is_empty());
+        assert_eq!(first_modified, second_modified);
+    }
+
+    #[test]
+    fn invalid_compile_cache_falls_back_to_full_compile() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("Hello cache fallback")).expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 0);
+        let pdf_path = options.output_dir.join("main.pdf");
+        let first_modified = fs::metadata(&pdf_path)
+            .expect("pdf metadata")
+            .modified()
+            .expect("pdf modified time");
+
+        let cache_file = fs::read_dir(options.output_dir.join(".ferritex-cache"))
+            .expect("read cache dir")
+            .map(|entry| entry.expect("cache entry").path())
+            .next()
+            .expect("cache metadata file");
+        fs::write(&cache_file, b"{not json").expect("corrupt cache metadata");
+
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let second = service(&FsTestFileAccessGate, &loader).compile(&options);
+        let second_modified = fs::metadata(&pdf_path)
+            .expect("pdf metadata")
+            .modified()
+            .expect("pdf modified time");
+
+        let cache_diagnostic = second
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("compile cache metadata is invalid")
+            })
+            .expect("cache fallback diagnostic");
+
+        assert_eq!(second.exit_code, 0);
+        assert_eq!(cache_diagnostic.severity, Severity::Info);
+        assert!(second_modified > first_modified);
     }
 
     #[test]

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ferritex-core = { path = "../ferritex-core" }
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 
