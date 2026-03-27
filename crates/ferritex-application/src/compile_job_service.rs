@@ -5,7 +5,10 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferritex_core::assets::{AssetHandle, LogicalAssetId};
-use ferritex_core::bibliography::api::{parse_bbl, BibliographyDiagnostic, BibliographyState};
+use ferritex_core::bibliography::api::{
+    parse_bbl, BibliographyDiagnostic, BibliographyInputFingerprint, BibliographyState,
+    BibliographyToolchain,
+};
 use ferritex_core::compilation::{
     CompilationJob, CompilationSnapshot, DocumentState, IndexEntry, SymbolLocation,
 };
@@ -33,7 +36,7 @@ use serde_json::json;
 
 use crate::compile_cache::{fingerprint_bytes, CachedSourceSubtree, CompileCache};
 use crate::execution_policy_factory::ExecutionPolicyFactory;
-use crate::ports::AssetBundleLoaderPort;
+use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
 use crate::runtime_options::RuntimeOptions;
 use crate::stable_compile_state::{
     CrossReferenceCaptionEntry, CrossReferenceSectionEntry, CrossReferenceSeed, StableCompileState,
@@ -57,6 +60,7 @@ pub struct CompileResult {
 pub struct CompileJobService<'a> {
     file_access_gate: &'a dyn FileAccessGate,
     asset_bundle_loader: &'a dyn AssetBundleLoaderPort,
+    shell_command_gateway: &'a dyn ShellCommandGatewayPort,
     parser: MinimalLatexParser,
     typesetter: MinimalTypesetter,
     pdf_renderer: PdfRenderer,
@@ -267,14 +271,138 @@ impl<'a> CompileJobService<'a> {
     pub fn new(
         file_access_gate: &'a dyn FileAccessGate,
         asset_bundle_loader: &'a dyn AssetBundleLoaderPort,
+        shell_command_gateway: &'a dyn ShellCommandGatewayPort,
     ) -> Self {
         Self {
             file_access_gate,
             asset_bundle_loader,
+            shell_command_gateway,
             parser: MinimalLatexParser,
             typesetter: MinimalTypesetter,
             pdf_renderer: PdfRenderer::default(),
         }
+    }
+
+    fn try_generate_bibliography(
+        &self,
+        bibliography_context: &BibliographyContext,
+        output_dir: &Path,
+        jobname: &str,
+    ) -> Option<Diagnostic> {
+        match bibliography_context.toolchain() {
+            Some(BibliographyToolchain::Bibtex) => {
+                let aux_contents = bibliography_context.bibtex_aux_contents()?;
+                let aux_path = output_dir.join(format!("{jobname}.aux"));
+                if let Err(error) = self
+                    .file_access_gate
+                    .write_file(&aux_path, aux_contents.as_bytes())
+                {
+                    return Some(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            format!("failed to prepare bibliography aux file: {error}"),
+                        )
+                        .with_file(aux_path.to_string_lossy().into_owned())
+                        .with_suggestion("run bibtex manually or verify the output directory"),
+                    );
+                }
+
+                let command = self
+                    .shell_command_gateway
+                    .execute("bibtex", &[jobname], output_dir);
+                match command {
+                    Ok(result) if result.exit_code == 0 => None,
+                    Ok(result) => {
+                        let mut detail = format!("bibtex exited with code {}", result.exit_code);
+                        let stdout = String::from_utf8_lossy(&result.stdout).trim().to_string();
+                        let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+                        if !stdout.is_empty() {
+                            detail.push_str(&format!(", stdout: {stdout}"));
+                        }
+                        if !stderr.is_empty() {
+                            detail.push_str(&format!(", stderr: {stderr}"));
+                        }
+
+                        Some(
+                            Diagnostic::new(
+                                Severity::Warning,
+                                "automatic bibliography generation failed",
+                            )
+                            .with_file(aux_path.to_string_lossy().into_owned())
+                            .with_context(detail)
+                            .with_suggestion(
+                                "inspect the bibliography tool output or run bibtex manually",
+                            ),
+                        )
+                    }
+                    Err(error) => Some(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            "automatic bibliography generation failed",
+                        )
+                        .with_file(aux_path.to_string_lossy().into_owned())
+                        .with_context(error)
+                        .with_suggestion(
+                            "inspect the bibliography tool output or run bibtex manually",
+                        ),
+                    ),
+                }
+            }
+            Some(BibliographyToolchain::Biber) => Some(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "automatic bibliography generation for biber is not implemented",
+                )
+                .with_file(
+                    output_dir
+                        .join(format!("{jobname}.bbl"))
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .with_suggestion("run biber manually or provide a pre-generated .bbl file"),
+            ),
+            None => None,
+        }
+    }
+
+    fn write_bibliography_sidecar(
+        &self,
+        bbl_path: &Path,
+        input_fingerprint: &BibliographyInputFingerprint,
+        toolchain: BibliographyToolchain,
+    ) -> Option<Diagnostic> {
+        let sidecar_path = bibliography_sidecar_path(bbl_path);
+        let toolchain = match toolchain {
+            BibliographyToolchain::Bibtex => "bibtex",
+            BibliographyToolchain::Biber => "biber",
+        };
+        let payload = json!({
+            "inputFingerprint": { "hash": input_fingerprint.hash },
+            "toolchain": toolchain,
+        });
+        let bytes = match serde_json::to_vec_pretty(&payload) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Some(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        format!("failed to serialize bibliography sidecar metadata: {error}"),
+                    )
+                    .with_file(sidecar_path.to_string_lossy().into_owned()),
+                );
+            }
+        };
+
+        self.file_access_gate
+            .write_file(&sidecar_path, &bytes)
+            .err()
+            .map(|error| {
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!("failed to persist bibliography sidecar metadata: {error}"),
+                )
+                .with_file(sidecar_path.to_string_lossy().into_owned())
+            })
     }
 
     pub fn compile(&self, options: &RuntimeOptions) -> CompileResult {
@@ -450,13 +578,60 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
-        let loaded_bibliography_state = load_bibliography_state(
+        let bibliography_context = BibliographyContext::from_source(&source_tree.source);
+        let mut bibliography_diagnostics = Vec::new();
+        let mut loaded_bibliography_state = load_bibliography_state(
             self.file_access_gate,
             &project_root,
             &options.overlay_roots,
             &options.output_dir,
             &options.jobname,
         );
+        let bibliography_issue = loaded_bibliography_state
+            .as_ref()
+            .and_then(|loaded| {
+                check_bbl_freshness(
+                    loaded,
+                    &bibliography_context,
+                    &project_root,
+                    &options.overlay_roots,
+                )
+            })
+            .or_else(|| {
+                (loaded_bibliography_state.is_none() && bibliography_context.has_citations())
+                    .then_some(BibliographyDiagnostic::MissingBbl)
+            });
+        if bibliography_issue.is_some() && execution_policy.shell_escape_allowed {
+            if let Some(diagnostic) = self.try_generate_bibliography(
+                &bibliography_context,
+                &options.output_dir,
+                &options.jobname,
+            ) {
+                bibliography_diagnostics.push(diagnostic);
+            }
+
+            let bbl_path = options.output_dir.join(format!("{}.bbl", options.jobname));
+            if bbl_path.exists() {
+                if let (Some(input_fingerprint), Some(toolchain)) = (
+                    bibliography_context.current_fingerprint(&project_root, &options.overlay_roots),
+                    bibliography_context.toolchain(),
+                ) {
+                    if let Some(diagnostic) =
+                        self.write_bibliography_sidecar(&bbl_path, &input_fingerprint, toolchain)
+                    {
+                        bibliography_diagnostics.push(diagnostic);
+                    }
+                }
+            }
+
+            loaded_bibliography_state = load_bibliography_state(
+                self.file_access_gate,
+                &project_root,
+                &options.overlay_roots,
+                &options.output_dir,
+                &options.jobname,
+            );
+        }
         let initial_bibliography_state = loaded_bibliography_state
             .as_ref()
             .map(|loaded| loaded.state.clone());
@@ -574,11 +749,11 @@ impl<'a> CompileJobService<'a> {
             .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
             .collect();
         parse_diagnostics.extend(font_diagnostics);
+        parse_diagnostics.extend(bibliography_diagnostics);
         if let Some(loaded_bibliography_state) = &loaded_bibliography_state {
-            let bibliography_names = extract_bibliography_declarations(&source_tree.source);
             if let Some(diagnostic) = check_bbl_freshness(
-                &loaded_bibliography_state.path,
-                &bibliography_names,
+                loaded_bibliography_state,
+                &bibliography_context,
                 &project_root,
                 &options.overlay_roots,
             ) {
@@ -586,7 +761,7 @@ impl<'a> CompileJobService<'a> {
             }
         }
         if initial_bibliography_state.is_none()
-            && source_uses_citations(&source_tree.source)
+            && bibliography_context.has_citations()
             && document
                 .as_ref()
                 .map(|parsed| {
@@ -637,6 +812,20 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
+        for citation_key in &bibliography_context.citation_keys {
+            if parsed_document
+                .bibliography_state
+                .resolve_citation(citation_key)
+                .is_none()
+            {
+                parse_diagnostics.push(diagnostic_for_bibliography(
+                    BibliographyDiagnostic::UnresolvedCitation {
+                        key: citation_key.clone(),
+                    },
+                    Vec::new(),
+                ));
+            }
+        }
         let typeset_document = typeset_document.expect("parsed documents should always typeset");
         let cross_reference_seed =
             cross_reference_seed_from_document(&parsed_document, &typeset_document);
@@ -1414,6 +1603,21 @@ struct ParsePassResult {
 struct LoadedBibliographyState {
     state: BibliographyState,
     path: PathBuf,
+    sidecar: Option<BibliographySidecarMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BibliographyContext {
+    declarations: Vec<String>,
+    addbibresources: Vec<String>,
+    citation_keys: Vec<String>,
+    style: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BibliographySidecarMetadata {
+    input_fingerprint: BibliographyInputFingerprint,
+    toolchain: BibliographyToolchain,
 }
 
 fn load_bibliography_state(
@@ -1436,9 +1640,18 @@ fn load_bibliography_state(
             continue;
         };
         let input = String::from_utf8_lossy(&bytes);
+        let sidecar = load_bibliography_sidecar(file_access_gate, &candidate);
+        let mut state = BibliographyState::from_snapshot(parse_bbl(&input));
+        if let Some(snapshot) = state.bbl.as_mut() {
+            if let Some(sidecar) = &sidecar {
+                snapshot.input_fingerprint = Some(sidecar.input_fingerprint.clone());
+                snapshot.toolchain = Some(sidecar.toolchain);
+            }
+        }
         return Some(LoadedBibliographyState {
-            state: BibliographyState::from_snapshot(parse_bbl(&input)),
+            state,
             path: candidate,
+            sidecar,
         });
     }
 
@@ -1454,9 +1667,9 @@ fn bibliography_candidate_paths(
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
 
-    for root in std::iter::once(project_root)
+    for root in std::iter::once(artifact_root)
+        .chain(std::iter::once(project_root))
         .chain(overlay_roots.iter().map(PathBuf::as_path))
-        .chain(std::iter::once(artifact_root))
     {
         let candidate = root.join(format!("{jobname}.bbl"));
         if seen.insert(candidate.clone()) {
@@ -1467,54 +1680,262 @@ fn bibliography_candidate_paths(
     candidates
 }
 
-fn source_uses_citations(source: &str) -> bool {
-    source.contains(r"\cite")
+impl BibliographyContext {
+    fn from_source(source: &str) -> Self {
+        Self {
+            declarations: extract_bibliography_declarations(source),
+            addbibresources: extract_addbibresource_declarations(source),
+            citation_keys: extract_citation_keys(source),
+            style: extract_bibliography_style(source),
+        }
+    }
+
+    fn has_citations(&self) -> bool {
+        !self.citation_keys.is_empty()
+    }
+
+    fn toolchain(&self) -> Option<BibliographyToolchain> {
+        if !self.addbibresources.is_empty() {
+            Some(BibliographyToolchain::Biber)
+        } else if !self.declarations.is_empty() {
+            Some(BibliographyToolchain::Bibtex)
+        } else {
+            None
+        }
+    }
+
+    fn current_fingerprint(
+        &self,
+        project_root: &Path,
+        overlay_roots: &[PathBuf],
+    ) -> Option<BibliographyInputFingerprint> {
+        let toolchain = self.toolchain()?;
+        let inputs = bibliography_input_paths(project_root, overlay_roots, self)
+            .into_iter()
+            .map(|path| {
+                let hash = std::fs::read(&path)
+                    .map(|bytes| format!("{:016x}", fingerprint_bytes(&bytes)))
+                    .unwrap_or_else(|_| "unreadable".to_string());
+                (path.to_string_lossy().into_owned(), hash)
+            })
+            .collect::<Vec<_>>();
+        let canonical = json!({
+            "toolchain": match toolchain {
+                BibliographyToolchain::Bibtex => "bibtex",
+                BibliographyToolchain::Biber => "biber",
+            },
+            "bibliography": self.declarations,
+            "resources": self.addbibresources,
+            "style": self.style,
+            "inputs": inputs,
+        });
+        let bytes = serde_json::to_vec(&canonical).ok()?;
+        Some(BibliographyInputFingerprint {
+            hash: format!("{:016x}", fingerprint_bytes(&bytes)),
+        })
+    }
+
+    fn bibtex_aux_contents(&self) -> Option<String> {
+        if self.toolchain() != Some(BibliographyToolchain::Bibtex) || self.declarations.is_empty() {
+            return None;
+        }
+
+        let mut lines = Vec::new();
+        lines.push("\\relax".to_string());
+        for key in &self.citation_keys {
+            lines.push(format!("\\citation{{{key}}}"));
+        }
+        lines.push(format!(
+            "\\bibstyle{{{}}}",
+            self.style.as_deref().unwrap_or("plain")
+        ));
+        lines.push(format!("\\bibdata{{{}}}", self.declarations.join(",")));
+        Some(format!("{}\n", lines.join("\n")))
+    }
+}
+
+fn bibliography_sidecar_path(bbl_path: &Path) -> PathBuf {
+    bbl_path.with_extension("bbl.ferritex.json")
+}
+
+fn load_bibliography_sidecar(
+    file_access_gate: &dyn FileAccessGate,
+    bbl_path: &Path,
+) -> Option<BibliographySidecarMetadata> {
+    let sidecar_path = bibliography_sidecar_path(bbl_path);
+    if !sidecar_path.exists()
+        || file_access_gate.check_read(&sidecar_path) == PathAccessDecision::Denied
+    {
+        return None;
+    }
+
+    let bytes = file_access_gate.read_file(&sidecar_path).ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    let hash = value
+        .get("inputFingerprint")
+        .and_then(|entry| entry.get("hash"))
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let toolchain = match value.get("toolchain").and_then(serde_json::Value::as_str)? {
+        "bibtex" => BibliographyToolchain::Bibtex,
+        "biber" => BibliographyToolchain::Biber,
+        _ => return None,
+    };
+
+    Some(BibliographySidecarMetadata {
+        input_fingerprint: BibliographyInputFingerprint { hash },
+        toolchain,
+    })
 }
 
 fn extract_bibliography_declarations(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut cursor = 0usize;
+    extract_command_arguments(source, "bibliography", false)
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
 
-    while let Some(relative_start) = source[cursor..].find(r"\bibliography") {
+fn extract_addbibresource_declarations(source: &str) -> Vec<String> {
+    extract_command_arguments(source, "addbibresource", true)
+}
+
+fn extract_bibliography_style(source: &str) -> Option<String> {
+    extract_command_arguments(source, "bibliographystyle", false)
+        .into_iter()
+        .next()
+}
+
+fn extract_citation_keys(source: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in extract_command_arguments(source, "cite", true) {
+        for key in value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            if seen.insert(key.to_string()) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+fn extract_command_arguments(source: &str, command: &str, skip_optional: bool) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut cursor = 0usize;
+    let needle = format!(r"\{command}");
+
+    while let Some(relative_start) = source[cursor..].find(&needle) {
         let command_start = cursor + relative_start;
-        let mut index = command_start + r"\bibliography".len();
+        let mut index = command_start + needle.len();
+        if source[index..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        {
+            cursor = index;
+            continue;
+        }
         let trimmed = source[index..].trim_start();
         index += source[index..].len() - trimmed.len();
+
+        if skip_optional && source[index..].starts_with('[') {
+            let Some(optional_end) = find_matching_delimiter(source, index, '[', ']') else {
+                break;
+            };
+            index = optional_end;
+            let trimmed = source[index..].trim_start();
+            index += source[index..].len() - trimmed.len();
+        }
 
         if !source[index..].starts_with('{') {
             cursor = (index + 1).min(source.len());
             continue;
         }
 
-        let Some(closing_offset) = source[index..].find('}') else {
+        let Some(argument_end) = find_matching_delimiter(source, index, '{', '}') else {
             break;
         };
-        let declaration = &source[index + 1..index + closing_offset];
-        names.extend(
-            declaration
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned),
-        );
-        cursor = index + closing_offset + 1;
+        let value = source[index + 1..argument_end - 1].trim();
+        if !value.is_empty() {
+            values.push(value.to_string());
+        }
+        cursor = argument_end;
     }
 
-    names
+    values
+}
+
+fn find_matching_delimiter(input: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut escaped = false;
+
+    for (offset, ch) in input[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(start + offset + ch.len_utf8());
+            }
+        }
+    }
+
+    None
 }
 
 fn check_bbl_freshness(
-    bbl_path: &Path,
-    bib_names: &[String],
+    loaded_bibliography_state: &LoadedBibliographyState,
+    bibliography_context: &BibliographyContext,
     project_root: &Path,
     overlay_roots: &[PathBuf],
 ) -> Option<BibliographyDiagnostic> {
-    let bbl_modified = std::fs::metadata(bbl_path).ok()?.modified().ok()?;
+    let current_fingerprint = bibliography_context.current_fingerprint(project_root, overlay_roots);
+    if let (Some(sidecar), Some(current_fingerprint)) = (
+        &loaded_bibliography_state.sidecar,
+        current_fingerprint.as_ref(),
+    ) {
+        if sidecar.toolchain
+            != bibliography_context
+                .toolchain()
+                .unwrap_or(sidecar.toolchain)
+            || sidecar.input_fingerprint != *current_fingerprint
+        {
+            return Some(BibliographyDiagnostic::StaleBbl {
+                reason: format!(
+                    "bibliography input fingerprint no longer matches `{}`",
+                    loaded_bibliography_state.path.display()
+                ),
+            });
+        }
+        return None;
+    }
 
-    for bib_name in bib_names {
-        let Some(candidate) = bibliography_input_path(project_root, overlay_roots, bib_name) else {
-            continue;
-        };
+    let bbl_modified = std::fs::metadata(&loaded_bibliography_state.path)
+        .ok()?
+        .modified()
+        .ok()?;
+
+    for candidate in bibliography_input_paths(project_root, overlay_roots, bibliography_context) {
         let Ok(metadata) = std::fs::metadata(&candidate) else {
             continue;
         };
@@ -1527,7 +1948,7 @@ fn check_bbl_freshness(
                 reason: format!(
                     "bibliography source `{}` is newer than `{}`",
                     candidate.display(),
-                    bbl_path.display()
+                    loaded_bibliography_state.path.display()
                 ),
             });
         }
@@ -1536,14 +1957,33 @@ fn check_bbl_freshness(
     None
 }
 
+fn bibliography_input_paths(
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    bibliography_context: &BibliographyContext,
+) -> Vec<PathBuf> {
+    bibliography_context
+        .declarations
+        .iter()
+        .chain(bibliography_context.addbibresources.iter())
+        .filter_map(|name| bibliography_input_path(project_root, overlay_roots, name))
+        .collect()
+}
+
 fn bibliography_input_path(
     project_root: &Path,
     overlay_roots: &[PathBuf],
     bib_name: &str,
 ) -> Option<PathBuf> {
+    let candidate_name = if Path::new(bib_name).extension().is_some() {
+        PathBuf::from(bib_name)
+    } else {
+        PathBuf::from(format!("{bib_name}.bib"))
+    };
+
     std::iter::once(project_root)
         .chain(overlay_roots.iter().map(PathBuf::as_path))
-        .map(|root| root.join(format!("{bib_name}.bib")))
+        .map(|root| root.join(&candidate_name))
         .find(|candidate| candidate.exists())
 }
 
@@ -3052,7 +3492,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{run_font_tasks, CompileJobService};
-    use crate::ports::AssetBundleLoaderPort;
+    use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput};
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
     use ferritex_core::diagnostics::Severity;
     use ferritex_core::font::OpenTypeFont;
@@ -3371,6 +3811,77 @@ mod tests {
         }
     }
 
+    struct NoopShellCommandGateway;
+
+    impl ShellCommandGatewayPort for NoopShellCommandGateway {
+        fn execute(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _working_dir: &Path,
+        ) -> Result<ShellCommandOutput, String> {
+            Ok(ShellCommandOutput {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    static NOOP_SHELL_COMMAND_GATEWAY: NoopShellCommandGateway = NoopShellCommandGateway;
+
+    #[derive(Default)]
+    struct MockShellCommandGateway {
+        commands: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
+        generated_bbl: Mutex<Option<String>>,
+        exit_code: Mutex<i32>,
+        error: Mutex<Option<String>>,
+    }
+
+    impl MockShellCommandGateway {
+        fn with_bbl(bbl: impl Into<String>) -> Self {
+            Self {
+                generated_bbl: Mutex::new(Some(bbl.into())),
+                ..Self::default()
+            }
+        }
+
+        fn commands(&self) -> Vec<(String, Vec<String>, PathBuf)> {
+            self.commands.lock().expect("commands lock").clone()
+        }
+    }
+
+    impl ShellCommandGatewayPort for MockShellCommandGateway {
+        fn execute(
+            &self,
+            program: &str,
+            args: &[&str],
+            working_dir: &Path,
+        ) -> Result<ShellCommandOutput, String> {
+            self.commands.lock().expect("commands lock").push((
+                program.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                working_dir.to_path_buf(),
+            ));
+
+            if let Some(error) = self.error.lock().expect("error lock").clone() {
+                return Err(error);
+            }
+
+            if let Some(bbl) = self.generated_bbl.lock().expect("bbl lock").clone() {
+                let jobname = args.first().copied().unwrap_or("main");
+                fs::write(working_dir.join(format!("{jobname}.bbl")), bbl)
+                    .expect("write generated bbl");
+            }
+
+            Ok(ShellCommandOutput {
+                exit_code: *self.exit_code.lock().expect("exit code lock"),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
     fn runtime_options(input_file: PathBuf, output_dir: PathBuf) -> RuntimeOptions {
         RuntimeOptions {
             input_file,
@@ -3393,7 +3904,19 @@ mod tests {
         file_access_gate: &'a dyn FileAccessGate,
         asset_bundle_loader: &'a dyn AssetBundleLoaderPort,
     ) -> CompileJobService<'a> {
-        CompileJobService::new(file_access_gate, asset_bundle_loader)
+        CompileJobService::new(
+            file_access_gate,
+            asset_bundle_loader,
+            &NOOP_SHELL_COMMAND_GATEWAY,
+        )
+    }
+
+    fn service_with_shell<'a>(
+        file_access_gate: &'a dyn FileAccessGate,
+        asset_bundle_loader: &'a dyn AssetBundleLoaderPort,
+        shell_command_gateway: &'a dyn ShellCommandGatewayPort,
+    ) -> CompileJobService<'a> {
+        CompileJobService::new(file_access_gate, asset_bundle_loader, shell_command_gateway)
     }
 
     fn document(body: &str) -> String {
@@ -4194,6 +4717,39 @@ mod tests {
     }
 
     #[test]
+    fn prefers_artifact_root_bbl_over_project_root_bbl() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            dir.path().join("main.bbl"),
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Project reference\n\\end{thebibliography}\n",
+        )
+        .expect("write project bbl");
+        fs::write(
+            output_dir.join("main.bbl"),
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Artifact reference\n\\end{thebibliography}\n",
+        )
+        .expect("write artifact bbl");
+
+        let options = runtime_options(input_file, output_dir.clone());
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("[1] Artifact reference"));
+        assert!(!pdf.contains("[1] Project reference"));
+    }
+
+    #[test]
     fn stale_bbl_emits_warning_when_bib_is_newer() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -4235,6 +4791,92 @@ mod tests {
     }
 
     #[test]
+    fn stale_bbl_emits_warning_when_sidecar_fingerprint_mismatches() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let bbl_path = dir.path().join("main.bbl");
+        let bib_path = dir.path().join("refs.bib");
+        let sidecar_path = dir.path().join("main.bbl.ferritex.json");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(&bib_path, "@book{key,\n  title = {Reference text}\n}\n").expect("write bib");
+        fs::write(
+            &bbl_path,
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Reference text\n\\end{thebibliography}\n",
+        )
+        .expect("write bbl");
+        fs::write(
+            &sidecar_path,
+            r#"{"inputFingerprint":{"hash":"deadbeef"},"toolchain":"bibtex"}"#,
+        )
+        .expect("write sidecar");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 1);
+        let stale = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "bibliography .bbl file appears stale")
+            .expect("stale bibliography diagnostic");
+        assert!(stale
+            .context
+            .as_deref()
+            .unwrap_or_default()
+            .contains("fingerprint"));
+    }
+
+    #[test]
+    fn shell_escape_runs_bibtex_when_bbl_is_missing() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let bib_path = dir.path().join("refs.bib");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliographystyle{plain}\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            &bib_path,
+            "@book{key,\n  title = {Generated reference}\n}\n",
+        )
+        .expect("write bib");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.shell_escape = ShellEscapeMode::Enabled;
+        let loader = MockAssetBundleLoader::valid();
+        let shell_gateway = MockShellCommandGateway::with_bbl(
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Generated reference\n\\end{thebibliography}\n",
+        );
+
+        let result =
+            service_with_shell(&FsTestFileAccessGate, &loader, &shell_gateway).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            shell_gateway.commands(),
+            vec![(
+                "bibtex".to_string(),
+                vec!["main".to_string()],
+                options.output_dir.clone()
+            )]
+        );
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [1]."));
+        assert!(pdf.contains("[1] Generated reference"));
+        let sidecar = fs::read_to_string(options.output_dir.join("main.bbl.ferritex.json"))
+            .expect("read sidecar");
+        assert!(sidecar.contains("\"toolchain\": \"bibtex\""));
+    }
+
+    #[test]
     fn missing_bbl_emits_warning_when_citations_are_present() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -4247,12 +4889,44 @@ mod tests {
 
         assert_eq!(result.exit_code, 1);
         assert!(result.output_pdf.is_some());
-        assert_eq!(result.diagnostics.len(), 1);
-        assert_eq!(result.diagnostics[0].severity, Severity::Warning);
-        assert_eq!(
-            result.diagnostics[0].message,
-            "bibliography .bbl file not found"
-        );
+        assert_eq!(result.diagnostics.len(), 2);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "bibliography .bbl file not found"));
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "unresolved citation `missing`"));
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [?]."));
+    }
+
+    #[test]
+    fn unresolved_citation_emits_warning_when_bbl_lacks_requested_key() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            document("See \\cite{missing}.\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            dir.path().join("main.bbl"),
+            "\\begin{thebibliography}{99}\n\\bibitem{other} Other reference\n\\end{thebibliography}\n",
+        )
+        .expect("write bbl");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 1);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "unresolved citation `missing`"));
         let pdf = read_pdf(&options.output_dir.join("main.pdf"));
         assert!(pdf.contains("See [?]."));
     }

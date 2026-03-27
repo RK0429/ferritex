@@ -14,6 +14,7 @@ use ferritex_core::policy::{ExecutionPolicy, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessGate, PathAccessDecision};
 use ferritex_infra::asset_bundle::AssetBundleLoader;
 use ferritex_infra::fs::FsFileAccessGate;
+use ferritex_infra::shell::ShellCommandGateway;
 use ferritex_infra::watcher::PollingFileWatcher;
 
 use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, CompileCommand};
@@ -21,9 +22,14 @@ use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, Com
 pub fn run_watch(command: &CompileCommand) -> i32 {
     let options = runtime_options_from_command(command);
     let policy = ExecutionPolicyFactory::create(&options);
+    let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
     let file_access_gate = FsFileAccessGate::from_policy(policy);
     let asset_bundle_loader = AssetBundleLoader;
-    let service = CompileJobService::new(&file_access_gate, &asset_bundle_loader);
+    let service = CompileJobService::new(
+        &file_access_gate,
+        &asset_bundle_loader,
+        &shell_command_gateway,
+    );
     let scheduler = WorkspaceJobScheduler::default();
     let workspace_root = options
         .input_file

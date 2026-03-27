@@ -12,6 +12,7 @@ use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_infra::asset_bundle::AssetBundleLoader;
 use ferritex_infra::fs::FsFileAccessGate;
 use ferritex_infra::preview::LoopbackPreviewTransport;
+use ferritex_infra::shell::ShellCommandGateway;
 
 mod lsp_server;
 mod watch_runner;
@@ -119,9 +120,14 @@ fn run(cli: Cli) -> i32 {
 fn handle_compile(command: &CompileCommand) -> i32 {
     let options = runtime_options_from_command(command);
     let policy = ExecutionPolicyFactory::create(&options);
+    let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
     let file_access_gate = FsFileAccessGate::from_policy(policy);
     let asset_bundle_loader = AssetBundleLoader;
-    let service = CompileJobService::new(&file_access_gate, &asset_bundle_loader);
+    let service = CompileJobService::new(
+        &file_access_gate,
+        &asset_bundle_loader,
+        &shell_command_gateway,
+    );
     let result = service.compile(&options);
     emit_diagnostics(&result.diagnostics);
     result.exit_code
@@ -203,9 +209,14 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
         input_file: options.input_file.clone(),
         jobname: options.jobname.clone(),
     };
+    let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
     let file_access_gate = FsFileAccessGate::from_policy(policy.clone());
     let asset_bundle_loader = AssetBundleLoader;
-    let service = CompileJobService::new(&file_access_gate, &asset_bundle_loader);
+    let service = CompileJobService::new(
+        &file_access_gate,
+        &asset_bundle_loader,
+        &shell_command_gateway,
+    );
     let result = service.compile(&options);
     if result.exit_code != 0 {
         return Err(result.diagnostics);

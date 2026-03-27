@@ -15,6 +15,7 @@ use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::policy::{ExecutionPolicy, PreviewPublicationPolicy};
 use ferritex_infra::asset_bundle::AssetBundleLoader;
 use ferritex_infra::fs::FsFileAccessGate;
+use ferritex_infra::shell::ShellCommandGateway;
 use serde_json::{json, Value};
 
 use crate::emit_diagnostic;
@@ -483,7 +484,12 @@ fn refresh_compile_state(
             }),
         });
         let asset_bundle_loader = AssetBundleLoader;
-        let compile_service = CompileJobService::new(&file_access_gate, &asset_bundle_loader);
+        let shell_command_gateway = ShellCommandGateway::new(false);
+        let compile_service = CompileJobService::new(
+            &file_access_gate,
+            &asset_bundle_loader,
+            &shell_command_gateway,
+        );
         *latest_compile_state = Some((
             uri.to_string(),
             compile_service.compile_from_source(text, uri),
