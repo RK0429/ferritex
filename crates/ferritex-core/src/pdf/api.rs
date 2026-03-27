@@ -1,3 +1,4 @@
+use crate::compilation::LinkStyle;
 pub use crate::graphics::api::ImageColorSpace;
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
@@ -133,6 +134,7 @@ impl PdfRenderer {
     pub fn render(&self, document: &TypesetDocument) -> PdfDocument {
         let page_count = document.pages.len();
         let total_lines = document.pages.iter().map(|page| page.lines.len()).sum();
+        let link_style = &document.navigation.default_link_style;
         let mut pdf = Vec::<u8>::new();
         let mut offsets = Vec::<usize>::new();
         let page_object_start = 3usize;
@@ -227,7 +229,7 @@ impl PdfRenderer {
                 .get(page_index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let stream = render_page_stream(page, page_images, &image_objects);
+            let stream = render_page_stream(page, page_images, &image_objects, link_style);
             append_object(
                 &mut pdf,
                 &mut offsets,
@@ -241,16 +243,23 @@ impl PdfRenderer {
 
         for annotations in &page_annotations {
             for annotation in annotations {
+                let (border, color) = if link_style.color_links {
+                    ("[0 0 0]", "")
+                } else {
+                    ("[0 0 1]", " /C [0 0 1]")
+                };
                 append_object(
                     &mut pdf,
                     &mut offsets,
                     &format!(
-                        "{} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border [0 0 0] /A << /Type /Action /S /URI /URI ({}) >> >>\nendobj\n",
+                        "{} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border {}{} /A << /Type /Action /S /URI /URI ({}) >> >>\nendobj\n",
                         annotation.object_id,
                         points_to_pdf_number(annotation.x_start),
                         points_to_pdf_number(annotation.y_bottom),
                         points_to_pdf_number(annotation.x_end),
                         points_to_pdf_number(annotation.y_top),
+                        border,
+                        color,
                         escape_pdf_text(&annotation.url),
                     ),
                 );
@@ -518,13 +527,14 @@ fn render_page_stream(
     page: &TypesetPage,
     placed_images: &[PlacedImage],
     image_objects: &[PdfImageXObject],
+    link_style: &LinkStyle,
 ) -> String {
     let mut stream = String::new();
 
-    stream.push_str(&render_text_lines(&page.lines));
+    stream.push_str(&render_text_lines(&page.lines, link_style));
     for placement in &page.float_placements {
         let lines = resolve_float_lines(placement);
-        stream.push_str(&render_text_lines(&lines));
+        stream.push_str(&render_text_lines(&lines, link_style));
     }
 
     for placement in placed_images {
@@ -536,7 +546,7 @@ fn render_page_stream(
     stream
 }
 
-fn render_text_lines(lines: &[TextLine]) -> String {
+fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
     let Some(first_line) = lines.first() else {
         return String::new();
     };
@@ -547,7 +557,7 @@ fn render_text_lines(lines: &[TextLine]) -> String {
         LEFT_MARGIN_PT,
         points_to_pdf_number(first_line.y)
     ));
-    stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&first_line.text)));
+    render_text_line(&mut stream, first_line, link_style);
 
     let mut previous_y = first_line.y;
     for line in &lines[1..] {
@@ -555,11 +565,60 @@ fn render_text_lines(lines: &[TextLine]) -> String {
             "0 {} Td\n",
             points_to_pdf_number(line.y - previous_y)
         ));
-        stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
+        render_text_line(&mut stream, line, link_style);
         previous_y = line.y;
     }
     stream.push_str("ET\n");
     stream
+}
+
+fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle) {
+    let Some(link_color) = active_link_color(link_style) else {
+        stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
+        return;
+    };
+
+    let mut links = line
+        .links
+        .iter()
+        .filter(|link| !link.url.is_empty() && link.start_char < link.end_char)
+        .collect::<Vec<_>>();
+    if links.is_empty() {
+        stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
+        return;
+    }
+
+    links.sort_by_key(|link| (link.start_char, link.end_char));
+    let boundaries = char_boundaries(&line.text);
+    let char_count = boundaries.len().saturating_sub(1);
+    let mut cursor = 0usize;
+    for link in links {
+        let start = link.start_char.min(char_count);
+        let end = link.end_char.min(char_count);
+        if start >= end || start < cursor {
+            continue;
+        }
+        if cursor < start {
+            stream.push_str(&format!(
+                "({}) Tj\n",
+                escape_pdf_text(char_slice(&line.text, &boundaries, cursor, start))
+            ));
+        }
+        stream.push_str(&pdf_rgb_operator(link_color));
+        stream.push_str(&format!(
+            "({}) Tj\n",
+            escape_pdf_text(char_slice(&line.text, &boundaries, start, end))
+        ));
+        stream.push_str("0 0 0 rg\n");
+        cursor = end;
+    }
+
+    if cursor < char_count {
+        stream.push_str(&format!(
+            "({}) Tj\n",
+            escape_pdf_text(char_slice(&line.text, &boundaries, cursor, char_count))
+        ));
+    }
 }
 
 fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
@@ -573,6 +632,57 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
             links: line.links.clone(),
         })
         .collect()
+}
+
+fn resolve_named_color(name: &str) -> Option<(f64, f64, f64)> {
+    match name.to_ascii_lowercase().as_str() {
+        "red" => Some((1.0, 0.0, 0.0)),
+        "blue" => Some((0.0, 0.0, 1.0)),
+        "green" => Some((0.0, 1.0, 0.0)),
+        "cyan" => Some((0.0, 1.0, 1.0)),
+        "magenta" => Some((1.0, 0.0, 1.0)),
+        "yellow" => Some((1.0, 1.0, 0.0)),
+        "black" => Some((0.0, 0.0, 0.0)),
+        "white" => Some((1.0, 1.0, 1.0)),
+        "darkgray" | "darkgrey" => Some((0.25, 0.25, 0.25)),
+        "gray" | "grey" => Some((0.5, 0.5, 0.5)),
+        "lightgray" | "lightgrey" => Some((0.75, 0.75, 0.75)),
+        "brown" => Some((0.75, 0.5, 0.25)),
+        "olive" => Some((0.5, 0.5, 0.0)),
+        "orange" => Some((1.0, 0.5, 0.0)),
+        "pink" => Some((1.0, 0.75, 0.75)),
+        "purple" => Some((0.75, 0.0, 0.25)),
+        "teal" => Some((0.0, 0.5, 0.5)),
+        "violet" => Some((0.5, 0.0, 0.5)),
+        _ => None,
+    }
+}
+
+fn active_link_color(link_style: &LinkStyle) -> Option<(f64, f64, f64)> {
+    link_style.color_links.then(|| {
+        link_style
+            .link_color
+            .as_deref()
+            .and_then(resolve_named_color)
+            .unwrap_or((0.0, 0.0, 1.0))
+    })
+}
+
+fn pdf_rgb_operator((red, green, blue): (f64, f64, f64)) -> String {
+    format!("{red} {green} {blue} rg\n")
+}
+
+fn char_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(text.len());
+    boundaries
+}
+
+fn char_slice<'a>(text: &'a str, boundaries: &[usize], start: usize, end: usize) -> &'a str {
+    &text[boundaries[start]..boundaries[end]]
 }
 
 fn render_image_placement(image: &PlacedImage) -> String {
@@ -799,11 +909,13 @@ fn escape_pdf_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FontResource, ImageColorSpace, ImageFilter, PdfImageXObject, PdfRenderer, PlacedImage,
+        resolve_named_color, FontResource, ImageColorSpace, ImageFilter, PdfImageXObject,
+        PdfRenderer, PlacedImage,
     };
+    use crate::compilation::LinkStyle;
     use crate::kernel::api::DimensionValue;
     use crate::typesetting::api::{
-        FloatPlacement, PageBox, TextLine, TypesetDocument, TypesetPage,
+        FloatPlacement, PageBox, TextLine, TextLineLink, TypesetDocument, TypesetPage,
     };
 
     const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -829,6 +941,7 @@ mod tests {
                 .collect(),
             images: Vec::new(),
             float_placements: Vec::new(),
+            index_entries: Vec::new(),
         }
     }
 
@@ -839,6 +952,20 @@ mod tests {
             title: None,
             author: None,
             navigation: Default::default(),
+            index_entries: Vec::new(),
+            has_unresolved_index: false,
+        }
+    }
+
+    fn linked_line(text: &str, start_char: usize, end_char: usize, url: &str) -> TextLine {
+        TextLine {
+            text: text.to_string(),
+            y: points(720),
+            links: vec![TextLineLink {
+                url: url.to_string(),
+                start_char,
+                end_char,
+            }],
         }
     }
 
@@ -881,6 +1008,8 @@ mod tests {
             title: None,
             author: None,
             navigation: Default::default(),
+            index_entries: Vec::new(),
+            has_unresolved_index: false,
         });
         let content = String::from_utf8_lossy(&pdf.bytes);
 
@@ -895,6 +1024,8 @@ mod tests {
             title: None,
             author: None,
             navigation: Default::default(),
+            index_entries: Vec::new(),
+            has_unresolved_index: false,
         };
         let pdf = PdfRenderer::default().render(&document);
         let content = String::from_utf8_lossy(&pdf.bytes);
@@ -975,6 +1106,142 @@ mod tests {
 
         assert!(content.contains("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"));
         assert!(content.contains("/Resources << /Font << /F1 5 0 R >> >>"));
+    }
+
+    #[test]
+    fn resolves_named_latex_colors() {
+        assert_eq!(resolve_named_color("red"), Some((1.0, 0.0, 0.0)));
+        assert_eq!(resolve_named_color("blue"), Some((0.0, 0.0, 1.0)));
+        assert_eq!(resolve_named_color("green"), Some((0.0, 1.0, 0.0)));
+        assert_eq!(resolve_named_color("cyan"), Some((0.0, 1.0, 1.0)));
+        assert_eq!(resolve_named_color("magenta"), Some((1.0, 0.0, 1.0)));
+        assert_eq!(resolve_named_color("yellow"), Some((1.0, 1.0, 0.0)));
+        assert_eq!(resolve_named_color("black"), Some((0.0, 0.0, 0.0)));
+        assert_eq!(resolve_named_color("white"), Some((1.0, 1.0, 1.0)));
+        assert_eq!(resolve_named_color("darkgray"), Some((0.25, 0.25, 0.25)));
+        assert_eq!(resolve_named_color("darkgrey"), Some((0.25, 0.25, 0.25)));
+        assert_eq!(resolve_named_color("gray"), Some((0.5, 0.5, 0.5)));
+        assert_eq!(resolve_named_color("grey"), Some((0.5, 0.5, 0.5)));
+        assert_eq!(resolve_named_color("lightgray"), Some((0.75, 0.75, 0.75)));
+        assert_eq!(resolve_named_color("lightgrey"), Some((0.75, 0.75, 0.75)));
+        assert_eq!(resolve_named_color("brown"), Some((0.75, 0.5, 0.25)));
+        assert_eq!(resolve_named_color("olive"), Some((0.5, 0.5, 0.0)));
+        assert_eq!(resolve_named_color("orange"), Some((1.0, 0.5, 0.0)));
+        assert_eq!(resolve_named_color("pink"), Some((1.0, 0.75, 0.75)));
+        assert_eq!(resolve_named_color("purple"), Some((0.75, 0.0, 0.25)));
+        assert_eq!(resolve_named_color("teal"), Some((0.0, 0.5, 0.5)));
+        assert_eq!(resolve_named_color("violet"), Some((0.5, 0.0, 0.5)));
+        assert_eq!(resolve_named_color("unknown"), None);
+    }
+
+    #[test]
+    fn colorlinks_render_colored_text_and_restore_default_color() {
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![linked_line(
+            "prefix link suffix",
+            7,
+            11,
+            "https://example.com",
+        )];
+        document.navigation.default_link_style = LinkStyle {
+            color_links: true,
+            link_color: Some("red".to_string()),
+        };
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("(prefix ) Tj\n1 0 0 rg\n(link) Tj\n0 0 0 rg\n( suffix) Tj"));
+        assert!(content.contains("/Border [0 0 0]"));
+    }
+
+    #[test]
+    fn default_link_annotations_have_visible_blue_border() {
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![linked_line(
+            "prefix link suffix",
+            7,
+            11,
+            "https://example.com",
+        )];
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/Border [0 0 1] /C [0 0 1]"));
+        assert!(!content.contains("1 0 0 rg"));
+    }
+
+    #[test]
+    fn colorlinks_without_named_color_fall_back_to_blue_text() {
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![linked_line(
+            "prefix link suffix",
+            7,
+            11,
+            "https://example.com",
+        )];
+        document.navigation.default_link_style = LinkStyle {
+            color_links: true,
+            link_color: Some("unknown".to_string()),
+        };
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("0 0 1 rg\n(link) Tj\n0 0 0 rg"));
+    }
+
+    #[test]
+    fn colorlinks_none_link_color_falls_back_to_blue() {
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![linked_line(
+            "prefix link suffix",
+            7,
+            11,
+            "https://example.com",
+        )];
+        document.navigation.default_link_style = LinkStyle {
+            color_links: true,
+            link_color: None,
+        };
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("0 0 1 rg\n(link) Tj\n0 0 0 rg"));
+    }
+
+    #[test]
+    fn colorlinks_multiple_links_on_same_line() {
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![TextLine {
+            text: "aaa bbb ccc".to_string(),
+            y: points(720),
+            links: vec![
+                TextLineLink {
+                    url: "https://a.com".to_string(),
+                    start_char: 4,
+                    end_char: 7,
+                },
+                TextLineLink {
+                    url: "https://b.com".to_string(),
+                    start_char: 8,
+                    end_char: 11,
+                },
+            ],
+        }];
+        document.navigation.default_link_style = LinkStyle {
+            color_links: true,
+            link_color: Some("red".to_string()),
+        };
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains(
+            "(aaa ) Tj\n1 0 0 rg\n(bbb) Tj\n0 0 0 rg\n( ) Tj\n1 0 0 rg\n(ccc) Tj\n0 0 0 rg"
+        ));
     }
 
     #[test]

@@ -6,13 +6,15 @@ use super::{
     line_breaker,
 };
 
-use crate::compilation::{LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft};
+use crate::compilation::{
+    IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
+};
 use crate::font::api::TfmMetrics;
 use crate::graphics::api::{
     compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
 };
 use crate::kernel::api::DimensionValue;
-use crate::parser::api::{DocumentNode, FloatType, MathNode, ParsedDocument};
+use crate::parser::api::{DocumentNode, FloatType, IndexRawEntry, MathNode, ParsedDocument};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
@@ -53,6 +55,7 @@ pub struct TypesetPage {
     pub images: Vec<TypesetImage>,
     pub page_box: PageBox,
     pub float_placements: Vec<FloatPlacement>,
+    pub index_entries: Vec<IndexRawEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +65,8 @@ pub struct TypesetDocument {
     pub title: Option<String>,
     pub author: Option<String>,
     pub navigation: NavigationState,
+    pub index_entries: Vec<IndexEntry>,
+    pub has_unresolved_index: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +307,9 @@ pub enum VListItem {
     Penalty {
         value: i32,
     },
+    IndexMarker {
+        entry: IndexRawEntry,
+    },
     Float {
         spec: PlacementSpec,
         content: FloatContent,
@@ -441,6 +449,7 @@ impl MinimalTypesetter {
         );
         let pages = paginate_vlist(&vlist, &page_box);
         let outlines = collect_outlines(document, &pages);
+        let index_entries = resolve_index_entries(&pages);
 
         TypesetDocument {
             pages,
@@ -448,6 +457,8 @@ impl MinimalTypesetter {
             title: document.title.clone(),
             author: document.author.clone(),
             navigation: build_navigation_state(document),
+            index_entries,
+            has_unresolved_index: document.has_unresolved_index,
         }
     }
 }
@@ -631,6 +642,15 @@ fn document_nodes_to_hlist_with_config(
                     }
                 }
                 hlist.extend(link_hlist);
+            }
+            DocumentNode::IndexMarker(_) => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                );
             }
             DocumentNode::InlineMath(nodes) => {
                 flush_word(
@@ -833,6 +853,19 @@ fn document_nodes_to_vlist_with_state(
                         vlist.push(VListItem::Image { graphics_box });
                     }
                 }
+                segment_start = index + 1;
+            }
+            DocumentNode::IndexMarker(entry) => {
+                append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                );
+                vlist.push(VListItem::IndexMarker {
+                    entry: entry.clone(),
+                });
                 segment_start = index + 1;
             }
             DocumentNode::Float {
@@ -1143,6 +1176,7 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                 consumed_height = consumed_height + *height;
             }
             VListItem::Penalty { .. }
+            | VListItem::IndexMarker { .. }
             | VListItem::Float { .. }
             | VListItem::PlacedFloat { .. }
             | VListItem::ClearPage => {}
@@ -1218,6 +1252,20 @@ pub fn resolve_page_labels(
         .collect()
 }
 
+fn resolve_index_entries(pages: &[TypesetPage]) -> Vec<IndexEntry> {
+    pages
+        .iter()
+        .enumerate()
+        .flat_map(|(page_index, page)| {
+            page.index_entries.iter().map(move |entry| IndexEntry {
+                sort_key: entry.sort_key.clone(),
+                display: entry.display.clone(),
+                page: Some((page_index + 1) as u32),
+            })
+        })
+        .collect()
+}
+
 fn find_outline_anchor(
     anchors: &[(usize, &TextLine)],
     used: &[bool],
@@ -1240,6 +1288,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
             images: Vec::new(),
             page_box: page_box.clone(),
             float_placements: Vec::new(),
+            index_entries: Vec::new(),
         }];
     }
 
@@ -1539,6 +1588,7 @@ fn vlist_item_height(item: &VListItem) -> DimensionValue {
         VListItem::Image { graphics_box } => graphics_box.height,
         VListItem::Glue { height } => *height,
         VListItem::Penalty { .. }
+        | VListItem::IndexMarker { .. }
         | VListItem::Float { .. }
         | VListItem::PlacedFloat { .. }
         | VListItem::ClearPage => DimensionValue::zero(),
@@ -1549,6 +1599,7 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
     let mut lines = Vec::new();
     let mut images = Vec::new();
     let mut float_placements = Vec::new();
+    let mut index_entries = Vec::new();
     let mut consumed_height = DimensionValue::zero();
 
     for item in items {
@@ -1592,6 +1643,9 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                     display_height: image.display_height,
                 }));
             }
+            VListItem::IndexMarker { entry } => {
+                index_entries.push(entry.clone());
+            }
             VListItem::Glue { height } => {
                 consumed_height = consumed_height + *height;
             }
@@ -1604,6 +1658,7 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
         images,
         page_box: page_box.clone(),
         float_placements,
+        index_entries,
     }
 }
 
@@ -1896,6 +1951,7 @@ mod tests {
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::bibliography::api::BibliographyState;
+    use crate::compilation::IndexEntry;
     use crate::font::api::TfmMetrics;
     use crate::graphics::api::{
         ExternalGraphic, GraphicAssetResolver, ImageColorSpace, ImageMetadata,
@@ -1903,8 +1959,8 @@ mod tests {
     use crate::kernel::api::DimensionValue;
     use crate::kernel::api::StableId;
     use crate::parser::api::{
-        DocumentNode, FloatType, IncludeGraphicsOptions, LineTag, MathLine, MathNode,
-        MinimalLatexParser, OverUnderKind, ParsedDocument, Parser,
+        DocumentNode, FloatType, IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine,
+        MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -2040,6 +2096,7 @@ mod tests {
                 images: Vec::new(),
                 page_box: page_box.clone(),
                 float_placements: Vec::new(),
+                index_entries: Vec::new(),
             },
             TypesetPage {
                 lines: vec![TextLine {
@@ -2050,12 +2107,54 @@ mod tests {
                 images: Vec::new(),
                 page_box,
                 float_placements: Vec::new(),
+                index_entries: Vec::new(),
             },
         ];
 
         assert_eq!(
             resolve_page_labels(&parsed, &typeset),
             BTreeMap::from([("sec:later".to_string(), 2)])
+        );
+    }
+
+    #[test]
+    fn minimal_typesetter_collects_index_entries_with_page_numbers() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\makeindex\n\\begin{document}\nAlpha\\index{Alpha}\n\\newpage\nBeta\\index{beta@Beta}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        let typeset = MinimalTypesetter.typeset(&document);
+
+        assert_eq!(
+            typeset.pages[0].index_entries,
+            vec![IndexRawEntry {
+                sort_key: "Alpha".to_string(),
+                display: "Alpha".to_string(),
+            }]
+        );
+        assert_eq!(
+            typeset.pages[1].index_entries,
+            vec![IndexRawEntry {
+                sort_key: "beta".to_string(),
+                display: "Beta".to_string(),
+            }]
+        );
+        assert_eq!(
+            typeset.index_entries,
+            vec![
+                IndexEntry {
+                    sort_key: "Alpha".to_string(),
+                    display: "Alpha".to_string(),
+                    page: Some(1),
+                },
+                IndexEntry {
+                    sort_key: "beta".to_string(),
+                    display: "Beta".to_string(),
+                    page: Some(2),
+                },
+            ]
         );
     }
 
@@ -3064,6 +3163,8 @@ mod tests {
             title: None,
             author: None,
             navigation: Default::default(),
+            index_entries: Vec::new(),
+            has_unresolved_index: false,
         };
         let hyphenated_lines = document.pages[0]
             .lines

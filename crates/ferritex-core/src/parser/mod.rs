@@ -6,8 +6,8 @@ mod registers;
 mod tokenizer;
 
 pub use api::{
-    parse_bbl_input, DocumentLabels, IncludeGraphicsOptions, MinimalLatexParser, ParseError,
-    ParseOutput, ParsedDocument, Parser, SectionEntry,
+    parse_bbl_input, DocumentLabels, IncludeGraphicsOptions, IndexRawEntry, MinimalLatexParser,
+    ParseError, ParseOutput, ParsedDocument, Parser, SectionEntry,
 };
 pub use macro_engine::{EnvironmentDef, MacroDef, MacroEngine};
 pub use package_loading::{

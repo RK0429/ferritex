@@ -40,6 +40,19 @@ pub struct NavigationState {
     pub default_link_style: LinkStyle,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IndexEntry {
+    pub sort_key: String,
+    pub display: String,
+    pub page: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IndexState {
+    pub enabled: bool,
+    pub entries: Vec<IndexEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutlineDraftEntry {
     pub level: u8,
@@ -62,4 +75,6 @@ pub struct DocumentState {
     pub bibliography_state: BibliographyState,
     #[serde(default)]
     pub navigation: NavigationState,
+    #[serde(default)]
+    pub index_state: IndexState,
 }

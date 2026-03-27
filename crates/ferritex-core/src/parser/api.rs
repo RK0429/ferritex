@@ -6,6 +6,7 @@ use std::{
 use thiserror::Error;
 
 use crate::bibliography::api::{parse_bbl, BibliographyState};
+use crate::compilation::IndexEntry;
 use crate::kernel::api::DimensionValue;
 
 use super::{
@@ -47,6 +48,9 @@ const BODY_FLOAT_CAPTION_SEP: char = '\u{E018}';
 const BODY_FLOAT_LABEL_SEP: char = '\u{E019}';
 const BODY_FLOAT_TYPE_SEP: char = '\u{E01A}';
 const BODY_FLOAT_SPECIFIER_SEP: char = '\u{E01C}';
+const BODY_INDEX_ENTRY_START: char = '\u{E01D}';
+const BODY_INDEX_ENTRY_END: char = '\u{E01E}';
+const BODY_INDEX_ENTRY_FIELD_SEP: char = '\u{E01F}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -103,6 +107,12 @@ impl Default for CaptionEntry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexRawEntry {
+    pub sort_key: String,
+    pub display: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentLabels {
     entries: BTreeMap<String, String>,
     pub citations: Vec<String>,
@@ -117,9 +127,12 @@ pub struct DocumentLabels {
     pub pdf_author: Option<String>,
     pub color_links: Option<bool>,
     pub link_color: Option<String>,
+    pub index_enabled: bool,
+    pub index_entries: Vec<IndexRawEntry>,
     pub has_unresolved_toc: bool,
     pub has_unresolved_lof: bool,
     pub has_unresolved_lot: bool,
+    pub has_unresolved_index: bool,
 }
 
 impl DocumentLabels {
@@ -137,9 +150,12 @@ impl DocumentLabels {
         pdf_author: Option<String>,
         color_links: Option<bool>,
         link_color: Option<String>,
+        index_enabled: bool,
+        index_entries: Vec<IndexRawEntry>,
         has_unresolved_toc: bool,
         has_unresolved_lof: bool,
         has_unresolved_lot: bool,
+        has_unresolved_index: bool,
     ) -> Self {
         Self {
             entries,
@@ -155,9 +171,12 @@ impl DocumentLabels {
             pdf_author,
             color_links,
             link_color,
+            index_enabled,
+            index_entries,
             has_unresolved_toc,
             has_unresolved_lof,
             has_unresolved_lot,
+            has_unresolved_index,
         }
     }
 
@@ -308,6 +327,7 @@ pub enum DocumentNode {
         url: String,
         children: Vec<DocumentNode>,
     },
+    IndexMarker(IndexRawEntry),
     ParBreak,
     PageBreak,
     ClearPage,
@@ -429,6 +449,7 @@ impl MinimalLatexParser {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            Vec::new(),
         )
     }
 
@@ -449,6 +470,7 @@ impl MinimalLatexParser {
         initial_figure_entries: Vec<CaptionEntry>,
         initial_table_entries: Vec<CaptionEntry>,
         initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
     ) -> Result<ParsedDocument, ParseError> {
         parse_minimal_latex_with_state(
             source,
@@ -457,6 +479,7 @@ impl MinimalLatexParser {
             initial_figure_entries,
             initial_table_entries,
             initial_page_labels,
+            initial_index_entries,
         )
     }
 
@@ -470,6 +493,7 @@ impl MinimalLatexParser {
         initial_bibliography: BTreeMap<String, String>,
         initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
     ) -> Result<ParsedDocument, ParseError> {
         parse_minimal_latex_with_context(
             source,
@@ -480,6 +504,7 @@ impl MinimalLatexParser {
             initial_bibliography,
             initial_bibliography_state,
             initial_page_labels,
+            initial_index_entries,
         )
     }
 
@@ -498,6 +523,7 @@ impl MinimalLatexParser {
             BTreeMap::new(),
             None,
             initial_page_labels,
+            Vec::new(),
         )
     }
 
@@ -509,6 +535,7 @@ impl MinimalLatexParser {
         initial_figure_entries: Vec<CaptionEntry>,
         initial_table_entries: Vec<CaptionEntry>,
         initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
     ) -> ParseOutput {
         self.parse_recovering_with_context(
             source,
@@ -519,6 +546,7 @@ impl MinimalLatexParser {
             BTreeMap::new(),
             None,
             initial_page_labels,
+            initial_index_entries,
         )
     }
 
@@ -532,6 +560,7 @@ impl MinimalLatexParser {
         initial_bibliography: BTreeMap<String, String>,
         initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
     ) -> ParseOutput {
         if source.trim().is_empty() {
             return ParseOutput {
@@ -549,6 +578,7 @@ impl MinimalLatexParser {
             initial_bibliography,
             initial_bibliography_state,
             initial_page_labels,
+            initial_index_entries,
         )
         .run_recovering()
     }
@@ -568,6 +598,7 @@ fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
         BTreeMap::new(),
         None,
         BTreeMap::new(),
+        Vec::new(),
     )
 }
 
@@ -585,6 +616,7 @@ fn parse_minimal_latex_with_labels(
         BTreeMap::new(),
         None,
         initial_page_labels,
+        Vec::new(),
     )
 }
 
@@ -595,6 +627,7 @@ fn parse_minimal_latex_with_state(
     initial_figure_entries: Vec<CaptionEntry>,
     initial_table_entries: Vec<CaptionEntry>,
     initial_page_labels: BTreeMap<String, u32>,
+    initial_index_entries: Vec<IndexEntry>,
 ) -> Result<ParsedDocument, ParseError> {
     parse_minimal_latex_with_context(
         source,
@@ -605,6 +638,7 @@ fn parse_minimal_latex_with_state(
         BTreeMap::new(),
         None,
         initial_page_labels,
+        initial_index_entries,
     )
 }
 
@@ -617,6 +651,7 @@ fn parse_minimal_latex_with_context(
     initial_bibliography: BTreeMap<String, String>,
     initial_bibliography_state: Option<BibliographyState>,
     initial_page_labels: BTreeMap<String, u32>,
+    initial_index_entries: Vec<IndexEntry>,
 ) -> Result<ParsedDocument, ParseError> {
     if source.trim().is_empty() {
         return Err(ParseError::EmptyInput);
@@ -631,6 +666,7 @@ fn parse_minimal_latex_with_context(
         initial_bibliography,
         initial_bibliography_state,
         initial_page_labels,
+        initial_index_entries,
     )
     .run()
 }
@@ -673,16 +709,20 @@ struct ParserState {
     citations: Vec<String>,
     bibliography: BTreeMap<String, String>,
     bibliography_state: BibliographyState,
+    index_enabled: bool,
+    index_entries: Vec<IndexRawEntry>,
     section_entries: Vec<SectionEntry>,
     figure_entries: Vec<CaptionEntry>,
     table_entries: Vec<CaptionEntry>,
     initial_section_entries: Vec<SectionEntry>,
     initial_figure_entries: Vec<CaptionEntry>,
     initial_table_entries: Vec<CaptionEntry>,
+    initial_index_entries: Vec<IndexEntry>,
     has_unresolved_refs: bool,
     has_unresolved_toc: bool,
     has_unresolved_lof: bool,
     has_unresolved_lot: bool,
+    has_unresolved_index: bool,
 }
 
 impl Default for ParserState {
@@ -695,6 +735,7 @@ impl Default for ParserState {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
+            Vec::new(),
         )
     }
 }
@@ -708,6 +749,7 @@ impl ParserState {
         initial_bibliography: BTreeMap<String, String>,
         initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
     ) -> Self {
         Self {
             chapter: 0,
@@ -725,16 +767,20 @@ impl ParserState {
             citations: Vec::new(),
             bibliography: initial_bibliography,
             bibliography_state: initial_bibliography_state.unwrap_or_default(),
+            index_enabled: false,
+            index_entries: Vec::new(),
             section_entries: Vec::new(),
             figure_entries: Vec::new(),
             table_entries: Vec::new(),
             initial_section_entries,
             initial_figure_entries,
             initial_table_entries,
+            initial_index_entries,
             has_unresolved_refs: false,
             has_unresolved_toc: false,
             has_unresolved_lof: false,
             has_unresolved_lot: false,
+            has_unresolved_index: false,
         }
     }
 
@@ -907,6 +953,7 @@ impl<'a> ParserDriver<'a> {
         initial_bibliography: BTreeMap<String, String>,
         initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
     ) -> Self {
         Self {
             tokenizer: Tokenizer::new(source.as_bytes()),
@@ -919,6 +966,7 @@ impl<'a> ParserDriver<'a> {
                 initial_bibliography,
                 initial_bibliography_state,
                 initial_page_labels,
+                initial_index_entries,
             ),
             package_registry: PackageRegistry::default(),
             class_registry: ClassRegistry::default(),
@@ -1161,9 +1209,12 @@ impl<'a> ParserDriver<'a> {
                 self.pdf_author.clone(),
                 self.color_links,
                 self.link_color.clone(),
+                self.state.index_enabled,
+                self.state.index_entries.clone(),
                 self.state.has_unresolved_toc,
                 self.state.has_unresolved_lof,
                 self.state.has_unresolved_lot,
+                self.state.has_unresolved_index,
             ),
             bibliography_state: self.state.bibliography_state.clone(),
             has_unresolved_refs: self.state.has_unresolved_refs,
@@ -1228,6 +1279,9 @@ impl<'a> ParserDriver<'a> {
             }
             "hypersetup" => {
                 self.parse_hypersetup_command()?;
+            }
+            "makeindex" => {
+                self.state.index_enabled = true;
             }
             "begin" => {
                 if self.read_environment_name()?.as_deref() == Some("document") {
@@ -1379,6 +1433,14 @@ impl<'a> ParserDriver<'a> {
                             self.body.push(BODY_PAGEREF_END);
                             self.state.has_unresolved_refs = true;
                         }
+                    }
+                    "index" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_index_command()?;
+                    }
+                    "printindex" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_printindex()?;
                     }
                     "[" => {
                         let _ = self.take_global_prefix();
@@ -2047,6 +2109,45 @@ impl<'a> ParserDriver<'a> {
             self.body.push('\n');
         }
         self.body.push('\n');
+    }
+
+    fn parse_index_command(&mut self) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let raw = tokens_to_text(&tokens);
+        let Some(entry) = parse_index_entry_argument(&raw) else {
+            return Ok(());
+        };
+
+        if !self.state.index_enabled {
+            return Ok(());
+        }
+
+        self.state.index_entries.push(entry.clone());
+        self.body.push(BODY_INDEX_ENTRY_START);
+        self.body.push_str(&serialize_index_marker(&entry));
+        self.body.push(BODY_INDEX_ENTRY_END);
+        Ok(())
+    }
+
+    fn parse_printindex(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_optional_bracket_tokens()?;
+
+        if self.state.initial_index_entries.is_empty() {
+            self.state.has_unresolved_index = self.state.index_enabled;
+            return Ok(());
+        }
+
+        let rendered = format_index_entries(&self.state.initial_index_entries);
+        if rendered.is_empty() {
+            return Ok(());
+        }
+
+        self.emit_paragraph_break_before_block();
+        self.body.push_str(&rendered);
+        self.body.push('\n');
+        Ok(())
     }
 
     fn class_supports_chapters(&self) -> bool {
@@ -4421,6 +4522,14 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_INDEX_ENTRY_START => {
+                let (content, next_index) =
+                    extract_single_marker_content(body, index, BODY_INDEX_ENTRY_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(deserialize_index_marker(content));
+                text.push(placeholder);
+                index = next_index;
+            }
             BODY_FLOAT_START => {
                 let (content, next_index) =
                     extract_single_marker_content(body, index, BODY_FLOAT_END);
@@ -4585,6 +4694,23 @@ fn extract_single_marker_content(
     (&body[content_start..], body.len())
 }
 
+fn serialize_index_marker(entry: &IndexRawEntry) -> String {
+    format!(
+        "{}{}{}",
+        entry.sort_key, BODY_INDEX_ENTRY_FIELD_SEP, entry.display
+    )
+}
+
+fn deserialize_index_marker(content: &str) -> DocumentNode {
+    let (sort_key, display) = content
+        .split_once(BODY_INDEX_ENTRY_FIELD_SEP)
+        .unwrap_or((content, content));
+    DocumentNode::IndexMarker(IndexRawEntry {
+        sort_key: sort_key.to_string(),
+        display: display.to_string(),
+    })
+}
+
 fn serialize_includegraphics_marker(path: &str, options: &IncludeGraphicsOptions) -> String {
     let width = options
         .width
@@ -4679,6 +4805,89 @@ fn parse_scale_marker_field(value: &str) -> Option<f64> {
     (!trimmed.is_empty())
         .then(|| trimmed.parse::<f64>().ok())
         .flatten()
+}
+
+fn parse_index_entry_argument(raw: &str) -> Option<IndexRawEntry> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (sort_key, display) = match trimmed.split_once('@') {
+        Some((sort_key, display)) => (sort_key.trim(), display.trim()),
+        None => (trimmed, trimmed),
+    };
+    if sort_key.is_empty() || display.is_empty() {
+        return None;
+    }
+
+    Some(IndexRawEntry {
+        sort_key: sort_key.to_string(),
+        display: display.to_string(),
+    })
+}
+
+fn format_index_entries(entries: &[IndexEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut entries = entries.to_vec();
+    entries.sort_by(|left, right| {
+        left.sort_key
+            .to_lowercase()
+            .cmp(&right.sort_key.to_lowercase())
+            .then_with(|| left.sort_key.cmp(&right.sort_key))
+            .then_with(|| left.display.cmp(&right.display))
+            .then_with(|| left.page.cmp(&right.page))
+    });
+
+    // Merge page numbers for entries with the same (sort_key, display)
+    let mut merged: Vec<(String, String, Vec<String>)> = Vec::new();
+    for entry in &entries {
+        let page_str = entry
+            .page
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        if let Some(last) = merged.last_mut() {
+            if last.0 == entry.sort_key && last.1 == entry.display {
+                if !last.2.contains(&page_str) {
+                    last.2.push(page_str);
+                }
+                continue;
+            }
+        }
+        merged.push((
+            entry.sort_key.clone(),
+            entry.display.clone(),
+            vec![page_str],
+        ));
+    }
+
+    let mut rendered = String::new();
+    let mut current_heading = None::<String>;
+    for (sort_key, display, pages) in &merged {
+        let heading = sort_key
+            .chars()
+            .next()
+            .map(|ch| ch.to_uppercase().collect::<String>())
+            .unwrap_or_else(|| "#".to_string());
+        if current_heading.as_deref() != Some(heading.as_str()) {
+            if !rendered.is_empty() {
+                rendered.push('\n');
+            }
+            rendered.push_str(&heading);
+            rendered.push('\n');
+            current_heading = Some(heading);
+        }
+
+        rendered.push_str(display);
+        rendered.push_str(" . . . . ");
+        rendered.push_str(&pages.join(", "));
+        rendered.push('\n');
+    }
+
+    rendered.trim_end().to_string()
 }
 
 fn parse_hypersetup_options(input: &str) -> Vec<(String, String)> {
@@ -5718,11 +5927,12 @@ fn eof_line(source: &str) -> u32 {
 mod tests {
     use super::{
         parse_bbl_input, render_math_nodes_for_anchor, render_math_nodes_for_encoding,
-        CaptionEntry, DocumentLabels, DocumentNode, FloatType, IncludeGraphicsOptions, LineTag,
-        MathLine, MathNode, MinimalLatexParser, OverUnderKind, PackageInfo, ParseError,
-        ParsedDocument, Parser, SectionEntry,
+        CaptionEntry, DocumentLabels, DocumentNode, FloatType, IncludeGraphicsOptions,
+        IndexRawEntry, LineTag, MathLine, MathNode, MinimalLatexParser, OverUnderKind, PackageInfo,
+        ParseError, ParsedDocument, Parser, SectionEntry,
     };
     use crate::bibliography::api::BibliographyState;
+    use crate::compilation::IndexEntry;
     use crate::kernel::api::DimensionValue;
     use std::collections::BTreeMap;
 
@@ -7085,6 +7295,7 @@ mod tests {
                 BTreeMap::new(),
                 None,
                 BTreeMap::from([("sec:later".to_string(), 5)]),
+                Vec::new(),
             )
             .expect("parse document");
 
@@ -7156,6 +7367,7 @@ mod tests {
                 BTreeMap::new(),
                 Some(bibliography_state),
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse document");
 
@@ -7178,6 +7390,7 @@ mod tests {
                 BTreeMap::new(),
                 Some(bibliography_state),
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse document");
 
@@ -7227,6 +7440,7 @@ mod tests {
                 BTreeMap::new(),
                 Some(bibliography_state),
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse document");
 
@@ -7248,6 +7462,7 @@ mod tests {
                 BTreeMap::new(),
                 Some(bibliography_state),
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse document");
 
@@ -7268,6 +7483,7 @@ mod tests {
                 first.bibliography.clone(),
                 Some(first.bibliography_state.clone()),
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse second pass");
 
@@ -7399,6 +7615,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse document");
 
@@ -7472,6 +7689,7 @@ mod tests {
                 ],
                 Vec::new(),
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse document");
 
@@ -7493,11 +7711,141 @@ mod tests {
                     caption: "Metrics".to_string(),
                 }],
                 BTreeMap::new(),
+                Vec::new(),
             )
             .expect("parse document");
 
         assert_eq!(document.body, "Table 1: Metrics");
         assert!(!document.has_unresolved_lot);
+    }
+
+    #[test]
+    fn makeindex_enables_index_collection() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\makeindex\n\\begin{document}\nAlpha\\index{Alpha}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert!(document.index_enabled);
+        assert_eq!(
+            document.index_entries,
+            vec![IndexRawEntry {
+                sort_key: "Alpha".to_string(),
+                display: "Alpha".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn index_command_parses_sort_key_and_display_text() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\makeindex\n\\begin{document}\nTerm\\index{sortkey@Display Text}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(
+            document.index_entries,
+            vec![IndexRawEntry {
+                sort_key: "sortkey".to_string(),
+                display: "Display Text".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn printindex_emits_seeded_entries_in_case_insensitive_order() {
+        let document = MinimalLatexParser
+            .parse_with_state(
+                "\\documentclass{article}\n\\makeindex\n\\begin{document}\n\\printindex\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                vec![
+                    IndexEntry {
+                        sort_key: "beta".to_string(),
+                        display: "Beta".to_string(),
+                        page: Some(2),
+                    },
+                    IndexEntry {
+                        sort_key: "Alpha".to_string(),
+                        display: "Alpha".to_string(),
+                        page: Some(1),
+                    },
+                ],
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "A\nAlpha . . . . 1\n\nB\nBeta . . . . 2");
+        assert!(!document.has_unresolved_index);
+    }
+
+    #[test]
+    fn printindex_without_seed_entries_requests_second_pass() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\makeindex\n\\begin{document}\nAlpha\\index{Alpha}\n\\printindex\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert!(document.has_unresolved_index);
+        assert_eq!(
+            document.index_entries,
+            vec![IndexRawEntry {
+                sort_key: "Alpha".to_string(),
+                display: "Alpha".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn index_without_makeindex_is_ignored() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\nAlpha\\index{Alpha}\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert!(document.index_entries.is_empty());
+        assert!(!document.has_unresolved_index);
+        assert!(!document.body.contains('\u{E01D}'));
+    }
+
+    #[test]
+    fn printindex_merges_page_numbers_for_same_term() {
+        let document = MinimalLatexParser
+            .parse_with_state(
+                "\\documentclass{article}\n\\makeindex\n\\begin{document}\n\\printindex\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                vec![
+                    IndexEntry {
+                        sort_key: "Alpha".to_string(),
+                        display: "Alpha".to_string(),
+                        page: Some(1),
+                    },
+                    IndexEntry {
+                        sort_key: "Alpha".to_string(),
+                        display: "Alpha".to_string(),
+                        page: Some(3),
+                    },
+                    IndexEntry {
+                        sort_key: "Beta".to_string(),
+                        display: "Beta".to_string(),
+                        page: Some(2),
+                    },
+                ],
+            )
+            .expect("parse document");
+
+        assert!(document.body.contains("Alpha . . . . 1, 3"));
+        assert!(document.body.contains("Beta . . . . 2"));
     }
 
     #[test]

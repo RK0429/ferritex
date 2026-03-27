@@ -520,6 +520,57 @@ fn compile_hypersetup_overrides_pdf_metadata() {
 }
 
 #[test]
+fn compile_colorlinks_true_renders_colored_link_text() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("colorlinks-true.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\hypersetup{colorlinks=true,linkcolor=red}\n\\begin{document}\n\\href{https://example.com}{click}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf =
+        std::fs::read_to_string(dir.path().join("colorlinks-true.pdf")).expect("read output pdf");
+    assert!(pdf.contains("1 0 0 rg"));
+    assert!(pdf.contains("(click) Tj"));
+    assert!(pdf.contains("/Subtype /Link"));
+    assert!(pdf.contains("/URI (https://example.com)"));
+    assert!(pdf.contains("/Border [0 0 0]"));
+}
+
+#[test]
+fn compile_colorlinks_false_renders_visible_border() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("colorlinks-false.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\href{https://example.com}{click}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf =
+        std::fs::read_to_string(dir.path().join("colorlinks-false.pdf")).expect("read output pdf");
+    assert!(pdf.contains("/Subtype /Link"));
+    assert!(pdf.contains("/URI (https://example.com)"));
+    assert!(pdf.contains("/Border [0 0 1] /C [0 0 1]"));
+    assert!(!pdf.contains("1 0 0 rg"));
+}
+
+#[test]
 fn compile_expands_newenvironment_usage_into_pdf_output() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("environment.tex");
@@ -644,6 +695,55 @@ fn compile_resolves_pageref_across_page_boundaries() {
     assert!(pdf.contains("See page 2."));
     assert!(pdf.contains("1 Later"));
     assert!(!pdf.contains("??"));
+}
+
+#[test]
+fn compile_index_resolves_page_numbers_across_passes() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("index.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\makeindex\n\\begin{document}\nAlpha\\index{Alpha}\n\\newpage\nBeta\\index{beta@Beta}\n\\printindex\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read_to_string(dir.path().join("index.pdf")).expect("read output pdf");
+    let alpha = pdf.find("Alpha . . . . 1").expect("Alpha index entry");
+    let beta = pdf.find("Beta . . . . 2").expect("Beta index entry");
+    assert!(alpha < beta);
+    assert!(pdf.contains("A"));
+    assert!(pdf.contains("B"));
+    assert!(!pdf.contains("??"));
+}
+
+#[test]
+fn compile_index_sort_at_display_syntax() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("index-display.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\makeindex\n\\begin{document}\nEntry\\index{sortkey@Display}\n\\printindex\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf =
+        std::fs::read_to_string(dir.path().join("index-display.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Display . . . . 1"));
+    assert!(!pdf.contains("sortkey . . . . 1"));
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use ferritex_core::assets::{AssetHandle, LogicalAssetId};
 use ferritex_core::bibliography::api::{parse_bbl, BibliographyDiagnostic, BibliographyState};
 use ferritex_core::compilation::{
-    CompilationJob, CompilationSnapshot, DocumentState, SymbolLocation,
+    CompilationJob, CompilationSnapshot, DocumentState, IndexEntry, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
@@ -270,6 +270,7 @@ impl<'a> CompileJobService<'a> {
             let parse_pass_result = self.parse_document_with_cross_references(
                 &source_tree.source,
                 initial_bibliography_state.clone(),
+                source_tree.document_state.index_state.entries.clone(),
                 |document| {
                     self.typesetter.typeset_with_provider_and_graphics_resolver(
                         document,
@@ -298,6 +299,7 @@ impl<'a> CompileJobService<'a> {
                 self.parse_document_with_cross_references(
                     &source_tree.source,
                     initial_bibliography_state.clone(),
+                    source_tree.document_state.index_state.entries.clone(),
                     |document| {
                         self.typesetter.typeset_with_provider_and_graphics_resolver(
                             document,
@@ -313,6 +315,7 @@ impl<'a> CompileJobService<'a> {
                 self.parse_document_with_cross_references(
                     &source_tree.source,
                     initial_bibliography_state.clone(),
+                    source_tree.document_state.index_state.entries.clone(),
                     |document| {
                         self.typesetter
                             .typeset_with_graphics_resolver(document, &graphics_resolver)
@@ -479,6 +482,7 @@ impl<'a> CompileJobService<'a> {
         } = self.parse_document_with_cross_references(
             &source_tree.source,
             source_tree.document_state.bibliography_state.clone().into(),
+            source_tree.document_state.index_state.entries.clone(),
             |document| self.typesetter.typeset(document),
         );
         let parse_diagnostics: Vec<Diagnostic> = errors
@@ -564,6 +568,7 @@ impl<'a> CompileJobService<'a> {
                 citations,
                 bibliography_state: BibliographyState::default(),
                 navigation: Default::default(),
+                index_state: Default::default(),
             },
         })
     }
@@ -624,6 +629,7 @@ impl<'a> CompileJobService<'a> {
         &self,
         source: &str,
         initial_bibliography_state: Option<BibliographyState>,
+        initial_index_entries: Vec<IndexEntry>,
         typeset_document_for: F,
     ) -> ParsePassResult
     where
@@ -638,6 +644,7 @@ impl<'a> CompileJobService<'a> {
             BTreeMap::new(),
             initial_bibliography_state.clone(),
             BTreeMap::new(),
+            initial_index_entries.clone(),
         );
         let Some(mut document) = output.document.clone() else {
             return ParsePassResult {
@@ -662,6 +669,7 @@ impl<'a> CompileJobService<'a> {
                 document.bibliography.clone(),
                 Some(document.bibliography_state.clone()),
                 BTreeMap::new(),
+                initial_index_entries,
             );
             if let Some(next_document) = second.document.clone() {
                 output = second;
@@ -672,38 +680,39 @@ impl<'a> CompileJobService<'a> {
 
         let mut typeset_document = typeset_document_for(&document);
 
-        if document.has_pageref_markers() {
-            let mut page_labels = resolve_page_labels(&document, &typeset_document.pages);
-            while pass_count < 3 && !page_labels.is_empty() {
-                let next = self.parser.parse_recovering_with_context(
-                    source,
-                    document.labels.clone().into_inner(),
-                    document.section_entries.clone(),
-                    document.figure_entries.clone(),
-                    document.table_entries.clone(),
-                    document.bibliography.clone(),
-                    Some(document.bibliography_state.clone()),
-                    page_labels.clone(),
-                );
-                let Some(next_document) = next.document.clone() else {
-                    break;
-                };
+        while pass_count < 3 {
+            let page_labels = if document.has_pageref_markers() {
+                resolve_page_labels(&document, &typeset_document.pages)
+            } else {
+                BTreeMap::new()
+            };
+            let index_entries = typeset_document.index_entries.clone();
+            let needs_pageref_pass = document.has_pageref_markers() && !page_labels.is_empty();
+            let needs_index_pass = document.has_unresolved_index && !index_entries.is_empty();
 
-                output = next;
-                document = next_document;
-                pass_count += 1;
-                typeset_document = typeset_document_for(&document);
-
-                if !document.has_pageref_markers() {
-                    break;
-                }
-
-                let next_page_labels = resolve_page_labels(&document, &typeset_document.pages);
-                if next_page_labels == page_labels {
-                    break;
-                }
-                page_labels = next_page_labels;
+            if !needs_pageref_pass && !needs_index_pass {
+                break;
             }
+
+            let next = self.parser.parse_recovering_with_context(
+                source,
+                document.labels.clone().into_inner(),
+                document.section_entries.clone(),
+                document.figure_entries.clone(),
+                document.table_entries.clone(),
+                document.bibliography.clone(),
+                Some(document.bibliography_state.clone()),
+                page_labels,
+                index_entries,
+            );
+            let Some(next_document) = next.document.clone() else {
+                break;
+            };
+
+            output = next;
+            document = next_document;
+            pass_count += 1;
+            typeset_document = typeset_document_for(&document);
         }
 
         ParsePassResult {
@@ -738,6 +747,8 @@ fn persist_compiled_document_state(
 ) {
     document_state.bibliography_state = parsed_document.bibliography_state.clone();
     document_state.navigation = typeset_document.navigation.clone();
+    document_state.index_state.enabled = parsed_document.index_enabled;
+    document_state.index_state.entries = typeset_document.index_entries.clone();
 }
 
 struct ParsePassResult {
@@ -2696,6 +2707,42 @@ mod tests {
                 .as_ref()
                 .map(|state| state.snapshot.pass_number),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn compile_resolves_index_entries_on_second_pass() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\makeindex\n\\begin{document}\nAlpha\\index{Alpha}\n\\newpage\nBeta\\index{beta@Beta}\n\\printindex\n\\end{document}\n",
+        )
+        .expect("write input");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("Alpha . . . . 1"));
+        assert!(pdf.contains("Beta . . . . 2"));
+        let stable_state = result
+            .stable_compile_state
+            .as_ref()
+            .expect("stable compile state");
+        assert_eq!(stable_state.snapshot.pass_number, 2);
+        assert!(stable_state.document_state.index_state.enabled);
+        assert_eq!(stable_state.document_state.index_state.entries.len(), 2);
+        assert_eq!(
+            stable_state.document_state.index_state.entries[0].page,
+            Some(1)
+        );
+        assert_eq!(
+            stable_state.document_state.index_state.entries[1].page,
+            Some(2)
         );
     }
 
