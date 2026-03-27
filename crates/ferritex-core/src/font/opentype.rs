@@ -1078,6 +1078,26 @@ mod tests {
         glyph_ids: &'a [u16],
     }
 
+    pub(crate) fn minimal_test_font_bytes() -> Vec<u8> {
+        build_test_font(TestFont {
+            sf_version: TRUETYPE_MAGIC,
+            units_per_em: 1000,
+            flags: 0x0005,
+            index_to_loc_format: 1,
+            ascender: 800,
+            descender: -200,
+            line_gap: 200,
+            h_metrics: &[(500, 0), (600, 10)],
+            extra_lsbs: &[20],
+            cmap_segments: &[TestCmapSegment {
+                start_code: 65,
+                end_code: 66,
+                id_delta: 0,
+                glyph_ids: &[1, 2],
+            }],
+        })
+    }
+
     fn build_test_font(config: TestFont<'_>) -> Vec<u8> {
         let glyph_count = config.h_metrics.len() + config.extra_lsbs.len();
         let head = build_head_table(
@@ -1282,3 +1302,6 @@ mod tests {
         data
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::minimal_test_font_bytes;

@@ -1877,6 +1877,7 @@ mod tests {
             class_options: Vec::new(),
             loaded_packages: Vec::new(),
             package_count: 0,
+            main_font_name: None,
             body: body.to_string(),
             labels: Default::default(),
             bibliography_state: BibliographyState::default(),

@@ -9,7 +9,9 @@ use ferritex_core::compilation::{
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
-use ferritex_core::font::{OpenTypeFont, TfmMetrics};
+use ferritex_core::font::{
+    resolve_named_font, OpenTypeFont, TfmMetrics, OPENTYPE_FONT_SEARCH_ROOTS,
+};
 use ferritex_core::graphics::api::{
     extract_png_image_data, parse_image_metadata, ExternalGraphic, GraphicAssetResolver,
     ImageMetadata,
@@ -36,13 +38,6 @@ const CMR10_TFM_CANDIDATES: [&str; 4] = [
     "texmf/cmr10.tfm",
     "cmr10.tfm",
 ];
-const OPENTYPE_FONT_SEARCH_ROOTS: [&str; 4] = [
-    "texmf/fonts/truetype",
-    "fonts/truetype",
-    "texmf/fonts/opentype",
-    "fonts/opentype",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileResult {
     pub diagnostics: Vec<Diagnostic>,
@@ -68,6 +63,12 @@ struct LoadedSourceTree {
 struct LoadedOpenTypeFont {
     base_font: String,
     font: OpenTypeFont,
+}
+
+enum CompileFontSelection {
+    OpenType(LoadedOpenTypeFont),
+    Tfm(TfmMetrics),
+    Basic,
 }
 
 struct CompileGraphicAssetResolver<'a> {
@@ -259,70 +260,64 @@ impl<'a> CompileJobService<'a> {
             project_root: &project_root,
             asset_bundle_path: options.asset_bundle.as_deref(),
         };
+        let mut font_selection = None;
+        let mut font_diagnostics = Vec::new();
+        let parse_pass_result = self.parse_document_with_cross_references(
+            &source_tree.source,
+            initial_bibliography_state.clone(),
+            source_tree.document_state.index_state.entries.clone(),
+            |document| {
+                let selection = font_selection.get_or_insert_with(|| {
+                    let (selection, diagnostics) = self.select_compile_font(
+                        &input_path,
+                        document.main_font_name.as_deref(),
+                        &input_dir,
+                        &project_root,
+                        options.asset_bundle.as_deref(),
+                    );
+                    font_diagnostics.extend(diagnostics);
+                    selection
+                });
 
-        let (parse_pass_result, pdf_renderer) = if let Some(loaded_font) =
-            load_opentype_font(self.file_access_gate, options.asset_bundle.as_deref())
-        {
-            let provider = OpenTypeWidthProvider {
-                font: &loaded_font.font,
-                fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
-            };
-            let parse_pass_result = self.parse_document_with_cross_references(
-                &source_tree.source,
-                initial_bibliography_state.clone(),
-                source_tree.document_state.index_state.entries.clone(),
-                |document| {
-                    self.typesetter.typeset_with_provider_and_graphics_resolver(
-                        document,
-                        &provider,
-                        Some(&graphics_resolver),
-                    )
-                },
-            );
-            let pdf_renderer = parse_pass_result
-                .typeset_document
-                .as_ref()
-                .and_then(|typeset_document| {
-                    build_opentype_pdf_renderer(&loaded_font, typeset_document)
-                        .map(|font_resource| PdfRenderer::with_fonts(vec![font_resource]))
-                })
-                .unwrap_or_else(PdfRenderer::default);
-            (parse_pass_result, pdf_renderer)
-        } else if let Some(metrics) =
-            load_cmr10_metrics(self.file_access_gate, options.asset_bundle.as_deref())
-        {
-            let provider = TfmWidthProvider {
-                metrics: &metrics,
-                fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
-            };
-            (
-                self.parse_document_with_cross_references(
-                    &source_tree.source,
-                    initial_bibliography_state.clone(),
-                    source_tree.document_state.index_state.entries.clone(),
-                    |document| {
+                match selection {
+                    CompileFontSelection::OpenType(loaded_font) => {
+                        let provider = OpenTypeWidthProvider {
+                            font: &loaded_font.font,
+                            fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                        };
                         self.typesetter.typeset_with_provider_and_graphics_resolver(
                             document,
                             &provider,
                             Some(&graphics_resolver),
                         )
-                    },
-                ),
-                self.pdf_renderer.clone(),
-            )
-        } else {
-            (
-                self.parse_document_with_cross_references(
-                    &source_tree.source,
-                    initial_bibliography_state.clone(),
-                    source_tree.document_state.index_state.entries.clone(),
-                    |document| {
-                        self.typesetter
-                            .typeset_with_graphics_resolver(document, &graphics_resolver)
-                    },
-                ),
-                self.pdf_renderer.clone(),
-            )
+                    }
+                    CompileFontSelection::Tfm(metrics) => {
+                        let provider = TfmWidthProvider {
+                            metrics,
+                            fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                        };
+                        self.typesetter.typeset_with_provider_and_graphics_resolver(
+                            document,
+                            &provider,
+                            Some(&graphics_resolver),
+                        )
+                    }
+                    CompileFontSelection::Basic => self
+                        .typesetter
+                        .typeset_with_graphics_resolver(document, &graphics_resolver),
+                }
+            },
+        );
+        let pdf_renderer = match (
+            font_selection.as_ref(),
+            parse_pass_result.typeset_document.as_ref(),
+        ) {
+            (Some(CompileFontSelection::OpenType(loaded_font)), Some(typeset_document)) => {
+                build_opentype_pdf_renderer(loaded_font, typeset_document)
+                    .map(|font_resource| PdfRenderer::with_fonts(vec![font_resource]))
+                    .unwrap_or_else(PdfRenderer::default)
+            }
+            _ => self.pdf_renderer.clone(),
         };
         let ParsePassResult {
             output: ParseOutput { document, errors },
@@ -333,6 +328,7 @@ impl<'a> CompileJobService<'a> {
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
             .collect();
+        parse_diagnostics.extend(font_diagnostics);
         if let Some(loaded_bibliography_state) = &loaded_bibliography_state {
             let bibliography_names = extract_bibliography_declarations(&source_tree.source);
             if let Some(diagnostic) = check_bbl_freshness(
@@ -529,6 +525,58 @@ impl<'a> CompileJobService<'a> {
         self.load_source_tree_with_root_source(input_file, None, project_root, asset_bundle_path)
     }
 
+    fn select_compile_font(
+        &self,
+        input_path: &str,
+        requested_main_font: Option<&str>,
+        input_dir: &Path,
+        project_root: &Path,
+        asset_bundle_path: Option<&Path>,
+    ) -> (CompileFontSelection, Vec<Diagnostic>) {
+        let mut diagnostics = Vec::new();
+        let opentype_font = if let Some(font_name) = requested_main_font {
+            match resolve_named_font(
+                font_name,
+                input_dir,
+                project_root,
+                asset_bundle_path,
+                self.file_access_gate,
+            ) {
+                Some(resolved_font) => Some(LoadedOpenTypeFont {
+                    base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
+                    font: resolved_font.font,
+                }),
+                None => {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            Severity::Error,
+                            format!(
+                                "Font \"{font_name}\" not found in project directory or asset bundle"
+                            ),
+                        )
+                        .with_file(input_path.to_string())
+                        .with_suggestion(
+                            "place the font in the document directory, project fonts/, or asset bundle",
+                        ),
+                    );
+                    load_opentype_font(self.file_access_gate, asset_bundle_path)
+                }
+            }
+        } else {
+            load_opentype_font(self.file_access_gate, asset_bundle_path)
+        };
+
+        if let Some(loaded_font) = opentype_font {
+            return (CompileFontSelection::OpenType(loaded_font), diagnostics);
+        }
+
+        if let Some(metrics) = load_cmr10_metrics(self.file_access_gate, asset_bundle_path) {
+            return (CompileFontSelection::Tfm(metrics), diagnostics);
+        }
+
+        (CompileFontSelection::Basic, diagnostics)
+    }
+
     fn load_source_tree_with_root_source(
         &self,
         input_file: &Path,
@@ -630,10 +678,10 @@ impl<'a> CompileJobService<'a> {
         source: &str,
         initial_bibliography_state: Option<BibliographyState>,
         initial_index_entries: Vec<IndexEntry>,
-        typeset_document_for: F,
+        mut typeset_document_for: F,
     ) -> ParsePassResult
     where
-        F: Fn(&ferritex_core::parser::ParsedDocument) -> TypesetDocument,
+        F: FnMut(&ferritex_core::parser::ParsedDocument) -> TypesetDocument,
     {
         let mut output = self.parser.parse_recovering_with_context(
             source,
@@ -999,7 +1047,13 @@ fn diagnostic_for_bibliography(
 }
 
 fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnostic {
-    let diagnostic = Diagnostic::new(Severity::Error, error.to_string()).with_file(input_path);
+    let severity = match error {
+        ParseError::FontspecNotLoaded { .. } | ParseError::SetmainfontInBody { .. } => {
+            Severity::Warning
+        }
+        _ => Severity::Error,
+    };
+    let diagnostic = Diagnostic::new(severity, error.to_string()).with_file(input_path);
     let diagnostic = if let Some(line) = error.line() {
         diagnostic.with_line(line)
     } else {
@@ -1051,6 +1105,16 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         ParseError::UnexpectedFi { .. } => diagnostic
             .with_context("the parser found \\fi without a matching open conditional")
             .with_suggestion("remove the stray \\fi or add the matching \\if..."),
+        ParseError::FontspecNotLoaded { .. } => diagnostic
+            .with_context(
+                "font selection commands activate only after loading the fontspec package",
+            )
+            .with_suggestion("add \\usepackage{fontspec} in the preamble before \\setmainfont"),
+        ParseError::SetmainfontInBody { .. } => diagnostic
+            .with_context(
+                "the minimal fontspec implementation only supports document-global font selection",
+            )
+            .with_suggestion("move \\setmainfont{...} before \\begin{document}"),
         ParseError::DivisionByZero { .. } => diagnostic
             .with_context("register division requires a non-zero divisor")
             .with_suggestion("change the divisor to a non-zero integer"),
@@ -2782,6 +2846,95 @@ mod tests {
         assert!(!pdf.contains("/BaseFont /Helvetica"));
         assert!(subset_len < font_bytes.len());
         assert!(pdf.contains(&format!("/Length1 {subset_len}")));
+    }
+
+    #[test]
+    fn compile_with_setmainfont_uses_named_font() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
+        fs::create_dir_all(&font_dir).expect("create font dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{ChosenSans}\n\\begin{document}\nAB\n\\end{document}\n",
+        )
+        .expect("write input");
+        fs::write(font_dir.join("AFirst.ttf"), build_test_ttf()).expect("write first font");
+        fs::write(font_dir.join("ChosenSans.ttf"), build_test_ttf()).expect("write chosen font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("FerritexSubset+ChosenSans"));
+        assert!(!pdf.contains("FerritexSubset+AFirst"));
+    }
+
+    #[test]
+    fn compile_with_setmainfont_not_found_emits_diagnostic() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
+        fs::create_dir_all(&font_dir).expect("create font dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{MissingFont}\n\\begin{document}\nAB\n\\end{document}\n",
+        )
+        .expect("write input");
+        fs::write(font_dir.join("FallbackSans.ttf"), build_test_ttf())
+            .expect("write fallback font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert!(result.output_pdf.is_some());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message
+                    == "Font \"MissingFont\" not found in project directory or asset bundle"
+        }));
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("FerritexSubset+FallbackSans"));
+    }
+
+    #[test]
+    fn compile_without_fontspec_uses_first_ttf_behavior() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
+        fs::create_dir_all(&font_dir).expect("create font dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(&input_file, document("AB")).expect("write input");
+        fs::write(font_dir.join("AFirst.ttf"), build_test_ttf()).expect("write first font");
+        fs::write(font_dir.join("ChosenSans.ttf"), build_test_ttf()).expect("write second font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("FerritexSubset+AFirst"));
+        assert!(!pdf.contains("FerritexSubset+ChosenSans"));
     }
 
     #[test]

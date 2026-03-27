@@ -226,6 +226,7 @@ pub struct ParsedDocument {
     pub class_options: Vec<String>,
     pub loaded_packages: Vec<PackageInfo>,
     pub package_count: usize,
+    pub main_font_name: Option<String>,
     pub body: String,
     pub labels: DocumentLabels,
     pub bibliography_state: BibliographyState,
@@ -397,6 +398,10 @@ pub enum ParseError {
     DivisionByZero { line: u32 },
     #[error("macro expansion limit exceeded")]
     MacroExpansionLimit { line: u32 },
+    #[error("\\setmainfont requires \\usepackage{{fontspec}}")]
+    FontspecNotLoaded { line: u32 },
+    #[error("\\setmainfont in document body is not supported; use it in the preamble")]
+    SetmainfontInBody { line: u32 },
 }
 
 impl ParseError {
@@ -416,7 +421,9 @@ impl ParseError {
             | Self::UnexpectedElse { line }
             | Self::UnexpectedFi { line }
             | Self::DivisionByZero { line }
-            | Self::MacroExpansionLimit { line } => Some(*line),
+            | Self::MacroExpansionLimit { line }
+            | Self::FontspecNotLoaded { line }
+            | Self::SetmainfontInBody { line } => Some(*line),
         }
     }
 }
@@ -926,6 +933,7 @@ struct ParserDriver<'a> {
     pdf_author: Option<String>,
     color_links: Option<bool>,
     link_color: Option<String>,
+    main_font_name: Option<String>,
     body: String,
     begin_found: bool,
     end_found: bool,
@@ -935,6 +943,7 @@ struct ParserDriver<'a> {
     consecutive_macro_expansions: usize,
     global_prefix: bool,
     alloc_count: u32,
+    alloc_toks: u32,
 }
 
 #[derive(Debug)]
@@ -984,6 +993,7 @@ impl<'a> ParserDriver<'a> {
             pdf_author: None,
             color_links: None,
             link_color: None,
+            main_font_name: None,
             body: String::new(),
             begin_found: false,
             end_found: false,
@@ -993,6 +1003,7 @@ impl<'a> ParserDriver<'a> {
             consecutive_macro_expansions: 0,
             global_prefix: false,
             alloc_count: 10,
+            alloc_toks: 10,
         }
     }
 
@@ -1194,6 +1205,7 @@ impl<'a> ParserDriver<'a> {
             class_options: active_class.options.clone(),
             loaded_packages: self.package_registry.loaded_packages().to_vec(),
             package_count: self.package_registry.loaded_packages().len(),
+            main_font_name: self.main_font_name.clone(),
             body: self.body.trim().to_string(),
             labels: DocumentLabels::with_metadata(
                 self.state.labels.clone(),
@@ -1282,6 +1294,19 @@ impl<'a> ParserDriver<'a> {
             }
             "makeindex" => {
                 self.state.index_enabled = true;
+            }
+            "setmainfont" => {
+                let font_tokens = self.read_required_braced_tokens()?;
+                if self.package_registry.is_loaded("fontspec") {
+                    if let Some(tokens) = font_tokens {
+                        let font_name = tokens_to_text(&tokens).trim().to_string();
+                        if !font_name.is_empty() {
+                            self.main_font_name = Some(font_name);
+                        }
+                    }
+                } else {
+                    self.record_error(ParseError::FontspecNotLoaded { line: token.line });
+                }
             }
             "begin" => {
                 if self.read_environment_name()?.as_deref() == Some("document") {
@@ -1486,6 +1511,11 @@ impl<'a> ParserDriver<'a> {
                         let _ = self.take_global_prefix();
                         self.parse_list_of_tables();
                     }
+                    "setmainfont" => {
+                        let _ = self.take_global_prefix();
+                        self.record_error(ParseError::SetmainfontInBody { line: token.line });
+                        let _ = self.read_required_braced_tokens()?;
+                    }
                     _ => {
                         let _ = self.take_global_prefix();
                         if let Some(expansion) =
@@ -1644,9 +1674,19 @@ impl<'a> ParserDriver<'a> {
                 self.parse_newcount(is_global, token.line)?;
                 Ok(true)
             }
+            "newtoks" => {
+                let is_global = self.take_global_prefix();
+                self.parse_newtoks(is_global, token.line)?;
+                Ok(true)
+            }
             "countdef" => {
                 let is_global = self.take_global_prefix();
                 self.parse_countdef(is_global, token.line)?;
+                Ok(true)
+            }
+            "toksdef" => {
+                let is_global = self.take_global_prefix();
+                self.parse_toksdef(is_global, token.line)?;
                 Ok(true)
             }
             "the" => {
@@ -2732,6 +2772,29 @@ impl<'a> ParserDriver<'a> {
     }
 
     fn expand_the(&mut self, line: u32) -> Result<(), ParseError> {
+        loop {
+            let Some(token) = self.next_significant_token() else {
+                return Ok(());
+            };
+
+            match control_sequence_name(&token).as_deref() {
+                Some("toks") => {
+                    let index = self.parse_register_index(line)?;
+                    self.push_front_tokens(self.registers.get_toks(index));
+                    return Ok(());
+                }
+                _ => {
+                    if let Some(expansion) = self.expand_defined_control_sequence_token(&token)? {
+                        self.push_front_tokens(expansion);
+                        continue;
+                    }
+
+                    self.push_front_token(token);
+                    break;
+                }
+            }
+        }
+
         let Some((kind, index)) = self.parse_register_target(line)? else {
             return Ok(());
         };
@@ -3283,6 +3346,19 @@ impl<'a> ParserDriver<'a> {
         Ok(())
     }
 
+    fn parse_newtoks(&mut self, is_global: bool, line: u32) -> Result<(), ParseError> {
+        let Some(name_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        let Some(name) = control_sequence_name(&name_token) else {
+            return Ok(());
+        };
+
+        let index = self.next_allocated_toks(line)?;
+        self.define_register_alias(name, "toks", index, is_global, line);
+        Ok(())
+    }
+
     fn parse_countdef(&mut self, is_global: bool, line: u32) -> Result<(), ParseError> {
         let Some(name_token) = self.next_significant_token() else {
             return Ok(());
@@ -3299,6 +3375,25 @@ impl<'a> ParserDriver<'a> {
 
         let index = self.parse_register_index(line)?;
         self.define_register_alias(name, "count", index, is_global, line);
+        Ok(())
+    }
+
+    fn parse_toksdef(&mut self, is_global: bool, line: u32) -> Result<(), ParseError> {
+        let Some(name_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        let Some(name) = control_sequence_name(&name_token) else {
+            return Ok(());
+        };
+
+        if let Some(token) = self.next_significant_token() {
+            if !matches!(token.kind, TokenKind::CharToken { char: '=', .. }) {
+                self.push_front_token(token);
+            }
+        }
+
+        let index = self.parse_register_index(line)?;
+        self.define_register_alias(name, "toks", index, is_global, line);
         Ok(())
     }
 
@@ -3613,6 +3708,16 @@ impl<'a> ParserDriver<'a> {
 
         let index = self.alloc_count as u16;
         self.alloc_count += 1;
+        Ok(index)
+    }
+
+    fn next_allocated_toks(&mut self, line: u32) -> Result<u16, ParseError> {
+        if self.alloc_toks > u32::from(MAX_REGISTER_INDEX) {
+            return Err(ParseError::InvalidRegisterIndex { line });
+        }
+
+        let index = self.alloc_toks as u16;
+        self.alloc_toks += 1;
         Ok(index)
     }
 
@@ -5942,6 +6047,7 @@ mod tests {
             class_options: Vec::new(),
             loaded_packages: Vec::new(),
             package_count: 0,
+            main_font_name: None,
             body: body.to_string(),
             labels: DocumentLabels::default(),
             bibliography_state: BibliographyState::default(),
@@ -5962,6 +6068,7 @@ mod tests {
                 class_options: Vec::new(),
                 loaded_packages: Vec::new(),
                 package_count: 0,
+                main_font_name: None,
                 body: "Hello".to_string(),
                 labels: DocumentLabels::default(),
                 bibliography_state: BibliographyState::default(),
@@ -6013,12 +6120,69 @@ mod tests {
                 class_options: Vec::new(),
                 loaded_packages: Vec::new(),
                 package_count: 0,
+                main_font_name: None,
                 body: "AB".to_string(),
                 labels: DocumentLabels::default(),
                 bibliography_state: BibliographyState::default(),
                 has_unresolved_refs: false,
             })
         );
+    }
+
+    #[test]
+    fn setmainfont_in_preamble_sets_main_font_name() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{TestFont}\n\\begin{document}\nBody\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.main_font_name, Some("TestFont".to_string()));
+    }
+
+    #[test]
+    fn setmainfont_without_fontspec_emits_warning() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\setmainfont{TestFont}\n\\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert_eq!(
+            output
+                .document
+                .as_ref()
+                .and_then(|document| document.main_font_name.clone()),
+            None
+        );
+        assert!(output
+            .errors
+            .contains(&ParseError::FontspecNotLoaded { line: 2 }));
+    }
+
+    #[test]
+    fn setmainfont_in_body_emits_warning() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{PreambleFont}\n\\begin{document}\n\\setmainfont{BodyFont}\nBody\n\\end{document}\n",
+        );
+
+        assert_eq!(
+            output
+                .document
+                .as_ref()
+                .and_then(|document| document.main_font_name.clone()),
+            Some("PreambleFont".to_string())
+        );
+        assert!(output
+            .errors
+            .contains(&ParseError::SetmainfontInBody { line: 5 }));
+    }
+
+    #[test]
+    fn no_fontspec_produces_none_main_font_name() {
+        let document = MinimalLatexParser
+            .parse("\\documentclass{article}\n\\begin{document}\nBody\n\\end{document}\n")
+            .expect("parse document");
+
+        assert_eq!(document.main_font_name, None);
     }
 
     #[test]
@@ -6898,6 +7062,28 @@ mod tests {
     }
 
     #[test]
+    fn expands_the_for_toks_register() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\toks0={hello}\\the\\toks0\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "hello");
+    }
+
+    #[test]
+    fn the_toks_in_edef() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\toks0={alpha}\n\\edef\\foo{\\the\\toks0}\n\\toks0={beta}\n\\begin{document}\n\\foo\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "alpha");
+    }
+
+    #[test]
     fn iftrue_keeps_true_branch() {
         let document = MinimalLatexParser
             .parse(
@@ -7085,6 +7271,17 @@ mod tests {
     }
 
     #[test]
+    fn newtoks_allocates_and_aliases() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\newtoks\\foo\n\\newtoks\\bar\n\\begin{document}\n\\foo={left}\\bar={right}\\the\\toks10/\\the\\toks11/\\the\\foo/\\the\\bar\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "left/right/left/right");
+    }
+
+    #[test]
     fn countdef_creates_named_count_aliases() {
         let document = MinimalLatexParser
             .parse(
@@ -7093,6 +7290,50 @@ mod tests {
             .expect("parse document");
 
         assert_eq!(document.body, "10/10");
+    }
+
+    #[test]
+    fn toksdef_creates_alias() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\toksdef\\foo=12\n\\begin{document}\n\\foo={value}\\the\\foo/\\the\\toks12\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "value/value");
+    }
+
+    #[test]
+    fn the_toks_empty_register() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\nA\\the\\toks0B\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "AB");
+    }
+
+    #[test]
+    fn toks_scope_with_the() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\begin{document}\n\\toks0={outer}{\\toks0={inner}}\\the\\toks0\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "outer");
+    }
+
+    #[test]
+    fn expands_the_for_newtoks_alias() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\newtoks\\mytoks\n\\begin{document}\n\\mytoks={alias}\\the\\mytoks\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "alias");
     }
 
     #[test]

@@ -73,6 +73,9 @@ pub struct XcolorExtension;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GeometryExtension;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FontspecExtension;
+
 impl PackageExtension for AmsmathExtension {
     fn name(&self) -> &str {
         "amsmath"
@@ -122,6 +125,16 @@ impl PackageExtension for GeometryExtension {
 
     fn register(&self, engine: &mut MacroEngine) {
         register_noop_command(engine, "geometry", 1);
+    }
+}
+
+impl PackageExtension for FontspecExtension {
+    fn name(&self) -> &str {
+        "fontspec"
+    }
+
+    fn register(&self, engine: &mut MacroEngine) {
+        register_noop_command(engine, "setmainfont", 1);
     }
 }
 
@@ -217,12 +230,14 @@ pub fn load_package(
 
 fn get_native_extension(name: &str) -> Option<&'static dyn PackageExtension> {
     static AMSMATH_EXTENSION: AmsmathExtension = AmsmathExtension;
+    static FONTSPEC_EXTENSION: FontspecExtension = FontspecExtension;
     static GEOMETRY_EXTENSION: GeometryExtension = GeometryExtension;
     static GRAPHICX_EXTENSION: GraphicxExtension = GraphicxExtension;
     static XCOLOR_EXTENSION: XcolorExtension = XcolorExtension;
 
     match name {
         "amsmath" => Some(&AMSMATH_EXTENSION),
+        "fontspec" => Some(&FONTSPEC_EXTENSION),
         "geometry" => Some(&GEOMETRY_EXTENSION),
         "graphicx" => Some(&GRAPHICX_EXTENSION),
         "xcolor" => Some(&XCOLOR_EXTENSION),
@@ -355,5 +370,15 @@ mod tests {
         assert!(engine.lookup("color").is_some());
         assert!(engine.lookup("textcolor").is_some());
         assert_eq!(registry.loaded_packages().len(), 1);
+    }
+
+    #[test]
+    fn fontspec_extension_registers_setmainfont() {
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+
+        assert!(load_package("fontspec", &[], &mut registry, &mut engine).expect("load fontspec"));
+
+        assert!(engine.lookup("setmainfont").is_some());
     }
 }
