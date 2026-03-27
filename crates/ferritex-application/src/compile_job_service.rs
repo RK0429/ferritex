@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferritex_core::assets::{AssetHandle, LogicalAssetId};
@@ -90,6 +91,17 @@ enum CompileFontSelection {
     OpenType(LoadedOpenTypeFont),
     Tfm(TfmMetrics),
     Basic,
+}
+
+struct FontLoadTaskResult {
+    loaded_font: Option<LoadedOpenTypeFont>,
+    diagnostic: Option<Diagnostic>,
+}
+
+enum FontLoadResult {
+    Main(FontLoadTaskResult),
+    Sans(FontLoadTaskResult),
+    Mono(FontLoadTaskResult),
 }
 
 struct CompileGraphicAssetResolver<'a> {
@@ -312,6 +324,7 @@ impl<'a> CompileJobService<'a> {
                         } else {
                             &[]
                         },
+                        options.parallelism,
                         options.trace_font_tasks,
                     );
                     font_diagnostics.extend(diagnostics);
@@ -360,6 +373,7 @@ impl<'a> CompileJobService<'a> {
                 let font_resources = build_multi_font_pdf_resources(
                     families,
                     typeset_document,
+                    options.parallelism,
                     options.trace_font_tasks,
                 );
                 if font_resources.is_empty() {
@@ -609,6 +623,7 @@ impl<'a> CompileJobService<'a> {
         overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
         host_font_roots: &[PathBuf],
+        parallelism: usize,
         trace_font_tasks: bool,
     ) -> (CompileFontSelection, FontFamilySelection, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
@@ -622,9 +637,27 @@ impl<'a> CompileJobService<'a> {
         } else {
             "place the font in the document directory, project fonts/, configured overlay roots, asset bundle, or host font catalog"
         };
-        let main = if let Some(font_name) = requested_main_font {
-            match trace_font_task(trace_font_tasks, "font-load-main", font_name, 0, || {
-                resolve_named_font(
+        let mut tasks: Vec<Box<dyn FnOnce() -> FontLoadResult + Send + '_>> =
+            vec![Box::new(move || {
+                FontLoadResult::Main(load_main_font_task(
+                    input_path,
+                    requested_main_font,
+                    input_dir,
+                    project_root,
+                    overlay_roots,
+                    asset_bundle_path,
+                    host_font_roots,
+                    self.file_access_gate,
+                    resolution_surface,
+                    resolution_suggestion,
+                    trace_font_tasks,
+                    0,
+                ))
+            })];
+        if let Some(font_name) = requested_sans_font {
+            tasks.push(Box::new(move || {
+                FontLoadResult::Sans(load_optional_font_task(
+                    input_path,
                     font_name,
                     input_dir,
                     project_root,
@@ -632,109 +665,61 @@ impl<'a> CompileJobService<'a> {
                     asset_bundle_path,
                     host_font_roots,
                     self.file_access_gate,
-                )
-            }) {
-                Some(resolved_font) => Some(LoadedOpenTypeFont {
-                    base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
-                    font: resolved_font.font,
-                }),
-                None => {
-                    diagnostics.push(
-                        Diagnostic::new(
-                            Severity::Error,
-                            format!(
-                                "Font \"{font_name}\" not found in {resolution_surface}"
-                            ),
-                        )
-                        .with_file(input_path.to_string())
-                        .with_suggestion(format!(
-                            "{resolution_suggestion}; compile will fall back to another available main font until then"
-                        )),
-                    );
-                    trace_font_task(
-                        trace_font_tasks,
-                        "font-load-main-default",
-                        default_font_asset_label(asset_bundle_path),
-                        0,
-                        || load_opentype_font(self.file_access_gate, asset_bundle_path),
-                    )
+                    resolution_surface,
+                    resolution_suggestion,
+                    "font-load-sans",
+                    "PDF output will fall back to a built-in sans font until then",
+                    trace_font_tasks,
+                    1,
+                ))
+            }));
+        }
+        if let Some(font_name) = requested_mono_font {
+            tasks.push(Box::new(move || {
+                FontLoadResult::Mono(load_optional_font_task(
+                    input_path,
+                    font_name,
+                    input_dir,
+                    project_root,
+                    overlay_roots,
+                    asset_bundle_path,
+                    host_font_roots,
+                    self.file_access_gate,
+                    resolution_surface,
+                    resolution_suggestion,
+                    "font-load-mono",
+                    "PDF output will fall back to a built-in mono font until then",
+                    trace_font_tasks,
+                    2,
+                ))
+            }));
+        }
+
+        let mut main = None;
+        let mut sans = None;
+        let mut mono = None;
+        for result in run_font_tasks(parallelism, tasks) {
+            match result {
+                FontLoadResult::Main(result) => {
+                    main = result.loaded_font;
+                    if let Some(diagnostic) = result.diagnostic {
+                        diagnostics.push(diagnostic);
+                    }
+                }
+                FontLoadResult::Sans(result) => {
+                    sans = result.loaded_font;
+                    if let Some(diagnostic) = result.diagnostic {
+                        diagnostics.push(diagnostic);
+                    }
+                }
+                FontLoadResult::Mono(result) => {
+                    mono = result.loaded_font;
+                    if let Some(diagnostic) = result.diagnostic {
+                        diagnostics.push(diagnostic);
+                    }
                 }
             }
-        } else {
-            trace_font_task(
-                trace_font_tasks,
-                "font-load-main-default",
-                default_font_asset_label(asset_bundle_path),
-                0,
-                || load_opentype_font(self.file_access_gate, asset_bundle_path),
-            )
-        };
-
-        let sans = requested_sans_font.and_then(|font_name| {
-            trace_font_task(trace_font_tasks, "font-load-sans", font_name, 0, || {
-                resolve_named_font(
-                    font_name,
-                    input_dir,
-                    project_root,
-                    overlay_roots,
-                    asset_bundle_path,
-                    host_font_roots,
-                    self.file_access_gate,
-                )
-            })
-            .map(|resolved_font| LoadedOpenTypeFont {
-                base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
-                font: resolved_font.font,
-            })
-            .or_else(|| {
-                diagnostics.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        format!(
-                            "Font \"{font_name}\" not found in {resolution_surface}"
-                        ),
-                    )
-                    .with_file(input_path.to_string())
-                    .with_suggestion(format!(
-                        "{resolution_suggestion}; PDF output will fall back to a built-in sans font until then"
-                    )),
-                );
-                None
-            })
-        });
-
-        let mono = requested_mono_font.and_then(|font_name| {
-            trace_font_task(trace_font_tasks, "font-load-mono", font_name, 0, || {
-                resolve_named_font(
-                    font_name,
-                    input_dir,
-                    project_root,
-                    overlay_roots,
-                    asset_bundle_path,
-                    host_font_roots,
-                    self.file_access_gate,
-                )
-            })
-            .map(|resolved_font| LoadedOpenTypeFont {
-                base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
-                font: resolved_font.font,
-            })
-            .or_else(|| {
-                diagnostics.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        format!(
-                            "Font \"{font_name}\" not found in {resolution_surface}"
-                        ),
-                    )
-                    .with_file(input_path.to_string())
-                    .with_suggestion(format!(
-                        "{resolution_suggestion}; PDF output will fall back to a built-in mono font until then"
-                    )),
-                );
-                None
-            })
-        });
+        }
 
         let families = FontFamilySelection { main, sans, mono };
 
@@ -1783,6 +1768,7 @@ fn is_ttf_path(path: &Path) -> bool {
 fn build_multi_font_pdf_resources(
     selection: &FontFamilySelection,
     document: &TypesetDocument,
+    parallelism: usize,
     trace_font_tasks: bool,
 ) -> Vec<FontResource> {
     let mut used_characters = vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
@@ -1803,22 +1789,77 @@ fn build_multi_font_pdf_resources(
         return Vec::new();
     };
 
-    (0..=highest_used_role)
+    let mut resources = (0..=highest_used_role)
         .map(|role| {
             selection
                 .font_for_role(role as u8)
-                .and_then(|font| {
-                    trace_font_task(
-                        trace_font_tasks,
-                        subset_task_id_for_role(role as u8),
-                        &font.base_font,
-                        0,
-                        || build_opentype_font_resource(font, &used_characters[role]),
-                    )
-                })
-                .unwrap_or_else(|| builtin_font_resource_for_role(role as u8))
+                .is_none()
+                .then(|| builtin_font_resource_for_role(role as u8))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut tasks: Vec<Box<dyn FnOnce() -> (usize, Option<FontResource>) + Send>> = Vec::new();
+
+    for role in 0..=highest_used_role {
+        let Some(font) = selection.font_for_role(role as u8) else {
+            continue;
+        };
+        let font = font.clone();
+        let role_characters = used_characters[role].clone();
+        tasks.push(Box::new(move || {
+            (
+                role,
+                trace_font_task(
+                    trace_font_tasks,
+                    subset_task_id_for_role(role as u8),
+                    &font.base_font,
+                    role,
+                    || build_opentype_font_resource(&font, &role_characters),
+                ),
+            )
+        }));
+    }
+
+    for (role, resource) in run_font_tasks(parallelism, tasks) {
+        resources[role] =
+            Some(resource.unwrap_or_else(|| builtin_font_resource_for_role(role as u8)));
+    }
+
+    resources.into_iter().flatten().collect()
+}
+
+fn run_font_tasks<'a, T>(
+    parallelism: usize,
+    mut tasks: Vec<Box<dyn FnOnce() -> T + Send + 'a>>,
+) -> Vec<T>
+where
+    T: Send + 'a,
+{
+    if tasks.len() <= 1 || parallelism <= 1 {
+        return tasks.into_iter().map(|task| task()).collect();
+    }
+
+    let mut results = Vec::with_capacity(tasks.len());
+    let concurrency = parallelism.max(1);
+
+    while !tasks.is_empty() {
+        let batch = tasks
+            .drain(..concurrency.min(tasks.len()))
+            .collect::<Vec<_>>();
+        let batch_results = thread::scope(|scope| {
+            let handles = batch
+                .into_iter()
+                .map(|task| scope.spawn(move || task()))
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("font task thread panicked"))
+                .collect::<Vec<_>>()
+        });
+        results.extend(batch_results);
+    }
+
+    results
 }
 
 fn subset_task_id_for_role(role: u8) -> &'static str {
@@ -1983,6 +2024,121 @@ fn trace_timestamp_micros() -> u64 {
         .unwrap_or_default()
         .as_micros()
         .min(u128::from(u64::MAX)) as u64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_main_font_task(
+    input_path: &str,
+    requested_main_font: Option<&str>,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+    host_font_roots: &[PathBuf],
+    file_access_gate: &dyn FileAccessGate,
+    resolution_surface: &str,
+    resolution_suggestion: &str,
+    trace_font_tasks: bool,
+    worker_id: usize,
+) -> FontLoadTaskResult {
+    if let Some(font_name) = requested_main_font {
+        match trace_font_task(trace_font_tasks, "font-load-main", font_name, worker_id, || {
+            resolve_named_font(
+                font_name,
+                input_dir,
+                project_root,
+                overlay_roots,
+                asset_bundle_path,
+                host_font_roots,
+                file_access_gate,
+            )
+        }) {
+            Some(resolved_font) => FontLoadTaskResult {
+                loaded_font: Some(LoadedOpenTypeFont {
+                    base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
+                    font: resolved_font.font,
+                }),
+                diagnostic: None,
+            },
+            None => FontLoadTaskResult {
+                loaded_font: trace_font_task(
+                    trace_font_tasks,
+                    "font-load-main-default",
+                    default_font_asset_label(asset_bundle_path),
+                    worker_id,
+                    || load_opentype_font(file_access_gate, asset_bundle_path),
+                ),
+                diagnostic: Some(
+                    Diagnostic::new(
+                        Severity::Error,
+                        format!("Font \"{font_name}\" not found in {resolution_surface}"),
+                    )
+                    .with_file(input_path.to_string())
+                    .with_suggestion(format!(
+                        "{resolution_suggestion}; compile will fall back to another available main font until then"
+                    )),
+                ),
+            },
+        }
+    } else {
+        FontLoadTaskResult {
+            loaded_font: trace_font_task(
+                trace_font_tasks,
+                "font-load-main-default",
+                default_font_asset_label(asset_bundle_path),
+                worker_id,
+                || load_opentype_font(file_access_gate, asset_bundle_path),
+            ),
+            diagnostic: None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_optional_font_task(
+    input_path: &str,
+    font_name: &str,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+    host_font_roots: &[PathBuf],
+    file_access_gate: &dyn FileAccessGate,
+    resolution_surface: &str,
+    resolution_suggestion: &str,
+    task_id: &'static str,
+    fallback_message: &'static str,
+    trace_font_tasks: bool,
+    worker_id: usize,
+) -> FontLoadTaskResult {
+    let loaded_font = trace_font_task(trace_font_tasks, task_id, font_name, worker_id, || {
+        resolve_named_font(
+            font_name,
+            input_dir,
+            project_root,
+            overlay_roots,
+            asset_bundle_path,
+            host_font_roots,
+            file_access_gate,
+        )
+    })
+    .map(|resolved_font| LoadedOpenTypeFont {
+        base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
+        font: resolved_font.font,
+    });
+    let diagnostic = loaded_font.is_none().then(|| {
+        Diagnostic::new(
+            Severity::Error,
+            format!("Font \"{font_name}\" not found in {resolution_surface}"),
+        )
+        .with_file(input_path.to_string())
+        .with_suggestion(format!("{resolution_suggestion}; {fallback_message}"))
+    });
+
+    FontLoadTaskResult {
+        loaded_font,
+        diagnostic,
+    }
 }
 
 fn default_font_asset_label(asset_bundle_path: Option<&Path>) -> String {
@@ -2394,10 +2550,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::thread;
     use std::time::Duration;
 
-    use super::CompileJobService;
+    use super::{run_font_tasks, CompileJobService};
     use crate::ports::AssetBundleLoaderPort;
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
     use ferritex_core::diagnostics::Severity;
@@ -2514,6 +2672,78 @@ mod tests {
         }
 
         fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+
+        fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), FileAccessError> {
+            fs::write(path, content).map_err(FileAccessError::from)
+        }
+
+        fn read_readback(
+            &self,
+            path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+    }
+
+    struct DelayedFontReadGate {
+        delay: Duration,
+        active_font_reads: AtomicUsize,
+        max_concurrent_font_reads: AtomicUsize,
+    }
+
+    impl DelayedFontReadGate {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                active_font_reads: AtomicUsize::new(0),
+                max_concurrent_font_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn max_concurrent_font_reads(&self) -> usize {
+            self.max_concurrent_font_reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl FileAccessGate for DelayedFontReadGate {
+        fn ensure_directory(&self, path: &Path) -> Result<(), FileAccessError> {
+            fs::create_dir_all(path).map_err(FileAccessError::from)
+        }
+
+        fn check_read(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_write(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_readback(
+            &self,
+            _path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
+            if matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("ttf" | "otf")
+            ) {
+                let active = self.active_font_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                record_peak(&self.max_concurrent_font_reads, active);
+                thread::sleep(self.delay);
+                let result = fs::read(path).map_err(FileAccessError::from);
+                self.active_font_reads.fetch_sub(1, Ordering::SeqCst);
+                return result;
+            }
+
             fs::read(path).map_err(FileAccessError::from)
         }
 
@@ -2741,6 +2971,12 @@ mod tests {
                 glyph
             })
             .collect()
+    }
+
+    fn record_peak(peak: &AtomicUsize, value: usize) {
+        let _ = peak.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (value > current).then_some(value)
+        });
     }
 
     fn build_glyph_tables(glyphs: &[Vec<u8>], index_to_loc_format: i16) -> (Vec<u8>, Vec<u8>) {
@@ -3432,6 +3668,65 @@ mod tests {
         assert!(pdf.contains("/F3 "));
         assert!(pdf.contains("/F2 12 Tf"));
         assert!(pdf.contains("/F3 12 Tf"));
+    }
+
+    #[test]
+    fn run_font_tasks_parallelizes_up_to_requested_parallelism() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let tasks: Vec<Box<dyn FnOnce() -> usize + Send>> = (0..3)
+            .map(|index| {
+                let active_ref = &active;
+                let peak_ref = &peak;
+                Box::new(move || {
+                    let in_flight = active_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                    record_peak(peak_ref, in_flight);
+                    thread::sleep(Duration::from_millis(30));
+                    active_ref.fetch_sub(1, Ordering::SeqCst);
+                    index as usize
+                }) as Box<dyn FnOnce() -> usize + Send>
+            })
+            .collect();
+
+        let results = run_font_tasks(2, tasks);
+
+        assert_eq!(results, vec![0, 1, 2]);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn compile_parallelizes_independent_font_loads_when_jobs_exceeds_one() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
+        fs::create_dir_all(&font_dir).expect("create font dir");
+        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{MainFace}\n\\setsansfont{SansFace}\n\\setmonofont{MonoFace}\n\\begin{document}\nAB\\par\n\\textsf{AB}\\par\n\\texttt{AB}\n\\end{document}\n",
+        )
+        .expect("write input");
+        fs::write(font_dir.join("MainFace.ttf"), build_test_ttf()).expect("write main font");
+        fs::write(font_dir.join("SansFace.ttf"), build_test_ttf()).expect("write sans font");
+        fs::write(font_dir.join("MonoFace.ttf"), build_test_ttf()).expect("write mono font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        options.parallelism = 4;
+        let loader = MockAssetBundleLoader::valid();
+        let gate = DelayedFontReadGate::new(Duration::from_millis(40));
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        assert!(gate.max_concurrent_font_reads() >= 2);
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("FerritexSubset+MainFace"));
+        assert!(pdf.contains("FerritexSubset+SansFace"));
+        assert!(pdf.contains("FerritexSubset+MonoFace"));
     }
 
     #[test]
