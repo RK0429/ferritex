@@ -28,6 +28,7 @@ pub struct CachedCompileArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheLookupResult {
     pub artifact: Option<CachedCompileArtifact>,
+    pub baseline_state: Option<StableCompileState>,
     pub diagnostics: Vec<Diagnostic>,
     pub changed_paths: Vec<PathBuf>,
     pub scope: Option<RecompilationScope>,
@@ -76,6 +77,7 @@ impl<'a> CompileCache<'a> {
             {
                 return CacheLookupResult {
                     artifact: None,
+                    baseline_state: None,
                     diagnostics: Vec::new(),
                     changed_paths: Vec::new(),
                     scope: None,
@@ -84,6 +86,7 @@ impl<'a> CompileCache<'a> {
             Err(error) => {
                 return CacheLookupResult {
                     artifact: None,
+                    baseline_state: None,
                     diagnostics: vec![cache_info_diagnostic(
                         format!("failed to read compile cache metadata: {error}"),
                         &self.metadata_path,
@@ -99,6 +102,7 @@ impl<'a> CompileCache<'a> {
             Err(error) => {
                 return CacheLookupResult {
                     artifact: None,
+                    baseline_state: None,
                     diagnostics: vec![cache_info_diagnostic(
                         format!("compile cache metadata is invalid: {error}"),
                         &self.metadata_path,
@@ -112,6 +116,7 @@ impl<'a> CompileCache<'a> {
         if record.version != CACHE_VERSION {
             return CacheLookupResult {
                 artifact: None,
+                baseline_state: None,
                 diagnostics: vec![cache_info_diagnostic(
                     format!(
                         "compile cache version mismatch (found {}, expected {CACHE_VERSION})",
@@ -130,16 +135,20 @@ impl<'a> CompileCache<'a> {
         {
             return CacheLookupResult {
                 artifact: None,
+                baseline_state: None,
                 diagnostics: Vec::new(),
                 changed_paths: Vec::new(),
                 scope: None,
             };
         }
 
+        let baseline_state = record.stable_compile_state.clone();
+
         let change_summary = self.detect_changes(&record.dependency_graph);
         if !change_summary.changed_paths.is_empty() {
             return CacheLookupResult {
                 artifact: None,
+                baseline_state: Some(baseline_state),
                 diagnostics: Vec::new(),
                 changed_paths: change_summary.changed_paths,
                 scope: Some(change_summary.scope),
@@ -151,6 +160,7 @@ impl<'a> CompileCache<'a> {
             Err(error) => {
                 return CacheLookupResult {
                     artifact: None,
+                    baseline_state: Some(baseline_state),
                     diagnostics: vec![cache_info_diagnostic(
                         format!("cached PDF artifact is unavailable: {error}"),
                         &self.output_pdf,
@@ -164,6 +174,7 @@ impl<'a> CompileCache<'a> {
         if output_pdf_hash != record.output_pdf_hash {
             return CacheLookupResult {
                 artifact: None,
+                baseline_state: Some(baseline_state),
                 diagnostics: vec![cache_info_diagnostic(
                     "cached PDF artifact hash mismatch; falling back to full compile",
                     &self.output_pdf,
@@ -178,6 +189,7 @@ impl<'a> CompileCache<'a> {
                 stable_compile_state: record.stable_compile_state,
                 output_pdf: record.output_pdf,
             }),
+            baseline_state: Some(baseline_state),
             diagnostics: Vec::new(),
             changed_paths: Vec::new(),
             scope: None,
@@ -371,6 +383,7 @@ mod tests {
                 jobname: "main".to_string(),
             },
             document_state: DocumentState::default(),
+            cross_reference_seed: Default::default(),
             page_count: 1,
             success: true,
             diagnostics: Vec::new(),
@@ -404,6 +417,7 @@ mod tests {
         let lookup = cache.lookup();
 
         assert!(lookup.artifact.is_none());
+        assert_eq!(lookup.baseline_state, Some(stable_state(&input)));
         assert_eq!(lookup.changed_paths, vec![input]);
         assert_eq!(lookup.scope, Some(RecompilationScope::LocalRegion));
     }
@@ -430,6 +444,7 @@ mod tests {
         let lookup = cache.lookup();
 
         assert!(lookup.diagnostics.is_empty());
+        assert_eq!(lookup.baseline_state, Some(expected_state.clone()));
         assert_eq!(
             lookup
                 .artifact

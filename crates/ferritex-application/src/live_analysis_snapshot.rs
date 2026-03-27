@@ -858,6 +858,7 @@ mod tests {
                 jobname: "main".to_string(),
             },
             document_state,
+            cross_reference_seed: Default::default(),
             page_count: 0,
             success,
             diagnostics,

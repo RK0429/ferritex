@@ -35,7 +35,10 @@ use crate::compile_cache::{fingerprint_bytes, CompileCache};
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::AssetBundleLoaderPort;
 use crate::runtime_options::RuntimeOptions;
-use crate::stable_compile_state::StableCompileState;
+use crate::stable_compile_state::{
+    CrossReferenceCaptionEntry, CrossReferenceSeed, CrossReferenceSectionEntry,
+    StableCompileState,
+};
 
 const DEFAULT_TFM_FALLBACK_WIDTH: DimensionValue = DimensionValue(65_536);
 const CMR10_TFM_CANDIDATES: [&str; 4] = [
@@ -344,8 +347,13 @@ impl<'a> CompileJobService<'a> {
             &options.jobname,
         );
         let mut cache_diagnostics = Vec::new();
+        let mut cached_cross_reference_seed = None;
         if !options.no_cache {
             let lookup = compile_cache.lookup();
+            cached_cross_reference_seed = lookup
+                .baseline_state
+                .as_ref()
+                .map(|state| state.cross_reference_seed.clone());
             if let Some(cached_artifact) = lookup.artifact {
                 tracing::info!(
                     jobname = %options.jobname,
@@ -430,6 +438,7 @@ impl<'a> CompileJobService<'a> {
             options.asset_bundle.as_deref(),
             initial_bibliography_state.clone(),
             source_tree.document_state.index_state.entries.clone(),
+            cached_cross_reference_seed.as_ref(),
             |document| {
                 if compile_font_selection.is_none() {
                     let (selection, families, diagnostics) = self.select_compile_fonts(
@@ -570,6 +579,7 @@ impl<'a> CompileJobService<'a> {
                     stable_compile_state: Some(stable_compile_state(
                         &compilation_job,
                         source_tree.document_state.clone(),
+                        CrossReferenceSeed::default(),
                         pass_count,
                         0,
                         false,
@@ -579,6 +589,8 @@ impl<'a> CompileJobService<'a> {
             }
         };
         let typeset_document = typeset_document.expect("parsed documents should always typeset");
+        let cross_reference_seed =
+            cross_reference_seed_from_document(&parsed_document, &typeset_document);
         persist_compiled_document_state(
             &mut source_tree.document_state,
             &parsed_document,
@@ -655,6 +667,7 @@ impl<'a> CompileJobService<'a> {
         let provisional_stable_state = stable_compile_state(
             &compilation_job,
             source_tree.document_state.clone(),
+            cross_reference_seed.clone(),
             pass_count,
             pdf_document.page_count,
             true,
@@ -673,6 +686,7 @@ impl<'a> CompileJobService<'a> {
         let stable_compile_state = stable_compile_state(
             &compilation_job,
             source_tree.document_state,
+            cross_reference_seed,
             pass_count,
             pdf_document.page_count,
             true,
@@ -736,6 +750,7 @@ impl<'a> CompileJobService<'a> {
             None,
             source_tree.document_state.bibliography_state.clone().into(),
             source_tree.document_state.index_state.entries.clone(),
+            None,
             |document| self.typesetter.typeset(document),
         );
         let parse_diagnostics: Vec<Diagnostic> = errors
@@ -753,9 +768,12 @@ impl<'a> CompileJobService<'a> {
                     &typeset_document,
                 );
                 let pdf_document = self.pdf_renderer.render(&typeset_document);
+                let cross_reference_seed =
+                    cross_reference_seed_from_document(&parsed_document, &typeset_document);
                 stable_compile_state(
                     &compilation_job,
                     source_tree.document_state,
+                    cross_reference_seed,
                     pass_count,
                     pdf_document.page_count,
                     true,
@@ -765,6 +783,7 @@ impl<'a> CompileJobService<'a> {
             None => stable_compile_state(
                 &compilation_job,
                 source_tree.document_state,
+                CrossReferenceSeed::default(),
                 pass_count,
                 0,
                 false,
@@ -1049,6 +1068,7 @@ impl<'a> CompileJobService<'a> {
         asset_bundle_path: Option<&Path>,
         initial_bibliography_state: Option<BibliographyState>,
         initial_index_entries: Vec<IndexEntry>,
+        cached_cross_reference_seed: Option<&CrossReferenceSeed>,
         mut typeset_document_for: F,
     ) -> ParsePassResult
     where
@@ -1064,17 +1084,42 @@ impl<'a> CompileJobService<'a> {
                 package_name,
             )
         };
+        let initial_labels = cached_cross_reference_seed
+            .map(|seed| seed.labels.clone())
+            .unwrap_or_default();
+        let initial_section_entries = cached_cross_reference_seed
+            .map(seed_section_entries_to_parser)
+            .unwrap_or_default();
+        let initial_figure_entries = cached_cross_reference_seed
+            .map(|seed| seed_caption_entries_to_parser(&seed.figure_entries))
+            .unwrap_or_default();
+        let initial_table_entries = cached_cross_reference_seed
+            .map(|seed| seed_caption_entries_to_parser(&seed.table_entries))
+            .unwrap_or_default();
+        let initial_bibliography = cached_cross_reference_seed
+            .map(|seed| seed.bibliography.clone())
+            .unwrap_or_default();
+        let initial_page_labels = cached_cross_reference_seed
+            .map(|seed| seed.page_labels.clone())
+            .unwrap_or_default();
+        let initial_index_entries = if initial_index_entries.is_empty() {
+            cached_cross_reference_seed
+                .map(|seed| seed.index_entries.clone())
+                .unwrap_or_default()
+        } else {
+            initial_index_entries
+        };
         let mut output = self
             .parser
             .parse_recovering_with_context_and_package_resolver(
                 source,
-                BTreeMap::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                BTreeMap::new(),
+                initial_labels,
+                initial_section_entries,
+                initial_figure_entries,
+                initial_table_entries,
+                initial_bibliography,
                 initial_bibliography_state.clone(),
-                BTreeMap::new(),
+                initial_page_labels,
                 initial_index_entries.clone(),
                 Some(&sty_resolver),
             );
@@ -1164,6 +1209,7 @@ impl<'a> CompileJobService<'a> {
 fn stable_compile_state(
     compilation_job: &CompilationJob,
     document_state: DocumentState,
+    cross_reference_seed: CrossReferenceSeed,
     pass_count: u32,
     page_count: usize,
     success: bool,
@@ -1172,9 +1218,95 @@ fn stable_compile_state(
     StableCompileState {
         snapshot: CompilationSnapshot::from_session(&compilation_job.begin_pass(pass_count)),
         document_state,
+        cross_reference_seed,
         page_count,
         success,
         diagnostics,
+    }
+}
+
+fn cross_reference_seed_from_document(
+    parsed_document: &ferritex_core::parser::ParsedDocument,
+    typeset_document: &TypesetDocument,
+) -> CrossReferenceSeed {
+    let page_labels = if parsed_document.has_pageref_markers() {
+        resolve_page_labels(parsed_document, &typeset_document.pages)
+    } else {
+        BTreeMap::new()
+    };
+
+    CrossReferenceSeed {
+        labels: parsed_document.labels.clone().into_inner(),
+        section_entries: parsed_document
+            .section_entries
+            .iter()
+            .map(|entry| CrossReferenceSectionEntry {
+                level: entry.level,
+                number: entry.number.clone(),
+                title: entry.title.clone(),
+            })
+            .collect(),
+        figure_entries: parsed_document
+            .figure_entries
+            .iter()
+            .map(|entry| CrossReferenceCaptionEntry {
+                kind: caption_kind_name(entry.kind),
+                number: entry.number.clone(),
+                caption: entry.caption.clone(),
+            })
+            .collect(),
+        table_entries: parsed_document
+            .table_entries
+            .iter()
+            .map(|entry| CrossReferenceCaptionEntry {
+                kind: caption_kind_name(entry.kind),
+                number: entry.number.clone(),
+                caption: entry.caption.clone(),
+            })
+            .collect(),
+        bibliography: parsed_document.bibliography.clone(),
+        page_labels,
+        index_entries: typeset_document.index_entries.clone(),
+    }
+}
+
+fn seed_section_entries_to_parser(
+    seed: &CrossReferenceSeed,
+) -> Vec<ferritex_core::parser::SectionEntry> {
+    seed.section_entries
+        .iter()
+        .map(|entry| ferritex_core::parser::SectionEntry {
+            level: entry.level,
+            number: entry.number.clone(),
+            title: entry.title.clone(),
+        })
+        .collect()
+}
+
+fn seed_caption_entries_to_parser(
+    entries: &[CrossReferenceCaptionEntry],
+) -> Vec<ferritex_core::parser::api::CaptionEntry> {
+    entries
+        .iter()
+        .map(|entry| ferritex_core::parser::api::CaptionEntry {
+            kind: caption_kind_from_name(&entry.kind),
+            number: entry.number.clone(),
+            caption: entry.caption.clone(),
+        })
+        .collect()
+}
+
+fn caption_kind_name(kind: ferritex_core::parser::api::FloatType) -> String {
+    match kind {
+        ferritex_core::parser::api::FloatType::Figure => "figure".to_string(),
+        ferritex_core::parser::api::FloatType::Table => "table".to_string(),
+    }
+}
+
+fn caption_kind_from_name(kind: &str) -> ferritex_core::parser::api::FloatType {
+    match kind {
+        "table" => ferritex_core::parser::api::FloatType::Table,
+        _ => ferritex_core::parser::api::FloatType::Figure,
     }
 }
 
@@ -3624,6 +3756,66 @@ mod tests {
     }
 
     #[test]
+    fn changed_dependency_reuses_cached_cross_reference_seed_and_matches_full_compile() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let chapter_file = dir.path().join("chapter.tex");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\begin{document}\n\\tableofcontents\n\\input{chapter}\nSee Section \\ref{sec:intro}.\n\\end{document}\n",
+        )
+        .expect("write main input");
+        fs::write(
+            &chapter_file,
+            "\\section{Intro}\\label{sec:intro}\nInitial paragraph.\n",
+        )
+        .expect("write chapter input");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        let first_state = first
+            .stable_compile_state
+            .clone()
+            .expect("first stable state");
+        assert_eq!(first.exit_code, 0);
+        assert!(
+            first_state.snapshot.pass_number >= 2,
+            "first compile should need at least one fixpoint pass",
+        );
+
+        fs::write(
+            &chapter_file,
+            "\\section{Intro}\\label{sec:intro}\nEdited paragraph after cache warmup.\n",
+        )
+        .expect("update chapter input");
+
+        let second = service(&FsTestFileAccessGate, &loader).compile(&options);
+        let second_state = second
+            .stable_compile_state
+            .clone()
+            .expect("second stable state");
+        assert_eq!(second.exit_code, 0);
+        assert_eq!(second_state.snapshot.pass_number, 1);
+
+        let incremental_pdf =
+            fs::read(options.output_dir.join("main.pdf")).expect("read incremental pdf");
+        let incremental_pdf_text = String::from_utf8_lossy(&incremental_pdf);
+        assert!(incremental_pdf_text.contains("Edited paragraph after cache warmup."));
+        assert!(incremental_pdf_text.contains("See Section 1."));
+
+        let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0);
+
+        let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
+        assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
     fn writes_pdf_and_reports_recoverable_parse_diagnostics() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -4660,6 +4852,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             |document| compile_service.typesetter.typeset(document),
         );
         let document = parse_result
@@ -4723,6 +4916,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
             |document| compile_service.typesetter.typeset(document),
         );
         let document = parse_result
