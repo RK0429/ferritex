@@ -6,6 +6,7 @@ use super::{
     line_breaker,
 };
 
+use crate::compilation::{LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft};
 use crate::font::api::TfmMetrics;
 use crate::graphics::api::{
     compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
@@ -60,6 +61,7 @@ pub struct TypesetDocument {
     pub outlines: Vec<TypesetOutline>,
     pub title: Option<String>,
     pub author: Option<String>,
+    pub navigation: NavigationState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,7 +447,41 @@ impl MinimalTypesetter {
             outlines,
             title: document.title.clone(),
             author: document.author.clone(),
+            navigation: build_navigation_state(document),
         }
+    }
+}
+
+fn build_navigation_state(document: &ParsedDocument) -> NavigationState {
+    NavigationState {
+        metadata: PdfMetadataDraft {
+            title: document
+                .labels
+                .pdf_title
+                .clone()
+                .or_else(|| document.title.clone()),
+            author: document
+                .labels
+                .pdf_author
+                .clone()
+                .or_else(|| document.author.clone()),
+        },
+        outline_entries: document
+            .section_entries
+            .iter()
+            .filter_map(|entry| {
+                let title = entry.display_title();
+                (!title.is_empty()).then_some(OutlineDraftEntry {
+                    level: entry.level,
+                    title,
+                })
+            })
+            .collect(),
+        named_destinations: BTreeMap::new(),
+        default_link_style: LinkStyle {
+            color_links: document.labels.color_links.unwrap_or(false),
+            link_color: document.labels.link_color.clone(),
+        },
     }
 }
 
@@ -891,9 +927,26 @@ fn render_math_nodes(nodes: &[MathNode]) -> String {
         .join("")
 }
 
+fn visible_math_delimiter(delimiter: &str) -> &str {
+    if delimiter == "." {
+        ""
+    } else {
+        delimiter
+    }
+}
+
+fn render_math_annotation(nodes: &[MathNode]) -> String {
+    if nodes.len() > 1 {
+        format!("({})", render_math_nodes(nodes))
+    } else {
+        render_math_nodes(nodes)
+    }
+}
+
 fn render_math_node(node: &MathNode) -> String {
     match node {
         MathNode::Ordinary(ch) => ch.to_string(),
+        MathNode::Symbol(symbol) => symbol.clone(),
         MathNode::Superscript(node) => format!("^{}", render_math_attachment(node)),
         MathNode::Subscript(node) => format!("_{}", render_math_attachment(node)),
         MathNode::Frac { numer, denom } => {
@@ -902,6 +955,32 @@ fn render_math_node(node: &MathNode) -> String {
                 render_math_nodes(numer),
                 render_math_nodes(denom)
             )
+        }
+        MathNode::Sqrt { radicand, index } => {
+            let body = render_math_nodes(radicand);
+            match index {
+                Some(index) => format!("√[{}]({body})", render_math_nodes(index)),
+                None => format!("√({body})"),
+            }
+        }
+        MathNode::MathFont { body, .. } => render_math_nodes(body),
+        MathNode::LeftRight { left, right, body } => format!(
+            "{}{}{}",
+            visible_math_delimiter(left),
+            render_math_nodes(body),
+            visible_math_delimiter(right)
+        ),
+        MathNode::OverUnder {
+            kind,
+            base,
+            annotation,
+        } => {
+            let base = render_math_nodes(base);
+            let annotation = render_math_annotation(annotation);
+            match kind {
+                crate::parser::api::OverUnderKind::Over => format!("{base}^{annotation}"),
+                crate::parser::api::OverUnderKind::Under => format!("{base}_{annotation}"),
+            }
         }
         MathNode::Group(nodes) => render_math_nodes(nodes),
         MathNode::Text(text) => text.clone(),
@@ -1816,6 +1895,7 @@ mod tests {
         TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
+    use crate::bibliography::api::BibliographyState;
     use crate::font::api::TfmMetrics;
     use crate::graphics::api::{
         ExternalGraphic, GraphicAssetResolver, ImageColorSpace, ImageMetadata,
@@ -1824,7 +1904,7 @@ mod tests {
     use crate::kernel::api::StableId;
     use crate::parser::api::{
         DocumentNode, FloatType, IncludeGraphicsOptions, LineTag, MathLine, MathNode,
-        MinimalLatexParser, ParsedDocument, Parser,
+        MinimalLatexParser, OverUnderKind, ParsedDocument, Parser,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -1839,6 +1919,7 @@ mod tests {
             package_count: 0,
             body: body.to_string(),
             labels: Default::default(),
+            bibliography_state: BibliographyState::default(),
             has_unresolved_refs: false,
         }
     }
@@ -2695,6 +2776,47 @@ mod tests {
     }
 
     #[test]
+    fn document_nodes_to_hlist_renders_extended_math_nodes_readably() {
+        let hlist = document_nodes_to_hlist(
+            &[
+                DocumentNode::Text("f = ".to_string()),
+                DocumentNode::InlineMath(vec![
+                    MathNode::MathFont {
+                        cmd: "mathrm".to_string(),
+                        body: vec![
+                            MathNode::Ordinary('m'),
+                            MathNode::Ordinary('a'),
+                            MathNode::Ordinary('x'),
+                        ],
+                    },
+                    MathNode::LeftRight {
+                        left: "(".to_string(),
+                        right: ")".to_string(),
+                        body: vec![MathNode::Symbol("α".to_string())],
+                    },
+                    MathNode::Ordinary('+'),
+                    MathNode::Sqrt {
+                        radicand: vec![MathNode::Ordinary('x')],
+                        index: Some(vec![MathNode::Ordinary('3')]),
+                    },
+                    MathNode::Ordinary('+'),
+                    MathNode::OverUnder {
+                        kind: OverUnderKind::Under,
+                        base: vec![MathNode::Ordinary('Y')],
+                        annotation: vec![MathNode::Ordinary('n')],
+                    },
+                ]),
+            ],
+            &default_fixed_width_provider(),
+        );
+
+        assert_eq!(
+            wrap_hlist(&hlist, MAX_LINE_WIDTH),
+            vec!["f = max(α)+√[3](x)+Y_n".to_string()]
+        );
+    }
+
+    #[test]
     fn document_nodes_to_hlist_puts_display_math_on_separate_lines() {
         let hlist = document_nodes_to_hlist(
             &[
@@ -2941,6 +3063,7 @@ mod tests {
             outlines: Vec::new(),
             title: None,
             author: None,
+            navigation: Default::default(),
         };
         let hyphenated_lines = document.pages[0]
             .lines
@@ -2956,6 +3079,49 @@ mod tests {
         assert_ne!(hyphenated_lines, plain_lines);
         assert!(hyphenated_lines.iter().any(|line| line.ends_with('-')));
         assert!(plain_lines.iter().all(|line| !line.ends_with('-')));
+    }
+
+    #[test]
+    fn minimal_typesetter_populates_navigation_from_hypersetup() {
+        let parsed = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\title{Document Title}\n\\author{Document Author}\n\\begin{document}\n\\hypersetup{pdftitle={PDF Title},pdfauthor={PDF Author},colorlinks=true,linkcolor=red}\nBody\n\\end{document}\n",
+            )
+            .expect("parse document");
+        let document = MinimalTypesetter.typeset(&parsed);
+
+        assert_eq!(
+            document.navigation.metadata.title.as_deref(),
+            Some("PDF Title")
+        );
+        assert_eq!(
+            document.navigation.metadata.author.as_deref(),
+            Some("PDF Author")
+        );
+        assert!(document.navigation.default_link_style.color_links);
+        assert_eq!(
+            document.navigation.default_link_style.link_color.as_deref(),
+            Some("red")
+        );
+    }
+
+    #[test]
+    fn minimal_typesetter_navigation_falls_back_to_document_title() {
+        let parsed = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\title{Document Title}\n\\author{Document Author}\n\\begin{document}\nBody\n\\end{document}\n",
+            )
+            .expect("parse document");
+        let document = MinimalTypesetter.typeset(&parsed);
+
+        assert_eq!(
+            document.navigation.metadata.title.as_deref(),
+            Some("Document Title")
+        );
+        assert_eq!(
+            document.navigation.metadata.author.as_deref(),
+            Some("Document Author")
+        );
     }
 
     #[test]

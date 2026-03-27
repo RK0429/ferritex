@@ -495,6 +495,31 @@ fn compile_emits_citations_links_outlines_and_metadata() {
 }
 
 #[test]
+fn compile_hypersetup_overrides_pdf_metadata() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hypersetup.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\title{Visible Title}\n\\author{Visible Author}\n\\hypersetup{pdftitle={Test Title},pdfauthor={Test Author},colorlinks=true}\n\\begin{document}\nSee \\href{https://example.com}{Example}.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read_to_string(dir.path().join("hypersetup.pdf")).expect("read output pdf");
+    assert!(pdf.contains("/Title (Test Title)"));
+    assert!(pdf.contains("/Author (Test Author)"));
+    assert!(!pdf.contains("/Title (Visible Title)"));
+    assert!(pdf.contains("/Subtype /Link"));
+    assert!(pdf.contains("/URI (https://example.com)"));
+}
+
+#[test]
 fn compile_expands_newenvironment_usage_into_pdf_output() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("environment.tex");

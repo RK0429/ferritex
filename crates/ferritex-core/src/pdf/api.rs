@@ -743,10 +743,18 @@ fn build_outline_objects(
 fn build_info_dictionary(document: &TypesetDocument) -> Option<String> {
     let mut fields = Vec::new();
 
-    if let Some(title) = document.title.as_deref().filter(|title| !title.is_empty()) {
+    if let Some(title) = document
+        .navigation
+        .metadata
+        .title
+        .as_deref()
+        .filter(|title| !title.is_empty())
+    {
         fields.push(format!("/Title ({})", escape_pdf_text(title)));
     }
     if let Some(author) = document
+        .navigation
+        .metadata
         .author
         .as_deref()
         .filter(|author| !author.is_empty())
@@ -830,6 +838,7 @@ mod tests {
             outlines: Vec::new(),
             title: None,
             author: None,
+            navigation: Default::default(),
         }
     }
 
@@ -871,6 +880,7 @@ mod tests {
             outlines: Vec::new(),
             title: None,
             author: None,
+            navigation: Default::default(),
         });
         let content = String::from_utf8_lossy(&pdf.bytes);
 
@@ -884,12 +894,30 @@ mod tests {
             outlines: Vec::new(),
             title: None,
             author: None,
+            navigation: Default::default(),
         };
         let pdf = PdfRenderer::default().render(&document);
         let content = String::from_utf8_lossy(&pdf.bytes);
 
         assert_eq!(pdf.page_count, 2);
         assert!(content.contains("/Count 2"));
+    }
+
+    #[test]
+    fn info_dictionary_uses_navigation_metadata() {
+        let mut document = single_page(&["Metadata"]);
+        document.title = Some("Legacy Title".to_string());
+        document.author = Some("Legacy Author".to_string());
+        document.navigation.metadata.title = Some("Navigation Title".to_string());
+        document.navigation.metadata.author = Some("Navigation Author".to_string());
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/Title (Navigation Title)"));
+        assert!(content.contains("/Author (Navigation Author)"));
+        assert!(!content.contains("/Title (Legacy Title)"));
+        assert!(!content.contains("/Author (Legacy Author)"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::{
 
 use thiserror::Error;
 
+use crate::bibliography::api::{parse_bbl, BibliographyState};
 use crate::kernel::api::DimensionValue;
 
 use super::{
@@ -112,6 +113,10 @@ pub struct DocumentLabels {
     pub page_label_anchors: BTreeMap<String, String>,
     pub title: Option<String>,
     pub author: Option<String>,
+    pub pdf_title: Option<String>,
+    pub pdf_author: Option<String>,
+    pub color_links: Option<bool>,
+    pub link_color: Option<String>,
     pub has_unresolved_toc: bool,
     pub has_unresolved_lof: bool,
     pub has_unresolved_lot: bool,
@@ -128,6 +133,10 @@ impl DocumentLabels {
         page_label_anchors: BTreeMap<String, String>,
         title: Option<String>,
         author: Option<String>,
+        pdf_title: Option<String>,
+        pdf_author: Option<String>,
+        color_links: Option<bool>,
+        link_color: Option<String>,
         has_unresolved_toc: bool,
         has_unresolved_lof: bool,
         has_unresolved_lot: bool,
@@ -142,6 +151,10 @@ impl DocumentLabels {
             page_label_anchors,
             title,
             author,
+            pdf_title,
+            pdf_author,
+            color_links,
+            link_color,
             has_unresolved_toc,
             has_unresolved_lof,
             has_unresolved_lot,
@@ -196,6 +209,7 @@ pub struct ParsedDocument {
     pub package_count: usize,
     pub body: String,
     pub labels: DocumentLabels,
+    pub bibliography_state: BibliographyState,
     pub has_unresolved_refs: bool,
 }
 
@@ -225,14 +239,39 @@ pub struct ParseOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MathNode {
     Ordinary(char),
+    Symbol(String),
     Superscript(Box<MathNode>),
     Subscript(Box<MathNode>),
     Frac {
         numer: Vec<MathNode>,
         denom: Vec<MathNode>,
     },
+    Sqrt {
+        radicand: Vec<MathNode>,
+        index: Option<Vec<MathNode>>,
+    },
+    MathFont {
+        cmd: String,
+        body: Vec<MathNode>,
+    },
+    LeftRight {
+        left: String,
+        right: String,
+        body: Vec<MathNode>,
+    },
+    OverUnder {
+        kind: OverUnderKind,
+        base: Vec<MathNode>,
+        annotation: Vec<MathNode>,
+    },
     Group(Vec<MathNode>),
     Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverUnderKind {
+    Over,
+    Under,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +427,7 @@ impl MinimalLatexParser {
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
+            None,
             BTreeMap::new(),
         )
     }
@@ -428,6 +468,7 @@ impl MinimalLatexParser {
         initial_figure_entries: Vec<CaptionEntry>,
         initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Result<ParsedDocument, ParseError> {
         parse_minimal_latex_with_context(
@@ -437,6 +478,7 @@ impl MinimalLatexParser {
             initial_figure_entries,
             initial_table_entries,
             initial_bibliography,
+            initial_bibliography_state,
             initial_page_labels,
         )
     }
@@ -454,6 +496,7 @@ impl MinimalLatexParser {
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
+            None,
             initial_page_labels,
         )
     }
@@ -474,6 +517,7 @@ impl MinimalLatexParser {
             initial_figure_entries,
             initial_table_entries,
             BTreeMap::new(),
+            None,
             initial_page_labels,
         )
     }
@@ -486,6 +530,7 @@ impl MinimalLatexParser {
         initial_figure_entries: Vec<CaptionEntry>,
         initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> ParseOutput {
         if source.trim().is_empty() {
@@ -502,10 +547,15 @@ impl MinimalLatexParser {
             initial_figure_entries,
             initial_table_entries,
             initial_bibliography,
+            initial_bibliography_state,
             initial_page_labels,
         )
         .run_recovering()
     }
+}
+
+pub fn parse_bbl_input(input: &str) -> BibliographyState {
+    BibliographyState::from_snapshot(parse_bbl(input))
 }
 
 fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
@@ -516,6 +566,7 @@ fn parse_minimal_latex(source: &str) -> Result<ParsedDocument, ParseError> {
         Vec::new(),
         Vec::new(),
         BTreeMap::new(),
+        None,
         BTreeMap::new(),
     )
 }
@@ -532,6 +583,7 @@ fn parse_minimal_latex_with_labels(
         Vec::new(),
         Vec::new(),
         BTreeMap::new(),
+        None,
         initial_page_labels,
     )
 }
@@ -551,6 +603,7 @@ fn parse_minimal_latex_with_state(
         initial_figure_entries,
         initial_table_entries,
         BTreeMap::new(),
+        None,
         initial_page_labels,
     )
 }
@@ -562,6 +615,7 @@ fn parse_minimal_latex_with_context(
     initial_figure_entries: Vec<CaptionEntry>,
     initial_table_entries: Vec<CaptionEntry>,
     initial_bibliography: BTreeMap<String, String>,
+    initial_bibliography_state: Option<BibliographyState>,
     initial_page_labels: BTreeMap<String, u32>,
 ) -> Result<ParsedDocument, ParseError> {
     if source.trim().is_empty() {
@@ -575,6 +629,7 @@ fn parse_minimal_latex_with_context(
         initial_figure_entries,
         initial_table_entries,
         initial_bibliography,
+        initial_bibliography_state,
         initial_page_labels,
     )
     .run()
@@ -617,6 +672,7 @@ struct ParserState {
     page_label_anchors: BTreeMap<String, String>,
     citations: Vec<String>,
     bibliography: BTreeMap<String, String>,
+    bibliography_state: BibliographyState,
     section_entries: Vec<SectionEntry>,
     figure_entries: Vec<CaptionEntry>,
     table_entries: Vec<CaptionEntry>,
@@ -637,6 +693,7 @@ impl Default for ParserState {
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
+            None,
             BTreeMap::new(),
         )
     }
@@ -649,6 +706,7 @@ impl ParserState {
         initial_figure_entries: Vec<CaptionEntry>,
         initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Self {
         Self {
@@ -666,6 +724,7 @@ impl ParserState {
             page_label_anchors: BTreeMap::new(),
             citations: Vec::new(),
             bibliography: initial_bibliography,
+            bibliography_state: initial_bibliography_state.unwrap_or_default(),
             section_entries: Vec::new(),
             figure_entries: Vec::new(),
             table_entries: Vec::new(),
@@ -730,25 +789,39 @@ impl ParserState {
         number
     }
 
-    fn citation_number(&mut self, key: &str) -> Option<usize> {
+    fn citation_number(&mut self, key: &str) -> Option<String> {
+        if self.bibliography_state.has_citations() {
+            let citation = self.bibliography_state.resolve_citation(key)?;
+            if !self
+                .citations
+                .iter()
+                .any(|citation_key| citation_key == key)
+            {
+                self.citations.push(key.to_string());
+            }
+            return Some(citation.formatted_text.clone());
+        }
+
         if !self.bibliography.contains_key(key) {
             return None;
         }
 
         if let Some(index) = self.citations.iter().position(|citation| citation == key) {
-            Some(index + 1)
+            Some((index + 1).to_string())
         } else {
             self.citations.push(key.to_string());
-            Some(self.citations.len())
+            Some(self.citations.len().to_string())
         }
     }
 
-    fn register_bibliography_entry(&mut self, key: String, display_text: String) -> usize {
-        self.bibliography.insert(key.clone(), display_text);
-        self.citation_number(&key).unwrap_or_else(|| {
-            self.citations.push(key);
-            self.citations.len()
-        })
+    fn register_bibliography_entry(&mut self, key: String, display_text: String) -> String {
+        self.bibliography.insert(key.clone(), display_text.clone());
+        let rendered_block = self
+            .bibliography_state
+            .upsert_entry(key.clone(), display_text)
+            .rendered_block;
+        let _ = self.citation_number(&key);
+        rendered_block
     }
 }
 
@@ -803,6 +876,10 @@ struct ParserDriver<'a> {
     errors: Vec<ParseError>,
     title: Option<String>,
     author: Option<String>,
+    pdf_title: Option<String>,
+    pdf_author: Option<String>,
+    color_links: Option<bool>,
+    link_color: Option<String>,
     body: String,
     begin_found: bool,
     end_found: bool,
@@ -828,6 +905,7 @@ impl<'a> ParserDriver<'a> {
         initial_figure_entries: Vec<CaptionEntry>,
         initial_table_entries: Vec<CaptionEntry>,
         initial_bibliography: BTreeMap<String, String>,
+        initial_bibliography_state: Option<BibliographyState>,
         initial_page_labels: BTreeMap<String, u32>,
     ) -> Self {
         Self {
@@ -839,6 +917,7 @@ impl<'a> ParserDriver<'a> {
                 initial_figure_entries,
                 initial_table_entries,
                 initial_bibliography,
+                initial_bibliography_state,
                 initial_page_labels,
             ),
             package_registry: PackageRegistry::default(),
@@ -853,6 +932,10 @@ impl<'a> ParserDriver<'a> {
             errors: Vec::new(),
             title: None,
             author: None,
+            pdf_title: None,
+            pdf_author: None,
+            color_links: None,
+            link_color: None,
             body: String::new(),
             begin_found: false,
             end_found: false,
@@ -1074,10 +1157,15 @@ impl<'a> ParserDriver<'a> {
                 self.state.page_label_anchors.clone(),
                 self.title.clone(),
                 self.author.clone(),
+                self.pdf_title.clone(),
+                self.pdf_author.clone(),
+                self.color_links,
+                self.link_color.clone(),
                 self.state.has_unresolved_toc,
                 self.state.has_unresolved_lof,
                 self.state.has_unresolved_lot,
             ),
+            bibliography_state: self.state.bibliography_state.clone(),
             has_unresolved_refs: self.state.has_unresolved_refs,
         }
     }
@@ -1137,6 +1225,9 @@ impl<'a> ParserDriver<'a> {
                     let text = tokens_to_text(&tokens);
                     text.trim().to_string()
                 });
+            }
+            "hypersetup" => {
+                self.parse_hypersetup_command()?;
             }
             "begin" => {
                 if self.read_environment_name()?.as_deref() == Some("document") {
@@ -1198,6 +1289,18 @@ impl<'a> ParserDriver<'a> {
                         let _ = self.take_global_prefix();
                         self.parse_cite_command()?;
                     }
+                    "bibliography" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_bibliography_command()?;
+                    }
+                    "bibliographystyle" => {
+                        let _ = self.take_global_prefix();
+                        let _ = self.read_required_braced_tokens()?;
+                    }
+                    "printbibliography" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_printbibliography_command()?;
+                    }
                     "href" => {
                         let _ = self.take_global_prefix();
                         self.parse_href_command()?;
@@ -1205,6 +1308,10 @@ impl<'a> ParserDriver<'a> {
                     "url" => {
                         let _ = self.take_global_prefix();
                         self.parse_url_command()?;
+                    }
+                    "hypersetup" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_hypersetup_command()?;
                     }
                     "includegraphics" => {
                         let _ = self.take_global_prefix();
@@ -2026,6 +2133,40 @@ impl<'a> ParserDriver<'a> {
         Ok(())
     }
 
+    fn parse_bibliography_command(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_required_braced_tokens()?;
+        self.emit_bibliography_list();
+        Ok(())
+    }
+
+    fn parse_printbibliography_command(&mut self) -> Result<(), ParseError> {
+        let _ = self.read_optional_bracket_tokens()?;
+        self.emit_bibliography_list();
+        Ok(())
+    }
+
+    fn emit_bibliography_list(&mut self) {
+        let Some(entries) = self
+            .state
+            .bibliography_state
+            .bbl
+            .as_ref()
+            .map(|snapshot| snapshot.entries.clone())
+        else {
+            return;
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        self.emit_paragraph_break_before_block();
+        for entry in &entries {
+            self.body.push_str(&entry.rendered_block);
+            self.body.push('\n');
+        }
+        self.body.push('\n');
+    }
+
     fn parse_cite_command(&mut self) -> Result<(), ParseError> {
         let Some(tokens) = self.read_required_braced_tokens()? else {
             return Ok(());
@@ -2041,7 +2182,7 @@ impl<'a> ParserDriver<'a> {
                         self.state.has_unresolved_refs = true;
                         "?".to_string()
                     },
-                    |number| number.to_string(),
+                    |number| number,
                 )
             })
             .collect::<Vec<_>>();
@@ -2094,6 +2235,34 @@ impl<'a> ParserDriver<'a> {
         Ok(())
     }
 
+    fn parse_hypersetup_command(&mut self) -> Result<(), ParseError> {
+        let Some(tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        for (key, value) in parse_hypersetup_options(&tokens_to_text(&tokens)) {
+            match key.as_str() {
+                "pdftitle" => {
+                    self.pdf_title = (!value.is_empty()).then_some(value);
+                }
+                "pdfauthor" => {
+                    self.pdf_author = (!value.is_empty()).then_some(value);
+                }
+                "colorlinks" => {
+                    if let Some(color_links) = parse_hypersetup_bool(&value) {
+                        self.color_links = Some(color_links);
+                    }
+                }
+                "linkcolor" => {
+                    self.link_color = (!value.is_empty()).then_some(value);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
     fn parse_includegraphics_command(&mut self) -> Result<(), ParseError> {
         let option_tokens = self.read_optional_bracket_tokens()?;
         let Some(path_tokens) = self.read_required_braced_tokens()? else {
@@ -2141,6 +2310,7 @@ impl<'a> ParserDriver<'a> {
                     if let Some(key) = current_key.take() {
                         self.finalize_bibliography_entry(key, &mut current_tokens, &mut entries);
                     }
+                    let _ = self.read_optional_bracket_tokens()?;
                     current_key = self
                         .read_required_braced_tokens()?
                         .map(|tokens| tokens_to_text(&tokens).trim().to_string())
@@ -2283,14 +2453,7 @@ impl<'a> ParserDriver<'a> {
         let raw_text = tokens_to_text(current_tokens);
         current_tokens.clear();
         let display_text = encode_body_markers_in_text(raw_text.trim());
-        let number = self
-            .state
-            .register_bibliography_entry(key, display_text.clone());
-        if display_text.is_empty() {
-            entries.push(format!("[{number}]"));
-        } else {
-            entries.push(format!("[{number}] {display_text}"));
-        }
+        entries.push(self.state.register_bibliography_entry(key, display_text));
     }
 
     fn parse_label_command(&mut self) -> Result<(), ParseError> {
@@ -3860,6 +4023,193 @@ fn section_anchor_text(number: &str, title: &str) -> String {
     }
 }
 
+fn math_symbol_lookup(name: &str) -> Option<&'static str> {
+    match name {
+        "alpha" => Some("α"),
+        "beta" => Some("β"),
+        "gamma" => Some("γ"),
+        "delta" => Some("δ"),
+        "epsilon" => Some("ε"),
+        "zeta" => Some("ζ"),
+        "eta" => Some("η"),
+        "theta" => Some("θ"),
+        "iota" => Some("ι"),
+        "kappa" => Some("κ"),
+        "lambda" => Some("λ"),
+        "mu" => Some("μ"),
+        "nu" => Some("ν"),
+        "xi" => Some("ξ"),
+        "pi" => Some("π"),
+        "rho" => Some("ρ"),
+        "sigma" => Some("σ"),
+        "tau" => Some("τ"),
+        "upsilon" => Some("υ"),
+        "phi" => Some("φ"),
+        "chi" => Some("χ"),
+        "psi" => Some("ψ"),
+        "omega" => Some("ω"),
+        "varepsilon" => Some("ϵ"),
+        "vartheta" => Some("ϑ"),
+        "varphi" => Some("ϕ"),
+        "varrho" => Some("ϱ"),
+        "varsigma" => Some("ς"),
+        "varpi" => Some("ϖ"),
+        "Gamma" => Some("Γ"),
+        "Delta" => Some("Δ"),
+        "Theta" => Some("Θ"),
+        "Lambda" => Some("Λ"),
+        "Xi" => Some("Ξ"),
+        "Pi" => Some("Π"),
+        "Sigma" => Some("Σ"),
+        "Upsilon" => Some("Υ"),
+        "Phi" => Some("Φ"),
+        "Psi" => Some("Ψ"),
+        "Omega" => Some("Ω"),
+        "pm" => Some("±"),
+        "mp" => Some("∓"),
+        "times" => Some("×"),
+        "div" => Some("÷"),
+        "cdot" => Some("·"),
+        "star" => Some("⋆"),
+        "circ" => Some("∘"),
+        "bullet" => Some("•"),
+        "cap" => Some("∩"),
+        "cup" => Some("∪"),
+        "vee" => Some("∨"),
+        "wedge" => Some("∧"),
+        "oplus" => Some("⊕"),
+        "otimes" => Some("⊗"),
+        "odot" => Some("⊙"),
+        "leq" | "le" => Some("≤"),
+        "geq" | "ge" => Some("≥"),
+        "neq" | "ne" => Some("≠"),
+        "equiv" => Some("≡"),
+        "sim" => Some("∼"),
+        "simeq" => Some("≃"),
+        "approx" => Some("≈"),
+        "cong" => Some("≅"),
+        "subset" => Some("⊂"),
+        "supset" => Some("⊃"),
+        "subseteq" => Some("⊆"),
+        "supseteq" => Some("⊇"),
+        "in" => Some("∈"),
+        "notin" => Some("∉"),
+        "ni" => Some("∋"),
+        "propto" => Some("∝"),
+        "perp" => Some("⊥"),
+        "parallel" => Some("∥"),
+        "leftarrow" => Some("←"),
+        "rightarrow" | "to" => Some("→"),
+        "leftrightarrow" => Some("↔"),
+        "Leftarrow" => Some("⇐"),
+        "Rightarrow" => Some("⇒"),
+        "Leftrightarrow" => Some("⇔"),
+        "mapsto" => Some("↦"),
+        "implies" => Some("⟹"),
+        "infty" => Some("∞"),
+        "partial" => Some("∂"),
+        "nabla" => Some("∇"),
+        "forall" => Some("∀"),
+        "exists" => Some("∃"),
+        "neg" | "lnot" => Some("¬"),
+        "emptyset" => Some("∅"),
+        "sum" => Some("∑"),
+        "prod" => Some("∏"),
+        "int" => Some("∫"),
+        "oint" => Some("∮"),
+        "dots" | "ldots" => Some("…"),
+        "cdots" => Some("⋯"),
+        "vdots" => Some("⋮"),
+        "ddots" => Some("⋱"),
+        "ell" => Some("ℓ"),
+        "hbar" => Some("ℏ"),
+        "Re" => Some("ℜ"),
+        "Im" => Some("ℑ"),
+        "aleph" => Some("ℵ"),
+        "langle" => Some("⟨"),
+        "rangle" => Some("⟩"),
+        "lfloor" => Some("⌊"),
+        "rfloor" => Some("⌋"),
+        "lceil" => Some("⌈"),
+        "rceil" => Some("⌉"),
+        "lvert" | "rvert" | "vert" => Some("|"),
+        "lVert" | "rVert" | "Vert" => Some("‖"),
+        "lbrace" => Some("{"),
+        "rbrace" => Some("}"),
+        "quad" => Some("\u{2003}"),
+        "qquad" => Some("\u{2003}\u{2003}"),
+        "comma" => Some("\u{2009}"),
+        _ => None,
+    }
+}
+
+fn is_math_font_command(name: &str) -> bool {
+    matches!(
+        name,
+        "mathrm" | "mathbf" | "mathit" | "mathsf" | "mathtt" | "mathcal" | "mathbb" | "mathfrak"
+    )
+}
+
+fn visible_math_delimiter(delimiter: &str) -> &str {
+    if delimiter == "." {
+        ""
+    } else {
+        delimiter
+    }
+}
+
+fn encode_math_delimiter(delimiter: &str, is_left: bool) -> String {
+    match delimiter {
+        "." => ".".to_string(),
+        "{" => r"\{".to_string(),
+        "}" => r"\}".to_string(),
+        "⟨" | "⟩" => {
+            if is_left {
+                r"\langle".to_string()
+            } else {
+                r"\rangle".to_string()
+            }
+        }
+        "⌊" | "⌋" => {
+            if is_left {
+                r"\lfloor".to_string()
+            } else {
+                r"\rfloor".to_string()
+            }
+        }
+        "⌈" | "⌉" => {
+            if is_left {
+                r"\lceil".to_string()
+            } else {
+                r"\rceil".to_string()
+            }
+        }
+        "|" => {
+            if is_left {
+                r"\lvert".to_string()
+            } else {
+                r"\rvert".to_string()
+            }
+        }
+        "‖" => {
+            if is_left {
+                r"\lVert".to_string()
+            } else {
+                r"\rVert".to_string()
+            }
+        }
+        _ => delimiter.to_string(),
+    }
+}
+
+fn render_math_annotation_for_anchor(nodes: &[MathNode]) -> String {
+    if nodes.len() > 1 {
+        format!("({})", render_math_nodes_for_anchor(nodes))
+    } else {
+        render_math_nodes_for_anchor(nodes)
+    }
+}
+
 fn render_math_line_for_anchor(
     segments: &[Vec<MathNode>],
     display_tag: &str,
@@ -3895,6 +4245,7 @@ fn render_math_nodes_for_anchor(nodes: &[MathNode]) -> String {
 fn render_math_node_for_anchor(node: &MathNode) -> String {
     match node {
         MathNode::Ordinary(ch) => ch.to_string(),
+        MathNode::Symbol(symbol) => symbol.clone(),
         MathNode::Superscript(node) => format!("^{}", render_math_attachment_for_anchor(node)),
         MathNode::Subscript(node) => format!("_{}", render_math_attachment_for_anchor(node)),
         MathNode::Frac { numer, denom } => format!(
@@ -3902,6 +4253,32 @@ fn render_math_node_for_anchor(node: &MathNode) -> String {
             render_math_nodes_for_anchor(numer),
             render_math_nodes_for_anchor(denom)
         ),
+        MathNode::Sqrt { radicand, index } => {
+            let body = render_math_nodes_for_anchor(radicand);
+            match index {
+                Some(index) => format!("√[{}]({body})", render_math_nodes_for_anchor(index)),
+                None => format!("√({body})"),
+            }
+        }
+        MathNode::MathFont { body, .. } => render_math_nodes_for_anchor(body),
+        MathNode::LeftRight { left, right, body } => format!(
+            "{}{}{}",
+            visible_math_delimiter(left),
+            render_math_nodes_for_anchor(body),
+            visible_math_delimiter(right)
+        ),
+        MathNode::OverUnder {
+            kind,
+            base,
+            annotation,
+        } => {
+            let base = render_math_nodes_for_anchor(base);
+            let annotation = render_math_annotation_for_anchor(annotation);
+            match kind {
+                OverUnderKind::Over => format!("{base}^{annotation}"),
+                OverUnderKind::Under => format!("{base}_{annotation}"),
+            }
+        }
         MathNode::Group(nodes) => render_math_nodes_for_anchor(nodes),
         MathNode::Text(text) => text.clone(),
     }
@@ -4302,6 +4679,100 @@ fn parse_scale_marker_field(value: &str) -> Option<f64> {
     (!trimmed.is_empty())
         .then(|| trimmed.parse::<f64>().ok())
         .flatten()
+}
+
+fn parse_hypersetup_options(input: &str) -> Vec<(String, String)> {
+    split_top_level_delimited(input, ',')
+        .into_iter()
+        .filter_map(|entry| {
+            let (key, value) = split_top_level_key_value(entry)?;
+            Some((
+                key.trim().to_ascii_lowercase(),
+                normalize_hypersetup_value(value),
+            ))
+        })
+        .collect()
+}
+
+fn split_top_level_key_value(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => return Some((&input[..index], &input[index + 1..])),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn split_top_level_delimited(input: &str, delimiter: char) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if ch == delimiter && depth == 0 => {
+                let entry = input[start..index].trim();
+                if !entry.is_empty() {
+                    entries.push(entry);
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let entry = input[start..].trim();
+    if !entry.is_empty() {
+        entries.push(entry);
+    }
+
+    entries
+}
+
+fn normalize_hypersetup_value(value: &str) -> String {
+    let trimmed = value.trim();
+    strip_wrapping_braces(trimmed)
+        .map(str::trim)
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn strip_wrapping_braces(value: &str) -> Option<&str> {
+    if !value.starts_with('{') || !value.ends_with('}') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index != value.len() - ch.len_utf8() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    value.strip_prefix('{')?.strip_suffix('}')
+}
+
+fn parse_hypersetup_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_includegraphics_options(tokens: &[Token]) -> IncludeGraphicsOptions {
@@ -4864,6 +5335,7 @@ fn render_math_nodes_for_encoding(nodes: &[MathNode]) -> String {
 fn render_math_node_for_encoding(node: &MathNode) -> String {
     match node {
         MathNode::Ordinary(ch) => ch.to_string(),
+        MathNode::Symbol(symbol) => symbol.clone(),
         MathNode::Superscript(node) => format!("^{}", render_math_attachment_for_encoding(node)),
         MathNode::Subscript(node) => format!("_{}", render_math_attachment_for_encoding(node)),
         MathNode::Frac { numer, denom } => {
@@ -4871,6 +5343,38 @@ fn render_math_node_for_encoding(node: &MathNode) -> String {
                 r"\frac{{{}}}{{{}}}",
                 render_math_nodes_for_encoding(numer),
                 render_math_nodes_for_encoding(denom)
+            )
+        }
+        MathNode::Sqrt { radicand, index } => match index {
+            Some(index) => format!(
+                r"\sqrt[{}]{{{}}}",
+                render_math_nodes_for_encoding(index),
+                render_math_nodes_for_encoding(radicand)
+            ),
+            None => format!(r"\sqrt{{{}}}", render_math_nodes_for_encoding(radicand)),
+        },
+        MathNode::MathFont { cmd, body } => {
+            format!(r"\{cmd}{{{}}}", render_math_nodes_for_encoding(body))
+        }
+        MathNode::LeftRight { left, right, body } => format!(
+            r"\left{}{}\right{}",
+            encode_math_delimiter(left, true),
+            render_math_nodes_for_encoding(body),
+            encode_math_delimiter(right, false)
+        ),
+        MathNode::OverUnder {
+            kind,
+            base,
+            annotation,
+        } => {
+            let cmd = match kind {
+                OverUnderKind::Over => "overset",
+                OverUnderKind::Under => "underset",
+            };
+            format!(
+                r"\{cmd}{{{}}}{{{}}}",
+                render_math_nodes_for_encoding(annotation),
+                render_math_nodes_for_encoding(base)
             )
         }
         MathNode::Group(nodes) => format!("{{{}}}", render_math_nodes_for_encoding(nodes)),
@@ -4976,30 +5480,11 @@ impl<'a> MathParser<'a> {
         };
 
         if ch.is_ascii_alphabetic() {
-            let mut name = String::new();
-            while let Some(next) = self.peek_char() {
-                if !next.is_ascii_alphabetic() {
-                    break;
-                }
-                name.push(next);
-                let _ = self.take_char();
-            }
-
-            if name == "frac" {
-                let numer = self.parse_required_group();
-                let denom = self.parse_required_group();
-                return vec![MathNode::Frac { numer, denom }];
-            }
-
-            if name == "text" {
-                return vec![MathNode::Text(self.parse_required_text_group())];
-            }
-
-            return name.chars().map(MathNode::Ordinary).collect();
+            let name = self.take_control_word();
+            return self.parse_named_control_sequence(&name);
         }
 
-        let symbol = self.take_char().expect("peek_char ensured a symbol exists");
-        vec![MathNode::Ordinary(symbol)]
+        self.parse_control_symbol()
     }
 
     fn parse_required_group(&mut self) -> Vec<MathNode> {
@@ -5048,6 +5533,172 @@ impl<'a> MathParser<'a> {
         text
     }
 
+    fn parse_optional_group(&mut self, open: char, close: char) -> Option<Vec<MathNode>> {
+        while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
+            let _ = self.take_char();
+        }
+
+        if self.peek_char() != Some(open) {
+            return None;
+        }
+
+        let _ = self.take_char();
+        Some(self.parse_until(Some(close)))
+    }
+
+    fn take_control_word(&mut self) -> String {
+        let mut name = String::new();
+        while let Some(next) = self.peek_char() {
+            if !next.is_ascii_alphabetic() {
+                break;
+            }
+            name.push(next);
+            let _ = self.take_char();
+        }
+        name
+    }
+
+    fn parse_control_symbol(&mut self) -> Vec<MathNode> {
+        let symbol = self.take_char().expect("peek_char ensured a symbol exists");
+        match symbol {
+            ',' => vec![MathNode::Symbol("\u{2009}".to_string())],
+            _ => vec![MathNode::Ordinary(symbol)],
+        }
+    }
+
+    fn parse_named_control_sequence(&mut self, name: &str) -> Vec<MathNode> {
+        if name == "frac" {
+            let numer = self.parse_required_group();
+            let denom = self.parse_required_group();
+            return vec![MathNode::Frac { numer, denom }];
+        }
+
+        if name == "text" {
+            return vec![MathNode::Text(self.parse_required_text_group())];
+        }
+
+        if name == "sqrt" {
+            let index = self.parse_optional_group('[', ']');
+            let radicand = self.parse_required_group();
+            return vec![MathNode::Sqrt { radicand, index }];
+        }
+
+        if is_math_font_command(name) {
+            return vec![MathNode::MathFont {
+                cmd: name.to_string(),
+                body: self.parse_required_group(),
+            }];
+        }
+
+        if name == "left" {
+            let left = self.parse_math_delimiter();
+            let (body, right) = self.parse_until_right();
+            return vec![MathNode::LeftRight { left, right, body }];
+        }
+
+        if name == "overset" || name == "underset" {
+            let annotation = self.parse_required_group();
+            let base = self.parse_required_group();
+            return vec![MathNode::OverUnder {
+                kind: if name == "overset" {
+                    OverUnderKind::Over
+                } else {
+                    OverUnderKind::Under
+                },
+                base,
+                annotation,
+            }];
+        }
+
+        if let Some(symbol) = math_symbol_lookup(name) {
+            return vec![MathNode::Symbol(symbol.to_string())];
+        }
+
+        name.chars().map(MathNode::Ordinary).collect()
+    }
+
+    fn parse_math_delimiter(&mut self) -> String {
+        while matches!(self.peek_char(), Some(ch) if ch.is_whitespace()) {
+            let _ = self.take_char();
+        }
+
+        match self.peek_char() {
+            Some('\\') => {
+                let _ = self.take_char();
+                if matches!(self.peek_char(), Some(ch) if ch.is_ascii_alphabetic()) {
+                    let name = self.take_control_word();
+                    if let Some(symbol) = math_symbol_lookup(&name) {
+                        symbol.to_string()
+                    } else {
+                        name
+                    }
+                } else {
+                    self.take_char()
+                        .map(|ch| ch.to_string())
+                        .unwrap_or_else(|| ".".to_string())
+                }
+            }
+            Some(ch) => {
+                let _ = self.take_char();
+                ch.to_string()
+            }
+            None => ".".to_string(),
+        }
+    }
+
+    fn parse_until_right(&mut self) -> (Vec<MathNode>, String) {
+        let mut nodes = Vec::new();
+
+        while let Some(ch) = self.peek_char() {
+            if ch.is_whitespace() {
+                let _ = self.take_char();
+                continue;
+            }
+
+            match ch {
+                '^' => {
+                    let _ = self.take_char();
+                    if let Some(target) = self.parse_attachment() {
+                        nodes.push(MathNode::Superscript(Box::new(target)));
+                    }
+                }
+                '_' => {
+                    let _ = self.take_char();
+                    if let Some(target) = self.parse_attachment() {
+                        nodes.push(MathNode::Subscript(Box::new(target)));
+                    }
+                }
+                '{' => {
+                    let _ = self.take_char();
+                    nodes.push(MathNode::Group(self.parse_until(Some('}'))));
+                }
+                '\\' => {
+                    let _ = self.take_char();
+                    match self.peek_char() {
+                        Some(next) if next.is_ascii_alphabetic() => {
+                            let name = self.take_control_word();
+                            if name == "right" {
+                                return (nodes, self.parse_math_delimiter());
+                            }
+                            nodes.extend(self.parse_named_control_sequence(&name));
+                        }
+                        Some(_) => nodes.extend(self.parse_control_symbol()),
+                        None => {
+                            nodes.push(MathNode::Ordinary('\\'));
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = self.take_char();
+                    nodes.push(MathNode::Ordinary(ch));
+                }
+            }
+        }
+
+        (nodes, ".".to_string())
+    }
+
     fn peek_char(&self) -> Option<char> {
         self.input[self.index..].chars().next()
     }
@@ -5066,10 +5717,12 @@ fn eof_line(source: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
+        parse_bbl_input, render_math_nodes_for_anchor, render_math_nodes_for_encoding,
         CaptionEntry, DocumentLabels, DocumentNode, FloatType, IncludeGraphicsOptions, LineTag,
-        MathLine, MathNode, MinimalLatexParser, PackageInfo, ParseError, ParsedDocument, Parser,
-        SectionEntry,
+        MathLine, MathNode, MinimalLatexParser, OverUnderKind, PackageInfo, ParseError,
+        ParsedDocument, Parser, SectionEntry,
     };
+    use crate::bibliography::api::BibliographyState;
     use crate::kernel::api::DimensionValue;
     use std::collections::BTreeMap;
 
@@ -5081,6 +5734,7 @@ mod tests {
             package_count: 0,
             body: body.to_string(),
             labels: DocumentLabels::default(),
+            bibliography_state: BibliographyState::default(),
             has_unresolved_refs: false,
         }
     }
@@ -5100,6 +5754,7 @@ mod tests {
                 package_count: 0,
                 body: "Hello".to_string(),
                 labels: DocumentLabels::default(),
+                bibliography_state: BibliographyState::default(),
                 has_unresolved_refs: false,
             }
         );
@@ -5150,6 +5805,7 @@ mod tests {
                 package_count: 0,
                 body: "AB".to_string(),
                 labels: DocumentLabels::default(),
+                bibliography_state: BibliographyState::default(),
                 has_unresolved_refs: false,
             })
         );
@@ -5362,6 +6018,91 @@ mod tests {
     }
 
     #[test]
+    fn parses_named_symbol_commands_inside_math() {
+        assert_eq!(
+            parse_document(r"$\alpha\leq\beta\rightarrow\Gamma\quad\infty$").body_nodes(),
+            vec![DocumentNode::InlineMath(vec![
+                MathNode::Symbol("α".to_string()),
+                MathNode::Symbol("≤".to_string()),
+                MathNode::Symbol("β".to_string()),
+                MathNode::Symbol("→".to_string()),
+                MathNode::Symbol("Γ".to_string()),
+                MathNode::Symbol("\u{2003}".to_string()),
+                MathNode::Symbol("∞".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn parses_sqrt_with_and_without_index() {
+        assert_eq!(
+            parse_document(r"$\sqrt{x}+\sqrt[3]{y}$").body_nodes(),
+            vec![DocumentNode::InlineMath(vec![
+                MathNode::Sqrt {
+                    radicand: vec![MathNode::Ordinary('x')],
+                    index: None,
+                },
+                MathNode::Ordinary('+'),
+                MathNode::Sqrt {
+                    radicand: vec![MathNode::Ordinary('y')],
+                    index: Some(vec![MathNode::Ordinary('3')]),
+                },
+            ])]
+        );
+    }
+
+    #[test]
+    fn parses_math_font_left_right_and_over_under_commands() {
+        assert_eq!(
+            parse_document(r"$\mathrm{sin}\left(\alpha\right)+\overset{*}{X}+\underset{n}{Y}$")
+                .body_nodes(),
+            vec![DocumentNode::InlineMath(vec![
+                MathNode::MathFont {
+                    cmd: "mathrm".to_string(),
+                    body: vec![
+                        MathNode::Ordinary('s'),
+                        MathNode::Ordinary('i'),
+                        MathNode::Ordinary('n'),
+                    ],
+                },
+                MathNode::LeftRight {
+                    left: "(".to_string(),
+                    right: ")".to_string(),
+                    body: vec![MathNode::Symbol("α".to_string())],
+                },
+                MathNode::Ordinary('+'),
+                MathNode::OverUnder {
+                    kind: OverUnderKind::Over,
+                    base: vec![MathNode::Ordinary('X')],
+                    annotation: vec![MathNode::Ordinary('*')],
+                },
+                MathNode::Ordinary('+'),
+                MathNode::OverUnder {
+                    kind: OverUnderKind::Under,
+                    base: vec![MathNode::Ordinary('Y')],
+                    annotation: vec![MathNode::Ordinary('n')],
+                },
+            ])]
+        );
+    }
+
+    #[test]
+    fn parses_unknown_control_sequence_as_literal_characters() {
+        assert_eq!(
+            parse_document(r"$\mystery$").body_nodes(),
+            vec![DocumentNode::InlineMath(vec![
+                MathNode::Ordinary('m'),
+                MathNode::Ordinary('y'),
+                MathNode::Ordinary('s'),
+                MathNode::Ordinary('t'),
+                MathNode::Ordinary('e'),
+                MathNode::Ordinary('r'),
+                MathNode::Ordinary('y'),
+            ])]
+        );
+    }
+
+    #[test]
     fn parses_equation_environment_with_auto_number_and_label() {
         let document = parse_document(
             "\\begin{equation}a=b\\label{eq:test}\\end{equation}\nSee \\ref{eq:test}.",
@@ -5450,6 +6191,37 @@ mod tests {
                 numbered: false,
                 aligned: false,
             }]
+        );
+    }
+
+    #[test]
+    fn renders_extended_math_nodes_for_anchor_and_encoding() {
+        let nodes = vec![
+            MathNode::LeftRight {
+                left: ".".to_string(),
+                right: "⟩".to_string(),
+                body: vec![
+                    MathNode::MathFont {
+                        cmd: "mathbf".to_string(),
+                        body: vec![MathNode::Symbol("α".to_string())],
+                    },
+                    MathNode::OverUnder {
+                        kind: OverUnderKind::Over,
+                        base: vec![MathNode::Ordinary('X')],
+                        annotation: vec![MathNode::Ordinary('n')],
+                    },
+                ],
+            },
+            MathNode::Sqrt {
+                radicand: vec![MathNode::Ordinary('y')],
+                index: Some(vec![MathNode::Ordinary('3')]),
+            },
+        ];
+
+        assert_eq!(render_math_nodes_for_anchor(&nodes), "αX^n⟩√[3](y)");
+        assert_eq!(
+            render_math_nodes_for_encoding(&nodes),
+            r"\left.\mathbf{α}\overset{n}{X}\right\rangle\sqrt[3]{y}"
         );
     }
 
@@ -6311,6 +7083,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 BTreeMap::new(),
+                None,
                 BTreeMap::from([("sec:later".to_string(), 5)]),
             )
             .expect("parse document");
@@ -6345,11 +7118,81 @@ mod tests {
     }
 
     #[test]
+    fn bibitem_with_optional_label_resolves_correctly() {
+        let document = parse_document(
+            "\\begin{thebibliography}{99}\\bibitem[Knu84]{knuth} Donald Knuth\\end{thebibliography}\nSee \\cite{knuth}.",
+        );
+
+        assert!(document.body.contains("[1] Donald Knuth"));
+        assert!(document.body.contains("See [1]."));
+        assert!(!document.has_unresolved_refs);
+        assert_eq!(document.citations, vec!["knuth".to_string()]);
+        assert_eq!(
+            document.bibliography.get("knuth").map(String::as_str),
+            Some("Donald Knuth")
+        );
+    }
+
+    #[test]
     fn unresolved_cite_emits_question_mark_placeholder() {
         let document = parse_document("See \\cite{missing}.");
 
         assert_eq!(document.body, "See [?].");
         assert!(document.has_unresolved_refs);
+    }
+
+    #[test]
+    fn cite_resolves_through_bibliography_state() {
+        let bibliography_state = parse_bbl_input(
+            "\\begin{thebibliography}{99}\\bibitem{knuth} Donald Knuth\\end{thebibliography}",
+        );
+        let document = MinimalLatexParser
+            .parse_with_context(
+                "\\documentclass{article}\n\\begin{document}\nSee \\cite{knuth}.\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                Some(bibliography_state),
+                BTreeMap::new(),
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "See [1].");
+        assert_eq!(document.citations, vec!["knuth".to_string()]);
+    }
+
+    #[test]
+    fn bibliography_state_separate_from_labels() {
+        let bibliography_state = parse_bbl_input(
+            "\\begin{thebibliography}{99}\\bibitem{shared} Shared Reference\\end{thebibliography}",
+        );
+        let document = MinimalLatexParser
+            .parse_with_context(
+                "\\documentclass{article}\n\\begin{document}\nRef \\ref{shared}; cite \\cite{shared}.\n\\end{document}\n",
+                BTreeMap::from([("shared".to_string(), "42".to_string())]),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                Some(bibliography_state),
+                BTreeMap::new(),
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "Ref 42; cite [1].");
+        assert_eq!(
+            document.labels.get("shared").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            document
+                .bibliography_state
+                .resolve_citation("shared")
+                .map(|citation| citation.formatted_text.as_str()),
+            Some("1")
+        );
     }
 
     #[test]
@@ -6370,6 +7213,48 @@ mod tests {
     }
 
     #[test]
+    fn bibliography_command_renders_preparsed_bbl_entries() {
+        let bibliography_state = parse_bbl_input(
+            "\\begin{thebibliography}{99}\\bibitem{key} Reference text\\end{thebibliography}",
+        );
+        let document = MinimalLatexParser
+            .parse_with_context(
+                "\\documentclass{article}\n\\begin{document}\n\\bibliography{refs}\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                Some(bibliography_state),
+                BTreeMap::new(),
+            )
+            .expect("parse document");
+
+        assert!(document.body.contains("[1] Reference text"));
+    }
+
+    #[test]
+    fn printbibliography_renders_preparsed_bbl_entries_with_explicit_label() {
+        let bibliography_state = parse_bbl_input(
+            "\\begin{thebibliography}{99}\\bibitem[Knu84]{key} Reference text\\end{thebibliography}",
+        );
+        let document = MinimalLatexParser
+            .parse_with_context(
+                "\\documentclass{article}\n\\begin{document}\n\\printbibliography[heading=none]\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                Some(bibliography_state),
+                BTreeMap::new(),
+            )
+            .expect("parse document");
+
+        assert!(document.body.contains("[Knu84] Reference text"));
+    }
+
+    #[test]
     fn cite_forward_reference_resolves_on_second_pass() {
         let source = "\\documentclass{article}\n\\begin{document}\nSee \\cite{key}.\n\\begin{thebibliography}{99}\n\\bibitem{key} Reference text\n\\end{thebibliography}\n\\end{document}\n";
         let first = MinimalLatexParser.parse(source).expect("parse first pass");
@@ -6381,6 +7266,7 @@ mod tests {
                 first.figure_entries.clone(),
                 first.table_entries.clone(),
                 first.bibliography.clone(),
+                Some(first.bibliography_state.clone()),
                 BTreeMap::new(),
             )
             .expect("parse second pass");
@@ -6417,6 +7303,29 @@ mod tests {
                 children: vec![DocumentNode::Text("https://example.com".to_string())],
             }]
         );
+    }
+
+    #[test]
+    fn hypersetup_sets_pdf_metadata_overrides() {
+        let document = parse_document(r"\hypersetup{pdftitle={My Title},pdfauthor={Author Name}}");
+
+        assert_eq!(document.labels.pdf_title.as_deref(), Some("My Title"));
+        assert_eq!(document.labels.pdf_author.as_deref(), Some("Author Name"));
+    }
+
+    #[test]
+    fn hypersetup_sets_colorlinks_flag() {
+        let document = parse_document(r"\hypersetup{colorlinks=true}");
+
+        assert_eq!(document.labels.color_links, Some(true));
+    }
+
+    #[test]
+    fn hypersetup_sets_link_color_and_flag() {
+        let document = parse_document(r"\hypersetup{colorlinks=true,linkcolor=red}");
+
+        assert_eq!(document.labels.color_links, Some(true));
+        assert_eq!(document.labels.link_color.as_deref(), Some("red"));
     }
 
     #[test]

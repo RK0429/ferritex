@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use ferritex_core::assets::{AssetHandle, LogicalAssetId};
+use ferritex_core::bibliography::api::{parse_bbl, BibliographyDiagnostic, BibliographyState};
 use ferritex_core::compilation::{
     CompilationJob, CompilationSnapshot, DocumentState, SymbolLocation,
 };
@@ -168,7 +169,7 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
-        let source_tree = match self.load_source_tree(
+        let mut source_tree = match self.load_source_tree(
             &options.input_file,
             &project_root,
             options.asset_bundle.as_deref(),
@@ -185,6 +186,18 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
+        let loaded_bibliography_state = load_bibliography_state(
+            self.file_access_gate,
+            &project_root,
+            &options.output_dir,
+            &options.jobname,
+        );
+        let initial_bibliography_state = loaded_bibliography_state
+            .as_ref()
+            .map(|loaded| loaded.state.clone());
+        if let Some(bibliography_state) = &initial_bibliography_state {
+            source_tree.document_state.bibliography_state = bibliography_state.clone();
+        }
         if !is_valid_jobname(&options.jobname) {
             let diagnostics =
                 vec![
@@ -254,14 +267,17 @@ impl<'a> CompileJobService<'a> {
                 font: &loaded_font.font,
                 fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
             };
-            let parse_pass_result =
-                self.parse_document_with_cross_references(&source_tree.source, |document| {
+            let parse_pass_result = self.parse_document_with_cross_references(
+                &source_tree.source,
+                initial_bibliography_state.clone(),
+                |document| {
                     self.typesetter.typeset_with_provider_and_graphics_resolver(
                         document,
                         &provider,
                         Some(&graphics_resolver),
                     )
-                });
+                },
+            );
             let pdf_renderer = parse_pass_result
                 .typeset_document
                 .as_ref()
@@ -279,21 +295,29 @@ impl<'a> CompileJobService<'a> {
                 fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
             };
             (
-                self.parse_document_with_cross_references(&source_tree.source, |document| {
-                    self.typesetter.typeset_with_provider_and_graphics_resolver(
-                        document,
-                        &provider,
-                        Some(&graphics_resolver),
-                    )
-                }),
+                self.parse_document_with_cross_references(
+                    &source_tree.source,
+                    initial_bibliography_state.clone(),
+                    |document| {
+                        self.typesetter.typeset_with_provider_and_graphics_resolver(
+                            document,
+                            &provider,
+                            Some(&graphics_resolver),
+                        )
+                    },
+                ),
                 self.pdf_renderer.clone(),
             )
         } else {
             (
-                self.parse_document_with_cross_references(&source_tree.source, |document| {
-                    self.typesetter
-                        .typeset_with_graphics_resolver(document, &graphics_resolver)
-                }),
+                self.parse_document_with_cross_references(
+                    &source_tree.source,
+                    initial_bibliography_state.clone(),
+                    |document| {
+                        self.typesetter
+                            .typeset_with_graphics_resolver(document, &graphics_resolver)
+                    },
+                ),
                 self.pdf_renderer.clone(),
             )
         };
@@ -302,10 +326,39 @@ impl<'a> CompileJobService<'a> {
             typeset_document,
             pass_count,
         } = parse_pass_result;
-        let parse_diagnostics: Vec<Diagnostic> = errors
+        let mut parse_diagnostics: Vec<Diagnostic> = errors
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
             .collect();
+        if let Some(loaded_bibliography_state) = &loaded_bibliography_state {
+            let bibliography_names = extract_bibliography_declarations(&source_tree.source);
+            if let Some(diagnostic) = check_bbl_freshness(
+                &loaded_bibliography_state.path,
+                &bibliography_names,
+                &project_root,
+            ) {
+                parse_diagnostics.push(diagnostic_for_bibliography(diagnostic, Vec::new()));
+            }
+        }
+        if initial_bibliography_state.is_none()
+            && source_uses_citations(&source_tree.source)
+            && document
+                .as_ref()
+                .map(|parsed| {
+                    parsed
+                        .bibliography_state
+                        .bbl
+                        .as_ref()
+                        .map(|snapshot| snapshot.entries.is_empty())
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true)
+        {
+            parse_diagnostics.push(diagnostic_for_bibliography(
+                BibliographyDiagnostic::MissingBbl,
+                bibliography_candidate_paths(&project_root, &options.output_dir, &options.jobname),
+            ));
+        }
 
         let parsed_document = match document {
             Some(document) => document,
@@ -332,6 +385,11 @@ impl<'a> CompileJobService<'a> {
             }
         };
         let typeset_document = typeset_document.expect("parsed documents should always typeset");
+        persist_compiled_document_state(
+            &mut source_tree.document_state,
+            &parsed_document,
+            &typeset_document,
+        );
         let pdf_renderer = match build_pdf_renderer_with_images(
             self.file_access_gate,
             pdf_renderer,
@@ -406,7 +464,7 @@ impl<'a> CompileJobService<'a> {
         let project_root = project_root_for_policy(&execution_policy, &primary_input);
         let compilation_job =
             compilation_job(primary_input.clone(), jobname.clone(), execution_policy);
-        let source_tree = self
+        let mut source_tree = self
             .load_source_tree_with_root_source(&primary_input, Some(source), &project_root, None)
             .unwrap_or_else(|_| LoadedSourceTree {
                 source: source.to_string(),
@@ -418,18 +476,25 @@ impl<'a> CompileJobService<'a> {
             output: ParseOutput { document, errors },
             typeset_document,
             pass_count,
-        } = self.parse_document_with_cross_references(&source_tree.source, |document| {
-            self.typesetter.typeset(document)
-        });
+        } = self.parse_document_with_cross_references(
+            &source_tree.source,
+            source_tree.document_state.bibliography_state.clone().into(),
+            |document| self.typesetter.typeset(document),
+        );
         let parse_diagnostics: Vec<Diagnostic> = errors
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, primary_input_path.clone()))
             .collect();
 
         match document {
-            Some(_) => {
+            Some(parsed_document) => {
                 let typeset_document =
                     typeset_document.expect("parsed documents should always typeset");
+                persist_compiled_document_state(
+                    &mut source_tree.document_state,
+                    &parsed_document,
+                    &typeset_document,
+                );
                 let pdf_document = self.pdf_renderer.render(&typeset_document);
                 stable_compile_state(
                     &compilation_job,
@@ -497,6 +562,8 @@ impl<'a> CompileJobService<'a> {
                     .collect(),
                 labels,
                 citations,
+                bibliography_state: BibliographyState::default(),
+                navigation: Default::default(),
             },
         })
     }
@@ -556,12 +623,22 @@ impl<'a> CompileJobService<'a> {
     fn parse_document_with_cross_references<F>(
         &self,
         source: &str,
+        initial_bibliography_state: Option<BibliographyState>,
         typeset_document_for: F,
     ) -> ParsePassResult
     where
         F: Fn(&ferritex_core::parser::ParsedDocument) -> TypesetDocument,
     {
-        let mut output = self.parser.parse_recovering(source);
+        let mut output = self.parser.parse_recovering_with_context(
+            source,
+            BTreeMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            initial_bibliography_state.clone(),
+            BTreeMap::new(),
+        );
         let Some(mut document) = output.document.clone() else {
             return ParsePassResult {
                 output,
@@ -583,6 +660,7 @@ impl<'a> CompileJobService<'a> {
                 document.figure_entries.clone(),
                 document.table_entries.clone(),
                 document.bibliography.clone(),
+                Some(document.bibliography_state.clone()),
                 BTreeMap::new(),
             );
             if let Some(next_document) = second.document.clone() {
@@ -604,6 +682,7 @@ impl<'a> CompileJobService<'a> {
                     document.figure_entries.clone(),
                     document.table_entries.clone(),
                     document.bibliography.clone(),
+                    Some(document.bibliography_state.clone()),
                     page_labels.clone(),
                 );
                 let Some(next_document) = next.document.clone() else {
@@ -652,10 +731,134 @@ fn stable_compile_state(
     }
 }
 
+fn persist_compiled_document_state(
+    document_state: &mut DocumentState,
+    parsed_document: &ferritex_core::parser::ParsedDocument,
+    typeset_document: &TypesetDocument,
+) {
+    document_state.bibliography_state = parsed_document.bibliography_state.clone();
+    document_state.navigation = typeset_document.navigation.clone();
+}
+
 struct ParsePassResult {
     output: ParseOutput,
     typeset_document: Option<TypesetDocument>,
     pass_count: u32,
+}
+
+struct LoadedBibliographyState {
+    state: BibliographyState,
+    path: PathBuf,
+}
+
+fn load_bibliography_state(
+    file_access_gate: &dyn FileAccessGate,
+    project_root: &Path,
+    artifact_root: &Path,
+    jobname: &str,
+) -> Option<LoadedBibliographyState> {
+    for candidate in bibliography_candidate_paths(project_root, artifact_root, jobname) {
+        if !candidate.exists()
+            || file_access_gate.check_read(&candidate) == PathAccessDecision::Denied
+        {
+            continue;
+        }
+
+        let Ok(bytes) = file_access_gate.read_file(&candidate) else {
+            continue;
+        };
+        let input = String::from_utf8_lossy(&bytes);
+        return Some(LoadedBibliographyState {
+            state: BibliographyState::from_snapshot(parse_bbl(&input)),
+            path: candidate,
+        });
+    }
+
+    None
+}
+
+fn bibliography_candidate_paths(
+    project_root: &Path,
+    artifact_root: &Path,
+    jobname: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for root in [project_root, artifact_root] {
+        let candidate = root.join(format!("{jobname}.bbl"));
+        if seen.insert(candidate.clone()) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
+fn source_uses_citations(source: &str) -> bool {
+    source.contains(r"\cite")
+}
+
+fn extract_bibliography_declarations(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = source[cursor..].find(r"\bibliography") {
+        let command_start = cursor + relative_start;
+        let mut index = command_start + r"\bibliography".len();
+        let trimmed = source[index..].trim_start();
+        index += source[index..].len() - trimmed.len();
+
+        if !source[index..].starts_with('{') {
+            cursor = (index + 1).min(source.len());
+            continue;
+        }
+
+        let Some(closing_offset) = source[index..].find('}') else {
+            break;
+        };
+        let declaration = &source[index + 1..index + closing_offset];
+        names.extend(
+            declaration
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        cursor = index + closing_offset + 1;
+    }
+
+    names
+}
+
+fn check_bbl_freshness(
+    bbl_path: &Path,
+    bib_names: &[String],
+    project_root: &Path,
+) -> Option<BibliographyDiagnostic> {
+    let bbl_modified = std::fs::metadata(bbl_path).ok()?.modified().ok()?;
+
+    for bib_name in bib_names {
+        let candidate = project_root.join(format!("{bib_name}.bib"));
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        let Ok(bib_modified) = metadata.modified() else {
+            continue;
+        };
+
+        if bib_modified > bbl_modified {
+            return Some(BibliographyDiagnostic::StaleBbl {
+                reason: format!(
+                    "bibliography source `{}` is newer than `{}`",
+                    candidate.display(),
+                    bbl_path.display()
+                ),
+            });
+        }
+    }
+
+    None
 }
 
 fn project_root_for_policy(policy: &ExecutionPolicy, input_file: &Path) -> PathBuf {
@@ -754,6 +957,33 @@ fn diagnostic_for_output_error(error: FileAccessError, output_pdf: &Path) -> Dia
             format!("failed to write output file: {source}"),
         )
         .with_file(output_pdf.to_string_lossy().into_owned()),
+    }
+}
+
+fn diagnostic_for_bibliography(
+    diagnostic: BibliographyDiagnostic,
+    searched_paths: Vec<PathBuf>,
+) -> Diagnostic {
+    match diagnostic {
+        BibliographyDiagnostic::MissingBbl => {
+            let looked_in = searched_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Diagnostic::new(Severity::Warning, "bibliography .bbl file not found")
+                .with_context(format!("looked for {}", looked_in))
+                .with_suggestion("run bibtex or biber to generate the .bbl file")
+        }
+        BibliographyDiagnostic::StaleBbl { reason } => {
+            Diagnostic::new(Severity::Warning, "bibliography .bbl file appears stale")
+                .with_context(reason)
+                .with_suggestion("rebuild the bibliography with bibtex or biber")
+        }
+        BibliographyDiagnostic::UnresolvedCitation { key } => {
+            Diagnostic::new(Severity::Warning, format!("unresolved citation `{key}`"))
+                .with_suggestion("ensure the bibliography contains the cited key")
+        }
     }
 }
 
@@ -1642,10 +1872,12 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::CompileJobService;
     use crate::ports::AssetBundleLoaderPort;
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
+    use ferritex_core::diagnostics::Severity;
     use ferritex_core::font::OpenTypeFont;
     use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
     use tempfile::tempdir;
@@ -2303,6 +2535,140 @@ mod tests {
     }
 
     #[test]
+    fn stable_compile_state_persists_navigation_metadata_from_hypersetup() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\title{Visible Title}\n\\author{Visible Author}\n\\hypersetup{pdftitle={Persisted Title},pdfauthor={Persisted Author}}\n\\begin{document}\nHello\n\\end{document}\n",
+        )
+        .expect("write input");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let navigation = &result
+            .stable_compile_state
+            .as_ref()
+            .expect("stable compile state")
+            .document_state
+            .navigation;
+        assert_eq!(
+            navigation.metadata.title.as_deref(),
+            Some("Persisted Title")
+        );
+        assert_eq!(
+            navigation.metadata.author.as_deref(),
+            Some("Persisted Author")
+        );
+    }
+
+    #[test]
+    fn loads_bbl_from_project_root_and_renders_bibliography() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            dir.path().join("main.bbl"),
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Reference text\n\\end{thebibliography}\n",
+        )
+        .expect("write bbl");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [1]."));
+        assert!(pdf.contains("[1] Reference text"));
+        assert_eq!(
+            result
+                .stable_compile_state
+                .as_ref()
+                .and_then(|state| state
+                    .document_state
+                    .bibliography_state
+                    .resolve_citation("key"))
+                .map(|citation| citation.formatted_text.as_str()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn stale_bbl_emits_warning_when_bib_is_newer() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let bbl_path = dir.path().join("main.bbl");
+        let bib_path = dir.path().join("refs.bib");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            &bbl_path,
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Reference text\n\\end{thebibliography}\n",
+        )
+        .expect("write bbl");
+        std::thread::sleep(Duration::from_millis(1100));
+        fs::write(&bib_path, "@book{key,\n  title = {Reference text}\n}\n").expect("write bib");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 1);
+        let stale = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == "bibliography .bbl file appears stale")
+            .expect("stale bibliography diagnostic");
+        assert_eq!(stale.severity, Severity::Warning);
+        assert!(stale
+            .context
+            .as_deref()
+            .unwrap_or_default()
+            .contains("refs.bib"));
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [1]."));
+        assert!(pdf.contains("[1] Reference text"));
+    }
+
+    #[test]
+    fn missing_bbl_emits_warning_when_citations_are_present() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("See \\cite{missing}.")).expect("write input");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 1);
+        assert!(result.output_pdf.is_some());
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].severity, Severity::Warning);
+        assert_eq!(
+            result.diagnostics[0].message,
+            "bibliography .bbl file not found"
+        );
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [?]."));
+    }
+
+    #[test]
     fn compile_uses_third_pass_to_resolve_pageref() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -2502,6 +2868,34 @@ mod tests {
         assert_eq!(state.page_count, 1);
         assert_eq!(state.snapshot.primary_input, PathBuf::from("/tmp/main.tex"));
         assert_eq!(state.snapshot.jobname, "main");
+    }
+
+    #[test]
+    fn compile_from_source_persists_navigation_metadata_from_hypersetup() {
+        let gate = MockFileAccessGate {
+            read_decision: PathAccessDecision::Allowed,
+            write_decision: PathAccessDecision::Allowed,
+            read_result: MockReadResult::Success(Vec::new()),
+            created_dirs: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
+        };
+        let loader = MockAssetBundleLoader::valid();
+
+        let state = service(&gate, &loader).compile_from_source(
+            "\\documentclass{article}\n\\title{Visible Title}\n\\author{Visible Author}\n\\hypersetup{pdftitle={Source Title},pdfauthor={Source Author}}\n\\begin{document}\nHello\n\\end{document}\n",
+            "file:///tmp/main.tex",
+        );
+
+        assert!(state.success);
+        assert!(state.diagnostics.is_empty());
+        assert_eq!(
+            state.document_state.navigation.metadata.title.as_deref(),
+            Some("Source Title")
+        );
+        assert_eq!(
+            state.document_state.navigation.metadata.author.as_deref(),
+            Some("Source Author")
+        );
     }
 
     #[test]
