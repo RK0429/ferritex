@@ -157,6 +157,7 @@ fn default_host_font_roots() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         roots.push(PathBuf::from("/System/Library/Fonts"));
+        roots.push(PathBuf::from("/System/Library/AssetsV2"));
         roots.push(PathBuf::from("/Library/Fonts"));
         if let Some(home) = home_dir() {
             roots.push(home.join("Library/Fonts"));
