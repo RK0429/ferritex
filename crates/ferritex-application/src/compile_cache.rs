@@ -1,13 +1,16 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use ferritex_core::compilation::SymbolLocation;
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::incremental::{DependencyGraph, RecompilationScope};
 use ferritex_core::policy::{FileAccessError, FileAccessGate};
+use ferritex_core::synctex::SourceLineTrace;
 use serde::{Deserialize, Serialize};
 
 use crate::stable_compile_state::StableCompileState;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
 
 pub struct CompileCache<'a> {
@@ -31,7 +34,19 @@ pub struct CacheLookupResult {
     pub baseline_state: Option<StableCompileState>,
     pub diagnostics: Vec<Diagnostic>,
     pub changed_paths: Vec<PathBuf>,
+    pub rebuild_paths: BTreeSet<PathBuf>,
+    pub cached_dependency_graph: Option<DependencyGraph>,
+    pub cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     pub scope: Option<RecompilationScope>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedSourceSubtree {
+    pub text: String,
+    pub source_lines: Vec<SourceLineTrace>,
+    pub source_files: Vec<PathBuf>,
+    pub labels: BTreeMap<String, SymbolLocation>,
+    pub citations: BTreeMap<String, SymbolLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +58,8 @@ struct CompileCacheRecord {
     output_pdf_hash: u64,
     dependency_graph: DependencyGraph,
     stable_compile_state: StableCompileState,
+    #[serde(default)]
+    cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
 }
 
 impl<'a> CompileCache<'a> {
@@ -80,6 +97,9 @@ impl<'a> CompileCache<'a> {
                     baseline_state: None,
                     diagnostics: Vec::new(),
                     changed_paths: Vec::new(),
+                    rebuild_paths: BTreeSet::new(),
+                    cached_dependency_graph: None,
+                    cached_source_subtrees: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -92,6 +112,9 @@ impl<'a> CompileCache<'a> {
                         &self.metadata_path,
                     )],
                     changed_paths: Vec::new(),
+                    rebuild_paths: BTreeSet::new(),
+                    cached_dependency_graph: None,
+                    cached_source_subtrees: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -108,6 +131,9 @@ impl<'a> CompileCache<'a> {
                         &self.metadata_path,
                     )],
                     changed_paths: Vec::new(),
+                    rebuild_paths: BTreeSet::new(),
+                    cached_dependency_graph: None,
+                    cached_source_subtrees: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -125,6 +151,9 @@ impl<'a> CompileCache<'a> {
                     &self.metadata_path,
                 )],
                 changed_paths: Vec::new(),
+                rebuild_paths: BTreeSet::new(),
+                cached_dependency_graph: None,
+                cached_source_subtrees: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -138,6 +167,9 @@ impl<'a> CompileCache<'a> {
                 baseline_state: None,
                 diagnostics: Vec::new(),
                 changed_paths: Vec::new(),
+                rebuild_paths: BTreeSet::new(),
+                cached_dependency_graph: None,
+                cached_source_subtrees: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -151,6 +183,9 @@ impl<'a> CompileCache<'a> {
                 baseline_state: Some(baseline_state),
                 diagnostics: Vec::new(),
                 changed_paths: change_summary.changed_paths,
+                rebuild_paths: change_summary.rebuild_paths,
+                cached_dependency_graph: Some(record.dependency_graph),
+                cached_source_subtrees: record.cached_source_subtrees,
                 scope: Some(change_summary.scope),
             };
         }
@@ -166,6 +201,9 @@ impl<'a> CompileCache<'a> {
                         &self.output_pdf,
                     )],
                     changed_paths: Vec::new(),
+                    rebuild_paths: BTreeSet::new(),
+                    cached_dependency_graph: None,
+                    cached_source_subtrees: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -180,6 +218,9 @@ impl<'a> CompileCache<'a> {
                     &self.output_pdf,
                 )],
                 changed_paths: Vec::new(),
+                rebuild_paths: BTreeSet::new(),
+                cached_dependency_graph: None,
+                cached_source_subtrees: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -192,6 +233,9 @@ impl<'a> CompileCache<'a> {
             baseline_state: Some(baseline_state),
             diagnostics: Vec::new(),
             changed_paths: Vec::new(),
+            rebuild_paths: BTreeSet::new(),
+            cached_dependency_graph: Some(record.dependency_graph),
+            cached_source_subtrees: record.cached_source_subtrees,
             scope: None,
         }
     }
@@ -201,6 +245,7 @@ impl<'a> CompileCache<'a> {
         dependency_graph: &DependencyGraph,
         stable_compile_state: &StableCompileState,
         output_pdf_hash: u64,
+        cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
     ) -> Option<Diagnostic> {
         if let Err(error) = self.file_access_gate.ensure_directory(&self.cache_dir) {
             return Some(cache_info_diagnostic(
@@ -217,6 +262,7 @@ impl<'a> CompileCache<'a> {
             output_pdf_hash,
             dependency_graph: dependency_graph.clone(),
             stable_compile_state: stable_compile_state.clone(),
+            cached_source_subtrees: cached_source_subtrees.clone(),
         };
 
         let bytes = match serde_json::to_vec_pretty(&record) {
@@ -257,7 +303,10 @@ impl<'a> CompileCache<'a> {
             }
         }
 
-        let scope = if changed_paths.len() <= 1 {
+        let rebuild_paths = dependency_graph.affected_paths(changed_paths.iter());
+        let scope = if changed_paths.len() <= 1
+            || (!rebuild_paths.is_empty() && rebuild_paths.len() < dependency_graph.nodes.len())
+        {
             RecompilationScope::LocalRegion
         } else {
             RecompilationScope::FullDocument
@@ -265,6 +314,7 @@ impl<'a> CompileCache<'a> {
 
         ChangeSummary {
             changed_paths,
+            rebuild_paths,
             scope,
         }
     }
@@ -273,6 +323,7 @@ impl<'a> CompileCache<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChangeSummary {
     changed_paths: Vec<PathBuf>,
+    rebuild_paths: BTreeSet<PathBuf>,
     scope: RecompilationScope,
 }
 
@@ -312,6 +363,7 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use ferritex_core::compilation::{CompilationSnapshot, DocumentState};
@@ -409,6 +461,7 @@ mod tests {
                 &graph,
                 &stable_state(&input),
                 fingerprint_bytes(b"%PDF-1.4\n"),
+                &BTreeMap::new(),
             )
             .expect_none("cache stored");
 
@@ -419,6 +472,12 @@ mod tests {
         assert!(lookup.artifact.is_none());
         assert_eq!(lookup.baseline_state, Some(stable_state(&input)));
         assert_eq!(lookup.changed_paths, vec![input]);
+        assert_eq!(
+            lookup.rebuild_paths,
+            [dir.path().join("main.tex")]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
         assert_eq!(lookup.scope, Some(RecompilationScope::LocalRegion));
     }
 
@@ -438,7 +497,12 @@ mod tests {
         let expected_state = stable_state(&input);
         let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
         cache
-            .store(&graph, &expected_state, fingerprint_bytes(pdf_bytes))
+            .store(
+                &graph,
+                &expected_state,
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+            )
             .expect_none("cache stored");
 
         let lookup = cache.lookup();
@@ -452,6 +516,54 @@ mod tests {
                 .stable_compile_state,
             expected_state
         );
+    }
+
+    #[test]
+    fn rebuild_paths_include_transitive_parents_only() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let appendix = dir.path().join("appendix.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}\\input{appendix}").expect("write input");
+        fs::write(&chapter, "before").expect("write chapter");
+        fs::write(&appendix, "stable").expect("write appendix");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(
+            input.clone(),
+            fingerprint_bytes(b"\\input{chapter}\\input{appendix}"),
+        );
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"before"));
+        graph.record_node(appendix.clone(), fingerprint_bytes(b"stable"));
+        graph.record_edge(input.clone(), chapter.clone());
+        graph.record_edge(input.clone(), appendix.clone());
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+            )
+            .expect_none("cache stored");
+
+        fs::write(&chapter, "after").expect("update chapter");
+
+        let lookup = cache.lookup();
+
+        assert_eq!(lookup.changed_paths, vec![chapter.clone()]);
+        assert_eq!(
+            lookup.rebuild_paths,
+            [input, chapter]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(lookup.scope, Some(RecompilationScope::LocalRegion));
     }
 
     trait ExpectNone<T> {

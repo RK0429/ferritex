@@ -31,13 +31,12 @@ use ferritex_core::typesetting::{
 };
 use serde_json::json;
 
-use crate::compile_cache::{fingerprint_bytes, CompileCache};
+use crate::compile_cache::{fingerprint_bytes, CachedSourceSubtree, CompileCache};
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::AssetBundleLoaderPort;
 use crate::runtime_options::RuntimeOptions;
 use crate::stable_compile_state::{
-    CrossReferenceCaptionEntry, CrossReferenceSeed, CrossReferenceSectionEntry,
-    StableCompileState,
+    CrossReferenceCaptionEntry, CrossReferenceSectionEntry, CrossReferenceSeed, StableCompileState,
 };
 
 const DEFAULT_TFM_FALLBACK_WIDTH: DimensionValue = DimensionValue(65_536);
@@ -69,6 +68,22 @@ struct LoadedSourceTree {
     source_lines: Vec<SourceLineTrace>,
     document_state: DocumentState,
     dependency_graph: DependencyGraph,
+    cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedSourceSubtree {
+    expanded: ExpandedSource,
+    source_files: BTreeSet<PathBuf>,
+    labels: BTreeMap<String, SymbolLocation>,
+    citations: BTreeMap<String, SymbolLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceTreeReusePlan {
+    rebuild_paths: BTreeSet<PathBuf>,
+    cached_dependency_graph: DependencyGraph,
+    cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -224,6 +239,30 @@ impl ExpandedSourceBuilder {
     }
 }
 
+impl LoadedSourceSubtree {
+    fn from_cached_subtree(cached: &CachedSourceSubtree) -> Self {
+        Self {
+            expanded: ExpandedSource {
+                text: cached.text.clone(),
+                source_lines: cached.source_lines.clone(),
+            },
+            source_files: cached.source_files.iter().cloned().collect(),
+            labels: cached.labels.clone(),
+            citations: cached.citations.clone(),
+        }
+    }
+
+    fn to_cached_subtree(&self) -> CachedSourceSubtree {
+        CachedSourceSubtree {
+            text: self.expanded.text.clone(),
+            source_lines: self.expanded.source_lines.clone(),
+            source_files: self.source_files.iter().cloned().collect(),
+            labels: self.labels.clone(),
+            citations: self.citations.clone(),
+        }
+    }
+}
+
 impl<'a> CompileJobService<'a> {
     pub fn new(
         file_access_gate: &'a dyn FileAccessGate,
@@ -348,6 +387,7 @@ impl<'a> CompileJobService<'a> {
         );
         let mut cache_diagnostics = Vec::new();
         let mut cached_cross_reference_seed = None;
+        let mut source_tree_reuse_plan = None;
         if !options.no_cache {
             let lookup = compile_cache.lookup();
             cached_cross_reference_seed = lookup
@@ -375,9 +415,17 @@ impl<'a> CompileJobService<'a> {
                     jobname = %options.jobname,
                     input = %options.input_file.display(),
                     changed_paths = ?lookup.changed_paths,
+                    rebuild_paths = ?lookup.rebuild_paths,
                     ?scope,
                     "compile cache miss due to changed dependencies"
                 );
+            }
+            if let Some(cached_dependency_graph) = lookup.cached_dependency_graph {
+                source_tree_reuse_plan = Some(SourceTreeReusePlan {
+                    rebuild_paths: lookup.rebuild_paths,
+                    cached_dependency_graph,
+                    cached_source_subtrees: lookup.cached_source_subtrees,
+                });
             }
             cache_diagnostics.extend(lookup.diagnostics);
         }
@@ -387,6 +435,7 @@ impl<'a> CompileJobService<'a> {
             &project_root,
             &options.overlay_roots,
             options.asset_bundle.as_deref(),
+            source_tree_reuse_plan.as_ref(),
         ) {
             Ok(tree) => tree,
             Err(diagnostic) => {
@@ -678,6 +727,7 @@ impl<'a> CompileJobService<'a> {
                 &source_tree.dependency_graph,
                 &provisional_stable_state,
                 output_pdf_hash,
+                &source_tree.cached_source_subtrees,
             ) {
                 diagnostics.push(diagnostic);
             }
@@ -726,6 +776,7 @@ impl<'a> CompileJobService<'a> {
                 &project_root,
                 &[],
                 None,
+                None,
             )
             .unwrap_or_else(|_| LoadedSourceTree {
                 source: source.to_string(),
@@ -736,6 +787,7 @@ impl<'a> CompileJobService<'a> {
                 }],
                 document_state: DocumentState::default(),
                 dependency_graph: DependencyGraph::default(),
+                cached_source_subtrees: BTreeMap::new(),
             });
 
         let primary_input_path = primary_input.to_string_lossy().into_owned();
@@ -798,6 +850,7 @@ impl<'a> CompileJobService<'a> {
         project_root: &Path,
         overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
+        reuse_plan: Option<&SourceTreeReusePlan>,
     ) -> Result<LoadedSourceTree, Diagnostic> {
         self.load_source_tree_with_root_source(
             input_file,
@@ -805,6 +858,7 @@ impl<'a> CompileJobService<'a> {
             project_root,
             overlay_roots,
             asset_bundle_path,
+            reuse_plan,
         )
     }
 
@@ -957,15 +1011,14 @@ impl<'a> CompileJobService<'a> {
         project_root: &Path,
         overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
+        reuse_plan: Option<&SourceTreeReusePlan>,
     ) -> Result<LoadedSourceTree, Diagnostic> {
         let root_input = normalize_existing_path(input_file);
         let project_root = normalize_existing_path(project_root);
         let mut visited = BTreeSet::new();
         let mut include_guard = BTreeSet::new();
-        let mut source_files = BTreeSet::new();
-        let mut labels = BTreeMap::new();
-        let mut citations = BTreeMap::new();
         let mut dependency_graph = DependencyGraph::default();
+        let mut cached_source_subtrees = BTreeMap::new();
         let source = self.load_source_file(
             &root_input,
             &project_root,
@@ -974,29 +1027,30 @@ impl<'a> CompileJobService<'a> {
             asset_bundle_path,
             &mut visited,
             &mut include_guard,
-            &mut source_files,
-            &mut labels,
-            &mut citations,
+            reuse_plan,
             &mut dependency_graph,
+            &mut cached_source_subtrees,
         )?;
 
         Ok(LoadedSourceTree {
-            source: source.text,
-            source_lines: source.source_lines,
+            source: source.expanded.text,
+            source_lines: source.expanded.source_lines,
             document_state: DocumentState {
                 revision: 0,
                 bibliography_dirty: false,
-                source_files: source_files
+                source_files: source
+                    .source_files
                     .into_iter()
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect(),
-                labels,
-                citations,
+                labels: source.labels,
+                citations: source.citations,
                 bibliography_state: BibliographyState::default(),
                 navigation: Default::default(),
                 index_state: Default::default(),
             },
             dependency_graph,
+            cached_source_subtrees,
         })
     }
 
@@ -1010,11 +1064,10 @@ impl<'a> CompileJobService<'a> {
         asset_bundle_path: Option<&Path>,
         visited: &mut BTreeSet<PathBuf>,
         include_guard: &mut BTreeSet<PathBuf>,
-        source_files: &mut BTreeSet<PathBuf>,
-        labels: &mut BTreeMap<String, SymbolLocation>,
-        citations: &mut BTreeMap<String, SymbolLocation>,
+        reuse_plan: Option<&SourceTreeReusePlan>,
         dependency_graph: &mut DependencyGraph,
-    ) -> Result<ExpandedSource, Diagnostic> {
+        cached_source_subtrees: &mut BTreeMap<PathBuf, CachedSourceSubtree>,
+    ) -> Result<LoadedSourceSubtree, Diagnostic> {
         let normalized_path = normalize_existing_path(path);
         if !visited.insert(normalized_path.clone()) {
             return Err(Diagnostic::new(
@@ -1025,7 +1078,26 @@ impl<'a> CompileJobService<'a> {
             .with_suggestion("remove the recursive \\input/\\include chain"));
         }
 
-        source_files.insert(normalized_path.clone());
+        if source_override.is_none() {
+            if let Some(reuse_plan) = reuse_plan {
+                if !reuse_plan.rebuild_paths.contains(&normalized_path) {
+                    if let Some(cached_subtree) =
+                        reuse_plan.cached_source_subtrees.get(&normalized_path)
+                    {
+                        restore_cached_subtree_graph(
+                            dependency_graph,
+                            &reuse_plan.cached_dependency_graph,
+                            cached_subtree,
+                        );
+                        cached_source_subtrees
+                            .insert(normalized_path.clone(), cached_subtree.clone());
+                        visited.remove(&normalized_path);
+                        return Ok(LoadedSourceSubtree::from_cached_subtree(cached_subtree));
+                    }
+                }
+            }
+        }
+
         let source = match source_override {
             Some(source) => source.to_string(),
             None => read_utf8_file(self.file_access_gate, &normalized_path)?,
@@ -1034,8 +1106,11 @@ impl<'a> CompileJobService<'a> {
             normalized_path.clone(),
             fingerprint_bytes(source.as_bytes()),
         );
-        collect_symbol_locations(&source, &normalized_path, "label", labels);
-        collect_symbol_locations(&source, &normalized_path, "bibitem", citations);
+        let mut source_files = BTreeSet::from([normalized_path.clone()]);
+        let mut labels = BTreeMap::new();
+        let mut citations = BTreeMap::new();
+        collect_symbol_locations(&source, &normalized_path, "label", &mut labels);
+        collect_symbol_locations(&source, &normalized_path, "bibitem", &mut citations);
 
         let base_dir = normalized_path
             .parent()
@@ -1051,13 +1126,22 @@ impl<'a> CompileJobService<'a> {
             asset_bundle_path,
             visited,
             include_guard,
+            reuse_plan,
+            &mut source_files,
+            &mut labels,
+            &mut citations,
+            dependency_graph,
+            cached_source_subtrees,
+        )?;
+        visited.remove(&normalized_path);
+        let subtree = LoadedSourceSubtree {
+            expanded,
             source_files,
             labels,
             citations,
-            dependency_graph,
-        )?;
-        visited.remove(&normalized_path);
-        Ok(expanded)
+        };
+        cached_source_subtrees.insert(normalized_path, subtree.to_cached_subtree());
+        Ok(subtree)
     }
 
     fn parse_document_with_cross_references<F>(
@@ -1733,10 +1817,12 @@ fn expand_inputs(
     asset_bundle_path: Option<&Path>,
     visited: &mut BTreeSet<PathBuf>,
     include_guard: &mut BTreeSet<PathBuf>,
+    reuse_plan: Option<&SourceTreeReusePlan>,
     source_files: &mut BTreeSet<PathBuf>,
     labels: &mut BTreeMap<String, SymbolLocation>,
     citations: &mut BTreeMap<String, SymbolLocation>,
     dependency_graph: &mut DependencyGraph,
+    cached_source_subtrees: &mut BTreeMap<PathBuf, CachedSourceSubtree>,
 ) -> Result<ExpandedSource, Diagnostic> {
     let mut expanded = ExpandedSourceBuilder::default();
     let source_file = source_path.to_string_lossy().into_owned();
@@ -1775,10 +1861,9 @@ fn expand_inputs(
                             asset_bundle_path,
                             visited,
                             include_guard,
-                            source_files,
-                            labels,
-                            citations,
+                            reuse_plan,
                             dependency_graph,
+                            cached_source_subtrees,
                         )
                         .map_err(|diagnostic| {
                             diagnostic_for_nested_input_error(
@@ -1788,7 +1873,8 @@ fn expand_inputs(
                                 &command.value,
                             )
                         })?;
-                    expanded.append_expanded(&nested);
+                    merge_loaded_subtree(source_files, labels, citations, &nested);
+                    expanded.append_expanded(&nested.expanded);
                 }
                 InlineCommandKind::Include => {
                     dependency_graph.record_edge(source_path.to_path_buf(), resolved.clone());
@@ -1806,10 +1892,9 @@ fn expand_inputs(
                             asset_bundle_path,
                             visited,
                             include_guard,
-                            source_files,
-                            labels,
-                            citations,
+                            reuse_plan,
                             dependency_graph,
+                            cached_source_subtrees,
                         )
                         .map_err(|diagnostic| {
                             diagnostic_for_nested_input_error(
@@ -1819,7 +1904,8 @@ fn expand_inputs(
                                 &command.value,
                             )
                         })?;
-                    expanded.append_expanded(&nested);
+                    merge_loaded_subtree(source_files, labels, citations, &nested);
+                    expanded.append_expanded(&nested.expanded);
                 }
                 InlineCommandKind::InputIfFileExists {
                     true_branch,
@@ -1836,10 +1922,9 @@ fn expand_inputs(
                                 asset_bundle_path,
                                 visited,
                                 include_guard,
-                                source_files,
-                                labels,
-                                citations,
+                                reuse_plan,
                                 dependency_graph,
+                                cached_source_subtrees,
                             )
                             .map_err(|diagnostic| {
                                 diagnostic_for_nested_input_error(
@@ -1849,7 +1934,8 @@ fn expand_inputs(
                                     &command.value,
                                 )
                             })?;
-                        expanded.append_expanded(&nested);
+                        merge_loaded_subtree(source_files, labels, citations, &nested);
+                        expanded.append_expanded(&nested.expanded);
                         expanded.append_with_origin(true_branch, &source_file, source_line);
                     } else {
                         expanded.append_with_origin(false_branch, &source_file, source_line);
@@ -1863,6 +1949,56 @@ fn expand_inputs(
     }
 
     Ok(expanded.finish())
+}
+
+fn merge_loaded_subtree(
+    source_files: &mut BTreeSet<PathBuf>,
+    labels: &mut BTreeMap<String, SymbolLocation>,
+    citations: &mut BTreeMap<String, SymbolLocation>,
+    nested: &LoadedSourceSubtree,
+) {
+    source_files.extend(nested.source_files.iter().cloned());
+    extend_symbol_locations(labels, &nested.labels);
+    extend_symbol_locations(citations, &nested.citations);
+}
+
+fn extend_symbol_locations(
+    target: &mut BTreeMap<String, SymbolLocation>,
+    additional: &BTreeMap<String, SymbolLocation>,
+) {
+    for (key, value) in additional {
+        target.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+fn restore_cached_subtree_graph(
+    dependency_graph: &mut DependencyGraph,
+    cached_dependency_graph: &DependencyGraph,
+    cached_subtree: &CachedSourceSubtree,
+) {
+    let subtree_paths = cached_subtree
+        .source_files
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for path in &subtree_paths {
+        if let Some(node) = cached_dependency_graph.nodes.get(path) {
+            dependency_graph.nodes.insert(path.clone(), node.clone());
+        }
+        if let Some(edges) = cached_dependency_graph.edges.get(path) {
+            dependency_graph
+                .edges
+                .entry(path.clone())
+                .or_default()
+                .extend(
+                    edges
+                        .iter()
+                        .filter(|target| subtree_paths.contains(*target))
+                        .cloned(),
+                );
+        }
+    }
 }
 
 fn read_utf8_file(
@@ -2911,7 +3047,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -3033,6 +3169,75 @@ mod tests {
         }
 
         fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+
+        fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), FileAccessError> {
+            fs::write(path, content).map_err(FileAccessError::from)
+        }
+
+        fn read_readback(
+            &self,
+            path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingFsTestFileAccessGate {
+        read_counts: Arc<Mutex<BTreeMap<PathBuf, usize>>>,
+    }
+
+    impl CountingFsTestFileAccessGate {
+        fn new() -> Self {
+            Self {
+                read_counts: Arc::new(Mutex::new(BTreeMap::new())),
+            }
+        }
+
+        fn reset(&self) {
+            self.read_counts.lock().expect("lock read counts").clear();
+        }
+
+        fn read_count(&self, path: &Path) -> usize {
+            *self
+                .read_counts
+                .lock()
+                .expect("lock read counts")
+                .get(path)
+                .unwrap_or(&0)
+        }
+    }
+
+    impl FileAccessGate for CountingFsTestFileAccessGate {
+        fn ensure_directory(&self, path: &Path) -> Result<(), FileAccessError> {
+            fs::create_dir_all(path).map_err(FileAccessError::from)
+        }
+
+        fn check_read(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_write(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_readback(
+            &self,
+            _path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
+            let mut counts = self.read_counts.lock().expect("lock read counts");
+            *counts.entry(path.to_path_buf()).or_default() += 1;
+            drop(counts);
             fs::read(path).map_err(FileAccessError::from)
         }
 
@@ -3813,6 +4018,43 @@ mod tests {
 
         let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
         assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn changed_dependency_reuses_unaffected_cached_subtree() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let chapter_one = dir.path().join("chapter-one.tex");
+        let chapter_two = dir.path().join("chapter-two.tex");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\begin{document}\n\\input{chapter-one}\n\\input{chapter-two}\n\\end{document}\n",
+        )
+        .expect("write main input");
+        fs::write(&chapter_one, "Chapter one before.\n").expect("write chapter one");
+        fs::write(&chapter_two, "Chapter two stable.\n").expect("write chapter two");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+        let gate = CountingFsTestFileAccessGate::new();
+        let normalized_chapter_one = super::normalize_existing_path(&chapter_one);
+        let normalized_chapter_two = super::normalize_existing_path(&chapter_two);
+
+        let first = service(&gate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 0);
+
+        gate.reset();
+        fs::write(&chapter_one, "Chapter one after edit.\n").expect("update chapter one");
+
+        let second = service(&gate, &loader).compile(&options);
+        assert_eq!(second.exit_code, 0);
+        assert!(gate.read_count(&normalized_chapter_one) >= 1);
+        assert_eq!(
+            gate.read_count(&normalized_chapter_two),
+            1,
+            "unchanged sibling subtree should only be touched during hash detection",
+        );
     }
 
     #[test]

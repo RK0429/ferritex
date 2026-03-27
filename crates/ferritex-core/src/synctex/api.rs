@@ -8,7 +8,7 @@ const DEFAULT_CHAR_WIDTH_PT: i64 = 6;
 const DEFAULT_LINE_TOP_OFFSET_PT: i64 = 10;
 const DEFAULT_LINE_DESCENT_PT: i64 = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceLineTrace {
     pub file: String,
     pub line: u32,
