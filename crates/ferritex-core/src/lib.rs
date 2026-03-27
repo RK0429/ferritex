@@ -9,4 +9,5 @@ pub mod kernel;
 pub mod parser;
 pub mod pdf;
 pub mod policy;
+pub mod synctex;
 pub mod typesetting;

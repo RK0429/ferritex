@@ -4,7 +4,11 @@ A Rust-based high-performance TeX compiler.
 
 ## Status
 
-Early docs-aligned slice. `compile` accepts a minimal LaTeX document shape, recursively resolves `\\input` / `\\include` with current-file-relative lookup first and project-root fallback second, falls back to asset-bundle-backed TeX inputs after local files, handles `\\InputIfFileExists` true/false branches, runs a simple parse -> typeset -> PDF pipeline, and emits a PDF containing the expanded document body text instead of a placeholder artifact. The tokenizer is now wired into that compile path with minimal macro expansion for `\\def`, `\\gdef`, `\\newcommand`, and `\\renewcommand` (0-2 arguments), local group scoping, `\\catcode` assignment support, basic conditionals (`\\iftrue`, `\\iffalse`, `\\ifnum`, `\\ifx`, `\\ifcase`, `\\else`, `\\or`, `\\fi`), and count/dimen register primitives (`\\count`, `\\dimen`, `\\the`, `\\advance`, `\\multiply`, `\\divide`, `\\global`) with group-local rollback. `fontspec` preamble commands can resolve named fonts from the project tree, configured overlay roots, the asset bundle, and finally a cached host-font catalog fallback; `--reproducible` disables that host fallback for deterministic builds. `watch` refreshes its polled path set from the latest successful compile state, so newly introduced input dependencies are picked up on the next cycle. `preview` starts a loopback-only preview server and publishes the compiled PDF over HTTP. `lsp` speaks stdio JSON-RPC, answers `initialize`, recompiles on open/change, merges compile diagnostics with buffer-local analysis, and augments label / citation completion and definition lookups with the latest stable compile state. `ferritex-core` also includes a minimal TFM metric reader as a standalone building block. Full TeX/LaTeX compatibility, real macro expansion beyond this minimal subset, bibliography toolchains, and production-grade typesetting are still unimplemented.
+The current build covers a non-trivial docs-aligned subset rather than a placeholder shell. `compile` resolves `\\input` / `\\include` / `\\InputIfFileExists` across the current file, project root, configured overlay roots, and asset bundles; expands `\\def` / `\\gdef` / `\\edef`, `\\expandafter`, `\\noexpand`, `\\csname`, `\\newcommand`, `\\newenvironment`, and group-scoped definitions; supports conditionals (`\\if`, `\\ifx`, `\\ifcat`, `\\ifnum`, `\\ifdim`, `\\ifcase`) plus e-TeX `\\numexpr` / `\\dimexpr`; and handles the extended register families (`count`, `dimen`, `skip`, `muskip`, `toks`) with local/global rollback.
+
+The PDF path now includes multi-pass refs/`\\pageref`, TOC/LOF/LOT/index generation, equation/align-style math blocks, `hyperref` metadata and link annotations, `graphicx` PNG/JPEG embedding, bibliography `.bbl` readback, fontspec named-font resolution across project/overlay/bundle/host catalogs, and TrueType embedding with subsetting plus ToUnicode maps. `watch`, `preview`, and `lsp` are all live; LSP serves diagnostics, completion, definition, hover, and code actions from the latest stable compile state. `--synctex` now emits a `.synctex` sidecar with forward/inverse search data for the current line-based trace model.
+
+The largest remaining gaps against `docs/requirements.md` are incremental compilation and persistent cache, document-partition/commit-barrier parallelism, `tikz`/`pgf`, and higher-fidelity source-span tracking for SyncTeX.
 
 ## Quick start
 
@@ -15,6 +19,7 @@ cargo run -- watch hello.tex     # polls and recompiles on source changes
 cargo run -- preview hello.tex   # serves the current PDF on a loopback preview URL
 cargo run -- lsp                 # starts an LSP server over stdio
 cargo run -- compile hello.tex --reproducible  # disables host-font fallback
+cargo run -- compile hello.tex --synctex       # also emits hello.synctex
 ```
 
 ## Crate layout
@@ -32,7 +37,7 @@ Dependency direction: `cli → application + core + infra`, `application → cor
 ## Testing
 
 ```sh
-cargo test                              # unit + integration + E2E
+cargo test --workspace                  # unit + integration + E2E
 cargo clippy -- -D warnings             # lint
 python3 scripts/check_architecture.py   # crate dependency + context boundary checks
 ```

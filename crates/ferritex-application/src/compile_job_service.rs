@@ -24,6 +24,7 @@ use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
 use ferritex_core::pdf::{FontResource, ImageFilter, PdfImageXObject, PdfRenderer, PlacedImage};
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
+use ferritex_core::synctex::{RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData};
 use ferritex_core::typesetting::{
     resolve_page_labels, MinimalTypesetter, TextLine, TfmWidthProvider, TypesetDocument,
 };
@@ -60,7 +61,22 @@ pub struct CompileJobService<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadedSourceTree {
     source: String,
+    source_lines: Vec<SourceLineTrace>,
     document_state: DocumentState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ExpandedSource {
+    text: String,
+    source_lines: Vec<SourceLineTrace>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ExpandedSourceBuilder {
+    text: String,
+    source_lines: Vec<SourceLineTrace>,
+    current_line_text: String,
+    current_line_origin: Option<(String, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +151,70 @@ impl GraphicAssetResolver for CompileGraphicAssetResolver<'_> {
             },
             metadata,
         })
+    }
+}
+
+impl ExpandedSourceBuilder {
+    fn append_with_origin(&mut self, text: &str, file: &str, line: u32) {
+        if text.is_empty() {
+            return;
+        }
+
+        let mut remaining = text;
+        let mut current_line = line;
+        while !remaining.is_empty() {
+            if self.current_line_origin.is_none() {
+                self.current_line_origin = Some((file.to_string(), current_line));
+            }
+
+            if let Some(newline_index) = remaining.find('\n') {
+                let prefix = &remaining[..newline_index];
+                self.text.push_str(prefix);
+                self.text.push('\n');
+                self.current_line_text.push_str(prefix);
+                let (origin_file, origin_line) = self
+                    .current_line_origin
+                    .take()
+                    .expect("line origin should exist before newline flush");
+                self.source_lines.push(SourceLineTrace {
+                    file: origin_file,
+                    line: origin_line,
+                    text: self.current_line_text.clone(),
+                });
+                self.current_line_text.clear();
+                remaining = &remaining[newline_index + 1..];
+                current_line += 1;
+            } else {
+                self.text.push_str(remaining);
+                self.current_line_text.push_str(remaining);
+                break;
+            }
+        }
+    }
+
+    fn append_expanded(&mut self, expanded: &ExpandedSource) {
+        for (segment, origin) in expanded
+            .text
+            .split_inclusive('\n')
+            .zip(expanded.source_lines.iter())
+        {
+            self.append_with_origin(segment, &origin.file, origin.line);
+        }
+    }
+
+    fn finish(mut self) -> ExpandedSource {
+        if let Some((file, line)) = self.current_line_origin.take() {
+            self.source_lines.push(SourceLineTrace {
+                file,
+                line,
+                text: std::mem::take(&mut self.current_line_text),
+            });
+        }
+
+        ExpandedSource {
+            text: self.text,
+            source_lines: self.source_lines,
+        }
     }
 }
 
@@ -483,6 +563,7 @@ impl<'a> CompileJobService<'a> {
             options.jobname.clone(),
             execution_policy,
         );
+        let mut diagnostics = parse_diagnostics;
 
         if let Err(error) = self
             .file_access_gate
@@ -498,7 +579,30 @@ impl<'a> CompileJobService<'a> {
             };
         }
 
-        let diagnostics = parse_diagnostics;
+        if options.synctex {
+            let synctex_path = options
+                .output_dir
+                .join(format!("{}.synctex", options.jobname));
+            let synctex = SyncTexData::build_line_based(
+                &synctex_pages_for(&typeset_document),
+                &source_tree.source_lines,
+            );
+            match serde_json::to_vec_pretty(&synctex) {
+                Ok(bytes) => {
+                    if let Err(error) = self.file_access_gate.write_file(&synctex_path, &bytes) {
+                        diagnostics.push(diagnostic_for_synctex_error(error, &synctex_path));
+                    }
+                }
+                Err(error) => diagnostics.push(
+                    Diagnostic::new(
+                        Severity::Error,
+                        format!("failed to serialize SyncTeX data: {error}"),
+                    )
+                    .with_file(synctex_path.to_string_lossy().into_owned()),
+                ),
+            }
+        }
+
         let stable_compile_state = stable_compile_state(
             &compilation_job,
             source_tree.document_state,
@@ -544,6 +648,11 @@ impl<'a> CompileJobService<'a> {
             )
             .unwrap_or_else(|_| LoadedSourceTree {
                 source: source.to_string(),
+                source_lines: vec![SourceLineTrace {
+                    file: primary_input.to_string_lossy().into_owned(),
+                    line: 1,
+                    text: source.to_string(),
+                }],
                 document_state: DocumentState::default(),
             });
 
@@ -783,7 +892,8 @@ impl<'a> CompileJobService<'a> {
         )?;
 
         Ok(LoadedSourceTree {
-            source,
+            source: source.text,
+            source_lines: source.source_lines,
             document_state: DocumentState {
                 revision: 0,
                 bibliography_dirty: false,
@@ -813,7 +923,7 @@ impl<'a> CompileJobService<'a> {
         source_files: &mut BTreeSet<PathBuf>,
         labels: &mut BTreeMap<String, SymbolLocation>,
         citations: &mut BTreeMap<String, SymbolLocation>,
-    ) -> Result<String, Diagnostic> {
+    ) -> Result<ExpandedSource, Diagnostic> {
         let normalized_path = normalize_existing_path(path);
         if !visited.insert(normalized_path.clone()) {
             return Err(Diagnostic::new(
@@ -1243,6 +1353,38 @@ fn diagnostic_for_output_error(error: FileAccessError, output_pdf: &Path) -> Dia
     }
 }
 
+fn synctex_pages_for(document: &TypesetDocument) -> Vec<RenderedPageTrace> {
+    document
+        .pages
+        .iter()
+        .map(|page| RenderedPageTrace {
+            lines: page
+                .lines
+                .iter()
+                .map(|line| RenderedLineTrace {
+                    text: line.text.clone(),
+                    y: line.y,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn diagnostic_for_synctex_error(error: FileAccessError, synctex_path: &Path) -> Diagnostic {
+    match error {
+        FileAccessError::AccessDenied { .. } => {
+            Diagnostic::new(Severity::Error, "SyncTeX output access denied")
+                .with_file(synctex_path.to_string_lossy().into_owned())
+                .with_suggestion("check the output directory and file access policy")
+        }
+        FileAccessError::Io { source } => Diagnostic::new(
+            Severity::Error,
+            format!("failed to write SyncTeX output: {source}"),
+        )
+        .with_file(synctex_path.to_string_lossy().into_owned()),
+    }
+}
+
 fn diagnostic_for_bibliography(
     diagnostic: BibliographyDiagnostic,
     searched_paths: Vec<PathBuf>,
@@ -1385,20 +1527,22 @@ fn expand_inputs(
     source_files: &mut BTreeSet<PathBuf>,
     labels: &mut BTreeMap<String, SymbolLocation>,
     citations: &mut BTreeMap<String, SymbolLocation>,
-) -> Result<String, Diagnostic> {
-    let mut expanded = String::with_capacity(source.len());
+) -> Result<ExpandedSource, Diagnostic> {
+    let mut expanded = ExpandedSourceBuilder::default();
+    let source_file = source_path.to_string_lossy().into_owned();
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        let source_line = line_index as u32 + 1;
         let visible = strip_line_comment(line);
-        let matches = input_commands_in_line(&visible, line_index as u32 + 1);
+        let matches = input_commands_in_line(&visible, source_line);
         if matches.is_empty() {
-            expanded.push_str(line);
+            expanded.append_with_origin(line, &source_file, source_line);
             continue;
         }
 
         let mut cursor = 0usize;
         for command in matches {
-            expanded.push_str(&line[cursor..command.start]);
+            expanded.append_with_origin(&line[cursor..command.start], &source_file, source_line);
 
             let resolved = resolve_input_path(
                 base_dir,
@@ -1432,7 +1576,7 @@ fn expand_inputs(
                                 &command.value,
                             )
                         })?;
-                    expanded.push_str(&nested);
+                    expanded.append_expanded(&nested);
                 }
                 InlineCommandKind::Include => {
                     if !include_guard.insert(resolved.clone()) {
@@ -1461,7 +1605,7 @@ fn expand_inputs(
                                 &command.value,
                             )
                         })?;
-                    expanded.push_str(&nested);
+                    expanded.append_expanded(&nested);
                 }
                 InlineCommandKind::InputIfFileExists {
                     true_branch,
@@ -1489,20 +1633,20 @@ fn expand_inputs(
                                     &command.value,
                                 )
                             })?;
-                        expanded.push_str(&nested);
-                        expanded.push_str(true_branch);
+                        expanded.append_expanded(&nested);
+                        expanded.append_with_origin(true_branch, &source_file, source_line);
                     } else {
-                        expanded.push_str(false_branch);
+                        expanded.append_with_origin(false_branch, &source_file, source_line);
                     }
                 }
             }
             cursor = command.end;
         }
 
-        expanded.push_str(&line[cursor..]);
+        expanded.append_with_origin(&line[cursor..], &source_file, source_line);
     }
 
-    Ok(expanded)
+    Ok(expanded.finish())
 }
 
 fn read_utf8_file(
@@ -2561,6 +2705,7 @@ mod tests {
     use ferritex_core::diagnostics::Severity;
     use ferritex_core::font::OpenTypeFont;
     use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
+    use ferritex_core::synctex::SyncTexData;
     use tempfile::tempdir;
 
     enum MockReadResult {
@@ -2836,6 +2981,11 @@ mod tests {
 
     fn read_pdf(path: &Path) -> String {
         String::from_utf8_lossy(&fs::read(path).expect("read output pdf")).into_owned()
+    }
+
+    fn read_synctex(path: &Path) -> SyncTexData {
+        serde_json::from_slice(&fs::read(path).expect("read output synctex"))
+            .expect("parse output synctex")
     }
 
     fn build_test_tfm() -> Vec<u8> {
@@ -3269,6 +3419,44 @@ mod tests {
             created_dirs.as_slice(),
             std::slice::from_ref(&options.output_dir)
         );
+    }
+
+    #[test]
+    fn compile_with_synctex_writes_trace_sidecar() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\begin{document}\nHello world\n\\end{document}\n",
+        )
+        .expect("write input");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.synctex = true;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let synctex_path = options.output_dir.join("main.synctex");
+        assert!(synctex_path.exists());
+        let synctex = read_synctex(&synctex_path);
+        assert_eq!(
+            synctex.files,
+            vec![input_file
+                .canonicalize()
+                .expect("canonical input path")
+                .to_string_lossy()
+                .into_owned()]
+        );
+        assert!(!synctex.fragments.is_empty());
+        let positions = synctex.forward_search(ferritex_core::kernel::api::SourceLocation {
+            file_id: 0,
+            line: 3,
+            column: 1,
+        });
+        assert!(!positions.is_empty());
+        assert_eq!(positions[0].page, 1);
     }
 
     #[test]
