@@ -8,7 +8,7 @@ The current build covers a non-trivial docs-aligned subset rather than a placeho
 
 The PDF path now includes multi-pass refs/`\\pageref`, TOC/LOF/LOT/index generation, equation/align-style math blocks, `hyperref` metadata and link annotations, `graphicx` PNG/JPEG embedding, bibliography `.bbl` readback, fontspec named-font resolution across project/overlay/bundle/host catalogs, and TrueType embedding with subsetting plus ToUnicode maps. `watch`, `preview`, and `lsp` are all live; LSP serves diagnostics, completion, definition, hover, and code actions from the latest stable compile state. `--synctex` now emits a `.synctex` sidecar with forward/inverse search data for the current line-based trace model.
 
-The largest remaining gaps against `docs/requirements.md` are incremental compilation and persistent cache, document-partition/commit-barrier parallelism, `tikz`/`pgf`, and higher-fidelity source-span tracking for SyncTeX.
+The largest remaining gaps against `docs/requirements.md` are parser/typesetter/page-fragment-level partial recompilation, document-partition/commit-barrier parallelism, `tikz`/`pgf`, higher-fidelity source-span tracking for SyncTeX, and a fully memory-mapped production asset-bundle runtime.
 
 ## Quick start
 
@@ -20,6 +20,7 @@ cargo run -- preview hello.tex   # serves the current PDF on a loopback preview 
 cargo run -- lsp                 # starts an LSP server over stdio
 cargo run -- compile hello.tex --reproducible  # disables host-font fallback
 cargo run -- compile hello.tex --synctex       # also emits hello.synctex
+cargo run -- compile hello.tex --asset-bundle builtin:basic  # uses the built-in basic asset bundle
 ```
 
 ## Crate layout

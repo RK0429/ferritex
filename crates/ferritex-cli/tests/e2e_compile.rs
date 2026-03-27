@@ -878,6 +878,31 @@ fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
 }
 
 #[test]
+fn compile_accepts_builtin_asset_bundle_identifier() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\input{bundled}\n\\end{document}\n",
+    )
+    .expect("write input");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            "builtin:basic",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("main.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Bundled from built-in asset bundle."));
+}
+
+#[test]
 fn compile_rejects_commented_out_documentclass() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("broken.tex");

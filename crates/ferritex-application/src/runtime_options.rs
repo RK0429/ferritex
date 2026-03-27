@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+pub const BUILTIN_BASIC_ASSET_BUNDLE_ID: &str = "builtin:basic";
+const BUILTIN_BASIC_ASSET_BUNDLE_VERSION: &str = "0.1.0";
+const BUILTIN_BASIC_BUNDLED_TEX: &str = "Bundled from built-in asset bundle.\n";
+
 /// CLI から受け取る compile サブコマンド引数
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileArgs {
@@ -75,7 +79,7 @@ impl RuntimeOptions {
             parallelism: args.jobs.unwrap_or_else(default_parallelism).max(1),
             overlay_roots: args.overlay_roots.clone(),
             no_cache: args.no_cache,
-            asset_bundle: args.asset_bundle.clone(),
+            asset_bundle: args.asset_bundle.as_deref().map(resolve_asset_bundle_ref),
             host_font_fallback,
             host_font_roots: if host_font_fallback {
                 default_host_font_roots()
@@ -106,7 +110,7 @@ impl RuntimeOptions {
             parallelism: default_parallelism(),
             overlay_roots: Vec::new(),
             no_cache: false,
-            asset_bundle: None,
+            asset_bundle: default_lsp_asset_bundle(),
             host_font_fallback: true,
             host_font_roots: default_host_font_roots(),
             interaction_mode: InteractionMode::Nonstopmode,
@@ -114,6 +118,20 @@ impl RuntimeOptions {
             trace_font_tasks: false,
             shell_escape: ShellEscapeMode::Disabled,
         }
+    }
+}
+
+pub fn default_lsp_asset_bundle() -> Option<PathBuf> {
+    Some(resolve_asset_bundle_ref(Path::new(
+        BUILTIN_BASIC_ASSET_BUNDLE_ID,
+    )))
+}
+
+pub fn resolve_asset_bundle_ref(bundle_ref: &Path) -> PathBuf {
+    if bundle_ref == Path::new(BUILTIN_BASIC_ASSET_BUNDLE_ID) {
+        materialize_builtin_basic_asset_bundle()
+    } else {
+        bundle_ref.to_path_buf()
     }
 }
 
@@ -197,12 +215,31 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn materialize_builtin_basic_asset_bundle() -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "ferritex-builtin-bundles/basic-{BUILTIN_BASIC_ASSET_BUNDLE_VERSION}"
+    ));
+    let texmf_root = root.join("texmf");
+    let manifest_path = root.join("manifest.json");
+    let bundled_tex_path = texmf_root.join("bundled.tex");
+    let manifest = format!(
+        "{{\"name\":\"basic\",\"version\":\"{BUILTIN_BASIC_ASSET_BUNDLE_VERSION}\",\"min_ferritex_version\":\"0.1.0\"}}"
+    );
+
+    let _ = std::fs::create_dir_all(&texmf_root);
+    let _ = std::fs::write(&manifest_path, manifest);
+    let _ = std::fs::write(&bundled_tex_path, BUILTIN_BASIC_BUNDLED_TEX);
+
+    root
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::{
-        CompileArgs, CompileInteraction, InteractionMode, RuntimeOptions, ShellEscapeMode,
+        default_lsp_asset_bundle, resolve_asset_bundle_ref, CompileArgs, CompileInteraction,
+        InteractionMode, RuntimeOptions, ShellEscapeMode, BUILTIN_BASIC_ASSET_BUNDLE_ID,
     };
 
     fn compile_args(input_file: impl Into<PathBuf>) -> CompileArgs {
@@ -314,7 +351,9 @@ mod tests {
         assert_eq!(options.jobname, "main");
         assert_eq!(options.parallelism, super::default_parallelism());
         assert!(!options.no_cache);
-        assert_eq!(options.asset_bundle, None);
+        let bundle_path = options.asset_bundle.expect("lsp bundle path");
+        assert!(bundle_path.join("manifest.json").exists());
+        assert!(bundle_path.join("texmf/bundled.tex").exists());
         assert!(options.host_font_fallback);
         assert_eq!(options.host_font_roots, super::default_host_font_roots());
         assert_eq!(options.interaction_mode, InteractionMode::Nonstopmode);
@@ -332,5 +371,22 @@ mod tests {
 
         assert!(!options.host_font_fallback);
         assert!(options.host_font_roots.is_empty());
+    }
+
+    #[test]
+    fn resolves_builtin_asset_bundle_identifier_to_materialized_bundle() {
+        let resolved =
+            resolve_asset_bundle_ref(PathBuf::from(BUILTIN_BASIC_ASSET_BUNDLE_ID).as_path());
+
+        assert!(resolved.join("manifest.json").exists());
+        assert!(resolved.join("texmf/bundled.tex").exists());
+    }
+
+    #[test]
+    fn lsp_default_bundle_matches_builtin_materialization() {
+        let bundle = default_lsp_asset_bundle().expect("default bundle");
+
+        assert!(bundle.join("manifest.json").exists());
+        assert!(bundle.join("texmf/bundled.tex").exists());
     }
 }

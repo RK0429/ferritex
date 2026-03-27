@@ -37,7 +37,7 @@ use serde_json::json;
 use crate::compile_cache::{fingerprint_bytes, CachedSourceSubtree, CompileCache};
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
-use crate::runtime_options::RuntimeOptions;
+use crate::runtime_options::{default_lsp_asset_bundle, RuntimeOptions};
 use crate::stable_compile_state::{
     CrossReferenceCaptionEntry, CrossReferenceSectionEntry, CrossReferenceSeed, StableCompileState,
 };
@@ -956,6 +956,7 @@ impl<'a> CompileJobService<'a> {
         let jobname = jobname_for_input(&primary_input);
         let execution_policy = in_memory_execution_policy(&primary_input, &jobname);
         let project_root = project_root_for_policy(&execution_policy, &primary_input);
+        let asset_bundle = default_lsp_asset_bundle();
         let compilation_job =
             compilation_job(primary_input.clone(), jobname.clone(), execution_policy);
         let mut source_tree = self
@@ -964,7 +965,7 @@ impl<'a> CompileJobService<'a> {
                 Some(source),
                 &project_root,
                 &[],
-                None,
+                asset_bundle.as_deref(),
                 None,
             )
             .unwrap_or_else(|_| LoadedSourceTree {
@@ -988,7 +989,7 @@ impl<'a> CompileJobService<'a> {
             &source_tree.source,
             &project_root,
             &[],
-            None,
+            asset_bundle.as_deref(),
             source_tree.document_state.bibliography_state.clone().into(),
             source_tree.document_state.index_state.entries.clone(),
             None,

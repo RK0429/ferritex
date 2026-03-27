@@ -24,7 +24,7 @@
 | A | Incremental compilation (REQ-FUNC-027-030) | 高 | dependency graph / persistent cache / cache corruption fallback に加え、変更ファイルから親 subtree への reverse-propagation と unaffected `\\input` subtree cache 再利用までは実装済み。parser/typesetter/page fragment の本格 merge と性能適合度は未実装 |
 | B | Parallel pipeline (REQ-FUNC-031-033) | 高 | `CommitBarrier`、document partition planning、deterministic merge、partition benchmark を満たす本体並列化が未実装 |
 | C | tikz/pgf (REQ-FUNC-023) | 高 | `tikzpicture` / `\draw` / style inheritance / transform / clip / arrow を扱う graphics scene が未実装 |
-| D | Asset bundle runtime (REQ-FUNC-046) | 中 | manifest validation はあるが、versioned bundle の本実装・mmap 読み込み・built-in bundle 配布契約は未完 |
+| D | Asset bundle runtime (REQ-FUNC-046) | 中 | built-in bundle identifier (`builtin:basic`) と LSP/CLI 既定経路は実装済み。残差分は versioned bundle archive の本実装、Asset Index の mmap 読み込み、本番向け配布契約 |
 | E | SyncTeX fidelity (REQ-FUNC-041) | 中 | 現在は expanded source line ベースの trace で、`PlacedNode.sourceSpan` に基づく fragment 精度までは未到達 |
 | F | Full LaTeX compatibility | 中 | long-tail package behavior、TikZ 周辺、より厳密な layout parity は継続課題 |
 

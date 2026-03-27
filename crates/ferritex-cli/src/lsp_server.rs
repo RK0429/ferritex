@@ -10,6 +10,7 @@ use ferritex_application::lsp_capability_service::{
     LspCapabilityService, ServerCapabilities, TextDocumentSyncKind,
 };
 use ferritex_application::open_document_store::{OpenDocumentBuffer, OpenDocumentStore};
+use ferritex_application::runtime_options::default_lsp_asset_bundle;
 use ferritex_application::stable_compile_state::StableCompileState;
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::policy::{ExecutionPolicy, PreviewPublicationPolicy};
@@ -472,9 +473,13 @@ fn refresh_compile_state(
             .filter(|path| !path.as_os_str().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
+        let mut allowed_read_paths = vec![workspace_root.clone()];
+        if let Some(bundle_path) = default_lsp_asset_bundle() {
+            allowed_read_paths.push(bundle_path);
+        }
         let file_access_gate = FsFileAccessGate::from_policy(ExecutionPolicy {
             shell_escape_allowed: false,
-            allowed_read_paths: vec![workspace_root.clone()],
+            allowed_read_paths,
             allowed_write_paths: vec![workspace_root.clone()],
             output_dir: workspace_root,
             jobname: "lsp".to_string(),
