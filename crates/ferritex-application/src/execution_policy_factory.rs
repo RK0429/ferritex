@@ -10,6 +10,7 @@ impl ExecutionPolicyFactory {
     pub fn create(options: &RuntimeOptions) -> ExecutionPolicy {
         let project_root = project_root_for_input(&options.input_file);
         let mut allowed_read_paths = vec![project_root];
+        allowed_read_paths.extend(options.overlay_roots.iter().cloned());
         if let Some(bundle_path) = &options.asset_bundle {
             allowed_read_paths.push(bundle_path.clone());
         }
@@ -113,6 +114,7 @@ mod tests {
             output_dir: PathBuf::from("build"),
             jobname: "main".to_string(),
             parallelism: 1,
+            overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
             interaction_mode: InteractionMode::Nonstopmode,
@@ -164,6 +166,7 @@ mod tests {
             output_dir: project_root.join("build"),
             jobname: "main".to_string(),
             parallelism: 1,
+            overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
             interaction_mode: InteractionMode::Nonstopmode,
@@ -186,6 +189,7 @@ mod tests {
             output_dir: dir.path().join("build"),
             jobname: "main".to_string(),
             parallelism: 1,
+            overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
             interaction_mode: InteractionMode::Nonstopmode,
@@ -211,6 +215,7 @@ mod tests {
             output_dir: project_root.join("build"),
             jobname: "main".to_string(),
             parallelism: 1,
+            overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: Some(bundle_root.clone()),
             interaction_mode: InteractionMode::Nonstopmode,
@@ -222,5 +227,35 @@ mod tests {
         let policy = ExecutionPolicyFactory::create(&options);
 
         assert_eq!(policy.allowed_read_paths, vec![project_root, bundle_root]);
+    }
+
+    #[test]
+    fn includes_overlay_roots_between_project_and_bundle() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let overlay_root = dir.path().join("overlay");
+        let bundle_root = dir.path().join("bundle");
+        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+
+        let options = RuntimeOptions {
+            input_file: project_root.join("src/main.tex"),
+            output_dir: project_root.join("build"),
+            jobname: "main".to_string(),
+            parallelism: 1,
+            overlay_roots: vec![overlay_root.clone()],
+            no_cache: false,
+            asset_bundle: Some(bundle_root.clone()),
+            interaction_mode: InteractionMode::Nonstopmode,
+            synctex: false,
+            trace_font_tasks: false,
+            shell_escape: ShellEscapeMode::Disabled,
+        };
+
+        let policy = ExecutionPolicyFactory::create(&options);
+
+        assert_eq!(
+            policy.allowed_read_paths,
+            vec![project_root, overlay_root, bundle_root]
+        );
     }
 }

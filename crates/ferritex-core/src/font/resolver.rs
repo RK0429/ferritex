@@ -23,6 +23,7 @@ pub fn resolve_named_font(
     name: &str,
     input_dir: &Path,
     project_root: &Path,
+    overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
     file_access_gate: &dyn FileAccessGate,
 ) -> Option<ResolvedFont> {
@@ -38,6 +39,18 @@ pub fn resolve_named_font(
     }
 
     for candidate in collect_flat_opentype_candidates(&project_root.join("fonts")) {
+        if let Some(font) = try_load_named_candidate(&candidate, requested_name, file_access_gate) {
+            return Some(font);
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut overlay_candidates = Vec::new();
+    for overlay_root in overlay_roots {
+        collect_opentype_candidates_in_dir(overlay_root, &mut visited, &mut overlay_candidates);
+    }
+
+    for candidate in overlay_candidates {
         if let Some(font) = try_load_named_candidate(&candidate, requested_name, file_access_gate) {
             return Some(font);
         }
@@ -274,6 +287,7 @@ mod tests {
             "TestFont",
             &input_dir,
             &project_root,
+            &[],
             None,
             &FsTestFileAccessGate,
         )
@@ -297,6 +311,7 @@ mod tests {
             "TestFont",
             &input_dir,
             &project_root,
+            &[],
             Some(&bundle_path),
             &FsTestFileAccessGate,
         )
@@ -320,6 +335,7 @@ mod tests {
             "TestFont",
             &input_dir,
             &project_root,
+            &[],
             Some(&bundle_path),
             &FsTestFileAccessGate,
         )
@@ -340,6 +356,7 @@ mod tests {
             "testfont",
             &input_dir,
             &project_root,
+            &[],
             None,
             &FsTestFileAccessGate,
         )
@@ -359,9 +376,33 @@ mod tests {
             "Nonexistent",
             &input_dir,
             &project_root,
+            &[],
             Some(&bundle_path),
             &FsTestFileAccessGate,
         )
         .is_none());
+    }
+
+    #[test]
+    fn resolve_named_font_finds_overlay_root_font() {
+        let fixture = FixtureDir::new();
+        let input_dir = fixture.path().join("input");
+        let project_root = fixture.path().join("project");
+        let overlay_root = fixture.path().join("overlay");
+        let font_path = overlay_root.join("fonts/OverlayFace.ttf");
+        write_font(&font_path);
+
+        let resolved = resolve_named_font(
+            "OverlayFace",
+            &input_dir,
+            &project_root,
+            &[overlay_root],
+            None,
+            &FsTestFileAccessGate,
+        )
+        .expect("resolve overlay-root font");
+
+        assert_eq!(resolved.path, font_path);
+        assert_eq!(resolved.base_font_name, "OverlayFace".to_string());
     }
 }

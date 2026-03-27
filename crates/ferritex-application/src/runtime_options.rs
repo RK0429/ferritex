@@ -7,6 +7,7 @@ pub struct CompileArgs {
     pub output_dir: Option<PathBuf>,
     pub jobname: Option<String>,
     pub jobs: Option<usize>,
+    pub overlay_roots: Vec<PathBuf>,
     pub no_cache: bool,
     pub asset_bundle: Option<PathBuf>,
     pub interaction: Option<CompileInteraction>,
@@ -31,6 +32,7 @@ pub struct RuntimeOptions {
     pub output_dir: PathBuf,
     pub jobname: String,
     pub parallelism: usize,
+    pub overlay_roots: Vec<PathBuf>,
     pub no_cache: bool,
     pub asset_bundle: Option<PathBuf>,
     pub interaction_mode: InteractionMode,
@@ -67,6 +69,7 @@ impl RuntimeOptions {
                 .clone()
                 .unwrap_or_else(|| derive_jobname(&args.input_file)),
             parallelism: args.jobs.unwrap_or_else(default_parallelism).max(1),
+            overlay_roots: args.overlay_roots.clone(),
             no_cache: args.no_cache,
             asset_bundle: args.asset_bundle.clone(),
             interaction_mode: match args.interaction.unwrap_or(CompileInteraction::Nonstopmode) {
@@ -91,6 +94,7 @@ impl RuntimeOptions {
             jobname: jobname.unwrap_or_else(|| derive_jobname(&input_file)),
             input_file,
             parallelism: default_parallelism(),
+            overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
             interaction_mode: InteractionMode::Nonstopmode,
@@ -149,6 +153,7 @@ mod tests {
             output_dir: None,
             jobname: None,
             jobs: None,
+            overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
             interaction: None,
@@ -178,6 +183,7 @@ mod tests {
         args.output_dir = Some(PathBuf::from("build"));
         args.jobname = Some("custom-job".to_string());
         args.jobs = Some(4);
+        args.overlay_roots = vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")];
         args.no_cache = true;
         args.asset_bundle = Some(PathBuf::from("bundle"));
         args.interaction = Some(CompileInteraction::Batchmode);
@@ -190,6 +196,10 @@ mod tests {
         assert_eq!(options.output_dir, PathBuf::from("build"));
         assert_eq!(options.jobname, "custom-job");
         assert_eq!(options.parallelism, 4);
+        assert_eq!(
+            options.overlay_roots,
+            vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")]
+        );
         assert!(options.no_cache);
         assert_eq!(options.asset_bundle, Some(PathBuf::from("bundle")));
         assert_eq!(options.interaction_mode, InteractionMode::Batchmode);

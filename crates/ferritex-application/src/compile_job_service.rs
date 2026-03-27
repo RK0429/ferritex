@@ -94,6 +94,7 @@ struct CompileGraphicAssetResolver<'a> {
     file_access_gate: &'a dyn FileAccessGate,
     input_dir: &'a Path,
     project_root: &'a Path,
+    overlay_roots: &'a [PathBuf],
     asset_bundle_path: Option<&'a Path>,
 }
 
@@ -102,6 +103,7 @@ impl GraphicAssetResolver for CompileGraphicAssetResolver<'_> {
         let resolved_path = resolve_graphic_path(
             self.input_dir,
             self.project_root,
+            self.overlay_roots,
             path,
             self.asset_bundle_path,
         );
@@ -192,6 +194,7 @@ impl<'a> CompileJobService<'a> {
         let mut source_tree = match self.load_source_tree(
             &options.input_file,
             &project_root,
+            &options.overlay_roots,
             options.asset_bundle.as_deref(),
         ) {
             Ok(tree) => tree,
@@ -209,6 +212,7 @@ impl<'a> CompileJobService<'a> {
         let loaded_bibliography_state = load_bibliography_state(
             self.file_access_gate,
             &project_root,
+            &options.overlay_roots,
             &options.output_dir,
             &options.jobname,
         );
@@ -277,6 +281,7 @@ impl<'a> CompileJobService<'a> {
             file_access_gate: self.file_access_gate,
             input_dir: &input_dir,
             project_root: &project_root,
+            overlay_roots: &options.overlay_roots,
             asset_bundle_path: options.asset_bundle.as_deref(),
         };
         let mut compile_font_selection = None;
@@ -285,6 +290,7 @@ impl<'a> CompileJobService<'a> {
         let parse_pass_result = self.parse_document_with_cross_references(
             &source_tree.source,
             &project_root,
+            &options.overlay_roots,
             options.asset_bundle.as_deref(),
             initial_bibliography_state.clone(),
             source_tree.document_state.index_state.entries.clone(),
@@ -297,6 +303,7 @@ impl<'a> CompileJobService<'a> {
                         document.mono_font_name.as_deref(),
                         &input_dir,
                         &project_root,
+                        &options.overlay_roots,
                         options.asset_bundle.as_deref(),
                     );
                     font_diagnostics.extend(diagnostics);
@@ -367,6 +374,7 @@ impl<'a> CompileJobService<'a> {
                 &loaded_bibliography_state.path,
                 &bibliography_names,
                 &project_root,
+                &options.overlay_roots,
             ) {
                 parse_diagnostics.push(diagnostic_for_bibliography(diagnostic, Vec::new()));
             }
@@ -387,7 +395,12 @@ impl<'a> CompileJobService<'a> {
         {
             parse_diagnostics.push(diagnostic_for_bibliography(
                 BibliographyDiagnostic::MissingBbl,
-                bibliography_candidate_paths(&project_root, &options.output_dir, &options.jobname),
+                bibliography_candidate_paths(
+                    &project_root,
+                    &options.overlay_roots,
+                    &options.output_dir,
+                    &options.jobname,
+                ),
             ));
         }
 
@@ -496,7 +509,13 @@ impl<'a> CompileJobService<'a> {
         let compilation_job =
             compilation_job(primary_input.clone(), jobname.clone(), execution_policy);
         let mut source_tree = self
-            .load_source_tree_with_root_source(&primary_input, Some(source), &project_root, None)
+            .load_source_tree_with_root_source(
+                &primary_input,
+                Some(source),
+                &project_root,
+                &[],
+                None,
+            )
             .unwrap_or_else(|_| LoadedSourceTree {
                 source: source.to_string(),
                 document_state: DocumentState::default(),
@@ -510,6 +529,7 @@ impl<'a> CompileJobService<'a> {
         } = self.parse_document_with_cross_references(
             &source_tree.source,
             &project_root,
+            &[],
             None,
             source_tree.document_state.bibliography_state.clone().into(),
             source_tree.document_state.index_state.entries.clone(),
@@ -554,9 +574,16 @@ impl<'a> CompileJobService<'a> {
         &self,
         input_file: &Path,
         project_root: &Path,
+        overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
     ) -> Result<LoadedSourceTree, Diagnostic> {
-        self.load_source_tree_with_root_source(input_file, None, project_root, asset_bundle_path)
+        self.load_source_tree_with_root_source(
+            input_file,
+            None,
+            project_root,
+            overlay_roots,
+            asset_bundle_path,
+        )
     }
 
     fn select_compile_fonts(
@@ -567,6 +594,7 @@ impl<'a> CompileJobService<'a> {
         requested_mono_font: Option<&str>,
         input_dir: &Path,
         project_root: &Path,
+        overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
     ) -> (CompileFontSelection, FontFamilySelection, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
@@ -575,6 +603,7 @@ impl<'a> CompileJobService<'a> {
                 font_name,
                 input_dir,
                 project_root,
+                overlay_roots,
                 asset_bundle_path,
                 self.file_access_gate,
             ) {
@@ -607,6 +636,7 @@ impl<'a> CompileJobService<'a> {
                 font_name,
                 input_dir,
                 project_root,
+                overlay_roots,
                 asset_bundle_path,
                 self.file_access_gate,
             )
@@ -636,6 +666,7 @@ impl<'a> CompileJobService<'a> {
                 font_name,
                 input_dir,
                 project_root,
+                overlay_roots,
                 asset_bundle_path,
                 self.file_access_gate,
             )
@@ -682,6 +713,7 @@ impl<'a> CompileJobService<'a> {
         input_file: &Path,
         root_source: Option<&str>,
         project_root: &Path,
+        overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
     ) -> Result<LoadedSourceTree, Diagnostic> {
         let root_input = normalize_existing_path(input_file);
@@ -695,6 +727,7 @@ impl<'a> CompileJobService<'a> {
             &root_input,
             &project_root,
             root_source,
+            overlay_roots,
             asset_bundle_path,
             &mut visited,
             &mut include_guard,
@@ -727,6 +760,7 @@ impl<'a> CompileJobService<'a> {
         path: &Path,
         workspace_root: &Path,
         source_override: Option<&str>,
+        overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
         visited: &mut BTreeSet<PathBuf>,
         include_guard: &mut BTreeSet<PathBuf>,
@@ -762,6 +796,7 @@ impl<'a> CompileJobService<'a> {
             &normalized_path,
             base_dir,
             workspace_root,
+            overlay_roots,
             asset_bundle_path,
             visited,
             include_guard,
@@ -777,6 +812,7 @@ impl<'a> CompileJobService<'a> {
         &self,
         source: &str,
         project_root: &Path,
+        overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
         initial_bibliography_state: Option<BibliographyState>,
         initial_index_entries: Vec<IndexEntry>,
@@ -790,6 +826,7 @@ impl<'a> CompileJobService<'a> {
                 self.file_access_gate,
                 self.asset_bundle_loader,
                 project_root,
+                overlay_roots,
                 asset_bundle_path,
                 package_name,
             )
@@ -933,10 +970,13 @@ struct LoadedBibliographyState {
 fn load_bibliography_state(
     file_access_gate: &dyn FileAccessGate,
     project_root: &Path,
+    overlay_roots: &[PathBuf],
     artifact_root: &Path,
     jobname: &str,
 ) -> Option<LoadedBibliographyState> {
-    for candidate in bibliography_candidate_paths(project_root, artifact_root, jobname) {
+    for candidate in
+        bibliography_candidate_paths(project_root, overlay_roots, artifact_root, jobname)
+    {
         if !candidate.exists()
             || file_access_gate.check_read(&candidate) == PathAccessDecision::Denied
         {
@@ -958,13 +998,17 @@ fn load_bibliography_state(
 
 fn bibliography_candidate_paths(
     project_root: &Path,
+    overlay_roots: &[PathBuf],
     artifact_root: &Path,
     jobname: &str,
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
 
-    for root in [project_root, artifact_root] {
+    for root in std::iter::once(project_root)
+        .chain(overlay_roots.iter().map(PathBuf::as_path))
+        .chain(std::iter::once(artifact_root))
+    {
         let candidate = root.join(format!("{jobname}.bbl"));
         if seen.insert(candidate.clone()) {
             candidates.push(candidate);
@@ -1014,11 +1058,14 @@ fn check_bbl_freshness(
     bbl_path: &Path,
     bib_names: &[String],
     project_root: &Path,
+    overlay_roots: &[PathBuf],
 ) -> Option<BibliographyDiagnostic> {
     let bbl_modified = std::fs::metadata(bbl_path).ok()?.modified().ok()?;
 
     for bib_name in bib_names {
-        let candidate = project_root.join(format!("{bib_name}.bib"));
+        let Some(candidate) = bibliography_input_path(project_root, overlay_roots, bib_name) else {
+            continue;
+        };
         let Ok(metadata) = std::fs::metadata(&candidate) else {
             continue;
         };
@@ -1038,6 +1085,17 @@ fn check_bbl_freshness(
     }
 
     None
+}
+
+fn bibliography_input_path(
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    bib_name: &str,
+) -> Option<PathBuf> {
+    std::iter::once(project_root)
+        .chain(overlay_roots.iter().map(PathBuf::as_path))
+        .map(|root| root.join(format!("{bib_name}.bib")))
+        .find(|candidate| candidate.exists())
 }
 
 fn project_root_for_policy(policy: &ExecutionPolicy, input_file: &Path) -> PathBuf {
@@ -1274,6 +1332,7 @@ fn expand_inputs(
     source_path: &Path,
     base_dir: &Path,
     workspace_root: &Path,
+    overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
     visited: &mut BTreeSet<PathBuf>,
     include_guard: &mut BTreeSet<PathBuf>,
@@ -1298,6 +1357,7 @@ fn expand_inputs(
             let resolved = resolve_input_path(
                 base_dir,
                 workspace_root,
+                overlay_roots,
                 &command.value,
                 service.asset_bundle_loader,
                 asset_bundle_path,
@@ -1310,6 +1370,7 @@ fn expand_inputs(
                             &resolved,
                             workspace_root,
                             None,
+                            overlay_roots,
                             asset_bundle_path,
                             visited,
                             include_guard,
@@ -1338,6 +1399,7 @@ fn expand_inputs(
                             &resolved,
                             workspace_root,
                             None,
+                            overlay_roots,
                             asset_bundle_path,
                             visited,
                             include_guard,
@@ -1365,6 +1427,7 @@ fn expand_inputs(
                                 &resolved,
                                 workspace_root,
                                 None,
+                                overlay_roots,
                                 asset_bundle_path,
                                 visited,
                                 include_guard,
@@ -1793,6 +1856,7 @@ fn sanitize_pdf_font_name(value: &str) -> String {
 fn resolve_input_path(
     base_dir: &Path,
     workspace_root: &Path,
+    overlay_roots: &[PathBuf],
     value: &str,
     asset_bundle_loader: &dyn AssetBundleLoaderPort,
     asset_bundle_path: Option<&Path>,
@@ -1805,6 +1869,13 @@ fn resolve_input_path(
     let workspace_candidate = tex_path_candidate(workspace_root, value);
     if workspace_candidate.exists() {
         return workspace_candidate;
+    }
+
+    for overlay_root in overlay_roots {
+        let overlay_candidate = tex_path_candidate(overlay_root, value);
+        if overlay_candidate.exists() {
+            return overlay_candidate;
+        }
     }
 
     if let Some(bundle_path) = asset_bundle_path {
@@ -1824,12 +1895,14 @@ fn load_package_source(
     file_access_gate: &dyn FileAccessGate,
     asset_bundle_loader: &dyn AssetBundleLoaderPort,
     project_root: &Path,
+    overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
     package_name: &str,
 ) -> Option<String> {
     let resolved_path = resolve_package_path(
         asset_bundle_loader,
         project_root,
+        overlay_roots,
         asset_bundle_path,
         package_name,
     )?;
@@ -1844,22 +1917,37 @@ fn load_package_source(
 fn resolve_package_path(
     asset_bundle_loader: &dyn AssetBundleLoaderPort,
     project_root: &Path,
+    overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
     package_name: &str,
 ) -> Option<PathBuf> {
-    if let Some(bundle_path) = asset_bundle_path {
-        return asset_bundle_loader.resolve_package(bundle_path, package_name, Some(project_root));
+    if let Some(candidate) = resolve_guarded_path(
+        project_root,
+        &project_root.join(format!("{package_name}.sty")),
+    ) {
+        return Some(candidate);
     }
 
-    let candidate = project_root.join(format!("{package_name}.sty"));
-    let resolved = candidate.canonicalize().ok()?;
-    let project_root = project_root.canonicalize().ok()?;
-    resolved.starts_with(&project_root).then_some(resolved)
+    for overlay_root in overlay_roots {
+        if let Some(candidate) = resolve_guarded_path(
+            overlay_root,
+            &overlay_root.join(format!("{package_name}.sty")),
+        ) {
+            return Some(candidate);
+        }
+    }
+
+    if let Some(bundle_path) = asset_bundle_path {
+        return asset_bundle_loader.resolve_package(bundle_path, package_name, None);
+    }
+
+    None
 }
 
 fn resolve_graphic_path(
     base_dir: &Path,
     workspace_root: &Path,
+    overlay_roots: &[PathBuf],
     value: &str,
     asset_bundle_path: Option<&Path>,
 ) -> PathBuf {
@@ -1873,6 +1961,13 @@ fn resolve_graphic_path(
         return normalize_existing_path(&workspace_candidate);
     }
 
+    for overlay_root in overlay_roots {
+        let overlay_candidate = graphic_path_candidate(overlay_root, value);
+        if overlay_candidate.exists() {
+            return normalize_existing_path(&overlay_candidate);
+        }
+    }
+
     if let Some(bundle_path) = asset_bundle_path {
         let bundle_candidate = graphic_path_candidate(bundle_path, value);
         if bundle_candidate.exists() {
@@ -1881,6 +1976,12 @@ fn resolve_graphic_path(
     }
 
     candidate
+}
+
+fn resolve_guarded_path(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let resolved = candidate.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    resolved.starts_with(&root).then_some(resolved)
 }
 
 fn tex_path_candidate(base_dir: &Path, value: &str) -> PathBuf {
@@ -2341,6 +2442,7 @@ mod tests {
             output_dir,
             jobname: "main".to_string(),
             parallelism: 1,
+            overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
             interaction_mode: InteractionMode::Nonstopmode,
@@ -2899,6 +3001,36 @@ mod tests {
     }
 
     #[test]
+    fn loads_bbl_from_overlay_root_and_renders_bibliography() {
+        let dir = tempdir().expect("create tempdir");
+        let overlay_root = dir.path().join("overlay");
+        let input_file = dir.path().join("main.tex");
+        fs::create_dir_all(&overlay_root).expect("create overlay root");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            overlay_root.join("main.bbl"),
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Overlay reference\n\\end{thebibliography}\n",
+        )
+        .expect("write overlay bbl");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.overlay_roots = vec![overlay_root];
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [1]."));
+        assert!(pdf.contains("[1] Overlay reference"));
+    }
+
+    #[test]
     fn stale_bbl_emits_warning_when_bib_is_newer() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -3095,6 +3227,33 @@ mod tests {
         let pdf = read_pdf(&output_dir.join("main.pdf"));
         assert!(pdf.contains("FerritexSubset+ChosenSans"));
         assert!(!pdf.contains("FerritexSubset+AFirst"));
+    }
+
+    #[test]
+    fn compile_with_setmainfont_uses_overlay_root_font() {
+        let dir = tempdir().expect("create tempdir");
+        let overlay_root = dir.path().join("overlay");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(overlay_root.join("fonts")).expect("create overlay font dir");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{OverlaySans}\n\\begin{document}\nAB\n\\end{document}\n",
+        )
+        .expect("write input");
+        fs::write(overlay_root.join("fonts/OverlaySans.ttf"), build_test_ttf())
+            .expect("write overlay font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.overlay_roots = vec![overlay_root];
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("FerritexSubset+OverlaySans"));
     }
 
     #[test]
@@ -3589,6 +3748,36 @@ mod tests {
     }
 
     #[test]
+    fn overlay_root_fallback_resolves_when_project_root_misses_input() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let overlay_root = dir.path().join("overlay");
+        let src = project_root.join("src");
+        let subdir = src.join("subdir");
+        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(overlay_root.join("shared")).expect("create overlay shared dir");
+        fs::create_dir_all(&subdir).expect("create subdir");
+        fs::write(
+            overlay_root.join("shared/macros.tex"),
+            "OVERLAY ROOT MACROS\n",
+        )
+        .expect("write overlay macros");
+        fs::write(src.join("main.tex"), document("\\input{subdir/section}")).expect("write main");
+        fs::write(subdir.join("section.tex"), "\\input{shared/macros}\n").expect("write section");
+
+        let mut options = runtime_options(src.join("main.tex"), project_root.join("out"));
+        options.overlay_roots = vec![overlay_root];
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("OVERLAY ROOT MACROS"));
+    }
+
+    #[test]
     fn usepackage_loads_project_local_sty_and_recurses_requirepackage() {
         let dir = tempdir().expect("create tempdir");
         let project_root = dir.path().join("project");
@@ -3618,6 +3807,7 @@ mod tests {
         let parse_result = compile_service.parse_document_with_cross_references(
             source,
             &project_root,
+            &[],
             None,
             None,
             Vec::new(),
@@ -3651,6 +3841,60 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn usepackage_loads_overlay_root_sty_and_recurses_requirepackage() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let overlay_root = dir.path().join("overlay");
+        fs::create_dir_all(&project_root).expect("create project root");
+        fs::create_dir_all(&overlay_root).expect("create overlay root");
+        fs::write(
+            overlay_root.join("overlaypkg.sty"),
+            "\\NeedsTeXFormat{LaTeX2e}\n\
+             \\ProvidesPackage{overlaypkg}[2024/01/01 Overlay package]\n\
+             \\RequirePackage{amsmath}\n\
+             \\newcommand{\\overlaycmd}[1]{<#1>}\n",
+        )
+        .expect("write overlay package");
+
+        let source = "\\documentclass{article}\n\
+                      \\usepackage{overlaypkg}\n\
+                      \\begin{document}\n\
+                      \\overlaycmd{ok}\n\
+                      \\end{document}\n";
+        let gate = FsTestFileAccessGate;
+        let loader = MockAssetBundleLoader::valid();
+        let compile_service = service(&gate, &loader);
+        let parse_result = compile_service.parse_document_with_cross_references(
+            source,
+            &project_root,
+            &[overlay_root],
+            None,
+            None,
+            Vec::new(),
+            |document| compile_service.typesetter.typeset(document),
+        );
+        let document = parse_result
+            .output
+            .document
+            .expect("document should parse with overlay package");
+
+        assert!(
+            parse_result.output.errors.is_empty(),
+            "{:?}",
+            parse_result.output.errors
+        );
+        assert!(document.body.contains("<ok>"));
+        assert!(document
+            .loaded_packages
+            .iter()
+            .any(|package| package.name == "overlaypkg"));
+        assert!(document
+            .loaded_packages
+            .iter()
+            .any(|package| package.name == "amsmath"));
     }
 
     #[test]

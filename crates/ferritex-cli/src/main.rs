@@ -40,6 +40,8 @@ struct CompileCommand {
     jobname: Option<String>,
     #[arg(long, value_name = "N")]
     jobs: Option<usize>,
+    #[arg(long = "overlay", value_name = "DIR")]
+    overlay_roots: Vec<PathBuf>,
     #[arg(long)]
     no_cache: bool,
     #[arg(long, value_name = "PATH")]
@@ -75,6 +77,7 @@ impl CompileCommand {
             output_dir: self.output_dir.clone(),
             jobname: self.jobname.clone(),
             jobs: self.jobs,
+            overlay_roots: self.overlay_roots.clone(),
             no_cache: self.no_cache,
             asset_bundle: self.asset_bundle.clone(),
             interaction: self.interaction.map(InteractionArg::to_compile_interaction),
@@ -302,6 +305,7 @@ mod tests {
             output_dir: Some(PathBuf::from("build")),
             jobname: None,
             jobs: Some(4),
+            overlay_roots: vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")],
             no_cache: true,
             asset_bundle: Some(PathBuf::from("bundle")),
             interaction: Some(InteractionArg::Batchmode),
@@ -322,6 +326,10 @@ mod tests {
         assert_eq!(options.jobname, "custom-job");
         assert_eq!(options.output_dir, PathBuf::from("build"));
         assert_eq!(options.parallelism, 4);
+        assert_eq!(
+            options.overlay_roots,
+            vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")]
+        );
         assert!(options.no_cache);
         assert_eq!(options.asset_bundle, Some(PathBuf::from("bundle")));
         assert_eq!(options.interaction_mode, InteractionMode::Batchmode);
@@ -338,6 +346,10 @@ mod tests {
             "book.tex",
             "--jobname",
             "book",
+            "--overlay",
+            "shared",
+            "--overlay",
+            "vendor/texmf",
             "--interaction",
             "scrollmode",
             "--shell-escape",
@@ -351,6 +363,10 @@ mod tests {
 
         assert_eq!(command.file, PathBuf::from("book.tex"));
         assert_eq!(command.jobname.as_deref(), Some("book"));
+        assert_eq!(
+            command.overlay_roots,
+            vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")]
+        );
         assert_eq!(command.interaction, Some(InteractionArg::Scrollmode));
         assert!(command.shell_escape);
         assert!(command.no_shell_escape);
