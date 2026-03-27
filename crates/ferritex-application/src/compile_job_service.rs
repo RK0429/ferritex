@@ -21,7 +21,7 @@ use ferritex_core::graphics::api::{
     extract_png_image_data, parse_image_metadata, ExternalGraphic, GraphicAssetResolver,
     ImageMetadata,
 };
-use ferritex_core::incremental::DependencyGraph;
+use ferritex_core::incremental::{DependencyGraph, DocumentPartitionPlanner};
 use ferritex_core::kernel::api::DimensionValue;
 use ferritex_core::kernel::StableId;
 use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
@@ -853,8 +853,17 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
-        let pdf_document =
-            pdf_renderer.render_with_parallelism(&typeset_document, options.parallelism);
+        let partition_plan = DocumentPartitionPlanner::plan(
+            &options.input_file,
+            &parsed_document.document_class,
+            &parsed_document.section_entries,
+        );
+        let pdf_document = pdf_renderer.render_with_partition_plan(
+            &typeset_document,
+            options.parallelism,
+            pass_count,
+            &partition_plan,
+        );
         let compilation_job = compilation_job(
             options.input_file.clone(),
             options.jobname.clone(),

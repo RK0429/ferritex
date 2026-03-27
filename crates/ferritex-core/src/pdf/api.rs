@@ -1,7 +1,8 @@
 use std::thread;
 
-use crate::compilation::LinkStyle;
+use crate::compilation::{CommitBarrier, LinkStyle, StageCommitPayload};
 pub use crate::graphics::api::ImageColorSpace;
+use crate::incremental::DocumentPartitionPlan;
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
     FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage,
@@ -148,6 +149,16 @@ impl PdfRenderer {
         document: &TypesetDocument,
         parallelism: usize,
     ) -> PdfDocument {
+        self.render_with_partition_plan(document, parallelism, 1, &DocumentPartitionPlan::default())
+    }
+
+    pub fn render_with_partition_plan(
+        &self,
+        document: &TypesetDocument,
+        parallelism: usize,
+        pass_number: u32,
+        partition_plan: &DocumentPartitionPlan,
+    ) -> PdfDocument {
         let page_count = document.pages.len();
         let total_lines = document.pages.iter().map(|page| page.lines.len()).sum();
         let link_style = &document.navigation.default_link_style;
@@ -157,12 +168,15 @@ impl PdfRenderer {
         let content_object_start = page_object_start + page_count;
         let annotation_object_start = content_object_start + page_count;
         let mut image_objects = self.images.clone();
+        let page_partition_ids = page_partition_ids_for_plan(document, partition_plan);
         let page_payloads = render_page_payloads(
             &document.pages,
             &self.page_images,
             &image_objects,
             link_style,
+            &page_partition_ids,
             parallelism,
+            pass_number,
         );
         let mut page_annotations = page_payloads
             .iter()
@@ -404,6 +418,17 @@ struct PageRenderPayload {
     stream: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartitionRenderPayload {
+    page_payloads: Vec<PageRenderPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageRenderWorkload {
+    partition_id: String,
+    page_indices: Vec<usize>,
+}
+
 fn default_font_resources() -> Vec<FontResource> {
     vec![FontResource::BuiltinType1 {
         base_font: "Helvetica".to_string(),
@@ -578,41 +603,44 @@ fn render_page_payloads(
     page_images: &[Vec<PlacedImage>],
     image_objects: &[PdfImageXObject],
     link_style: &LinkStyle,
+    page_partition_ids: &[String],
     parallelism: usize,
+    pass_number: u32,
 ) -> Vec<PageRenderPayload> {
-    let concurrency = parallelism.max(1).min(pages.len().max(1));
-    if pages.len() <= 1 || concurrency <= 1 {
-        return pages
-            .iter()
-            .enumerate()
-            .map(|(page_index, page)| PageRenderPayload {
-                page_index,
-                annotations: page_link_annotations(page),
-                stream: render_page_stream(
-                    page,
-                    page_images
-                        .get(page_index)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
-                    image_objects,
-                    link_style,
-                ),
+    let workloads = page_render_workloads(page_partition_ids, pages.len(), parallelism);
+    if workloads.len() <= 1 {
+        return workloads
+            .into_iter()
+            .flat_map(|workload| {
+                workload
+                    .page_indices
+                    .into_iter()
+                    .map(|page_index| PageRenderPayload {
+                        page_index,
+                        annotations: page_link_annotations(&pages[page_index]),
+                        stream: render_page_stream(
+                            &pages[page_index],
+                            page_images
+                                .get(page_index)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            image_objects,
+                            link_style,
+                        ),
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
     }
 
-    let chunk_size = pages.len().div_ceil(concurrency);
-    let mut payloads = thread::scope(|scope| {
+    let payloads = thread::scope(|scope| {
         let mut handles = Vec::new();
-        for worker in 0..concurrency {
-            let start = worker * chunk_size;
-            let end = (start + chunk_size).min(pages.len());
-            if start >= end {
-                continue;
-            }
-
+        for workload in workloads {
             handles.push(scope.spawn(move || {
-                (start..end)
+                let mut page_payloads = workload
+                    .page_indices
+                    .iter()
+                    .copied()
                     .map(|page_index| {
                         let page = &pages[page_index];
                         PageRenderPayload {
@@ -629,17 +657,125 @@ fn render_page_payloads(
                             ),
                         }
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                page_payloads.sort_by_key(|payload| payload.page_index);
+                StageCommitPayload::layout_merge(
+                    workload.partition_id,
+                    PartitionRenderPayload { page_payloads },
+                )
             }));
         }
 
         handles
             .into_iter()
-            .flat_map(|handle| handle.join().expect("page render worker should not panic"))
+            .rev()
+            .map(|handle| handle.join().expect("page render worker should not panic"))
             .collect::<Vec<_>>()
     });
-    payloads.sort_by_key(|payload| payload.page_index);
-    payloads
+    let mut barrier = CommitBarrier::new(pass_number);
+    for payload in payloads {
+        barrier.commit(payload);
+    }
+    barrier
+        .into_ordered()
+        .into_iter()
+        .flat_map(|payload| payload.payload.page_payloads)
+        .collect()
+}
+
+fn page_partition_ids_for_plan(
+    document: &TypesetDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> Vec<String> {
+    let mut page_partition_ids =
+        vec![partition_plan.fallback_partition_id.clone(); document.pages.len()];
+    if document.pages.is_empty() {
+        return page_partition_ids;
+    }
+
+    let mut markers = Vec::new();
+    let mut outline_cursor = 0usize;
+    for work_unit in &partition_plan.work_units {
+        if let Some(offset) = document.outlines[outline_cursor..]
+            .iter()
+            .position(|outline| {
+                outline.level == work_unit.locator.level && outline.title == work_unit.title
+            })
+        {
+            let outline_index = outline_cursor + offset;
+            markers.push((
+                document.outlines[outline_index].page_index,
+                work_unit.partition_id.clone(),
+            ));
+            outline_cursor = outline_index + 1;
+        }
+    }
+
+    if markers.is_empty() {
+        return page_partition_ids;
+    }
+
+    for (marker_index, (start_page, partition_id)) in markers.iter().enumerate() {
+        let start = (*start_page).min(page_partition_ids.len());
+        let end = markers
+            .get(marker_index + 1)
+            .map(|(next_page, _)| (*next_page).min(page_partition_ids.len()))
+            .unwrap_or(page_partition_ids.len());
+        for page_partition_id in &mut page_partition_ids[start..end] {
+            *page_partition_id = partition_id.clone();
+        }
+    }
+
+    page_partition_ids
+}
+
+fn page_render_workloads(
+    page_partition_ids: &[String],
+    page_count: usize,
+    parallelism: usize,
+) -> Vec<PageRenderWorkload> {
+    if page_count == 0 {
+        return Vec::new();
+    }
+
+    let mut workloads = if page_partition_ids.len() == page_count {
+        let mut workloads = Vec::new();
+        let mut start = 0usize;
+        while start < page_count {
+            let partition_id = page_partition_ids[start].clone();
+            let mut end = start + 1;
+            while end < page_count && page_partition_ids[end] == partition_id {
+                end += 1;
+            }
+            workloads.push(PageRenderWorkload {
+                partition_id,
+                page_indices: (start..end).collect(),
+            });
+            start = end;
+        }
+        workloads
+    } else {
+        vec![PageRenderWorkload {
+            partition_id: "document:0000:root".to_string(),
+            page_indices: (0..page_count).collect(),
+        }]
+    };
+
+    if workloads.len() == 1 && parallelism > 1 && page_count > 1 {
+        let concurrency = parallelism.max(1).min(page_count);
+        let chunk_size = page_count.div_ceil(concurrency);
+        let base_partition_id = workloads[0].partition_id.clone();
+        workloads = (0..page_count)
+            .step_by(chunk_size)
+            .enumerate()
+            .map(|(chunk_index, start)| PageRenderWorkload {
+                partition_id: format!("{base_partition_id}:chunk-{chunk_index:04}"),
+                page_indices: (start..(start + chunk_size).min(page_count)).collect(),
+            })
+            .collect();
+    }
+
+    workloads
 }
 
 fn render_page_stream(
@@ -1066,15 +1202,19 @@ fn escape_pdf_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
         resolve_named_color, FontResource, ImageColorSpace, ImageFilter, PdfImageXObject,
         PdfRenderer, PlacedImage,
     };
     use crate::compilation::LinkStyle;
+    use crate::incremental::DocumentPartitionPlanner;
     use crate::kernel::api::DimensionValue;
+    use crate::parser::SectionEntry;
     use crate::typesetting::api::{
         FloatPlacement, PageBox, TextLine, TextLineLink, TypesetDocument, TypesetNamedDestination,
-        TypesetPage,
+        TypesetOutline, TypesetPage,
     };
 
     const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -1292,6 +1432,51 @@ mod tests {
 
         let sequential = renderer.render(&document);
         let parallel = renderer.render_with_parallelism(&document, 4);
+
+        assert_eq!(parallel.page_count, sequential.page_count);
+        assert_eq!(parallel.total_lines, sequential.total_lines);
+        assert_eq!(parallel.bytes, sequential.bytes);
+    }
+
+    #[test]
+    fn render_with_partition_plan_matches_sequential_output() {
+        let mut document = single_page(&["1 Intro", "Page 1 body"]);
+        document.pages.push(page(&["Page 2 body"]));
+        document.pages.push(page(&["2 Results", "Page 3 body"]));
+        document.outlines = vec![
+            TypesetOutline {
+                level: 0,
+                title: "1 Intro".to_string(),
+                page_index: 0,
+                y: points(720),
+            },
+            TypesetOutline {
+                level: 0,
+                title: "2 Results".to_string(),
+                page_index: 2,
+                y: points(720),
+            },
+        ];
+        let plan = DocumentPartitionPlanner::plan(
+            Path::new("book.tex"),
+            "book",
+            &[
+                SectionEntry {
+                    level: 0,
+                    number: "1".to_string(),
+                    title: "Intro".to_string(),
+                },
+                SectionEntry {
+                    level: 0,
+                    number: "2".to_string(),
+                    title: "Results".to_string(),
+                },
+            ],
+        );
+        let renderer = PdfRenderer::default();
+
+        let sequential = renderer.render(&document);
+        let parallel = renderer.render_with_partition_plan(&document, 4, 2, &plan);
 
         assert_eq!(parallel.page_count, sequential.page_count);
         assert_eq!(parallel.total_lines, sequential.total_lines);

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::parser::SectionEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RecompilationScope {
@@ -20,6 +22,47 @@ pub struct DependencyGraph {
     pub nodes: BTreeMap<PathBuf, DependencyNode>,
     pub edges: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PartitionKind {
+    Document,
+    Chapter,
+    Section,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionLocator {
+    pub entry_file: PathBuf,
+    pub level: u8,
+    pub ordinal: usize,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentWorkUnit {
+    pub partition_id: String,
+    pub kind: PartitionKind,
+    pub locator: PartitionLocator,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentPartitionPlan {
+    pub fallback_partition_id: String,
+    pub work_units: Vec<DocumentWorkUnit>,
+}
+
+impl Default for DocumentPartitionPlan {
+    fn default() -> Self {
+        Self {
+            fallback_partition_id: "document:0000:root".to_string(),
+            work_units: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocumentPartitionPlanner;
 
 impl DependencyGraph {
     pub fn record_node(&mut self, path: PathBuf, content_hash: u64) {
@@ -67,9 +110,119 @@ impl DependencyGraph {
     }
 }
 
+impl DocumentPartitionPlanner {
+    pub fn plan(
+        primary_input: &Path,
+        document_class: &str,
+        section_entries: &[SectionEntry],
+    ) -> DocumentPartitionPlan {
+        let fallback_partition_id = fallback_partition_id(primary_input);
+        let Some((level, kind)) = partition_strategy(document_class, section_entries) else {
+            return DocumentPartitionPlan {
+                fallback_partition_id: fallback_partition_id.clone(),
+                work_units: vec![DocumentWorkUnit {
+                    partition_id: fallback_partition_id,
+                    kind: PartitionKind::Document,
+                    locator: PartitionLocator {
+                        entry_file: primary_input.to_path_buf(),
+                        level: 0,
+                        ordinal: 0,
+                        title: "document".to_string(),
+                    },
+                    title: "document".to_string(),
+                }],
+            };
+        };
+
+        let work_units = section_entries
+            .iter()
+            .filter(|entry| entry.level == level)
+            .enumerate()
+            .map(|(ordinal, entry)| {
+                let title = entry.display_title();
+                let slug = slugify_partition_title(&title);
+                let partition_prefix = match kind {
+                    PartitionKind::Chapter => "chapter",
+                    PartitionKind::Section => "section",
+                    PartitionKind::Document => "document",
+                };
+
+                DocumentWorkUnit {
+                    partition_id: format!("{partition_prefix}:{:04}:{slug}", ordinal + 1),
+                    kind,
+                    locator: PartitionLocator {
+                        entry_file: primary_input.to_path_buf(),
+                        level: entry.level,
+                        ordinal,
+                        title: title.clone(),
+                    },
+                    title,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        DocumentPartitionPlan {
+            fallback_partition_id,
+            work_units,
+        }
+    }
+}
+
+fn partition_strategy(
+    document_class: &str,
+    section_entries: &[SectionEntry],
+) -> Option<(u8, PartitionKind)> {
+    let prefers_chapters = matches!(document_class, "book" | "report");
+    if prefers_chapters && section_entries.iter().any(|entry| entry.level == 0) {
+        return Some((0, PartitionKind::Chapter));
+    }
+    if section_entries.iter().any(|entry| entry.level == 1) {
+        return Some((1, PartitionKind::Section));
+    }
+    if section_entries.iter().any(|entry| entry.level == 0) {
+        return Some((0, PartitionKind::Section));
+    }
+    None
+}
+
+fn fallback_partition_id(primary_input: &Path) -> String {
+    let stem = primary_input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.trim().is_empty())
+        .map(slugify_partition_title)
+        .unwrap_or_else(|| "root".to_string());
+    format!("document:0000:{stem}")
+}
+
+fn slugify_partition_title(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "untitled".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DependencyGraph;
+    use std::path::{Path, PathBuf};
+
+    use crate::parser::SectionEntry;
+
+    use super::{DependencyGraph, DocumentPartitionPlanner, PartitionKind};
 
     #[test]
     fn affected_paths_include_transitive_parents() {
@@ -87,6 +240,80 @@ mod tests {
         assert_eq!(
             affected.into_iter().collect::<Vec<_>>(),
             vec![chapter, root, section]
+        );
+    }
+
+    #[test]
+    fn partition_planner_prefers_chapters_for_book_documents() {
+        let plan = DocumentPartitionPlanner::plan(
+            Path::new("book.tex"),
+            "book",
+            &[
+                SectionEntry {
+                    level: 0,
+                    number: "1".to_string(),
+                    title: "Intro".to_string(),
+                },
+                SectionEntry {
+                    level: 1,
+                    number: "1.1".to_string(),
+                    title: "Background".to_string(),
+                },
+                SectionEntry {
+                    level: 0,
+                    number: "2".to_string(),
+                    title: "Results".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(plan.work_units.len(), 2);
+        assert_eq!(plan.work_units[0].kind, PartitionKind::Chapter);
+        assert_eq!(plan.work_units[0].partition_id, "chapter:0001:1-intro");
+        assert_eq!(plan.work_units[1].partition_id, "chapter:0002:2-results");
+    }
+
+    #[test]
+    fn partition_planner_uses_sections_for_article_documents() {
+        let plan = DocumentPartitionPlanner::plan(
+            Path::new("paper.tex"),
+            "article",
+            &[
+                SectionEntry {
+                    level: 1,
+                    number: "1".to_string(),
+                    title: "Intro".to_string(),
+                },
+                SectionEntry {
+                    level: 2,
+                    number: "1.1".to_string(),
+                    title: "Motivation".to_string(),
+                },
+                SectionEntry {
+                    level: 1,
+                    number: "2".to_string(),
+                    title: "Method".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(plan.work_units.len(), 2);
+        assert_eq!(plan.work_units[0].kind, PartitionKind::Section);
+        assert_eq!(plan.work_units[0].partition_id, "section:0001:1-intro");
+        assert_eq!(plan.work_units[1].partition_id, "section:0002:2-method");
+    }
+
+    #[test]
+    fn partition_planner_falls_back_to_whole_document() {
+        let plan = DocumentPartitionPlanner::plan(Path::new("main.tex"), "article", &[]);
+
+        assert_eq!(plan.work_units.len(), 1);
+        assert_eq!(plan.work_units[0].kind, PartitionKind::Document);
+        assert_eq!(plan.work_units[0].partition_id, "document:0000:main");
+        assert_eq!(plan.fallback_partition_id, "document:0000:main");
+        assert_eq!(
+            plan.work_units[0].locator.entry_file,
+            PathBuf::from("main.tex")
         );
     }
 }
