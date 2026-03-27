@@ -853,7 +853,8 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
-        let pdf_document = pdf_renderer.render(&typeset_document);
+        let pdf_document =
+            pdf_renderer.render_with_parallelism(&typeset_document, options.parallelism);
         let compilation_job = compilation_job(
             options.input_file.clone(),
             options.jobname.clone(),

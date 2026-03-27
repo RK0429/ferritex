@@ -1,3 +1,5 @@
+use std::thread;
+
 use crate::compilation::LinkStyle;
 pub use crate::graphics::api::ImageColorSpace;
 use crate::kernel::api::DimensionValue;
@@ -138,6 +140,14 @@ impl PdfRenderer {
     }
 
     pub fn render(&self, document: &TypesetDocument) -> PdfDocument {
+        self.render_with_parallelism(document, 1)
+    }
+
+    pub fn render_with_parallelism(
+        &self,
+        document: &TypesetDocument,
+        parallelism: usize,
+    ) -> PdfDocument {
         let page_count = document.pages.len();
         let total_lines = document.pages.iter().map(|page| page.lines.len()).sum();
         let link_style = &document.navigation.default_link_style;
@@ -147,10 +157,16 @@ impl PdfRenderer {
         let content_object_start = page_object_start + page_count;
         let annotation_object_start = content_object_start + page_count;
         let mut image_objects = self.images.clone();
-        let mut page_annotations = document
-            .pages
+        let page_payloads = render_page_payloads(
+            &document.pages,
+            &self.page_images,
+            &image_objects,
+            link_style,
+            parallelism,
+        );
+        let mut page_annotations = page_payloads
             .iter()
-            .map(page_link_annotations)
+            .map(|payload| payload.annotations.clone())
             .collect::<Vec<_>>();
         let next_object_after_annotations =
             assign_annotation_object_ids(&mut page_annotations, annotation_object_start);
@@ -237,21 +253,15 @@ impl PdfRenderer {
             );
         }
 
-        for (page_index, page) in document.pages.iter().enumerate() {
+        for page_index in 0..document.pages.len() {
             let content_object_id = content_object_start + page_index;
-            let page_images = self
-                .page_images
-                .get(page_index)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let stream = render_page_stream(page, page_images, &image_objects, link_style);
             append_object(
                 &mut pdf,
                 &mut offsets,
                 &format!(
                     "{content_object_id} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
-                    stream.len(),
-                    stream
+                    page_payloads[page_index].stream.len(),
+                    page_payloads[page_index].stream
                 ),
             );
         }
@@ -385,6 +395,13 @@ impl Default for PdfRenderer {
 struct FontObjectSet {
     dictionary_object_id: usize,
     objects: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageRenderPayload {
+    page_index: usize,
+    annotations: Vec<PdfLinkAnnotation>,
+    stream: String,
 }
 
 fn default_font_resources() -> Vec<FontResource> {
@@ -554,6 +571,75 @@ fn page_kids(page_count: usize, page_object_start: usize) -> String {
         .map(|index| format!("{} 0 R", page_object_start + index))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn render_page_payloads(
+    pages: &[TypesetPage],
+    page_images: &[Vec<PlacedImage>],
+    image_objects: &[PdfImageXObject],
+    link_style: &LinkStyle,
+    parallelism: usize,
+) -> Vec<PageRenderPayload> {
+    let concurrency = parallelism.max(1).min(pages.len().max(1));
+    if pages.len() <= 1 || concurrency <= 1 {
+        return pages
+            .iter()
+            .enumerate()
+            .map(|(page_index, page)| PageRenderPayload {
+                page_index,
+                annotations: page_link_annotations(page),
+                stream: render_page_stream(
+                    page,
+                    page_images
+                        .get(page_index)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    image_objects,
+                    link_style,
+                ),
+            })
+            .collect();
+    }
+
+    let chunk_size = pages.len().div_ceil(concurrency);
+    let mut payloads = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for worker in 0..concurrency {
+            let start = worker * chunk_size;
+            let end = (start + chunk_size).min(pages.len());
+            if start >= end {
+                continue;
+            }
+
+            handles.push(scope.spawn(move || {
+                (start..end)
+                    .map(|page_index| {
+                        let page = &pages[page_index];
+                        PageRenderPayload {
+                            page_index,
+                            annotations: page_link_annotations(page),
+                            stream: render_page_stream(
+                                page,
+                                page_images
+                                    .get(page_index)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                                image_objects,
+                                link_style,
+                            ),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("page render worker should not panic"))
+            .collect::<Vec<_>>()
+    });
+    payloads.sort_by_key(|payload| payload.page_index);
+    payloads
 }
 
 fn render_page_stream(
@@ -1160,6 +1246,56 @@ mod tests {
         assert!(content
             .contains("/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns 1 >>"));
         assert!(content.contains("q 100 0 0 100 72 600 cm /Im1 Do Q"));
+    }
+
+    #[test]
+    fn render_with_parallelism_matches_sequential_output() {
+        let mut document = single_page(&["Page 1 link", "Page 1 body"]);
+        document.pages.push(page(&["Page 2 link", "Page 2 body"]));
+        document.pages[0].lines[0].links = vec![TextLineLink {
+            url: "https://example.com/one".to_string(),
+            start_char: 0,
+            end_char: 11,
+        }];
+        document.pages[1].lines[0].links = vec![TextLineLink {
+            url: "https://example.com/two".to_string(),
+            start_char: 0,
+            end_char: 11,
+        }];
+        let renderer = PdfRenderer::default().with_images(
+            vec![PdfImageXObject {
+                object_id: 0,
+                width: 1,
+                height: 1,
+                color_space: ImageColorSpace::DeviceRGB,
+                bits_per_component: 8,
+                data: vec![120, 156, 99, 248, 207, 192, 0, 0, 3, 1, 1, 0],
+                filter: ImageFilter::FlateDecode,
+            }],
+            vec![
+                vec![PlacedImage {
+                    xobject_index: 0,
+                    x: points(72),
+                    y: points(600),
+                    display_width: points(40),
+                    display_height: points(40),
+                }],
+                vec![PlacedImage {
+                    xobject_index: 0,
+                    x: points(120),
+                    y: points(540),
+                    display_width: points(60),
+                    display_height: points(60),
+                }],
+            ],
+        );
+
+        let sequential = renderer.render(&document);
+        let parallel = renderer.render_with_parallelism(&document, 4);
+
+        assert_eq!(parallel.page_count, sequential.page_count);
+        assert_eq!(parallel.total_lines, sequential.total_lines);
+        assert_eq!(parallel.bytes, sequential.bytes);
     }
 
     #[test]

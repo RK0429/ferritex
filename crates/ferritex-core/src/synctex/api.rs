@@ -59,8 +59,7 @@ impl SyncTexData {
 
         let mut files = Vec::new();
         let mut fragments = Vec::new();
-        let mut source_index = 0usize;
-        let mut remaining_budget = source_lines[0].budget;
+        let mut cursor = SourceCursor::default();
 
         for (page_index, page) in pages.iter().enumerate() {
             for line in &page.lines {
@@ -68,27 +67,19 @@ impl SyncTexData {
                     continue;
                 }
 
-                source_index = advance_to_best_source_line(
-                    &source_lines,
-                    source_index,
-                    &line.text,
-                    remaining_budget,
-                );
-                remaining_budget = source_lines[source_index].budget;
-                let source_line = &source_lines[source_index];
-                let file_id = file_id_for(&mut files, &source_line.file);
-                fragments.push(fragment_for_line(
-                    page_index as u32 + 1,
-                    line,
-                    file_id,
-                    source_line,
-                ));
-
-                let consumed = normalized_text(&line.text).chars().count().max(1);
-                remaining_budget = remaining_budget.saturating_sub(consumed);
-                if remaining_budget == 0 && source_index + 1 < source_lines.len() {
-                    source_index += 1;
-                    remaining_budget = source_lines[source_index].budget;
+                for rendered_fragment in rendered_fragments(&line.text) {
+                    if let Some(source_fragment) =
+                        match_rendered_fragment(&source_lines, &mut cursor, &rendered_fragment)
+                    {
+                        let file_id = file_id_for(&mut files, &source_fragment.file);
+                        fragments.push(fragment_for_rendered_fragment(
+                            page_index as u32 + 1,
+                            line,
+                            &rendered_fragment,
+                            file_id,
+                            source_fragment,
+                        ));
+                    }
                 }
             }
         }
@@ -121,25 +112,49 @@ struct PreparedSourceLine {
     file: String,
     line: u32,
     text: String,
-    normalized: String,
-    budget: usize,
+    visible_chars: Vec<VisibleSourceChar>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleSourceChar {
+    ch: char,
+    column: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SourceCursor {
+    line_index: usize,
+    visible_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedTextFragment {
+    text: String,
+    start_char: usize,
+    end_char: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatchedSourceFragment {
+    file: String,
+    line: u32,
+    start_column: u32,
+    end_column: u32,
 }
 
 fn prepare_source_lines(source_lines: &[SourceLineTrace]) -> Vec<PreparedSourceLine> {
     let mut prepared = source_lines
         .iter()
         .map(|line| {
-            let text = visible_text_hint(&line.text);
-            let normalized = normalized_text(&text);
+            let visible_chars = visible_source_chars(&line.text);
             PreparedSourceLine {
                 file: line.file.clone(),
                 line: line.line,
                 text: line.text.clone(),
-                budget: normalized.chars().count().max(1),
-                normalized,
+                visible_chars,
             }
         })
-        .filter(|line| !line.normalized.is_empty())
+        .filter(|line| !line.visible_chars.is_empty())
         .collect::<Vec<_>>();
 
     if prepared.is_empty() {
@@ -147,70 +162,168 @@ fn prepare_source_lines(source_lines: &[SourceLineTrace]) -> Vec<PreparedSourceL
             file: "unknown".to_string(),
             line: 1,
             text: String::new(),
-            normalized: String::new(),
-            budget: 1,
+            visible_chars: Vec::new(),
         });
     }
 
     prepared
 }
 
-fn advance_to_best_source_line(
+fn rendered_fragments(text: &str) -> Vec<RenderedTextFragment> {
+    let mut fragments = Vec::new();
+    let mut current_start = None;
+    let mut current_text = String::new();
+
+    for (char_index, ch) in text.chars().enumerate() {
+        if ch.is_whitespace() {
+            if let Some(start_char) = current_start.take() {
+                fragments.push(RenderedTextFragment {
+                    text: std::mem::take(&mut current_text),
+                    start_char,
+                    end_char: char_index,
+                });
+            }
+            continue;
+        }
+
+        current_start.get_or_insert(char_index);
+        current_text.push(ch);
+    }
+
+    if let Some(start_char) = current_start {
+        fragments.push(RenderedTextFragment {
+            text: current_text,
+            start_char,
+            end_char: text.chars().count(),
+        });
+    }
+
+    fragments
+}
+
+fn match_rendered_fragment(
     source_lines: &[PreparedSourceLine],
-    current_index: usize,
-    output_text: &str,
-    remaining_budget: usize,
-) -> usize {
-    if current_index + 1 >= source_lines.len() {
-        return current_index;
+    cursor: &mut SourceCursor,
+    fragment: &RenderedTextFragment,
+) -> Option<MatchedSourceFragment> {
+    let mut fragment_chars = normalized_chars(&fragment.text);
+    if fragment_chars.is_empty() {
+        return None;
     }
 
-    let normalized_output = normalized_text(output_text);
-    if normalized_output.is_empty() {
-        return current_index;
+    if let Some(matched) = match_fragment_chars(source_lines, cursor, &fragment_chars) {
+        return Some(matched);
     }
 
-    let current = &source_lines[current_index];
-    let next = &source_lines[current_index + 1];
-    let current_matches = normalized_contains(&current.normalized, &normalized_output);
-    let next_matches = normalized_contains(&next.normalized, &normalized_output);
-
-    if !current_matches && next_matches {
-        current_index + 1
-    } else if remaining_budget == 0 {
-        current_index + 1
-    } else {
-        current_index
+    if fragment_chars.last() == Some(&'-') {
+        fragment_chars.pop();
+        if let Some(matched) = match_fragment_chars(source_lines, cursor, &fragment_chars) {
+            return Some(matched);
+        }
     }
+
+    fallback_source_fragment(source_lines, cursor)
 }
 
-fn normalized_contains(haystack: &str, needle: &str) -> bool {
-    !needle.is_empty() && (haystack.contains(needle) || needle.contains(haystack))
+fn match_fragment_chars(
+    source_lines: &[PreparedSourceLine],
+    cursor: &mut SourceCursor,
+    fragment_chars: &[char],
+) -> Option<MatchedSourceFragment> {
+    for line_index in cursor.line_index..source_lines.len() {
+        let line = &source_lines[line_index];
+        let search_start = if line_index == cursor.line_index {
+            cursor.visible_index.min(line.visible_chars.len())
+        } else {
+            0
+        };
+        if let Some((start_index, end_index)) =
+            find_fragment_in_line(line, search_start, fragment_chars)
+        {
+            let start_column = line.visible_chars[start_index].column;
+            let end_column = line.visible_chars[end_index - 1].column + 1;
+            cursor.line_index = line_index;
+            cursor.visible_index = end_index;
+            return Some(MatchedSourceFragment {
+                file: line.file.clone(),
+                line: line.line,
+                start_column,
+                end_column,
+            });
+        }
+    }
+
+    None
 }
 
-fn fragment_for_line(
+fn find_fragment_in_line(
+    line: &PreparedSourceLine,
+    search_start: usize,
+    fragment_chars: &[char],
+) -> Option<(usize, usize)> {
+    if fragment_chars.is_empty() {
+        return None;
+    }
+
+    let max_start = line.visible_chars.len().checked_sub(fragment_chars.len())?;
+    for start in search_start..=max_start {
+        let matches = fragment_chars
+            .iter()
+            .enumerate()
+            .all(|(offset, expected)| line.visible_chars[start + offset].ch == *expected);
+        if matches {
+            return Some((start, start + fragment_chars.len()));
+        }
+    }
+
+    None
+}
+
+fn fallback_source_fragment(
+    source_lines: &[PreparedSourceLine],
+    cursor: &mut SourceCursor,
+) -> Option<MatchedSourceFragment> {
+    for (line_index, line) in source_lines.iter().enumerate().skip(cursor.line_index) {
+        if line.visible_chars.is_empty() {
+            continue;
+        }
+        cursor.line_index = line_index;
+        cursor.visible_index = line.visible_chars.len();
+        return Some(MatchedSourceFragment {
+            file: line.file.clone(),
+            line: line.line,
+            start_column: line.visible_chars.first()?.column,
+            end_column: line.visible_chars.last()?.column + 1,
+        });
+    }
+
+    None
+}
+
+fn fragment_for_rendered_fragment(
     page: u32,
     line: &RenderedLineTrace,
+    rendered_fragment: &RenderedTextFragment,
     file_id: u32,
-    source_line: &PreparedSourceLine,
+    source_fragment: MatchedSourceFragment,
 ) -> SyncTraceFragment {
-    let x_start = points(LEFT_MARGIN_PT);
-    let x_end = x_start + points((line.text.chars().count().max(1) as i64) * DEFAULT_CHAR_WIDTH_PT);
+    let x_start =
+        points(LEFT_MARGIN_PT + rendered_fragment.start_char as i64 * DEFAULT_CHAR_WIDTH_PT);
+    let x_end = points(LEFT_MARGIN_PT + rendered_fragment.end_char as i64 * DEFAULT_CHAR_WIDTH_PT);
     let y_bottom = line.y - points(DEFAULT_LINE_DESCENT_PT);
     let y_top = line.y + points(DEFAULT_LINE_TOP_OFFSET_PT);
-    let end_column = source_line.text.chars().count().max(1) as u32 + 1;
 
     SyncTraceFragment {
         span: SourceSpan {
             start: SourceLocation {
                 file_id,
-                line: source_line.line,
-                column: 1,
+                line: source_fragment.line,
+                column: source_fragment.start_column,
             },
             end: SourceLocation {
                 file_id,
-                line: source_line.line,
-                column: end_column,
+                line: source_fragment.line,
+                column: source_fragment.end_column,
             },
         },
         page,
@@ -218,7 +331,7 @@ fn fragment_for_line(
         x_end,
         y_bottom,
         y_top,
-        text: line.text.clone(),
+        text: rendered_fragment.text.clone(),
     }
 }
 
@@ -251,11 +364,11 @@ fn points(value: i64) -> DimensionValue {
     DimensionValue(value * SCALED_POINTS_PER_POINT)
 }
 
-fn normalized_text(text: &str) -> String {
+fn normalized_chars(text: &str) -> Vec<char> {
     text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
-fn visible_text_hint(text: &str) -> String {
+fn visible_source_chars(text: &str) -> Vec<VisibleSourceChar> {
     let trimmed = text.trim_start();
     if let Some(command) = leading_control_word(trimmed) {
         if matches!(
@@ -276,28 +389,40 @@ fn visible_text_hint(text: &str) -> String {
                 | "printindex"
                 | "hypersetup"
         ) {
-            return String::new();
+            return Vec::new();
         }
     }
 
-    let mut visible = String::new();
+    let mut visible = Vec::new();
     let mut chars = text.chars().peekable();
+    let mut column = 1u32;
 
     while let Some(ch) = chars.next() {
         match ch {
             '%' => break,
             '\\' => {
+                column += 1;
                 while chars.peek().is_some_and(|next| next.is_alphabetic()) {
                     chars.next();
+                    column += 1;
                 }
             }
-            '{' | '}' | '[' | ']' => {}
-            _ if !ch.is_control() => visible.push(ch),
-            _ => {}
+            '{' | '}' | '[' | ']' => {
+                column += 1;
+            }
+            _ if !ch.is_control() => {
+                if !ch.is_whitespace() {
+                    visible.push(VisibleSourceChar { ch, column });
+                }
+                column += 1;
+            }
+            _ => {
+                column += 1;
+            }
         }
     }
 
-    visible.trim().to_string()
+    visible
 }
 
 fn leading_control_word(text: &str) -> Option<&str> {
@@ -381,5 +506,56 @@ mod tests {
         assert_eq!(data.fragments.len(), 2);
         assert_eq!(data.fragments[0].span.start.file_id, 0);
         assert_eq!(data.fragments[1].span.start.file_id, 1);
+    }
+
+    #[test]
+    fn build_line_based_emits_column_precise_fragments() {
+        let document = simple_document(vec![text_line("Hello world", 700)]);
+        let data = SyncTexData::build_line_based(
+            &document,
+            &[SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 3,
+                text: "Hello world".to_string(),
+            }],
+        );
+
+        assert_eq!(data.fragments.len(), 2);
+        assert_eq!(data.fragments[0].text, "Hello");
+        assert_eq!(data.fragments[0].span.start.column, 1);
+        assert_eq!(data.fragments[0].span.end.column, 6);
+        assert_eq!(data.fragments[1].text, "world");
+        assert_eq!(data.fragments[1].span.start.column, 7);
+        assert_eq!(data.fragments[1].span.end.column, 12);
+
+        let positions = data.forward_search(SourceLocation {
+            file_id: 0,
+            line: 3,
+            column: 8,
+        });
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].x, points(108));
+    }
+
+    #[test]
+    fn build_line_based_keeps_wrapped_fragments_on_same_source_line() {
+        let document = simple_document(vec![text_line("Hello", 700), text_line("world", 682)]);
+        let data = SyncTexData::build_line_based(
+            &document,
+            &[SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 3,
+                text: "Hello world".to_string(),
+            }],
+        );
+
+        assert_eq!(data.fragments.len(), 2);
+        assert_eq!(data.fragments[0].span.start.line, 3);
+        assert_eq!(data.fragments[0].span.start.column, 1);
+        assert_eq!(data.fragments[0].span.end.column, 6);
+        assert_eq!(data.fragments[1].span.start.line, 3);
+        assert_eq!(data.fragments[1].span.start.column, 7);
+        assert_eq!(data.fragments[1].span.end.column, 12);
+        assert_eq!(data.fragments[1].y_top, points(692));
     }
 }
