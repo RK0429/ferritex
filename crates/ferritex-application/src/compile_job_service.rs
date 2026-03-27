@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferritex_core::assets::{AssetHandle, LogicalAssetId};
 use ferritex_core::bibliography::api::{parse_bbl, BibliographyDiagnostic, BibliographyState};
@@ -25,6 +26,7 @@ use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision}
 use ferritex_core::typesetting::{
     resolve_page_labels, MinimalTypesetter, TextLine, TfmWidthProvider, TypesetDocument,
 };
+use serde_json::json;
 
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::AssetBundleLoaderPort;
@@ -310,6 +312,7 @@ impl<'a> CompileJobService<'a> {
                         } else {
                             &[]
                         },
+                        options.trace_font_tasks,
                     );
                     font_diagnostics.extend(diagnostics);
                     compile_font_selection = Some(selection);
@@ -354,7 +357,11 @@ impl<'a> CompileJobService<'a> {
             parse_pass_result.typeset_document.as_ref(),
         ) {
             (Some(families), Some(typeset_document)) => {
-                let font_resources = build_multi_font_pdf_resources(families, typeset_document);
+                let font_resources = build_multi_font_pdf_resources(
+                    families,
+                    typeset_document,
+                    options.trace_font_tasks,
+                );
                 if font_resources.is_empty() {
                     self.pdf_renderer.clone()
                 } else {
@@ -602,6 +609,7 @@ impl<'a> CompileJobService<'a> {
         overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
         host_font_roots: &[PathBuf],
+        trace_font_tasks: bool,
     ) -> (CompileFontSelection, FontFamilySelection, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
         let resolution_surface = if host_font_roots.is_empty() {
@@ -615,15 +623,17 @@ impl<'a> CompileJobService<'a> {
             "place the font in the document directory, project fonts/, configured overlay roots, asset bundle, or host font catalog"
         };
         let main = if let Some(font_name) = requested_main_font {
-            match resolve_named_font(
-                font_name,
-                input_dir,
-                project_root,
-                overlay_roots,
-                asset_bundle_path,
-                host_font_roots,
-                self.file_access_gate,
-            ) {
+            match trace_font_task(trace_font_tasks, "font-load-main", font_name, 0, || {
+                resolve_named_font(
+                    font_name,
+                    input_dir,
+                    project_root,
+                    overlay_roots,
+                    asset_bundle_path,
+                    host_font_roots,
+                    self.file_access_gate,
+                )
+            }) {
                 Some(resolved_font) => Some(LoadedOpenTypeFont {
                     base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
                     font: resolved_font.font,
@@ -641,23 +651,37 @@ impl<'a> CompileJobService<'a> {
                             "{resolution_suggestion}; compile will fall back to another available main font until then"
                         )),
                     );
-                    load_opentype_font(self.file_access_gate, asset_bundle_path)
+                    trace_font_task(
+                        trace_font_tasks,
+                        "font-load-main-default",
+                        default_font_asset_label(asset_bundle_path),
+                        0,
+                        || load_opentype_font(self.file_access_gate, asset_bundle_path),
+                    )
                 }
             }
         } else {
-            load_opentype_font(self.file_access_gate, asset_bundle_path)
+            trace_font_task(
+                trace_font_tasks,
+                "font-load-main-default",
+                default_font_asset_label(asset_bundle_path),
+                0,
+                || load_opentype_font(self.file_access_gate, asset_bundle_path),
+            )
         };
 
         let sans = requested_sans_font.and_then(|font_name| {
-            resolve_named_font(
-                font_name,
-                input_dir,
-                project_root,
-                overlay_roots,
-                asset_bundle_path,
-                host_font_roots,
-                self.file_access_gate,
-            )
+            trace_font_task(trace_font_tasks, "font-load-sans", font_name, 0, || {
+                resolve_named_font(
+                    font_name,
+                    input_dir,
+                    project_root,
+                    overlay_roots,
+                    asset_bundle_path,
+                    host_font_roots,
+                    self.file_access_gate,
+                )
+            })
             .map(|resolved_font| LoadedOpenTypeFont {
                 base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
                 font: resolved_font.font,
@@ -680,15 +704,17 @@ impl<'a> CompileJobService<'a> {
         });
 
         let mono = requested_mono_font.and_then(|font_name| {
-            resolve_named_font(
-                font_name,
-                input_dir,
-                project_root,
-                overlay_roots,
-                asset_bundle_path,
-                host_font_roots,
-                self.file_access_gate,
-            )
+            trace_font_task(trace_font_tasks, "font-load-mono", font_name, 0, || {
+                resolve_named_font(
+                    font_name,
+                    input_dir,
+                    project_root,
+                    overlay_roots,
+                    asset_bundle_path,
+                    host_font_roots,
+                    self.file_access_gate,
+                )
+            })
             .map(|resolved_font| LoadedOpenTypeFont {
                 base_font: sanitize_pdf_font_name(&resolved_font.base_font_name),
                 font: resolved_font.font,
@@ -720,10 +746,26 @@ impl<'a> CompileJobService<'a> {
             );
         }
 
-        if let Some(metrics) = load_cmr10_metrics(self.file_access_gate, asset_bundle_path) {
+        if let Some(metrics) = trace_font_task(
+            trace_font_tasks,
+            "font-load-cmr10-fallback",
+            "cmr10.tfm",
+            0,
+            || load_cmr10_metrics(self.file_access_gate, asset_bundle_path),
+        ) {
             return (CompileFontSelection::Tfm(metrics), families, diagnostics);
         }
 
+        if trace_font_tasks {
+            let timestamp = trace_timestamp_micros();
+            emit_font_task_trace(
+                "font-load-basic-fallback",
+                "builtin:basic",
+                timestamp,
+                timestamp,
+                0,
+            );
+        }
         (CompileFontSelection::Basic, families, diagnostics)
     }
 
@@ -1741,6 +1783,7 @@ fn is_ttf_path(path: &Path) -> bool {
 fn build_multi_font_pdf_resources(
     selection: &FontFamilySelection,
     document: &TypesetDocument,
+    trace_font_tasks: bool,
 ) -> Vec<FontResource> {
     let mut used_characters = vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
     let mut used_roles = [false; 3];
@@ -1764,10 +1807,26 @@ fn build_multi_font_pdf_resources(
         .map(|role| {
             selection
                 .font_for_role(role as u8)
-                .and_then(|font| build_opentype_font_resource(font, &used_characters[role]))
+                .and_then(|font| {
+                    trace_font_task(
+                        trace_font_tasks,
+                        subset_task_id_for_role(role as u8),
+                        &font.base_font,
+                        0,
+                        || build_opentype_font_resource(font, &used_characters[role]),
+                    )
+                })
                 .unwrap_or_else(|| builtin_font_resource_for_role(role as u8))
         })
         .collect()
+}
+
+fn subset_task_id_for_role(role: u8) -> &'static str {
+    match role {
+        1 => "font-subset-sans",
+        2 => "font-subset-mono",
+        _ => "font-subset-main",
+    }
 }
 
 fn collect_used_characters_for_lines(
@@ -1870,6 +1929,67 @@ fn sanitize_pdf_font_name(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn trace_font_task<T, F>(
+    enabled: bool,
+    font_task_id: impl AsRef<str>,
+    font_asset: impl AsRef<str>,
+    worker_id: usize,
+    operation: F,
+) -> T
+where
+    F: FnOnce() -> T,
+{
+    if !enabled {
+        return operation();
+    }
+
+    let started_at = trace_timestamp_micros();
+    let result = operation();
+    let finished_at = trace_timestamp_micros();
+    emit_font_task_trace(
+        font_task_id.as_ref(),
+        font_asset.as_ref(),
+        started_at,
+        finished_at,
+        worker_id,
+    );
+    result
+}
+
+fn emit_font_task_trace(
+    font_task_id: &str,
+    font_asset: &str,
+    started_at: u64,
+    finished_at: u64,
+    worker_id: usize,
+) {
+    eprintln!(
+        "{}",
+        json!({
+            "fontTaskId": font_task_id,
+            "fontAsset": font_asset,
+            "startedAt": started_at,
+            "finishedAt": finished_at,
+            "workerId": worker_id,
+        })
+    );
+}
+
+fn trace_timestamp_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn default_font_asset_label(asset_bundle_path: Option<&Path>) -> String {
+    asset_bundle_path.map_or_else(
+        || "asset-bundle:none".to_string(),
+        |path| format!("asset-bundle:{}", path.display()),
+    )
 }
 
 fn resolve_input_path(

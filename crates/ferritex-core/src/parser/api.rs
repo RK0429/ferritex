@@ -819,6 +819,12 @@ enum ArithmeticOperation {
     Divide,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedDimensionValue {
+    Unitless(i32),
+    Scaled(i32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParserState {
     chapter: u32,
@@ -2019,8 +2025,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
             "dimexpr" => {
                 let _ = self.take_global_prefix();
-                self.consume_dimexpr_stub()?;
-                self.push_front_tokens(tokens_from_text("0pt", token.line));
+                let value = self.parse_dimexpr_value(token.line)?;
+                self.push_front_tokens(tokens_from_text(&format_dimen(value), token.line));
                 Ok(true)
             }
             "detokenize" => {
@@ -3496,7 +3502,16 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     if let Some(value) =
                         self.parse_dimension_control_sequence_value(&value_token, sign)?
                     {
-                        return Ok(Some(value));
+                        return Ok(Some(match value {
+                            ParsedDimensionValue::Unitless(value) => {
+                                if self.read_keyword("pt") {
+                                    scale_points_to_sp(value)
+                                } else {
+                                    value
+                                }
+                            }
+                            ParsedDimensionValue::Scaled(value) => value,
+                        }));
                     }
                     if let Some(expansion) =
                         self.expand_defined_control_sequence_token(&value_token)?
@@ -3571,29 +3586,141 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         &mut self,
         token: &Token,
         sign: i32,
-    ) -> Result<Option<i32>, ParseError> {
+    ) -> Result<Option<ParsedDimensionValue>, ParseError> {
         match control_sequence_name(token).as_deref() {
             Some("dimen") => {
                 let index = self.parse_register_index(token.line)?;
-                Ok(Some(sign * self.registers.get_dimen(index)))
+                Ok(Some(ParsedDimensionValue::Scaled(
+                    sign * self.registers.get_dimen(index),
+                )))
             }
             Some("count") => {
                 let index = self.parse_register_index(token.line)?;
-                Ok(Some(sign * self.registers.get_count(index)))
+                Ok(Some(ParsedDimensionValue::Unitless(
+                    sign * self.registers.get_count(index),
+                )))
             }
             Some("skip") => {
                 let index = self.parse_register_index(token.line)?;
-                Ok(Some(sign * self.registers.get_skip(index)))
+                Ok(Some(ParsedDimensionValue::Scaled(
+                    sign * self.registers.get_skip(index),
+                )))
             }
             Some("muskip") => {
                 let index = self.parse_register_index(token.line)?;
-                Ok(Some(sign * self.registers.get_muskip(index)))
+                Ok(Some(ParsedDimensionValue::Scaled(
+                    sign * self.registers.get_muskip(index),
+                )))
             }
-            Some("dimexpr") => {
-                self.consume_dimexpr_stub()?;
-                Ok(Some(0))
-            }
+            Some("dimexpr") => Ok(Some(ParsedDimensionValue::Scaled(
+                sign * self.parse_dimexpr_value(token.line)?,
+            ))),
+            Some("numexpr") => Ok(Some(ParsedDimensionValue::Unitless(
+                sign * self.parse_numexpr_value(token.line)?,
+            ))),
             _ => Ok(None),
+        }
+    }
+
+    fn parse_dimexpr_value(&mut self, line: u32) -> Result<i32, ParseError> {
+        let value = self.parse_dimexpr_sum(line)?;
+        if let Some((leading, token)) = self.next_non_space_token_with_leading() {
+            if !matches!(control_sequence_name(&token).as_deref(), Some("relax")) {
+                self.push_back_with_leading(leading, token);
+            }
+        }
+        Ok(value)
+    }
+
+    fn parse_dimexpr_sum(&mut self, line: u32) -> Result<i32, ParseError> {
+        let mut value = self.parse_dimexpr_product(line)?;
+
+        loop {
+            let Some((leading, token)) = self.next_non_space_token_with_leading() else {
+                return Ok(value);
+            };
+
+            match token.kind {
+                TokenKind::CharToken { char: '+', .. } => {
+                    value = clamp_i64_to_i32(
+                        i64::from(value) + i64::from(self.parse_dimexpr_product(line)?),
+                    );
+                }
+                TokenKind::CharToken { char: '-', .. } => {
+                    value = clamp_i64_to_i32(
+                        i64::from(value) - i64::from(self.parse_dimexpr_product(line)?),
+                    );
+                }
+                _ if matches!(control_sequence_name(&token).as_deref(), Some("relax")) => {
+                    return Ok(value);
+                }
+                _ => {
+                    self.push_back_with_leading(leading, token);
+                    return Ok(value);
+                }
+            }
+        }
+    }
+
+    fn parse_dimexpr_product(&mut self, line: u32) -> Result<i32, ParseError> {
+        let mut value = self.parse_dimexpr_factor(line)?;
+
+        loop {
+            let Some((leading, token)) = self.next_non_space_token_with_leading() else {
+                return Ok(value);
+            };
+
+            match token.kind {
+                TokenKind::CharToken { char: '*', .. } => {
+                    let factor = self.parse_integer_value()?.unwrap_or(0);
+                    value = apply_integer_arithmetic(
+                        value,
+                        factor,
+                        ArithmeticOperation::Multiply,
+                        line,
+                    )?;
+                }
+                TokenKind::CharToken { char: '/', .. } => {
+                    let divisor = self.parse_integer_value()?.unwrap_or(0);
+                    value = apply_integer_arithmetic(
+                        value,
+                        divisor,
+                        ArithmeticOperation::Divide,
+                        line,
+                    )?;
+                }
+                _ if matches!(control_sequence_name(&token).as_deref(), Some("relax")) => {
+                    return Ok(value);
+                }
+                _ => {
+                    self.push_back_with_leading(leading, token);
+                    return Ok(value);
+                }
+            }
+        }
+    }
+
+    fn parse_dimexpr_factor(&mut self, line: u32) -> Result<i32, ParseError> {
+        let Some((leading, token)) = self.next_non_space_token_with_leading() else {
+            return Ok(0);
+        };
+
+        match token.kind {
+            TokenKind::CharToken { char: '+', .. } => self.parse_dimexpr_factor(line),
+            TokenKind::CharToken { char: '-', .. } => Ok(-self.parse_dimexpr_factor(line)?),
+            TokenKind::CharToken { char: '(', .. } => {
+                let value = self.parse_dimexpr_sum(line)?;
+                if let Some((inner_leading, closer)) = self.next_non_space_token_with_leading() {
+                    if !matches!(closer.kind, TokenKind::CharToken { char: ')', .. }) {
+                        self.push_back_with_leading(inner_leading, closer);
+                    }
+                }
+                Ok(value)
+            }
+            _ => {
+                self.push_back_with_leading(leading, token);
+                Ok(self.parse_dimension_value()?.unwrap_or(0))
+            }
         }
     }
 
@@ -3715,36 +3842,6 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             _ => {
                 self.push_back_with_leading(leading, token);
                 Ok(0)
-            }
-        }
-    }
-
-    fn consume_dimexpr_stub(&mut self) -> Result<(), ParseError> {
-        let mut paren_depth = 0usize;
-
-        loop {
-            let Some((leading, token)) = self.next_non_space_token_with_leading() else {
-                return Ok(());
-            };
-
-            match token.kind {
-                TokenKind::CharToken { char: '(', .. } => paren_depth += 1,
-                TokenKind::CharToken { char: ')', .. } => {
-                    paren_depth = paren_depth.saturating_sub(1);
-                }
-                _ if paren_depth == 0
-                    && matches!(control_sequence_name(&token).as_deref(), Some("relax")) =>
-                {
-                    return Ok(());
-                }
-                TokenKind::CharToken { char, .. }
-                    if char.is_ascii_alphanumeric()
-                        || matches!(char, '+' | '-' | '*' | '/' | '.' | ',') => {}
-                TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => {}
-                _ => {
-                    self.push_back_with_leading(leading, token);
-                    return Ok(());
-                }
             }
         }
     }
@@ -4614,8 +4711,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     body.extend(tokens_from_text(&value.to_string(), token.line));
                 }
                 TokenKind::ControlWord(ref name) if name == "dimexpr" => {
-                    self.consume_dimexpr_stub()?;
-                    body.extend(tokens_from_text("0pt", token.line));
+                    let value = self.parse_dimexpr_value(token.line)?;
+                    body.extend(tokens_from_text(&format_dimen(value), token.line));
                 }
                 TokenKind::ControlWord(ref name) if name == "the" => {
                     self.expand_the(token.line)?;
@@ -9664,12 +9761,27 @@ mod tests {
     }
 
     #[test]
-    fn etex_stub_primitives_expand_in_body_and_conditionals() {
+    fn etex_primitives_expand_in_body_and_conditionals() {
         let document = parse_document(
             "\\def\\foo{X}\\numexpr(2+3)*4\\relax/\\ifnum\\numexpr(10-4)/3\\relax=2Y\\else N\\fi/\\dimexpr1pt+2pt\\relax/\\detokenize{\\foo bar}/\\unexpanded{\\foo}",
         );
 
-        assert_eq!(document.body, "20/Y/0pt/\\foobar/X");
+        assert_eq!(document.body, "20/Y/3.0pt/\\foobar/X");
+    }
+
+    #[test]
+    fn dimexpr_supports_parentheses_multiply_divide_and_registers() {
+        let document =
+            parse_document("\\dimen0=2pt\\skip0=4pt\\dimexpr(\\dimen0+\\skip0)*3/2\\relax");
+
+        assert_eq!(document.body, "9.0pt");
+    }
+
+    #[test]
+    fn ifdim_accepts_dimexpr_operands() {
+        let document = parse_document("\\ifdim\\dimexpr1pt+2pt\\relax=3pt T\\else F\\fi");
+
+        assert_eq!(document.body, "T");
     }
 
     #[test]

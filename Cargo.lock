@@ -143,6 +143,7 @@ name = "ferritex-application"
 version = "0.1.0"
 dependencies = [
  "ferritex-core",
+ "serde_json",
  "tempfile",
  "tracing",
 ]

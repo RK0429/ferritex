@@ -55,6 +55,35 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 }
 
 #[test]
+fn compile_with_trace_font_tasks_emits_font_task_trace_to_stderr() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("trace-fonts.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nTrace me\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--trace-font-tasks",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"fontTaskId\""));
+    assert!(stderr.contains("\"fontAsset\""));
+    assert!(stderr.contains("\"startedAt\""));
+    assert!(stderr.contains("\"finishedAt\""));
+    assert!(stderr.contains("\"workerId\""));
+    assert!(!stderr.contains("error:"));
+}
+
+#[test]
 fn compile_includegraphics_embeds_image_xobject_into_pdf() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("image.tex");
