@@ -46,6 +46,8 @@ struct CompileCommand {
     no_cache: bool,
     #[arg(long, value_name = "PATH")]
     asset_bundle: Option<PathBuf>,
+    #[arg(long)]
+    reproducible: bool,
     #[arg(long, value_name = "MODE", value_enum)]
     interaction: Option<InteractionArg>,
     #[arg(long)]
@@ -80,6 +82,7 @@ impl CompileCommand {
             overlay_roots: self.overlay_roots.clone(),
             no_cache: self.no_cache,
             asset_bundle: self.asset_bundle.clone(),
+            reproducible: self.reproducible,
             interaction: self.interaction.map(InteractionArg::to_compile_interaction),
             synctex: self.synctex,
             trace_font_tasks: self.trace_font_tasks,
@@ -308,6 +311,7 @@ mod tests {
             overlay_roots: vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")],
             no_cache: true,
             asset_bundle: Some(PathBuf::from("bundle")),
+            reproducible: false,
             interaction: Some(InteractionArg::Batchmode),
             synctex: true,
             trace_font_tasks: true,
@@ -332,6 +336,8 @@ mod tests {
         );
         assert!(options.no_cache);
         assert_eq!(options.asset_bundle, Some(PathBuf::from("bundle")));
+        assert!(options.host_font_fallback);
+        assert!(!options.host_font_roots.is_empty() || cfg!(target_os = "unknown"));
         assert_eq!(options.interaction_mode, InteractionMode::Batchmode);
         assert!(options.synctex);
         assert!(options.trace_font_tasks);
@@ -350,6 +356,7 @@ mod tests {
             "shared",
             "--overlay",
             "vendor/texmf",
+            "--reproducible",
             "--interaction",
             "scrollmode",
             "--shell-escape",
@@ -367,6 +374,7 @@ mod tests {
             command.overlay_roots,
             vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")]
         );
+        assert!(command.reproducible);
         assert_eq!(command.interaction, Some(InteractionArg::Scrollmode));
         assert!(command.shell_escape);
         assert!(command.no_shell_escape);
@@ -433,6 +441,7 @@ mod tests {
         command.jobs = Some(1);
         command.no_cache = false;
         command.asset_bundle = None;
+        command.reproducible = false;
         command.interaction = None;
         command.synctex = false;
         command.trace_font_tasks = false;

@@ -10,6 +10,7 @@ pub struct CompileArgs {
     pub overlay_roots: Vec<PathBuf>,
     pub no_cache: bool,
     pub asset_bundle: Option<PathBuf>,
+    pub reproducible: bool,
     pub interaction: Option<CompileInteraction>,
     pub synctex: bool,
     pub trace_font_tasks: bool,
@@ -35,6 +36,8 @@ pub struct RuntimeOptions {
     pub overlay_roots: Vec<PathBuf>,
     pub no_cache: bool,
     pub asset_bundle: Option<PathBuf>,
+    pub host_font_fallback: bool,
+    pub host_font_roots: Vec<PathBuf>,
     pub interaction_mode: InteractionMode,
     pub synctex: bool,
     pub trace_font_tasks: bool,
@@ -58,6 +61,7 @@ pub enum ShellEscapeMode {
 
 impl RuntimeOptions {
     pub fn from_compile_args(args: &CompileArgs) -> Self {
+        let host_font_fallback = !args.reproducible;
         Self {
             input_file: args.input_file.clone(),
             output_dir: args
@@ -72,6 +76,12 @@ impl RuntimeOptions {
             overlay_roots: args.overlay_roots.clone(),
             no_cache: args.no_cache,
             asset_bundle: args.asset_bundle.clone(),
+            host_font_fallback,
+            host_font_roots: if host_font_fallback {
+                default_host_font_roots()
+            } else {
+                Vec::new()
+            },
             interaction_mode: match args.interaction.unwrap_or(CompileInteraction::Nonstopmode) {
                 CompileInteraction::Nonstopmode => InteractionMode::Nonstopmode,
                 CompileInteraction::Batchmode => InteractionMode::Batchmode,
@@ -97,6 +107,8 @@ impl RuntimeOptions {
             overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
+            host_font_fallback: true,
+            host_font_roots: default_host_font_roots(),
             interaction_mode: InteractionMode::Nonstopmode,
             synctex: false,
             trace_font_tasks: false,
@@ -139,6 +151,51 @@ fn default_parallelism() -> usize {
         .max(1)
 }
 
+fn default_host_font_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        roots.push(PathBuf::from("/System/Library/Fonts"));
+        roots.push(PathBuf::from("/Library/Fonts"));
+        if let Some(home) = home_dir() {
+            roots.push(home.join("Library/Fonts"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        roots.push(PathBuf::from("/usr/share/fonts"));
+        roots.push(PathBuf::from("/usr/local/share/fonts"));
+        if let Some(home) = home_dir() {
+            roots.push(home.join(".fonts"));
+            roots.push(home.join(".local/share/fonts"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(windir) = std::env::var_os("WINDIR") {
+            roots.push(PathBuf::from(windir).join("Fonts"));
+        } else {
+            roots.push(PathBuf::from(r"C:\Windows\Fonts"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local_app_data).join("Microsoft/Windows/Fonts"));
+        }
+    }
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -156,6 +213,7 @@ mod tests {
             overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
+            reproducible: false,
             interaction: None,
             synctex: false,
             trace_font_tasks: false,
@@ -202,6 +260,8 @@ mod tests {
         );
         assert!(options.no_cache);
         assert_eq!(options.asset_bundle, Some(PathBuf::from("bundle")));
+        assert!(options.host_font_fallback);
+        assert_eq!(options.host_font_roots, super::default_host_font_roots());
         assert_eq!(options.interaction_mode, InteractionMode::Batchmode);
         assert!(options.synctex);
         assert!(options.trace_font_tasks);
@@ -254,9 +314,22 @@ mod tests {
         assert_eq!(options.parallelism, super::default_parallelism());
         assert!(!options.no_cache);
         assert_eq!(options.asset_bundle, None);
+        assert!(options.host_font_fallback);
+        assert_eq!(options.host_font_roots, super::default_host_font_roots());
         assert_eq!(options.interaction_mode, InteractionMode::Nonstopmode);
         assert!(!options.synctex);
         assert!(!options.trace_font_tasks);
         assert_eq!(options.shell_escape, ShellEscapeMode::Disabled);
+    }
+
+    #[test]
+    fn reproducible_mode_disables_host_font_fallback() {
+        let mut args = compile_args(PathBuf::from("input.tex"));
+        args.reproducible = true;
+
+        let options = RuntimeOptions::from_compile_args(&args);
+
+        assert!(!options.host_font_fallback);
+        assert!(options.host_font_roots.is_empty());
     }
 }

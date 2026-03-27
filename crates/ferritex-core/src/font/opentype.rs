@@ -13,6 +13,8 @@ const MAXP_TABLE_MIN_LEN: usize = 6;
 const CMAP_HEADER_LEN: usize = 4;
 const CMAP_ENCODING_RECORD_LEN: usize = 8;
 const CMAP_FORMAT_4_HEADER_LEN: usize = 14;
+const NAME_HEADER_LEN: usize = 6;
+const NAME_RECORD_LEN: usize = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum OpenTypeError {
@@ -268,6 +270,16 @@ impl OpenTypeFont {
     }
 }
 
+pub(crate) fn extract_font_names(data: &[u8]) -> Result<Vec<String>, OpenTypeError> {
+    let table_directory = parse_table_directory(data)?;
+    let Some(name_record) = table_directory.maybe_table_record("name") else {
+        return Ok(Vec::new());
+    };
+    let table = read_slice(data, name_record.offset, name_record.length)?;
+
+    parse_name_table(table)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TableRecord {
     tag: [u8; 4],
@@ -365,6 +377,77 @@ fn parse_head(data: &[u8]) -> Result<HeadTable, OpenTypeError> {
         x_max: read_i16(data, 40)?,
         y_max: read_i16(data, 42)?,
     })
+}
+
+fn parse_name_table(table: &[u8]) -> Result<Vec<String>, OpenTypeError> {
+    if table.len() < NAME_HEADER_LEN {
+        return Err(OpenTypeError::Truncated);
+    }
+
+    let format = read_u16(table, 0)?;
+    if !matches!(format, 0 | 1) {
+        return Err(invalid_table_data(
+            "name",
+            format!("unsupported name table format: {format}"),
+        ));
+    }
+
+    let count = usize::from(read_u16(table, 2)?);
+    let string_offset = usize::from(read_u16(table, 4)?);
+    let records = read_slice(
+        table,
+        NAME_HEADER_LEN,
+        count
+            .checked_mul(NAME_RECORD_LEN)
+            .ok_or(OpenTypeError::Truncated)?,
+    )?;
+    let mut names = BTreeSet::new();
+
+    for record in records.chunks_exact(NAME_RECORD_LEN) {
+        let platform_id = u16::from_be_bytes([record[0], record[1]]);
+        let encoding_id = u16::from_be_bytes([record[2], record[3]]);
+        let name_id = u16::from_be_bytes([record[6], record[7]]);
+        if !matches!(name_id, 1 | 4 | 16) {
+            continue;
+        }
+
+        let length = usize::from(u16::from_be_bytes([record[8], record[9]]));
+        let offset = usize::from(u16::from_be_bytes([record[10], record[11]]));
+        let raw = match read_slice(table, string_offset.saturating_add(offset), length) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let Some(name) = decode_name_record(raw, platform_id, encoding_id) else {
+            continue;
+        };
+        let trimmed = name.trim_matches('\0').trim();
+        if !trimmed.is_empty() {
+            names.insert(trimmed.to_string());
+        }
+    }
+
+    Ok(names.into_iter().collect())
+}
+
+fn decode_name_record(raw: &[u8], platform_id: u16, _encoding_id: u16) -> Option<String> {
+    match platform_id {
+        0 | 3 => decode_utf16be(raw),
+        1 => Some(String::from_utf8_lossy(raw).into_owned()),
+        _ => std::str::from_utf8(raw).ok().map(ToOwned::to_owned),
+    }
+}
+
+fn decode_utf16be(raw: &[u8]) -> Option<String> {
+    if raw.len() % 2 != 0 {
+        return None;
+    }
+
+    let code_units = raw
+        .chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+
+    String::from_utf16(&code_units).ok()
 }
 
 fn parse_maxp(data: &[u8]) -> Result<MaxpTable, OpenTypeError> {
@@ -882,8 +965,8 @@ mod tests {
     use crate::font::api::OpenTypeWidthProvider;
 
     use super::{
-        build_loca_table, build_sfnt, parse_cmap, write_i16, write_u16, write_u32, OpenTypeError,
-        OpenTypeFont, HEAD_MAGIC, OPENTYPE_CFF_MAGIC, TRUETYPE_MAGIC,
+        build_loca_table, build_sfnt, extract_font_names, parse_cmap, write_i16, write_u16,
+        write_u32, OpenTypeError, OpenTypeFont, HEAD_MAGIC, OPENTYPE_CFF_MAGIC, TRUETYPE_MAGIC,
     };
 
     const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -906,6 +989,7 @@ mod tests {
                 id_delta: 0,
                 glyph_ids: &[1, 2],
             }],
+            font_names: &[],
         });
 
         let font = OpenTypeFont::parse(&data).expect("parse minimal font");
@@ -957,6 +1041,7 @@ mod tests {
                 id_delta: 0,
                 glyph_ids: &[1, 2],
             }],
+            font_names: &[],
         });
         let font = OpenTypeFont::parse(&data).expect("parse font");
 
@@ -1009,6 +1094,7 @@ mod tests {
                     glyph_ids: &[2],
                 },
             ],
+            font_names: &[],
         });
         let font = OpenTypeFont::parse(&data).expect("parse font");
         let provider = OpenTypeWidthProvider {
@@ -1042,6 +1128,7 @@ mod tests {
                 id_delta: 0,
                 glyph_ids: &[1, 2],
             }],
+            font_names: &[],
         });
         let font = OpenTypeFont::parse(&data).expect("parse font");
         let mut used_glyph_ids = BTreeSet::new();
@@ -1058,6 +1145,44 @@ mod tests {
         assert_eq!(glyph_table.loca_offsets, vec![0, 10, 10, 20]);
     }
 
+    #[test]
+    fn extracts_family_and_full_font_names_from_name_table() {
+        let data = build_test_font(TestFont {
+            sf_version: TRUETYPE_MAGIC,
+            units_per_em: 1000,
+            flags: 0x0005,
+            index_to_loc_format: 1,
+            ascender: 800,
+            descender: -200,
+            line_gap: 200,
+            h_metrics: &[(500, 0), (600, 10)],
+            extra_lsbs: &[20],
+            cmap_segments: &[TestCmapSegment {
+                start_code: 65,
+                end_code: 66,
+                id_delta: 0,
+                glyph_ids: &[1, 2],
+            }],
+            font_names: &[
+                TestFontName {
+                    name_id: 1,
+                    value: "Noto Serif",
+                },
+                TestFontName {
+                    name_id: 4,
+                    value: "Noto Serif Regular",
+                },
+            ],
+        });
+
+        let names = extract_font_names(&data).expect("extract font names");
+
+        assert_eq!(
+            names,
+            vec!["Noto Serif".to_string(), "Noto Serif Regular".to_string()]
+        );
+    }
+
     struct TestFont<'a> {
         sf_version: u32,
         units_per_em: u16,
@@ -1069,6 +1194,7 @@ mod tests {
         h_metrics: &'a [(u16, i16)],
         extra_lsbs: &'a [i16],
         cmap_segments: &'a [TestCmapSegment<'a>],
+        font_names: &'a [TestFontName<'a>],
     }
 
     struct TestCmapSegment<'a> {
@@ -1076,6 +1202,11 @@ mod tests {
         end_code: u16,
         id_delta: i16,
         glyph_ids: &'a [u16],
+    }
+
+    struct TestFontName<'a> {
+        name_id: u16,
+        value: &'a str,
     }
 
     pub(crate) fn minimal_test_font_bytes() -> Vec<u8> {
@@ -1095,6 +1226,37 @@ mod tests {
                 id_delta: 0,
                 glyph_ids: &[1, 2],
             }],
+            font_names: &[],
+        })
+    }
+
+    pub(crate) fn named_test_font_bytes(family_name: &str, full_font_name: &str) -> Vec<u8> {
+        build_test_font(TestFont {
+            sf_version: TRUETYPE_MAGIC,
+            units_per_em: 1000,
+            flags: 0x0005,
+            index_to_loc_format: 1,
+            ascender: 800,
+            descender: -200,
+            line_gap: 200,
+            h_metrics: &[(500, 0), (600, 10)],
+            extra_lsbs: &[20],
+            cmap_segments: &[TestCmapSegment {
+                start_code: 65,
+                end_code: 66,
+                id_delta: 0,
+                glyph_ids: &[1, 2],
+            }],
+            font_names: &[
+                TestFontName {
+                    name_id: 1,
+                    value: family_name,
+                },
+                TestFontName {
+                    name_id: 4,
+                    value: full_font_name,
+                },
+            ],
         })
     }
 
@@ -1116,19 +1278,64 @@ mod tests {
         let cmap = build_cmap_table(3, 1, config.cmap_segments);
         let glyphs = build_default_glyphs(glyph_count);
         let (loca, glyf) = build_glyph_tables(&glyphs, config.index_to_loc_format);
+        let name = (!config.font_names.is_empty()).then(|| build_name_table(config.font_names));
 
-        build_sfnt(
-            config.sf_version,
-            &[
-                (*b"head", head),
-                (*b"hhea", hhea),
-                (*b"maxp", maxp),
-                (*b"hmtx", hmtx),
-                (*b"cmap", cmap),
-                (*b"loca", loca),
-                (*b"glyf", glyf),
-            ],
-        )
+        let mut tables = vec![
+            (*b"head", head),
+            (*b"hhea", hhea),
+            (*b"maxp", maxp),
+            (*b"hmtx", hmtx),
+            (*b"cmap", cmap),
+            (*b"loca", loca),
+            (*b"glyf", glyf),
+        ];
+        if let Some(name) = name {
+            tables.push((*b"name", name));
+        }
+
+        build_sfnt(config.sf_version, &tables)
+    }
+
+    fn build_name_table(names: &[TestFontName<'_>]) -> Vec<u8> {
+        let mut string_storage = Vec::new();
+        let mut records = Vec::with_capacity(names.len());
+
+        for name in names {
+            let encoded = name
+                .value
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<_>>();
+            let offset = u16::try_from(string_storage.len()).expect("name string offset");
+            let length = u16::try_from(encoded.len()).expect("name string length");
+            string_storage.extend_from_slice(&encoded);
+            records.push((name.name_id, length, offset));
+        }
+
+        let name_header_len = 6usize;
+        let name_record_len = 12usize;
+        let mut data = Vec::with_capacity(name_header_len + records.len() * name_record_len);
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(
+            &(u16::try_from(records.len()).expect("name record count")).to_be_bytes(),
+        );
+        data.extend_from_slice(
+            &(u16::try_from(name_header_len + records.len() * name_record_len)
+                .expect("name string storage offset"))
+            .to_be_bytes(),
+        );
+
+        for (name_id, length, offset) in records {
+            data.extend_from_slice(&3u16.to_be_bytes());
+            data.extend_from_slice(&1u16.to_be_bytes());
+            data.extend_from_slice(&0x0409u16.to_be_bytes());
+            data.extend_from_slice(&name_id.to_be_bytes());
+            data.extend_from_slice(&length.to_be_bytes());
+            data.extend_from_slice(&offset.to_be_bytes());
+        }
+
+        data.extend_from_slice(&string_storage);
+        data
     }
 
     fn build_head_table(units_per_em: u16, flags: u16, index_to_loc_format: i16) -> Vec<u8> {
@@ -1304,4 +1511,4 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(crate) use tests::minimal_test_font_bytes;
+pub(crate) use tests::{minimal_test_font_bytes, named_test_font_bytes};

@@ -305,6 +305,11 @@ impl<'a> CompileJobService<'a> {
                         &project_root,
                         &options.overlay_roots,
                         options.asset_bundle.as_deref(),
+                        if options.host_font_fallback {
+                            &options.host_font_roots
+                        } else {
+                            &[]
+                        },
                     );
                     font_diagnostics.extend(diagnostics);
                     compile_font_selection = Some(selection);
@@ -596,8 +601,19 @@ impl<'a> CompileJobService<'a> {
         project_root: &Path,
         overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
+        host_font_roots: &[PathBuf],
     ) -> (CompileFontSelection, FontFamilySelection, Vec<Diagnostic>) {
         let mut diagnostics = Vec::new();
+        let resolution_surface = if host_font_roots.is_empty() {
+            "project directory, overlay roots, or asset bundle"
+        } else {
+            "project directory, overlay roots, asset bundle, or host font catalog"
+        };
+        let resolution_suggestion = if host_font_roots.is_empty() {
+            "place the font in the document directory, project fonts/, configured overlay roots, or asset bundle"
+        } else {
+            "place the font in the document directory, project fonts/, configured overlay roots, asset bundle, or host font catalog"
+        };
         let main = if let Some(font_name) = requested_main_font {
             match resolve_named_font(
                 font_name,
@@ -605,6 +621,7 @@ impl<'a> CompileJobService<'a> {
                 project_root,
                 overlay_roots,
                 asset_bundle_path,
+                host_font_roots,
                 self.file_access_gate,
             ) {
                 Some(resolved_font) => Some(LoadedOpenTypeFont {
@@ -616,13 +633,13 @@ impl<'a> CompileJobService<'a> {
                         Diagnostic::new(
                             Severity::Error,
                             format!(
-                                "Font \"{font_name}\" not found in project directory or asset bundle"
+                                "Font \"{font_name}\" not found in {resolution_surface}"
                             ),
                         )
                         .with_file(input_path.to_string())
-                        .with_suggestion(
-                            "place the font in the document directory, project fonts/, or asset bundle; compile will fall back to another available main font until then",
-                        ),
+                        .with_suggestion(format!(
+                            "{resolution_suggestion}; compile will fall back to another available main font until then"
+                        )),
                     );
                     load_opentype_font(self.file_access_gate, asset_bundle_path)
                 }
@@ -638,6 +655,7 @@ impl<'a> CompileJobService<'a> {
                 project_root,
                 overlay_roots,
                 asset_bundle_path,
+                host_font_roots,
                 self.file_access_gate,
             )
             .map(|resolved_font| LoadedOpenTypeFont {
@@ -649,13 +667,13 @@ impl<'a> CompileJobService<'a> {
                     Diagnostic::new(
                         Severity::Error,
                         format!(
-                            "Font \"{font_name}\" not found in project directory or asset bundle"
+                            "Font \"{font_name}\" not found in {resolution_surface}"
                         ),
                     )
                     .with_file(input_path.to_string())
-                    .with_suggestion(
-                        "place the font in the document directory, project fonts/, or asset bundle; PDF output will fall back to a built-in sans font until then",
-                    ),
+                    .with_suggestion(format!(
+                        "{resolution_suggestion}; PDF output will fall back to a built-in sans font until then"
+                    )),
                 );
                 None
             })
@@ -668,6 +686,7 @@ impl<'a> CompileJobService<'a> {
                 project_root,
                 overlay_roots,
                 asset_bundle_path,
+                host_font_roots,
                 self.file_access_gate,
             )
             .map(|resolved_font| LoadedOpenTypeFont {
@@ -679,13 +698,13 @@ impl<'a> CompileJobService<'a> {
                     Diagnostic::new(
                         Severity::Error,
                         format!(
-                            "Font \"{font_name}\" not found in project directory or asset bundle"
+                            "Font \"{font_name}\" not found in {resolution_surface}"
                         ),
                     )
                     .with_file(input_path.to_string())
-                    .with_suggestion(
-                        "place the font in the document directory, project fonts/, or asset bundle; PDF output will fall back to a built-in mono font until then",
-                    ),
+                    .with_suggestion(format!(
+                        "{resolution_suggestion}; PDF output will fall back to a built-in mono font until then"
+                    )),
                 );
                 None
             })
@@ -2445,6 +2464,8 @@ mod tests {
             overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
+            host_font_fallback: false,
+            host_font_roots: Vec::new(),
             interaction_mode: InteractionMode::Nonstopmode,
             synctex: false,
             trace_font_tasks: false,
@@ -3377,10 +3398,71 @@ mod tests {
         assert!(result.diagnostics.iter().any(|diagnostic| {
             diagnostic.severity == Severity::Error
                 && diagnostic.message
-                    == "Font \"MissingFont\" not found in project directory or asset bundle"
+                    == "Font \"MissingFont\" not found in project directory, overlay roots, or asset bundle"
         }));
         let pdf = read_pdf(&output_dir.join("main.pdf"));
         assert!(pdf.contains("FerritexSubset+FallbackSans"));
+    }
+
+    #[test]
+    fn compile_with_setmainfont_uses_host_font_catalog_fallback() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let host_font_root = dir.path().join("host-fonts");
+        fs::create_dir_all(&host_font_root).expect("create host font root");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{Noto Serif}\n\\begin{document}\nAB\n\\end{document}\n",
+        )
+        .expect("write input");
+        fs::write(host_font_root.join("Noto Serif.ttf"), build_test_ttf())
+            .expect("write host font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.host_font_fallback = true;
+        options.host_font_roots = vec![host_font_root];
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("FerritexSubset+NotoSerif"));
+    }
+
+    #[test]
+    fn reproducible_mode_disables_host_font_catalog_fallback() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let host_font_root = dir.path().join("host-fonts");
+        fs::create_dir_all(&host_font_root).expect("create host font root");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{Noto Serif}\n\\begin{document}\nAB\n\\end{document}\n",
+        )
+        .expect("write input");
+        fs::write(host_font_root.join("Noto Serif.ttf"), build_test_ttf())
+            .expect("write host font");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.host_font_fallback = false;
+        options.host_font_roots = vec![host_font_root];
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert!(result.output_pdf.is_some());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message
+                    == "Font \"Noto Serif\" not found in project directory, overlay roots, or asset bundle"
+        }));
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("/Subtype /Type1 /BaseFont /Helvetica"));
+        assert!(!pdf.contains("FerritexSubset+NotoSerif"));
     }
 
     #[test]

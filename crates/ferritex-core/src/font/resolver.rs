@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use super::opentype::OpenTypeFont;
+use super::host_catalog::resolve_host_font;
+use super::opentype::{extract_font_names, OpenTypeFont};
 use crate::policy::FileAccessGate;
 use crate::policy::PathAccessDecision;
 
@@ -25,6 +26,7 @@ pub fn resolve_named_font(
     project_root: &Path,
     overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
+    host_font_roots: &[PathBuf],
     file_access_gate: &dyn FileAccessGate,
 ) -> Option<ResolvedFont> {
     let requested_name = name.trim();
@@ -56,17 +58,34 @@ pub fn resolve_named_font(
         }
     }
 
-    let bundle_path = asset_bundle_path?;
-    let mut visited = BTreeSet::new();
-    let mut candidates = Vec::new();
+    if let Some(bundle_path) = asset_bundle_path {
+        let mut visited = BTreeSet::new();
+        let mut candidates = Vec::new();
 
-    for root in OPENTYPE_FONT_SEARCH_ROOTS {
-        collect_opentype_candidates_in_dir(&bundle_path.join(root), &mut visited, &mut candidates);
+        for root in OPENTYPE_FONT_SEARCH_ROOTS {
+            collect_opentype_candidates_in_dir(
+                &bundle_path.join(root),
+                &mut visited,
+                &mut candidates,
+            );
+        }
+        collect_opentype_candidates_in_dir(bundle_path, &mut visited, &mut candidates);
+
+        for candidate in candidates {
+            if let Some(font) =
+                try_load_named_candidate(&candidate, requested_name, file_access_gate)
+            {
+                return Some(font);
+            }
+        }
     }
-    collect_opentype_candidates_in_dir(bundle_path, &mut visited, &mut candidates);
 
-    for candidate in candidates {
-        if let Some(font) = try_load_named_candidate(&candidate, requested_name, file_access_gate) {
+    if let Some(host_font_path) =
+        resolve_host_font(requested_name, host_font_roots, file_access_gate)
+    {
+        if let Some(font) =
+            try_load_named_candidate(&host_font_path, requested_name, file_access_gate)
+        {
             return Some(font);
         }
     }
@@ -79,15 +98,14 @@ fn try_load_named_candidate(
     requested_name: &str,
     file_access_gate: &dyn FileAccessGate,
 ) -> Option<ResolvedFont> {
-    if !matches_requested_font_name(candidate, requested_name) {
-        return None;
-    }
-
     if file_access_gate.check_read(candidate) == PathAccessDecision::Denied {
         return None;
     }
 
     let bytes = file_access_gate.read_file(candidate).ok()?;
+    if !matches_requested_font_name(candidate, requested_name, &bytes) {
+        return None;
+    }
     let font = OpenTypeFont::parse(&bytes).ok()?;
     let stem = candidate
         .file_stem()
@@ -154,11 +172,21 @@ fn collect_opentype_candidates_in_dir(
     }
 }
 
-fn matches_requested_font_name(path: &Path, requested_name: &str) -> bool {
-    path.file_stem()
+fn matches_requested_font_name(path: &Path, requested_name: &str, bytes: &[u8]) -> bool {
+    if path
+        .file_stem()
         .and_then(|stem| stem.to_str())
         .map(|stem| normalize_font_name(stem) == normalize_font_name(requested_name))
         .unwrap_or(false)
+    {
+        return true;
+    }
+
+    extract_font_names(bytes)
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|name| normalize_font_name(&name) == normalize_font_name(requested_name))
 }
 
 fn is_opentype_path(path: &Path) -> bool {
@@ -189,7 +217,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::resolve_named_font;
-    use crate::font::opentype::minimal_test_font_bytes;
+    use crate::font::opentype::{minimal_test_font_bytes, named_test_font_bytes};
     use crate::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
 
     struct FsTestFileAccessGate;
@@ -289,6 +317,7 @@ mod tests {
             &project_root,
             &[],
             None,
+            &[],
             &FsTestFileAccessGate,
         )
         .expect("resolve project-local font");
@@ -313,6 +342,7 @@ mod tests {
             &project_root,
             &[],
             Some(&bundle_path),
+            &[],
             &FsTestFileAccessGate,
         )
         .expect("resolve asset bundle font");
@@ -337,6 +367,7 @@ mod tests {
             &project_root,
             &[],
             Some(&bundle_path),
+            &[],
             &FsTestFileAccessGate,
         )
         .expect("resolve preferred project-local font");
@@ -358,6 +389,7 @@ mod tests {
             &project_root,
             &[],
             None,
+            &[],
             &FsTestFileAccessGate,
         )
         .expect("resolve case-insensitive font name");
@@ -378,6 +410,7 @@ mod tests {
             &project_root,
             &[],
             Some(&bundle_path),
+            &[],
             &FsTestFileAccessGate,
         )
         .is_none());
@@ -398,11 +431,45 @@ mod tests {
             &project_root,
             &[overlay_root],
             None,
+            &[],
             &FsTestFileAccessGate,
         )
         .expect("resolve overlay-root font");
 
         assert_eq!(resolved.path, font_path);
         assert_eq!(resolved.base_font_name, "OverlayFace".to_string());
+    }
+
+    #[test]
+    fn resolve_named_font_uses_host_catalog_after_bundle_miss() {
+        let fixture = FixtureDir::new();
+        let input_dir = fixture.path().join("input");
+        let project_root = fixture.path().join("project");
+        let host_root = fixture.path().join("host");
+        let font_path = host_root.join("opaque-file-name.ttf");
+        if let Some(parent) = font_path.parent() {
+            fs::create_dir_all(parent).expect("create host font parent");
+        }
+        fs::write(
+            &font_path,
+            named_test_font_bytes("Noto Serif", "Noto Serif Regular"),
+        )
+        .expect("write host font");
+
+        let resolved = resolve_named_font(
+            "Noto Serif",
+            &input_dir,
+            &project_root,
+            &[],
+            None,
+            &[host_root],
+            &FsTestFileAccessGate,
+        )
+        .expect("resolve host catalog font");
+
+        assert_eq!(
+            resolved.path,
+            font_path.canonicalize().expect("canonical host font path")
+        );
     }
 }

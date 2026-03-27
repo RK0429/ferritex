@@ -14,6 +14,9 @@ impl ExecutionPolicyFactory {
         if let Some(bundle_path) = &options.asset_bundle {
             allowed_read_paths.push(bundle_path.clone());
         }
+        if options.host_font_fallback {
+            allowed_read_paths.extend(options.host_font_roots.iter().cloned());
+        }
 
         ExecutionPolicy {
             shell_escape_allowed: matches!(options.shell_escape, ShellEscapeMode::Enabled),
@@ -117,6 +120,8 @@ mod tests {
             overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
+            host_font_fallback: false,
+            host_font_roots: Vec::new(),
             interaction_mode: InteractionMode::Nonstopmode,
             synctex: false,
             trace_font_tasks: false,
@@ -169,6 +174,8 @@ mod tests {
             overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
+            host_font_fallback: false,
+            host_font_roots: Vec::new(),
             interaction_mode: InteractionMode::Nonstopmode,
             synctex: false,
             trace_font_tasks: false,
@@ -192,6 +199,8 @@ mod tests {
             overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: None,
+            host_font_fallback: false,
+            host_font_roots: Vec::new(),
             interaction_mode: InteractionMode::Nonstopmode,
             synctex: false,
             trace_font_tasks: false,
@@ -218,6 +227,8 @@ mod tests {
             overlay_roots: Vec::new(),
             no_cache: false,
             asset_bundle: Some(bundle_root.clone()),
+            host_font_fallback: false,
+            host_font_roots: Vec::new(),
             interaction_mode: InteractionMode::Nonstopmode,
             synctex: false,
             trace_font_tasks: false,
@@ -245,6 +256,8 @@ mod tests {
             overlay_roots: vec![overlay_root.clone()],
             no_cache: false,
             asset_bundle: Some(bundle_root.clone()),
+            host_font_fallback: false,
+            host_font_roots: Vec::new(),
             interaction_mode: InteractionMode::Nonstopmode,
             synctex: false,
             trace_font_tasks: false,
@@ -256,6 +269,38 @@ mod tests {
         assert_eq!(
             policy.allowed_read_paths,
             vec![project_root, overlay_root, bundle_root]
+        );
+    }
+
+    #[test]
+    fn includes_host_font_roots_after_bundle_when_enabled() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let bundle_root = dir.path().join("bundle");
+        let host_root = dir.path().join("host-fonts");
+        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+
+        let options = RuntimeOptions {
+            input_file: project_root.join("src/main.tex"),
+            output_dir: project_root.join("build"),
+            jobname: "main".to_string(),
+            parallelism: 1,
+            overlay_roots: Vec::new(),
+            no_cache: false,
+            asset_bundle: Some(bundle_root.clone()),
+            host_font_fallback: true,
+            host_font_roots: vec![host_root.clone()],
+            interaction_mode: InteractionMode::Nonstopmode,
+            synctex: false,
+            trace_font_tasks: false,
+            shell_escape: ShellEscapeMode::Disabled,
+        };
+
+        let policy = ExecutionPolicyFactory::create(&options);
+
+        assert_eq!(
+            policy.allowed_read_paths,
+            vec![project_root, bundle_root, host_root]
         );
     }
 }
