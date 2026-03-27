@@ -847,9 +847,14 @@ fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
     std::fs::create_dir_all(bundle_root.join("texmf")).expect("create bundle texmf");
     std::fs::write(
         bundle_root.join("manifest.json"),
-        r#"{"name":"default","version":"2026.03.18","min_ferritex_version":"0.1.0"}"#,
+        r#"{"name":"default","version":"2026.03.18","min_ferritex_version":"0.1.0","format_version":1,"asset_index_path":"asset-index.json"}"#,
     )
     .expect("write bundle manifest");
+    std::fs::write(
+        bundle_root.join("asset-index.json"),
+        r#"{"tex_inputs":{"bundled.tex":"texmf/bundled.tex"},"packages":{},"opentype_fonts":{},"tfm_fonts":{},"default_opentype_fonts":[]}"#,
+    )
+    .expect("write bundle asset index");
     std::fs::write(
         bundle_root.join("texmf/bundled.tex"),
         "Bundled from asset bundle.\n",

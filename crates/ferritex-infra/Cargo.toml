@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ferritex-application = { path = "../ferritex-application" }
 ferritex-core = { path = "../ferritex-core" }
+memmap2 = "0.9"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

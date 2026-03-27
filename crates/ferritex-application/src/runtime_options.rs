@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
+
 pub const BUILTIN_BASIC_ASSET_BUNDLE_ID: &str = "builtin:basic";
 const BUILTIN_BASIC_ASSET_BUNDLE_VERSION: &str = "0.1.0";
 const BUILTIN_BASIC_BUNDLED_TEX: &str = "Bundled from built-in asset bundle.\n";
+const BUILTIN_BASIC_ASSET_INDEX_PATH: &str = "asset-index.json";
 
 /// CLI から受け取る compile サブコマンド引数
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,13 +224,34 @@ fn materialize_builtin_basic_asset_bundle() -> PathBuf {
     ));
     let texmf_root = root.join("texmf");
     let manifest_path = root.join("manifest.json");
+    let asset_index_path = root.join(BUILTIN_BASIC_ASSET_INDEX_PATH);
     let bundled_tex_path = texmf_root.join("bundled.tex");
-    let manifest = format!(
-        "{{\"name\":\"basic\",\"version\":\"{BUILTIN_BASIC_ASSET_BUNDLE_VERSION}\",\"min_ferritex_version\":\"0.1.0\"}}"
-    );
+    let manifest = json!({
+        "name": "basic",
+        "version": BUILTIN_BASIC_ASSET_BUNDLE_VERSION,
+        "min_ferritex_version": "0.1.0",
+        "format_version": 1,
+        "asset_index_path": BUILTIN_BASIC_ASSET_INDEX_PATH,
+    });
+    let asset_index = json!({
+        "tex_inputs": {
+            "bundled.tex": "texmf/bundled.tex",
+        },
+        "packages": {},
+        "opentype_fonts": {},
+        "tfm_fonts": {},
+        "default_opentype_fonts": [],
+    });
 
     let _ = std::fs::create_dir_all(&texmf_root);
-    let _ = std::fs::write(&manifest_path, manifest);
+    let _ = std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).unwrap_or_default(),
+    );
+    let _ = std::fs::write(
+        &asset_index_path,
+        serde_json::to_vec(&asset_index).unwrap_or_default(),
+    );
     let _ = std::fs::write(&bundled_tex_path, BUILTIN_BASIC_BUNDLED_TEX);
 
     root
@@ -353,6 +377,9 @@ mod tests {
         assert!(!options.no_cache);
         let bundle_path = options.asset_bundle.expect("lsp bundle path");
         assert!(bundle_path.join("manifest.json").exists());
+        assert!(bundle_path
+            .join(super::BUILTIN_BASIC_ASSET_INDEX_PATH)
+            .exists());
         assert!(bundle_path.join("texmf/bundled.tex").exists());
         assert!(options.host_font_fallback);
         assert_eq!(options.host_font_roots, super::default_host_font_roots());
@@ -379,6 +406,9 @@ mod tests {
             resolve_asset_bundle_ref(PathBuf::from(BUILTIN_BASIC_ASSET_BUNDLE_ID).as_path());
 
         assert!(resolved.join("manifest.json").exists());
+        assert!(resolved
+            .join(super::BUILTIN_BASIC_ASSET_INDEX_PATH)
+            .exists());
         assert!(resolved.join("texmf/bundled.tex").exists());
     }
 
@@ -387,6 +417,7 @@ mod tests {
         let bundle = default_lsp_asset_bundle().expect("default bundle");
 
         assert!(bundle.join("manifest.json").exists());
+        assert!(bundle.join(super::BUILTIN_BASIC_ASSET_INDEX_PATH).exists());
         assert!(bundle.join("texmf/bundled.tex").exists());
     }
 }

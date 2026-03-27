@@ -15,7 +15,7 @@ use ferritex_core::compilation::{
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
 use ferritex_core::font::{
-    resolve_named_font, OpenTypeFont, TfmMetrics, OPENTYPE_FONT_SEARCH_ROOTS,
+    resolve_named_font, OpenTypeFont, ResolvedFont, TfmMetrics, OPENTYPE_FONT_SEARCH_ROOTS,
 };
 use ferritex_core::graphics::api::{
     extract_png_image_data, parse_image_metadata, ExternalGraphic, GraphicAssetResolver,
@@ -1085,6 +1085,7 @@ impl<'a> CompileJobService<'a> {
                     input_dir,
                     project_root,
                     overlay_roots,
+                    self.asset_bundle_loader,
                     asset_bundle_path,
                     host_font_roots,
                     self.file_access_gate,
@@ -1102,6 +1103,7 @@ impl<'a> CompileJobService<'a> {
                     input_dir,
                     project_root,
                     overlay_roots,
+                    self.asset_bundle_loader,
                     asset_bundle_path,
                     host_font_roots,
                     self.file_access_gate,
@@ -1122,6 +1124,7 @@ impl<'a> CompileJobService<'a> {
                     input_dir,
                     project_root,
                     overlay_roots,
+                    self.asset_bundle_loader,
                     asset_bundle_path,
                     host_font_roots,
                     self.file_access_gate,
@@ -1176,7 +1179,13 @@ impl<'a> CompileJobService<'a> {
             "font-load-cmr10-fallback",
             "cmr10.tfm",
             0,
-            || load_cmr10_metrics(self.file_access_gate, asset_bundle_path),
+            || {
+                load_cmr10_metrics(
+                    self.file_access_gate,
+                    self.asset_bundle_loader,
+                    asset_bundle_path,
+                )
+            },
         ) {
             return (CompileFontSelection::Tfm(metrics), families, diagnostics);
         }
@@ -2549,100 +2558,192 @@ fn normalize_existing_path(path: &Path) -> PathBuf {
 
 fn load_cmr10_metrics(
     file_access_gate: &dyn FileAccessGate,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
     asset_bundle_path: Option<&Path>,
 ) -> Option<TfmMetrics> {
     let bundle_path = asset_bundle_path?;
 
+    if let Some(candidate) = asset_bundle_loader.resolve_tfm_font(bundle_path, "cmr10") {
+        if let Some(metrics) = load_tfm_metrics_from_path(file_access_gate, &candidate) {
+            return Some(metrics);
+        }
+    }
+
     for relative_path in CMR10_TFM_CANDIDATES {
         let candidate = bundle_path.join(relative_path);
-        if !candidate.is_file() {
-            continue;
-        }
-
-        if file_access_gate.check_read(&candidate) == PathAccessDecision::Denied {
-            tracing::warn!(
-                path = %candidate.display(),
-                "cmr10.tfm access denied; falling back to fixed-width typesetting"
-            );
-            continue;
-        }
-
-        let bytes = match file_access_gate.read_file(&candidate) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(
-                    path = %candidate.display(),
-                    %error,
-                    "failed to read cmr10.tfm; falling back to fixed-width typesetting"
-                );
-                continue;
-            }
-        };
-
-        match TfmMetrics::parse(&bytes) {
-            Ok(metrics) => return Some(metrics),
-            Err(error) => {
-                tracing::warn!(
-                    path = %candidate.display(),
-                    %error,
-                    "failed to parse cmr10.tfm; falling back to fixed-width typesetting"
-                );
-            }
+        if let Some(metrics) = load_tfm_metrics_from_path(file_access_gate, &candidate) {
+            return Some(metrics);
         }
     }
 
     None
 }
 
+fn load_tfm_metrics_from_path(
+    file_access_gate: &dyn FileAccessGate,
+    candidate: &Path,
+) -> Option<TfmMetrics> {
+    if !candidate.is_file() {
+        return None;
+    }
+
+    if file_access_gate.check_read(candidate) == PathAccessDecision::Denied {
+        tracing::warn!(
+            path = %candidate.display(),
+            "cmr10.tfm access denied; falling back to fixed-width typesetting"
+        );
+        return None;
+    }
+
+    let bytes = match file_access_gate.read_file(candidate) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                %error,
+                "failed to read cmr10.tfm; falling back to fixed-width typesetting"
+            );
+            return None;
+        }
+    };
+
+    match TfmMetrics::parse(&bytes) {
+        Ok(metrics) => Some(metrics),
+        Err(error) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                %error,
+                "failed to parse cmr10.tfm; falling back to fixed-width typesetting"
+            );
+            None
+        }
+    }
+}
+
 fn load_opentype_font(
     file_access_gate: &dyn FileAccessGate,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
     asset_bundle_path: Option<&Path>,
 ) -> Option<LoadedOpenTypeFont> {
     let bundle_path = asset_bundle_path?;
 
-    for candidate in collect_ttf_candidates(bundle_path) {
-        if file_access_gate.check_read(&candidate) == PathAccessDecision::Denied {
-            tracing::warn!(
-                path = %candidate.display(),
-                "ttf access denied; falling back to other font paths"
-            );
-            continue;
+    if let Some(candidate) = asset_bundle_loader.resolve_default_opentype_font(bundle_path) {
+        if let Some(font) = load_resolved_font(file_access_gate, &candidate) {
+            return Some(LoadedOpenTypeFont {
+                base_font: sanitize_pdf_font_name(&font.base_font_name),
+                font: font.font,
+            });
         }
+    }
 
-        let bytes = match file_access_gate.read_file(&candidate) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(
-                    path = %candidate.display(),
-                    %error,
-                    "failed to read TTF font; falling back to other font paths"
-                );
-                continue;
-            }
-        };
-
-        match OpenTypeFont::parse(&bytes) {
-            Ok(font) => {
-                let stem = candidate
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("FerritexOpenType");
-                return Some(LoadedOpenTypeFont {
-                    base_font: sanitize_pdf_font_name(stem),
-                    font,
-                });
-            }
-            Err(error) => {
-                tracing::warn!(
-                    path = %candidate.display(),
-                    %error,
-                    "failed to parse TTF font; falling back to other font paths"
-                );
-            }
+    for candidate in collect_ttf_candidates(bundle_path) {
+        if let Some(font) = load_resolved_font(file_access_gate, &candidate) {
+            return Some(LoadedOpenTypeFont {
+                base_font: sanitize_pdf_font_name(&font.base_font_name),
+                font: font.font,
+            });
         }
     }
 
     None
+}
+
+fn resolve_named_font_with_bundle_index(
+    font_name: &str,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    asset_bundle_path: Option<&Path>,
+    host_font_roots: &[PathBuf],
+    file_access_gate: &dyn FileAccessGate,
+) -> Option<ResolvedFont> {
+    resolve_named_font(
+        font_name,
+        input_dir,
+        project_root,
+        overlay_roots,
+        None,
+        &[],
+        file_access_gate,
+    )
+    .or_else(|| {
+        resolve_bundle_named_font(
+            font_name,
+            asset_bundle_loader,
+            asset_bundle_path,
+            file_access_gate,
+        )
+    })
+    .or_else(|| {
+        resolve_named_font(
+            font_name,
+            input_dir,
+            project_root,
+            overlay_roots,
+            asset_bundle_path,
+            host_font_roots,
+            file_access_gate,
+        )
+    })
+}
+
+fn resolve_bundle_named_font(
+    font_name: &str,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    asset_bundle_path: Option<&Path>,
+    file_access_gate: &dyn FileAccessGate,
+) -> Option<ResolvedFont> {
+    let bundle_path = asset_bundle_path?;
+    let candidate = asset_bundle_loader.resolve_opentype_font(bundle_path, font_name)?;
+    load_resolved_font(file_access_gate, &candidate)
+}
+
+fn load_resolved_font(
+    file_access_gate: &dyn FileAccessGate,
+    candidate: &Path,
+) -> Option<ResolvedFont> {
+    if file_access_gate.check_read(candidate) == PathAccessDecision::Denied {
+        tracing::warn!(
+            path = %candidate.display(),
+            "ttf access denied; falling back to other font paths"
+        );
+        return None;
+    }
+
+    let bytes = match file_access_gate.read_file(candidate) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                %error,
+                "failed to read TTF font; falling back to other font paths"
+            );
+            return None;
+        }
+    };
+
+    match OpenTypeFont::parse(&bytes) {
+        Ok(font) => {
+            let stem = candidate
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("FerritexOpenType");
+            Some(ResolvedFont {
+                path: candidate.to_path_buf(),
+                font,
+                base_font_name: stem.to_string(),
+            })
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                %error,
+                "failed to parse TTF font; falling back to other font paths"
+            );
+            None
+        }
+    }
 }
 
 fn collect_ttf_candidates(bundle_path: &Path) -> Vec<PathBuf> {
@@ -2970,6 +3071,7 @@ fn load_main_font_task(
     input_dir: &Path,
     project_root: &Path,
     overlay_roots: &[PathBuf],
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
     asset_bundle_path: Option<&Path>,
     host_font_roots: &[PathBuf],
     file_access_gate: &dyn FileAccessGate,
@@ -2980,11 +3082,12 @@ fn load_main_font_task(
 ) -> FontLoadTaskResult {
     if let Some(font_name) = requested_main_font {
         match trace_font_task(trace_font_tasks, "font-load-main", font_name, worker_id, || {
-            resolve_named_font(
+            resolve_named_font_with_bundle_index(
                 font_name,
                 input_dir,
                 project_root,
                 overlay_roots,
+                asset_bundle_loader,
                 asset_bundle_path,
                 host_font_roots,
                 file_access_gate,
@@ -3003,7 +3106,7 @@ fn load_main_font_task(
                     "font-load-main-default",
                     default_font_asset_label(asset_bundle_path),
                     worker_id,
-                    || load_opentype_font(file_access_gate, asset_bundle_path),
+                    || load_opentype_font(file_access_gate, asset_bundle_loader, asset_bundle_path),
                 ),
                 diagnostic: Some(
                     Diagnostic::new(
@@ -3024,7 +3127,7 @@ fn load_main_font_task(
                 "font-load-main-default",
                 default_font_asset_label(asset_bundle_path),
                 worker_id,
-                || load_opentype_font(file_access_gate, asset_bundle_path),
+                || load_opentype_font(file_access_gate, asset_bundle_loader, asset_bundle_path),
             ),
             diagnostic: None,
         }
@@ -3038,6 +3141,7 @@ fn load_optional_font_task(
     input_dir: &Path,
     project_root: &Path,
     overlay_roots: &[PathBuf],
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
     asset_bundle_path: Option<&Path>,
     host_font_roots: &[PathBuf],
     file_access_gate: &dyn FileAccessGate,
@@ -3049,11 +3153,12 @@ fn load_optional_font_task(
     worker_id: usize,
 ) -> FontLoadTaskResult {
     let loaded_font = trace_font_task(trace_font_tasks, task_id, font_name, worker_id, || {
-        resolve_named_font(
+        resolve_named_font_with_bundle_index(
             font_name,
             input_dir,
             project_root,
             overlay_roots,
+            asset_bundle_loader,
             asset_bundle_path,
             host_font_roots,
             file_access_gate,
@@ -3491,6 +3596,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    use serde_json::json;
 
     use super::{run_font_tasks, CompileJobService};
     use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput};
@@ -4004,6 +4111,143 @@ mod tests {
                 (*b"glyf", glyf),
             ],
         )
+    }
+
+    fn write_asset_bundle_fixture(bundle_path: &Path) {
+        let mut tex_inputs = BTreeMap::new();
+        let mut packages = BTreeMap::new();
+        let mut opentype_fonts = BTreeMap::new();
+        let mut tfm_fonts = BTreeMap::new();
+        let mut default_opentype_fonts = Vec::new();
+
+        collect_bundle_assets(
+            bundle_path,
+            bundle_path,
+            &mut tex_inputs,
+            &mut packages,
+            &mut opentype_fonts,
+            &mut tfm_fonts,
+            &mut default_opentype_fonts,
+        );
+        default_opentype_fonts.sort();
+        default_opentype_fonts.dedup();
+
+        fs::create_dir_all(bundle_path).expect("create bundle dir");
+        fs::write(
+            bundle_path.join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "name": "test-bundle",
+                "version": "2026.03.18",
+                "min_ferritex_version": "0.1.0",
+                "format_version": 1,
+                "asset_index_path": "asset-index.json",
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        fs::write(
+            bundle_path.join("asset-index.json"),
+            serde_json::to_vec(&json!({
+                "tex_inputs": tex_inputs,
+                "packages": packages,
+                "opentype_fonts": opentype_fonts,
+                "tfm_fonts": tfm_fonts,
+                "default_opentype_fonts": default_opentype_fonts,
+            }))
+            .expect("serialize asset index"),
+        )
+        .expect("write asset index");
+    }
+
+    fn collect_bundle_assets(
+        bundle_root: &Path,
+        current: &Path,
+        tex_inputs: &mut BTreeMap<String, String>,
+        packages: &mut BTreeMap<String, String>,
+        opentype_fonts: &mut BTreeMap<String, String>,
+        tfm_fonts: &mut BTreeMap<String, String>,
+        default_opentype_fonts: &mut Vec<String>,
+    ) {
+        let Ok(read_dir) = fs::read_dir(current) else {
+            return;
+        };
+
+        let mut entries = read_dir
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        entries.sort();
+
+        for path in entries {
+            if path.is_dir() {
+                collect_bundle_assets(
+                    bundle_root,
+                    &path,
+                    tex_inputs,
+                    packages,
+                    opentype_fonts,
+                    tfm_fonts,
+                    default_opentype_fonts,
+                );
+                continue;
+            }
+
+            let Some(relative) = path
+                .strip_prefix(bundle_root)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+            else {
+                continue;
+            };
+
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase());
+            match extension.as_deref() {
+                Some("tex") => {
+                    let logical = relative
+                        .strip_prefix("texmf/")
+                        .unwrap_or(&relative)
+                        .to_string();
+                    tex_inputs.insert(logical, relative);
+                }
+                Some("sty") => {
+                    let logical = relative
+                        .strip_prefix("texmf/")
+                        .unwrap_or(&relative)
+                        .to_ascii_lowercase();
+                    packages.insert(logical, relative);
+                }
+                Some("ttf") | Some("otf") => {
+                    let key = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| {
+                            stem.chars()
+                                .filter(|ch| ch.is_alphanumeric())
+                                .flat_map(|ch| ch.to_lowercase())
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    if !key.is_empty() {
+                        opentype_fonts.insert(key, relative.clone());
+                        default_opentype_fonts.push(relative);
+                    }
+                }
+                Some("tfm") => {
+                    let key = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(|stem| stem.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if !key.is_empty() {
+                        tfm_fonts.insert(key, relative);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn build_head_table(units_per_em: u16, flags: u16, index_to_loc_format: i16) -> Vec<u8> {
@@ -5007,10 +5251,10 @@ mod tests {
         let bundle_path = dir.path().join("bundle");
         let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
         fs::create_dir_all(&font_dir).expect("create font dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
         fs::write(&input_file, document("AB")).expect("write input");
         let font_bytes = build_test_ttf();
         fs::write(font_dir.join("TestSans.ttf"), &font_bytes).expect("write font");
+        write_asset_bundle_fixture(&bundle_path);
 
         let mut options = runtime_options(input_file.clone(), output_dir.clone());
         options.asset_bundle = Some(bundle_path);
@@ -5045,7 +5289,6 @@ mod tests {
         let bundle_path = dir.path().join("bundle");
         let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
         fs::create_dir_all(&font_dir).expect("create font dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
         fs::write(
             &input_file,
             "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{ChosenSans}\n\\begin{document}\nAB\n\\end{document}\n",
@@ -5053,6 +5296,7 @@ mod tests {
         .expect("write input");
         fs::write(font_dir.join("AFirst.ttf"), build_test_ttf()).expect("write first font");
         fs::write(font_dir.join("ChosenSans.ttf"), build_test_ttf()).expect("write chosen font");
+        write_asset_bundle_fixture(&bundle_path);
 
         let mut options = runtime_options(input_file, output_dir.clone());
         options.asset_bundle = Some(bundle_path);
@@ -5102,7 +5346,6 @@ mod tests {
         let bundle_path = dir.path().join("bundle");
         let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
         fs::create_dir_all(&font_dir).expect("create font dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
         fs::write(
             &input_file,
             "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{MainFace}\n\\setsansfont{SansFace}\n\\setmonofont{MonoFace}\n\\begin{document}\nAB\\par\n\\textsf{AB}\\par\n\\texttt{AB}\n\\end{document}\n",
@@ -5111,6 +5354,7 @@ mod tests {
         fs::write(font_dir.join("MainFace.ttf"), build_test_ttf()).expect("write main font");
         fs::write(font_dir.join("SansFace.ttf"), build_test_ttf()).expect("write sans font");
         fs::write(font_dir.join("MonoFace.ttf"), build_test_ttf()).expect("write mono font");
+        write_asset_bundle_fixture(&bundle_path);
 
         let mut options = runtime_options(input_file, output_dir.clone());
         options.asset_bundle = Some(bundle_path);
@@ -5163,7 +5407,6 @@ mod tests {
         let bundle_path = dir.path().join("bundle");
         let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
         fs::create_dir_all(&font_dir).expect("create font dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
         fs::write(
             &input_file,
             "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{MainFace}\n\\setsansfont{SansFace}\n\\setmonofont{MonoFace}\n\\begin{document}\nAB\\par\n\\textsf{AB}\\par\n\\texttt{AB}\n\\end{document}\n",
@@ -5172,6 +5415,7 @@ mod tests {
         fs::write(font_dir.join("MainFace.ttf"), build_test_ttf()).expect("write main font");
         fs::write(font_dir.join("SansFace.ttf"), build_test_ttf()).expect("write sans font");
         fs::write(font_dir.join("MonoFace.ttf"), build_test_ttf()).expect("write mono font");
+        write_asset_bundle_fixture(&bundle_path);
 
         let mut options = runtime_options(input_file, output_dir.clone());
         options.asset_bundle = Some(bundle_path);
@@ -5226,8 +5470,8 @@ mod tests {
                 .expect("cmr10.tfm path should have a parent directory"),
         )
         .expect("create tfm dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
         fs::write(&tfm_path, build_test_tfm()).expect("write tfm");
+        write_asset_bundle_fixture(&bundle_path);
         fs::write(
             &input_file,
             "\\documentclass{article}\n\\begin{document}\nMain\\par\n\\textsf{Sans}\\par\n\\texttt{Mono}\n\\end{document}\n",
@@ -5255,7 +5499,6 @@ mod tests {
         let bundle_path = dir.path().join("bundle");
         let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
         fs::create_dir_all(&font_dir).expect("create font dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
         fs::write(
             &input_file,
             "\\documentclass{article}\n\\usepackage{fontspec}\n\\setmainfont{MissingFont}\n\\begin{document}\nAB\n\\end{document}\n",
@@ -5263,6 +5506,7 @@ mod tests {
         .expect("write input");
         fs::write(font_dir.join("FallbackSans.ttf"), build_test_ttf())
             .expect("write fallback font");
+        write_asset_bundle_fixture(&bundle_path);
 
         let mut options = runtime_options(input_file, output_dir.clone());
         options.asset_bundle = Some(bundle_path);
@@ -5349,10 +5593,10 @@ mod tests {
         let bundle_path = dir.path().join("bundle");
         let font_dir = bundle_path.join("texmf/fonts/truetype/public/test");
         fs::create_dir_all(&font_dir).expect("create font dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
         fs::write(&input_file, document("AB")).expect("write input");
         fs::write(font_dir.join("AFirst.ttf"), build_test_ttf()).expect("write first font");
         fs::write(font_dir.join("ChosenSans.ttf"), build_test_ttf()).expect("write second font");
+        write_asset_bundle_fixture(&bundle_path);
 
         let mut options = runtime_options(input_file, output_dir.clone());
         options.asset_bundle = Some(bundle_path);
@@ -5374,7 +5618,7 @@ mod tests {
         let output_dir = dir.path().join("out");
         let bundle_path = dir.path().join("bundle");
         fs::create_dir_all(&bundle_path).expect("create bundle dir");
-        fs::write(bundle_path.join("manifest.json"), "{}").expect("write manifest");
+        write_asset_bundle_fixture(&bundle_path);
         fs::write(&input_file, document("Hello")).expect("write input");
 
         let mut options = runtime_options(input_file, output_dir.clone());

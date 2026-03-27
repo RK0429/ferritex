@@ -11,6 +11,15 @@ pub trait AssetBundleLoaderPort: Send + Sync {
     ) -> Option<PathBuf> {
         None
     }
+    fn resolve_opentype_font(&self, _bundle_path: &Path, _font_name: &str) -> Option<PathBuf> {
+        None
+    }
+    fn resolve_default_opentype_font(&self, _bundle_path: &Path) -> Option<PathBuf> {
+        None
+    }
+    fn resolve_tfm_font(&self, _bundle_path: &Path, _font_name: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
