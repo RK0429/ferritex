@@ -1,5 +1,6 @@
 use crate::graphics::api::{
-    Color, GraphicNode, GraphicText, GraphicsScene, PathSegment, Point, VectorPrimitive,
+    ArrowSpec, Color, GraphicGroup, GraphicNode, GraphicText, GraphicsScene, PathSegment, Point,
+    Transform2D, VectorPrimitive,
 };
 
 const CM_IN_PT: f64 = 28.3465;
@@ -19,19 +20,219 @@ pub enum TikzDiagnostic {
 }
 
 pub fn parse_tikzpicture(content: &str) -> TikzParseResult {
-    let mut scene = GraphicsScene::default();
     let mut diagnostics = Vec::new();
-
-    for statement in split_statements(content) {
-        parse_statement(statement.trim(), &mut scene, &mut diagnostics);
-    }
+    let scene = GraphicsScene {
+        nodes: materialize_statements(parse_scope_items(
+            content,
+            ScopeState::default(),
+            &mut diagnostics,
+        )),
+    };
 
     TikzParseResult { scene, diagnostics }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScopeState {
+    default_stroke: Option<Color>,
+    default_fill: Option<Color>,
+    default_line_width: Option<f64>,
+    transform: Transform2D,
+}
+
+impl Default for ScopeState {
+    fn default() -> Self {
+        Self {
+            default_stroke: None,
+            default_fill: None,
+            default_line_width: Some(DEFAULT_LINE_WIDTH_PT),
+            transform: Transform2D::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ParsedStatement {
+    Node(GraphicNode),
+    Clip(ClipGroupSpec),
+}
+
+#[derive(Debug, Clone)]
+struct ClipGroupSpec {
+    default_stroke: Option<Color>,
+    default_fill: Option<Color>,
+    default_line_width: Option<f64>,
+    clip_path: Vec<PathSegment>,
+    transform: Transform2D,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PathCommandKind {
+    Draw,
+    Fill,
+    FillDraw,
+    Clip,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathStyle {
+    stroke: Option<Color>,
+    fill: Option<Color>,
+    line_width: f64,
+    transform: Transform2D,
+    arrows: ArrowSpec,
+}
+
+fn parse_scope_items(
+    content: &str,
+    state: ScopeState,
+    diagnostics: &mut Vec<TikzDiagnostic>,
+) -> Vec<ParsedStatement> {
+    let mut items = Vec::new();
+    let mut cursor = Cursor::new(content);
+
+    while !cursor.is_eof() {
+        cursor.skip_whitespace();
+        if cursor.is_eof() {
+            break;
+        }
+
+        if cursor.remaining().starts_with("\\begin") {
+            if let Some(group) = parse_scope_block(&mut cursor, state, diagnostics) {
+                items.push(ParsedStatement::Node(GraphicNode::Group(group)));
+            }
+            continue;
+        }
+
+        let Some(statement) = cursor.parse_statement_chunk() else {
+            break;
+        };
+        parse_statement(statement.trim(), state, &mut items, diagnostics);
+    }
+
+    items
+}
+
+fn materialize_statements(statements: Vec<ParsedStatement>) -> Vec<GraphicNode> {
+    let mut nodes = Vec::new();
+    let mut iter = statements.into_iter();
+    while let Some(statement) = iter.next() {
+        match statement {
+            ParsedStatement::Node(node) => nodes.push(node),
+            ParsedStatement::Clip(clip) => {
+                nodes.push(GraphicNode::Group(GraphicGroup {
+                    children: materialize_statements(iter.collect()),
+                    default_stroke: clip.default_stroke,
+                    default_fill: clip.default_fill,
+                    default_line_width: clip.default_line_width,
+                    clip_path: Some(clip.clip_path),
+                    transform: clip.transform,
+                }));
+                break;
+            }
+        }
+    }
+    nodes
+}
+
+fn parse_scope_block(
+    cursor: &mut Cursor<'_>,
+    parent_state: ScopeState,
+    diagnostics: &mut Vec<TikzDiagnostic>,
+) -> Option<GraphicGroup> {
+    if !cursor.consume_prefix("\\begin") {
+        return None;
+    }
+
+    cursor.skip_whitespace();
+    let Some(environment) = cursor.parse_braced_text() else {
+        emit_parse_error(
+            diagnostics,
+            "begin requires braced environment name".to_string(),
+        );
+        cursor.index = cursor.input.len();
+        return None;
+    };
+    if environment != "scope" {
+        emit_unsupported(diagnostics, format!("begin{{{environment}}}"));
+        cursor.index = cursor.input.len();
+        return None;
+    }
+
+    let Some(options) = cursor.parse_optional_bracket_group() else {
+        emit_parse_error(diagnostics, "unterminated scope option list".to_string());
+        cursor.index = cursor.input.len();
+        return None;
+    };
+
+    let body_start = cursor.index;
+    let Some((body_end, scope_end)) = find_matching_scope_end(cursor.input, body_start) else {
+        emit_parse_error(diagnostics, "unterminated scope environment".to_string());
+        cursor.index = cursor.input.len();
+        return None;
+    };
+    cursor.index = scope_end;
+
+    let scope_options = ScopeOptions::parse(options.as_deref(), parent_state, diagnostics);
+    let child_state = ScopeState {
+        default_stroke: scope_options.default_stroke,
+        default_fill: scope_options.default_fill,
+        default_line_width: scope_options.default_line_width,
+        transform: parent_state.transform.compose(scope_options.transform),
+    };
+
+    Some(GraphicGroup {
+        children: materialize_statements(parse_scope_items(
+            &cursor.input[body_start..body_end],
+            child_state,
+            diagnostics,
+        )),
+        default_stroke: scope_options.default_stroke,
+        default_fill: scope_options.default_fill,
+        default_line_width: scope_options.default_line_width,
+        clip_path: None,
+        transform: scope_options.transform,
+    })
+}
+
+fn find_matching_scope_end(input: &str, start: usize) -> Option<(usize, usize)> {
+    let mut depth = 1usize;
+    let mut index = start;
+    let begin_token = "\\begin{scope}";
+    let end_token = "\\end{scope}";
+
+    while index < input.len() {
+        let remaining = &input[index..];
+        let next_begin = remaining.find(begin_token).map(|offset| index + offset);
+        let next_end = remaining.find(end_token).map(|offset| index + offset);
+
+        match (next_begin, next_end) {
+            (Some(begin), Some(end)) if begin < end => {
+                depth += 1;
+                index = begin + begin_token.len();
+            }
+            (_, Some(end)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((end, end + end_token.len()));
+                }
+                index = end + end_token.len();
+            }
+            (Some(begin), None) => {
+                depth += 1;
+                index = begin + begin_token.len();
+            }
+            (None, None) => break,
+        }
+    }
+
+    None
+}
+
 fn parse_statement(
     statement: &str,
-    scene: &mut GraphicsScene,
+    state: ScopeState,
+    items: &mut Vec<ParsedStatement>,
     diagnostics: &mut Vec<TikzDiagnostic>,
 ) {
     if statement.is_empty() {
@@ -62,107 +263,62 @@ fn parse_statement(
     let command = &rest[..command_len];
     let remainder = &rest[command_len..];
     match command {
-        "draw" => parse_path_statement(
-            remainder,
-            Some(named_color("black")),
-            None,
-            scene,
-            diagnostics,
-        ),
-        "fill" => parse_path_statement(
-            remainder,
-            None,
-            Some(named_color("black")),
-            scene,
-            diagnostics,
-        ),
-        "filldraw" => parse_path_statement(
-            remainder,
-            Some(named_color("black")),
-            Some(named_color("black")),
-            scene,
-            diagnostics,
-        ),
-        "node" => parse_node_statement(remainder, scene, diagnostics),
+        "draw" => {
+            if let Some(node) =
+                parse_path_statement(remainder, state, PathCommandKind::Draw, diagnostics)
+            {
+                items.push(ParsedStatement::Node(node));
+            }
+        }
+        "fill" => {
+            if let Some(node) =
+                parse_path_statement(remainder, state, PathCommandKind::Fill, diagnostics)
+            {
+                items.push(ParsedStatement::Node(node));
+            }
+        }
+        "filldraw" => {
+            if let Some(node) =
+                parse_path_statement(remainder, state, PathCommandKind::FillDraw, diagnostics)
+            {
+                items.push(ParsedStatement::Node(node));
+            }
+        }
+        "clip" => {
+            if let Some(clip) = parse_clip_statement(remainder, state, diagnostics) {
+                items.push(ParsedStatement::Clip(clip));
+            }
+        }
+        "node" => {
+            if let Some(node) = parse_node_statement(remainder, state, diagnostics) {
+                items.push(ParsedStatement::Node(node));
+            }
+        }
         unsupported => emit_unsupported(diagnostics, unsupported.to_string()),
     }
 }
 
 fn parse_path_statement(
     statement: &str,
-    default_stroke: Option<Color>,
-    default_fill: Option<Color>,
-    scene: &mut GraphicsScene,
+    state: ScopeState,
+    command_kind: PathCommandKind,
     diagnostics: &mut Vec<TikzDiagnostic>,
-) {
+) -> Option<GraphicNode> {
     let mut cursor = Cursor::new(statement);
     let Some(options) = cursor.parse_optional_bracket_group() else {
         emit_parse_error(diagnostics, "unterminated tikz option list".to_string());
-        return;
-    };
-    let Some(style) = PathStyle::parse(
-        options.as_deref(),
-        default_stroke,
-        default_fill,
-        diagnostics,
-    ) else {
-        return;
+        return None;
     };
 
+    let mut style = PathStyle::parse(options.as_deref(), state, command_kind, diagnostics);
     cursor.skip_whitespace();
-    let Some(start) = cursor.parse_point() else {
-        emit_parse_error(diagnostics, "expected starting coordinate".to_string());
-        return;
-    };
-
-    cursor.skip_whitespace();
-    let path = if cursor.consume_keyword("rectangle") {
+    if let Some(inline_arrows) = cursor.consume_arrow_spec() {
+        style.arrows = inline_arrows;
         cursor.skip_whitespace();
-        let Some(end) = cursor.parse_point() else {
-            emit_parse_error(
-                diagnostics,
-                "rectangle requires an end coordinate".to_string(),
-            );
-            return;
-        };
-        rectangle_path(start, end)
-    } else if cursor.consume_keyword("circle") {
-        cursor.skip_whitespace();
-        let Some(radius) = cursor.parse_circle_radius() else {
-            emit_parse_error(diagnostics, "circle requires a radius".to_string());
-            return;
-        };
-        circle_path(start, radius)
-    } else {
-        let mut path = vec![PathSegment::MoveTo(start)];
-        loop {
-            cursor.skip_whitespace();
-            if cursor.is_eof() {
-                break path;
-            }
-            if !cursor.consume_prefix("--") {
-                emit_parse_error(
-                    diagnostics,
-                    format!(
-                        "unsupported path segment near `{}`",
-                        cursor.remaining().trim()
-                    ),
-                );
-                return;
-            }
+    }
 
-            cursor.skip_whitespace();
-            if cursor.consume_keyword("cycle") {
-                path.push(PathSegment::ClosePath);
-                break path;
-            }
-
-            let Some(point) = cursor.parse_point() else {
-                emit_parse_error(diagnostics, "expected coordinate after `--`".to_string());
-                return;
-            };
-            path.push(PathSegment::LineTo(point));
-        }
+    let Some(path) = parse_path_segments(&mut cursor, diagnostics) else {
+        return None;
     };
 
     cursor.skip_whitespace();
@@ -174,52 +330,90 @@ fn parse_path_statement(
                 cursor.remaining().trim()
             ),
         );
-        return;
+        return None;
     }
 
-    scene.nodes.push(GraphicNode::Vector(VectorPrimitive {
-        path,
-        stroke: style.stroke,
-        fill: style.fill,
-        line_width: style.line_width,
-    }));
+    Some(wrap_with_transform(
+        GraphicNode::Vector(VectorPrimitive {
+            path,
+            stroke: style.stroke,
+            fill: style.fill,
+            line_width: style.line_width,
+            arrows: style.arrows,
+        }),
+        state,
+        style.transform,
+    ))
+}
+
+fn parse_clip_statement(
+    statement: &str,
+    state: ScopeState,
+    diagnostics: &mut Vec<TikzDiagnostic>,
+) -> Option<ClipGroupSpec> {
+    let mut cursor = Cursor::new(statement);
+    let Some(options) = cursor.parse_optional_bracket_group() else {
+        emit_parse_error(diagnostics, "unterminated tikz option list".to_string());
+        return None;
+    };
+
+    let style = PathStyle::parse(
+        options.as_deref(),
+        state,
+        PathCommandKind::Clip,
+        diagnostics,
+    );
+    let path = parse_path_segments(&mut cursor, diagnostics)?;
+
+    cursor.skip_whitespace();
+    if !cursor.is_eof() {
+        emit_parse_error(
+            diagnostics,
+            format!(
+                "could not parse tikz path tail `{}`",
+                cursor.remaining().trim()
+            ),
+        );
+        return None;
+    }
+
+    Some(ClipGroupSpec {
+        default_stroke: state.default_stroke,
+        default_fill: state.default_fill,
+        default_line_width: state.default_line_width,
+        clip_path: path,
+        transform: style.transform,
+    })
 }
 
 fn parse_node_statement(
     statement: &str,
-    scene: &mut GraphicsScene,
+    state: ScopeState,
     diagnostics: &mut Vec<TikzDiagnostic>,
-) {
+) -> Option<GraphicNode> {
     let mut cursor = Cursor::new(statement);
     let Some(options) = cursor.parse_optional_bracket_group() else {
         emit_parse_error(diagnostics, "unterminated tikz option list".to_string());
-        return;
+        return None;
     };
-    if let Some(options) = options.as_deref() {
-        for option in split_options(options) {
-            if !option.is_empty() {
-                emit_unsupported(diagnostics, option.to_string());
-                return;
-            }
-        }
-    }
+    let transform = parse_node_options(options.as_deref(), diagnostics);
 
     cursor.skip_whitespace();
     if !cursor.consume_keyword("at") {
         emit_parse_error(diagnostics, "node requires `at (x,y)`".to_string());
-        return;
+        return None;
     }
 
     cursor.skip_whitespace();
     let Some(position) = cursor.parse_point() else {
         emit_parse_error(diagnostics, "node requires a coordinate".to_string());
-        return;
+        return None;
     };
 
     cursor.skip_whitespace();
     let Some(content) = cursor.parse_braced_text() else {
         emit_parse_error(diagnostics, "node requires braced text".to_string());
-        return;
+        return None;
     };
 
     cursor.skip_whitespace();
@@ -228,12 +422,76 @@ fn parse_node_statement(
             diagnostics,
             format!("unexpected node tail `{}`", cursor.remaining().trim()),
         );
-        return;
+        return None;
     }
 
-    scene
-        .nodes
-        .push(GraphicNode::Text(GraphicText { position, content }));
+    Some(wrap_with_transform(
+        GraphicNode::Text(GraphicText { position, content }),
+        state,
+        transform,
+    ))
+}
+
+fn parse_path_segments(
+    cursor: &mut Cursor<'_>,
+    diagnostics: &mut Vec<TikzDiagnostic>,
+) -> Option<Vec<PathSegment>> {
+    cursor.skip_whitespace();
+    let Some(start) = cursor.parse_point() else {
+        emit_parse_error(diagnostics, "expected starting coordinate".to_string());
+        return None;
+    };
+
+    cursor.skip_whitespace();
+    if cursor.consume_keyword("rectangle") {
+        cursor.skip_whitespace();
+        let Some(end) = cursor.parse_point() else {
+            emit_parse_error(
+                diagnostics,
+                "rectangle requires an end coordinate".to_string(),
+            );
+            return None;
+        };
+        return Some(rectangle_path(start, end));
+    }
+    if cursor.consume_keyword("circle") {
+        cursor.skip_whitespace();
+        let Some(radius) = cursor.parse_circle_radius() else {
+            emit_parse_error(diagnostics, "circle requires a radius".to_string());
+            return None;
+        };
+        return Some(circle_path(start, radius));
+    }
+
+    let mut path = vec![PathSegment::MoveTo(start)];
+    loop {
+        cursor.skip_whitespace();
+        if cursor.is_eof() {
+            return Some(path);
+        }
+        if !cursor.consume_prefix("--") {
+            emit_parse_error(
+                diagnostics,
+                format!(
+                    "unsupported path segment near `{}`",
+                    cursor.remaining().trim()
+                ),
+            );
+            return None;
+        }
+
+        cursor.skip_whitespace();
+        if cursor.consume_keyword("cycle") {
+            path.push(PathSegment::ClosePath);
+            return Some(path);
+        }
+
+        let Some(point) = cursor.parse_point() else {
+            emit_parse_error(diagnostics, "expected coordinate after `--`".to_string());
+            return None;
+        };
+        path.push(PathSegment::LineTo(point));
+    }
 }
 
 fn rectangle_path(start: Point, end: Point) -> Vec<PathSegment> {
@@ -320,36 +578,6 @@ fn circle_path(center: Point, radius: f64) -> Vec<PathSegment> {
     ]
 }
 
-fn split_statements(content: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    let mut start = 0usize;
-    let mut brace_depth = 0usize;
-    let mut bracket_depth = 0usize;
-    let mut paren_depth = 0usize;
-
-    for (index, ch) in content.char_indices() {
-        match ch {
-            '{' => brace_depth += 1,
-            '}' => brace_depth = brace_depth.saturating_sub(1),
-            '[' => bracket_depth += 1,
-            ']' => bracket_depth = bracket_depth.saturating_sub(1),
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.saturating_sub(1),
-            ';' if brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 => {
-                statements.push(&content[start..index]);
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    if start < content.len() {
-        statements.push(&content[start..]);
-    }
-
-    statements
-}
-
 fn split_options(options: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0usize;
@@ -373,28 +601,30 @@ fn split_options(options: &str) -> Vec<&str> {
     result
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PathStyle {
-    stroke: Option<Color>,
-    fill: Option<Color>,
-    line_width: f64,
-}
-
 impl PathStyle {
     fn parse(
         options: Option<&str>,
-        default_stroke: Option<Color>,
-        default_fill: Option<Color>,
+        state: ScopeState,
+        command_kind: PathCommandKind,
         diagnostics: &mut Vec<TikzDiagnostic>,
-    ) -> Option<Self> {
+    ) -> Self {
         let mut style = Self {
-            stroke: default_stroke,
-            fill: default_fill,
-            line_width: DEFAULT_LINE_WIDTH_PT,
+            stroke: state.default_stroke,
+            fill: state.default_fill,
+            line_width: state.default_line_width.unwrap_or(DEFAULT_LINE_WIDTH_PT),
+            transform: Transform2D::default(),
+            arrows: ArrowSpec::None,
         };
 
+        if command_kind.uses_stroke() && style.stroke.is_none() {
+            style.stroke = Some(named_color("black"));
+        }
+        if command_kind.uses_fill() && style.fill.is_none() {
+            style.fill = Some(named_color("black"));
+        }
+
         let Some(options) = options else {
-            return Some(style);
+            return style;
         };
 
         for option in split_options(options) {
@@ -402,61 +632,184 @@ impl PathStyle {
                 continue;
             }
 
-            let Some((key, value)) = option
-                .split_once('=')
-                .map(|(key, value)| (key.trim(), Some(value.trim())))
-                .or_else(|| Some((option.trim(), None)))
-            else {
+            if let Some(arrows) = parse_arrow_option(option) {
+                style.arrows = arrows;
                 continue;
-            };
+            }
 
-            match (key, value) {
+            match split_option(option) {
                 ("draw", None) => style.stroke = Some(named_color("black")),
                 ("fill", None) => style.fill = Some(named_color("black")),
                 ("draw", Some(color_name)) => {
-                    let Some(color) = resolve_named_color(color_name) else {
+                    if let Some(color) = resolve_named_color(color_name) {
+                        style.stroke = Some(color);
+                    } else {
                         emit_unsupported(diagnostics, option.to_string());
-                        return None;
-                    };
-                    style.stroke = Some(color);
+                    }
                 }
                 ("fill", Some(color_name)) => {
-                    let Some(color) = resolve_named_color(color_name) else {
+                    if let Some(color) = resolve_named_color(color_name) {
+                        style.fill = Some(color);
+                    } else {
                         emit_unsupported(diagnostics, option.to_string());
-                        return None;
-                    };
-                    style.fill = Some(color);
+                    }
                 }
                 ("line width", Some(value)) => {
                     let Some(line_width) = parse_length(value, false) else {
                         emit_parse_error(diagnostics, format!("invalid line width `{value}`"));
-                        return None;
+                        continue;
                     };
                     style.line_width = line_width;
                 }
-                (color_name, None) => {
-                    let Some(color) = resolve_named_color(color_name) else {
-                        emit_unsupported(diagnostics, option.to_string());
-                        return None;
-                    };
-                    match (default_stroke.is_some(), default_fill.is_some()) {
-                        (true, true) => {
-                            style.stroke = Some(color);
-                            style.fill = Some(color);
-                        }
-                        (true, false) => style.stroke = Some(color),
-                        (false, true) => style.fill = Some(color),
-                        (false, false) => {}
+                ("xshift", Some(value)) => {
+                    if let Some(length) = parse_length(value, false) {
+                        style.transform.x_shift = length;
+                    } else {
+                        emit_parse_error(diagnostics, format!("invalid xshift `{value}`"));
                     }
                 }
-                _ => {
-                    emit_unsupported(diagnostics, option.to_string());
-                    return None;
+                ("yshift", Some(value)) => {
+                    if let Some(length) = parse_length(value, false) {
+                        style.transform.y_shift = length;
+                    } else {
+                        emit_parse_error(diagnostics, format!("invalid yshift `{value}`"));
+                    }
                 }
+                ("shift", Some(value)) => match parse_shift(value) {
+                    Some(point) => {
+                        style.transform.x_shift = point.x;
+                        style.transform.y_shift = point.y;
+                    }
+                    None => emit_parse_error(diagnostics, format!("invalid shift `{value}`")),
+                },
+                ("scale", Some(value)) => match value.parse::<f64>() {
+                    Ok(scale) if scale.is_finite() => style.transform.scale = scale,
+                    _ => emit_parse_error(diagnostics, format!("invalid scale `{value}`")),
+                },
+                ("rotate", Some(value)) => match value.parse::<f64>() {
+                    Ok(rotate) if rotate.is_finite() => style.transform.rotate = rotate,
+                    _ => emit_parse_error(diagnostics, format!("invalid rotate `{value}`")),
+                },
+                (color_name, None) => {
+                    if let Some(color) = resolve_named_color(color_name) {
+                        match (style.stroke.is_some(), style.fill.is_some()) {
+                            (true, true) => {
+                                style.stroke = Some(color);
+                                style.fill = Some(color);
+                            }
+                            (true, false) => style.stroke = Some(color),
+                            (false, true) => style.fill = Some(color),
+                            (false, false) => {}
+                        }
+                    } else {
+                        emit_unsupported(diagnostics, option.to_string());
+                    }
+                }
+                _ => emit_unsupported(diagnostics, option.to_string()),
             }
         }
 
-        Some(style)
+        style
+    }
+}
+
+impl PathCommandKind {
+    fn uses_stroke(self) -> bool {
+        matches!(self, Self::Draw | Self::FillDraw)
+    }
+
+    fn uses_fill(self) -> bool {
+        matches!(self, Self::Fill | Self::FillDraw)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScopeOptions {
+    default_stroke: Option<Color>,
+    default_fill: Option<Color>,
+    default_line_width: Option<f64>,
+    transform: Transform2D,
+}
+
+impl ScopeOptions {
+    fn parse(
+        options: Option<&str>,
+        parent: ScopeState,
+        diagnostics: &mut Vec<TikzDiagnostic>,
+    ) -> Self {
+        let mut parsed = Self {
+            default_stroke: parent.default_stroke,
+            default_fill: parent.default_fill,
+            default_line_width: parent.default_line_width,
+            transform: Transform2D::default(),
+        };
+
+        let Some(options) = options else {
+            return parsed;
+        };
+
+        for option in split_options(options) {
+            if option.is_empty() {
+                continue;
+            }
+
+            match split_option(option) {
+                ("draw", None) => parsed.default_stroke = Some(named_color("black")),
+                ("fill", None) => parsed.default_fill = Some(named_color("black")),
+                ("draw", Some(color_name)) => {
+                    if let Some(color) = resolve_named_color(color_name) {
+                        parsed.default_stroke = Some(color);
+                    } else {
+                        emit_unsupported(diagnostics, option.to_string());
+                    }
+                }
+                ("fill", Some(color_name)) => {
+                    if let Some(color) = resolve_named_color(color_name) {
+                        parsed.default_fill = Some(color);
+                    } else {
+                        emit_unsupported(diagnostics, option.to_string());
+                    }
+                }
+                ("line width", Some(value)) => match parse_length(value, false) {
+                    Some(line_width) => parsed.default_line_width = Some(line_width),
+                    None => emit_parse_error(diagnostics, format!("invalid line width `{value}`")),
+                },
+                ("xshift", Some(value)) => match parse_length(value, false) {
+                    Some(length) => parsed.transform.x_shift = length,
+                    None => emit_parse_error(diagnostics, format!("invalid xshift `{value}`")),
+                },
+                ("yshift", Some(value)) => match parse_length(value, false) {
+                    Some(length) => parsed.transform.y_shift = length,
+                    None => emit_parse_error(diagnostics, format!("invalid yshift `{value}`")),
+                },
+                ("shift", Some(value)) => match parse_shift(value) {
+                    Some(point) => {
+                        parsed.transform.x_shift = point.x;
+                        parsed.transform.y_shift = point.y;
+                    }
+                    None => emit_parse_error(diagnostics, format!("invalid shift `{value}`")),
+                },
+                ("scale", Some(value)) => match value.parse::<f64>() {
+                    Ok(scale) if scale.is_finite() => parsed.transform.scale = scale,
+                    _ => emit_parse_error(diagnostics, format!("invalid scale `{value}`")),
+                },
+                ("rotate", Some(value)) => match value.parse::<f64>() {
+                    Ok(rotate) if rotate.is_finite() => parsed.transform.rotate = rotate,
+                    _ => emit_parse_error(diagnostics, format!("invalid rotate `{value}`")),
+                },
+                (color_name, None) => {
+                    if let Some(color) = resolve_named_color(color_name) {
+                        parsed.default_stroke = Some(color);
+                        parsed.default_fill = Some(color);
+                    } else {
+                        emit_unsupported(diagnostics, option.to_string());
+                    }
+                }
+                _ => emit_unsupported(diagnostics, option.to_string()),
+            }
+        }
+
+        parsed
     }
 }
 
@@ -510,6 +863,19 @@ impl<'a> Cursor<'a> {
 
         self.index += keyword.len();
         true
+    }
+
+    fn consume_arrow_spec(&mut self) -> Option<ArrowSpec> {
+        for (token, arrows) in [
+            ("<->", ArrowSpec::Both),
+            ("->", ArrowSpec::Forward),
+            ("<-", ArrowSpec::Backward),
+        ] {
+            if self.consume_prefix(token) {
+                return Some(arrows);
+            }
+        }
+        None
     }
 
     fn parse_optional_bracket_group(&mut self) -> Option<Option<String>> {
@@ -617,6 +983,32 @@ impl<'a> Cursor<'a> {
         self.index += token_len;
         Some(value)
     }
+
+    fn parse_statement_chunk(&mut self) -> Option<&'a str> {
+        let start = self.index;
+        let mut brace_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut paren_depth = 0usize;
+
+        while self.index < self.input.len() {
+            let ch = self.remaining().chars().next()?;
+            self.index += ch.len_utf8();
+            match ch {
+                '{' => brace_depth += 1,
+                '}' => brace_depth = brace_depth.saturating_sub(1),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                ';' if brace_depth == 0 && bracket_depth == 0 && paren_depth == 0 => {
+                    return Some(&self.input[start..self.index - 1]);
+                }
+                _ => {}
+            }
+        }
+
+        (start < self.input.len()).then(|| self.input[start..].trim_end())
+    }
 }
 
 fn parse_length(token: &str, default_cm: bool) -> Option<f64> {
@@ -630,6 +1022,95 @@ fn parse_length(token: &str, default_cm: bool) -> Option<f64> {
     };
     let value = number.trim().parse::<f64>().ok()?;
     value.is_finite().then_some(value * unit_factor)
+}
+
+fn parse_shift(value: &str) -> Option<Point> {
+    let trimmed = value.trim();
+    let coordinate = trimmed
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    let mut cursor = Cursor::new(coordinate);
+    let point = cursor.parse_point()?;
+    cursor.skip_whitespace();
+    cursor.is_eof().then_some(point)
+}
+
+fn split_option(option: &str) -> (&str, Option<&str>) {
+    option
+        .split_once('=')
+        .map(|(key, value)| (key.trim(), Some(value.trim())))
+        .unwrap_or((option.trim(), None))
+}
+
+fn parse_arrow_option(option: &str) -> Option<ArrowSpec> {
+    match option.trim() {
+        "->" => Some(ArrowSpec::Forward),
+        "<-" => Some(ArrowSpec::Backward),
+        "<->" => Some(ArrowSpec::Both),
+        _ => None,
+    }
+}
+
+fn parse_node_options(options: Option<&str>, diagnostics: &mut Vec<TikzDiagnostic>) -> Transform2D {
+    let mut transform = Transform2D::default();
+    let Some(options) = options else {
+        return transform;
+    };
+
+    for option in split_options(options) {
+        if option.is_empty() {
+            continue;
+        }
+
+        match split_option(option) {
+            ("xshift", Some(value)) => match parse_length(value, false) {
+                Some(length) => transform.x_shift = length,
+                None => emit_parse_error(diagnostics, format!("invalid xshift `{value}`")),
+            },
+            ("yshift", Some(value)) => match parse_length(value, false) {
+                Some(length) => transform.y_shift = length,
+                None => emit_parse_error(diagnostics, format!("invalid yshift `{value}`")),
+            },
+            ("shift", Some(value)) => match parse_shift(value) {
+                Some(point) => {
+                    transform.x_shift = point.x;
+                    transform.y_shift = point.y;
+                }
+                None => emit_parse_error(diagnostics, format!("invalid shift `{value}`")),
+            },
+            ("scale", Some(value)) => match value.parse::<f64>() {
+                Ok(scale) if scale.is_finite() => transform.scale = scale,
+                _ => emit_parse_error(diagnostics, format!("invalid scale `{value}`")),
+            },
+            ("rotate", Some(value)) => match value.parse::<f64>() {
+                Ok(rotate) if rotate.is_finite() => transform.rotate = rotate,
+                _ => emit_parse_error(diagnostics, format!("invalid rotate `{value}`")),
+            },
+            _ => emit_unsupported(diagnostics, option.to_string()),
+        }
+    }
+
+    transform
+}
+
+fn wrap_with_transform(
+    node: GraphicNode,
+    state: ScopeState,
+    transform: Transform2D,
+) -> GraphicNode {
+    if transform == Transform2D::default() {
+        return node;
+    }
+
+    GraphicNode::Group(GraphicGroup {
+        children: vec![node],
+        default_stroke: state.default_stroke,
+        default_fill: state.default_fill,
+        default_line_width: state.default_line_width,
+        clip_path: None,
+        transform,
+    })
 }
 
 fn resolve_named_color(name: &str) -> Option<Color> {
@@ -684,7 +1165,8 @@ fn emit_parse_error(diagnostics: &mut Vec<TikzDiagnostic>, message: String) {
 #[cfg(test)]
 mod tests {
     use crate::graphics::api::{
-        compile_graphics_scene, GraphicNode, GraphicText, GraphicsScene, PathSegment, Point,
+        compile_graphics_scene, ArrowSpec, GraphicGroup, GraphicNode, GraphicText, GraphicsScene,
+        PathSegment, Point, Transform2D, VectorPrimitive,
     };
 
     use super::{circle_path, named_color, parse_tikzpicture, TikzDiagnostic, CM_IN_PT, KAPPA};
@@ -723,6 +1205,7 @@ mod tests {
                 stroke: Some(named_color("black")),
                 fill: None,
                 line_width: 0.4,
+                arrows: ArrowSpec::None,
             })]
         );
     }
@@ -754,6 +1237,7 @@ mod tests {
                 stroke: Some(named_color("black")),
                 fill: None,
                 line_width: 0.4,
+                arrows: ArrowSpec::None,
             })]
         );
     }
@@ -768,6 +1252,7 @@ mod tests {
         };
         assert_eq!(primitive.fill, Some(named_color("red")));
         assert_eq!(primitive.stroke, None);
+        assert_eq!(primitive.arrows, ArrowSpec::None);
         assert_eq!(primitive.path.len(), 6);
         assert!(matches!(
             primitive.path.first(),
@@ -840,6 +1325,7 @@ mod tests {
         };
         assert_eq!(primitive.stroke, Some(named_color("black")));
         assert_eq!(primitive.fill, Some(named_color("blue")));
+        assert_eq!(primitive.arrows, ArrowSpec::None);
     }
 
     #[test]
@@ -859,15 +1345,47 @@ mod tests {
     }
 
     #[test]
-    fn reports_unsupported_command_without_crashing() {
-        let result = parse_tikzpicture(r"\clip (0,0) rectangle (1,1);");
+    fn parses_clip_command_into_group() {
+        let result = parse_tikzpicture(r"\clip (0,0) rectangle (1,1);\draw (0,0) -- (1,0);");
 
-        assert!(result.scene.nodes.is_empty());
+        assert!(result.diagnostics.is_empty());
         assert_eq!(
-            result.diagnostics,
-            vec![TikzDiagnostic::UnsupportedCommand {
-                command: "clip".to_string(),
-            }]
+            result.scene.nodes,
+            vec![GraphicNode::Group(GraphicGroup {
+                children: vec![GraphicNode::Vector(VectorPrimitive {
+                    path: vec![
+                        PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                        PathSegment::LineTo(Point {
+                            x: CM_IN_PT,
+                            y: 0.0,
+                        }),
+                    ],
+                    stroke: Some(named_color("black")),
+                    fill: None,
+                    line_width: 0.4,
+                    arrows: ArrowSpec::None,
+                })],
+                default_stroke: None,
+                default_fill: None,
+                default_line_width: Some(0.4),
+                clip_path: Some(vec![
+                    PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                    PathSegment::LineTo(Point {
+                        x: CM_IN_PT,
+                        y: 0.0,
+                    }),
+                    PathSegment::LineTo(Point {
+                        x: CM_IN_PT,
+                        y: CM_IN_PT,
+                    }),
+                    PathSegment::LineTo(Point {
+                        x: 0.0,
+                        y: CM_IN_PT,
+                    }),
+                    PathSegment::ClosePath,
+                ]),
+                transform: Transform2D::default(),
+            })]
         );
     }
 
@@ -892,5 +1410,161 @@ mod tests {
             graphics_box.height.0,
             (2.0 * CM_IN_PT * 65_536.0).round() as i64
         );
+    }
+
+    #[test]
+    fn parses_scope_style_inheritance_and_override() {
+        let result = parse_tikzpicture(
+            r"\begin{scope}[draw=red]
+                \draw (0,0) -- (1,0);
+                \begin{scope}[draw=blue]
+                    \draw (0,1) -- (1,1);
+                \end{scope}
+            \end{scope}",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Group(outer)] = result.scene.nodes.as_slice() else {
+            panic!("expected outer scope group");
+        };
+        assert_eq!(outer.default_stroke, Some(named_color("red")));
+        let [GraphicNode::Vector(red_line), GraphicNode::Group(inner)] = outer.children.as_slice()
+        else {
+            panic!("expected outer vector and inner scope");
+        };
+        assert_eq!(red_line.stroke, Some(named_color("red")));
+        assert_eq!(inner.default_stroke, Some(named_color("blue")));
+        let [GraphicNode::Vector(blue_line)] = inner.children.as_slice() else {
+            panic!("expected inner vector");
+        };
+        assert_eq!(blue_line.stroke, Some(named_color("blue")));
+    }
+
+    #[test]
+    fn parses_three_level_nested_scopes() {
+        let result = parse_tikzpicture(
+            r"\begin{scope}[draw=red]
+                \begin{scope}[draw=green]
+                    \begin{scope}[draw=blue]
+                        \draw (0,0) -- (1,0);
+                    \end{scope}
+                \end{scope}
+            \end{scope}",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Group(level1)] = result.scene.nodes.as_slice() else {
+            panic!("expected level1 group");
+        };
+        let [GraphicNode::Group(level2)] = level1.children.as_slice() else {
+            panic!("expected level2 group");
+        };
+        let [GraphicNode::Group(level3)] = level2.children.as_slice() else {
+            panic!("expected level3 group");
+        };
+        let [GraphicNode::Vector(line)] = level3.children.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(level1.default_stroke, Some(named_color("red")));
+        assert_eq!(level2.default_stroke, Some(named_color("green")));
+        assert_eq!(level3.default_stroke, Some(named_color("blue")));
+        assert_eq!(line.stroke, Some(named_color("blue")));
+    }
+
+    #[test]
+    fn parses_scope_and_command_transforms() {
+        let result = parse_tikzpicture(
+            r"\begin{scope}[shift={(1,2)}]
+                \draw[xshift=10pt,yshift=5pt,scale=2,rotate=45] (0,0) -- (1,0);
+            \end{scope}",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Group(scope)] = result.scene.nodes.as_slice() else {
+            panic!("expected scope group");
+        };
+        assert_eq!(
+            scope.transform,
+            Transform2D {
+                x_shift: CM_IN_PT,
+                y_shift: 2.0 * CM_IN_PT,
+                scale: 1.0,
+                rotate: 0.0,
+            }
+        );
+        let [GraphicNode::Group(local_transform_group)] = scope.children.as_slice() else {
+            panic!("expected local transform wrapper");
+        };
+        assert_eq!(
+            local_transform_group.transform,
+            Transform2D {
+                x_shift: 10.0,
+                y_shift: 5.0,
+                scale: 2.0,
+                rotate: 45.0,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_arrow_options() {
+        let result = parse_tikzpicture(
+            r"\draw[->] (0,0) -- (1,0);
+               \draw[<-] (0,1) -- (1,1);
+               \draw[<->] (0,2) -- (1,2);",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(forward), GraphicNode::Vector(backward), GraphicNode::Vector(both)] =
+            result.scene.nodes.as_slice()
+        else {
+            panic!("expected three vector nodes");
+        };
+        assert_eq!(forward.arrows, ArrowSpec::Forward);
+        assert_eq!(backward.arrows, ArrowSpec::Backward);
+        assert_eq!(both.arrows, ArrowSpec::Both);
+    }
+
+    #[test]
+    fn unsupported_scope_options_emit_diagnostics_but_preserve_supported_ones() {
+        let result = parse_tikzpicture(
+            r"\begin{scope}[draw=red,foo=bar]
+                \draw (0,0) -- (1,0);
+            \end{scope}",
+        );
+
+        assert_eq!(
+            result.diagnostics,
+            vec![TikzDiagnostic::UnsupportedCommand {
+                command: "foo=bar".to_string(),
+            }]
+        );
+        let [GraphicNode::Group(scope)] = result.scene.nodes.as_slice() else {
+            panic!("expected scope group");
+        };
+        assert_eq!(scope.default_stroke, Some(named_color("red")));
+    }
+
+    #[test]
+    fn compile_graphics_scene_from_grouped_tikz_result_uses_bounds() {
+        let parsed = parse_tikzpicture(
+            r"\begin{scope}[xshift=1cm,yshift=2cm]
+                \draw (0,0) rectangle (2,1);
+            \end{scope}",
+        );
+        let graphics_box = compile_graphics_scene(parsed.scene);
+
+        assert_eq!(
+            graphics_box.width.0,
+            (2.0 * CM_IN_PT * 65_536.0).round() as i64
+        );
+        assert_eq!(graphics_box.height.0, (CM_IN_PT * 65_536.0).round() as i64);
+        assert!(matches!(
+            graphics_box
+                .scene
+                .as_ref()
+                .map(|scene| scene.nodes.as_slice()),
+            Some([GraphicNode::Group(_)])
+        ));
     }
 }

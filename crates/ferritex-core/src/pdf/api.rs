@@ -1,7 +1,9 @@
 use std::thread;
 
 use crate::compilation::{CommitBarrier, DocumentPartitionPlan, LinkStyle, StageCommitPayload};
-use crate::graphics::api::{Color, GraphicNode, GraphicsScene, ImageColorSpace, PathSegment};
+use crate::graphics::api::{
+    ArrowSpec, Color, GraphicGroup, GraphicNode, GraphicsScene, ImageColorSpace, PathSegment, Point,
+};
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
     FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage,
@@ -1058,11 +1060,7 @@ fn render_graphics_scene_placement(
 ) -> String {
     let mut body = String::new();
     for node in &scene.nodes {
-        match node {
-            GraphicNode::Vector(primitive) => body.push_str(&render_vector_primitive(primitive)),
-            GraphicNode::Text(text) => body.push_str(&render_graphic_text(text)),
-            GraphicNode::External(_) | GraphicNode::Pdf(_) => {}
-        }
+        body.push_str(&render_graphic_node(node));
     }
 
     if body.is_empty() {
@@ -1075,6 +1073,45 @@ fn render_graphics_scene_placement(
         pdf_real(dimension_to_pdf_number(y)),
         body
     )
+}
+
+fn render_graphic_node(node: &GraphicNode) -> String {
+    match node {
+        GraphicNode::External(_) | GraphicNode::Pdf(_) => String::new(),
+        GraphicNode::Group(group) => render_graphic_group(group),
+        GraphicNode::Vector(primitive) => render_vector_primitive(primitive),
+        GraphicNode::Text(text) => render_graphic_text(text),
+    }
+}
+
+fn render_graphic_group(group: &GraphicGroup) -> String {
+    let mut body = String::new();
+    body.push_str("q\n");
+
+    let radians = group.transform.rotate.to_radians();
+    let cos_theta = radians.cos() * group.transform.scale;
+    let sin_theta = radians.sin() * group.transform.scale;
+    body.push_str(&format!(
+        "{} {} {} {} {} {} cm\n",
+        pdf_real(cos_theta),
+        pdf_real(sin_theta),
+        pdf_real(-sin_theta),
+        pdf_real(cos_theta),
+        pdf_real(group.transform.x_shift),
+        pdf_real(group.transform.y_shift),
+    ));
+
+    if let Some(clip_path) = &group.clip_path {
+        body.push_str(&render_path_segments(clip_path));
+        body.push_str("W n\n");
+    }
+
+    for child in &group.children {
+        body.push_str(&render_graphic_node(child));
+    }
+
+    body.push_str("Q\n");
+    body
 }
 
 fn render_vector_primitive(primitive: &crate::graphics::api::VectorPrimitive) -> String {
@@ -1091,7 +1128,24 @@ fn render_vector_primitive(primitive: &crate::graphics::api::VectorPrimitive) ->
         stream.push_str(&pdf_rgb_operator(color_components(fill)));
     }
 
-    for segment in &primitive.path {
+    stream.push_str(&render_path_segments(&primitive.path));
+
+    stream.push_str(
+        match (primitive.stroke.is_some(), primitive.fill.is_some()) {
+            (true, true) => "B\n",
+            (true, false) => "S\n",
+            (false, true) => "f\n",
+            (false, false) => "n\n",
+        },
+    );
+
+    stream.push_str(&render_arrowheads(primitive));
+    stream
+}
+
+fn render_path_segments(path: &[PathSegment]) -> String {
+    let mut stream = String::new();
+    for segment in path {
         match segment {
             PathSegment::MoveTo(point) => {
                 stream.push_str(&format!("{} {} m\n", pdf_real(point.x), pdf_real(point.y)));
@@ -1117,16 +1171,119 @@ fn render_vector_primitive(primitive: &crate::graphics::api::VectorPrimitive) ->
             PathSegment::ClosePath => stream.push_str("h\n"),
         }
     }
-
-    stream.push_str(
-        match (primitive.stroke.is_some(), primitive.fill.is_some()) {
-            (true, true) => "B\n",
-            (true, false) => "S\n",
-            (false, true) => "f\n",
-            (false, false) => "n\n",
-        },
-    );
     stream
+}
+
+fn render_arrowheads(primitive: &crate::graphics::api::VectorPrimitive) -> String {
+    if primitive.arrows == ArrowSpec::None {
+        return String::new();
+    }
+
+    let Some(color) = primitive.stroke.or(primitive.fill).or(Some(Color {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+    })) else {
+        return String::new();
+    };
+
+    let (start, end) = path_arrow_anchors(&primitive.path);
+    let mut stream = String::new();
+
+    if matches!(primitive.arrows, ArrowSpec::Backward | ArrowSpec::Both) {
+        if let Some((tip, reference)) = start {
+            stream.push_str(&render_arrowhead(tip, reference, color));
+        }
+    }
+    if matches!(primitive.arrows, ArrowSpec::Forward | ArrowSpec::Both) {
+        if let Some((tip, reference)) = end {
+            stream.push_str(&render_arrowhead(tip, reference, color));
+        }
+    }
+
+    stream
+}
+
+fn path_arrow_anchors(path: &[PathSegment]) -> (Option<(Point, Point)>, Option<(Point, Point)>) {
+    let mut current = None;
+    let mut subpath_start = None;
+    let mut first_anchor = None;
+    let mut last_anchor = None;
+
+    for segment in path {
+        match segment {
+            PathSegment::MoveTo(point) => {
+                current = Some(*point);
+                subpath_start = Some(*point);
+            }
+            PathSegment::LineTo(point) => {
+                if let Some(start) = current {
+                    first_anchor.get_or_insert((start, *point));
+                    last_anchor = Some((*point, start));
+                }
+                current = Some(*point);
+            }
+            PathSegment::CurveTo {
+                control1,
+                control2,
+                end,
+            } => {
+                if let Some(start) = current {
+                    first_anchor.get_or_insert((start, *control1));
+                    last_anchor = Some((*end, *control2));
+                }
+                current = Some(*end);
+            }
+            PathSegment::ClosePath => {
+                if let (Some(start), Some(end)) = (subpath_start, current) {
+                    if end != start {
+                        first_anchor.get_or_insert((start, end));
+                        last_anchor = Some((start, end));
+                    }
+                    current = Some(start);
+                }
+            }
+        }
+    }
+
+    (first_anchor, last_anchor)
+}
+
+fn render_arrowhead(tip: Point, reference: Point, color: Color) -> String {
+    let dx = tip.x - reference.x;
+    let dy = tip.y - reference.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f64::EPSILON {
+        return String::new();
+    }
+
+    let ux = dx / length;
+    let uy = dy / length;
+    let arrow_length = 4.0;
+    let half_width = 2.0;
+    let base = Point {
+        x: tip.x - (ux * arrow_length),
+        y: tip.y - (uy * arrow_length),
+    };
+    let left = Point {
+        x: base.x - (uy * half_width),
+        y: base.y + (ux * half_width),
+    };
+    let right = Point {
+        x: base.x + (uy * half_width),
+        y: base.y - (ux * half_width),
+    };
+
+    format!(
+        "{}{} {} m\n{} {} l\n{} {} l\nh\nf\n",
+        pdf_rgb_operator(color_components(color)),
+        pdf_real(tip.x),
+        pdf_real(tip.y),
+        pdf_real(left.x),
+        pdf_real(left.y),
+        pdf_real(right.x),
+        pdf_real(right.y),
+    )
 }
 
 fn render_graphic_text(text: &crate::graphics::api::GraphicText) -> String {
@@ -1470,8 +1627,9 @@ mod tests {
         DocumentPartitionPlan, DocumentWorkUnit, LinkStyle, PartitionKind, PartitionLocator,
     };
     use crate::graphics::api::{
-        Color, ExternalGraphic, GraphicNode, GraphicText, GraphicsScene, ImageMetadata,
-        PathSegment, PdfGraphic, PdfGraphicMetadata, Point, VectorPrimitive,
+        ArrowSpec, Color, ExternalGraphic, GraphicGroup, GraphicNode, GraphicText, GraphicsScene,
+        ImageMetadata, PathSegment, PdfGraphic, PdfGraphicMetadata, Point, Transform2D,
+        VectorPrimitive,
     };
     use crate::kernel::api::{DimensionValue, StableId};
     use crate::typesetting::api::{
@@ -1580,6 +1738,66 @@ mod tests {
                     b: 1.0,
                 }),
                 line_width: 0.4,
+                arrows: ArrowSpec::None,
+            })],
+        }
+    }
+
+    fn grouped_vector_scene() -> GraphicsScene {
+        GraphicsScene {
+            nodes: vec![GraphicNode::Group(GraphicGroup {
+                children: vec![GraphicNode::Vector(VectorPrimitive {
+                    path: vec![
+                        PathSegment::MoveTo(Point { x: 1.0, y: 1.0 }),
+                        PathSegment::LineTo(Point { x: 8.0, y: 8.0 }),
+                    ],
+                    stroke: Some(Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                    }),
+                    fill: None,
+                    line_width: 0.4,
+                    arrows: ArrowSpec::None,
+                })],
+                default_stroke: Some(Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                }),
+                default_fill: None,
+                default_line_width: Some(0.4),
+                clip_path: Some(vec![
+                    PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                    PathSegment::LineTo(Point { x: 10.0, y: 0.0 }),
+                    PathSegment::LineTo(Point { x: 10.0, y: 10.0 }),
+                    PathSegment::ClosePath,
+                ]),
+                transform: Transform2D {
+                    x_shift: 5.0,
+                    y_shift: 7.0,
+                    scale: 2.0,
+                    rotate: 90.0,
+                },
+            })],
+        }
+    }
+
+    fn arrow_scene(arrows: ArrowSpec) -> GraphicsScene {
+        GraphicsScene {
+            nodes: vec![GraphicNode::Vector(VectorPrimitive {
+                path: vec![
+                    PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                    PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                ],
+                stroke: Some(Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                }),
+                fill: None,
+                line_width: 0.4,
+                arrows,
             })],
         }
     }
@@ -1797,6 +2015,57 @@ mod tests {
         assert!(content.contains("20 20 l"));
         assert!(content.contains("h"));
         assert!(content.contains("B"));
+    }
+
+    #[test]
+    fn emits_group_transform_and_clip_operators() {
+        let document = single_page_with_images(
+            &[],
+            vec![TypesetImage {
+                scene: grouped_vector_scene(),
+                x: points(72),
+                y: points(600),
+                display_width: points(20),
+                display_height: points(20),
+            }],
+        );
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("q 1 0 0 1 72 600 cm"));
+        assert!(content.contains("q\n0 2 -2 0 5 7 cm\n"));
+        assert!(content.contains("0 0 m\n10 0 l\n10 10 l\nh\nW n"));
+        assert!(content.contains("1 1 m\n8 8 l"));
+    }
+
+    #[test]
+    fn emits_arrowhead_paths_for_vector_primitives() {
+        let document = single_page_with_images(
+            &[],
+            vec![
+                TypesetImage {
+                    scene: arrow_scene(ArrowSpec::Forward),
+                    x: points(72),
+                    y: points(600),
+                    display_width: points(20),
+                    display_height: points(10),
+                },
+                TypesetImage {
+                    scene: arrow_scene(ArrowSpec::Both),
+                    x: points(100),
+                    y: points(560),
+                    display_width: points(20),
+                    display_height: points(10),
+                },
+            ],
+        );
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("20 0 m\n16 2 l\n16 -2 l\nh\nf"));
+        assert!(content.contains("0 0 m\n4 -2 l\n4 2 l\nh\nf"));
     }
 
     #[test]

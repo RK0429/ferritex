@@ -77,15 +77,71 @@ pub struct Color {
 
 impl Eq for Color {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Transform2D {
+    pub x_shift: f64,
+    pub y_shift: f64,
+    pub scale: f64,
+    pub rotate: f64,
+}
+
+impl Transform2D {
+    pub fn compose(self, child: Self) -> Self {
+        Self {
+            x_shift: self.x_shift + child.x_shift,
+            y_shift: self.y_shift + child.y_shift,
+            scale: self.scale * child.scale,
+            rotate: self.rotate + child.rotate,
+        }
+    }
+}
+
+impl Default for Transform2D {
+    fn default() -> Self {
+        Self {
+            x_shift: 0.0,
+            y_shift: 0.0,
+            scale: 1.0,
+            rotate: 0.0,
+        }
+    }
+}
+
+impl Eq for Transform2D {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ArrowSpec {
+    #[default]
+    None,
+    Forward,
+    Backward,
+    Both,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorPrimitive {
     pub path: Vec<PathSegment>,
     pub stroke: Option<Color>,
     pub fill: Option<Color>,
     pub line_width: f64,
+    #[serde(default)]
+    pub arrows: ArrowSpec,
 }
 
 impl Eq for VectorPrimitive {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphicGroup {
+    pub children: Vec<GraphicNode>,
+    pub default_stroke: Option<Color>,
+    pub default_fill: Option<Color>,
+    pub default_line_width: Option<f64>,
+    pub clip_path: Option<Vec<PathSegment>>,
+    #[serde(default)]
+    pub transform: Transform2D,
+}
+
+impl Eq for GraphicGroup {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphicText {
@@ -99,6 +155,7 @@ impl Eq for GraphicText {}
 pub enum GraphicNode {
     External(ExternalGraphic),
     Pdf(PdfGraphic),
+    Group(GraphicGroup),
     Vector(VectorPrimitive),
     Text(GraphicText),
 }
@@ -663,9 +720,32 @@ fn scene_bounds(scene: &GraphicsScene) -> Option<(f64, f64, f64, f64)> {
 fn graphic_node_bounds(node: &GraphicNode) -> Option<(f64, f64, f64, f64)> {
     match node {
         GraphicNode::External(_) | GraphicNode::Pdf(_) => None,
+        GraphicNode::Group(group) => group_bounds(group),
         GraphicNode::Vector(primitive) => vector_bounds(primitive),
         GraphicNode::Text(text) => text_bounds(text),
     }
+}
+
+fn group_bounds(group: &GraphicGroup) -> Option<(f64, f64, f64, f64)> {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut has_bounds = false;
+
+    for child in &group.children {
+        let Some((child_min_x, child_min_y, child_max_x, child_max_y)) = graphic_node_bounds(child)
+        else {
+            continue;
+        };
+        min_x = min_x.min(child_min_x);
+        min_y = min_y.min(child_min_y);
+        max_x = max_x.max(child_max_x);
+        max_y = max_y.max(child_max_y);
+        has_bounds = true;
+    }
+
+    has_bounds.then(|| apply_transform_to_bounds((min_x, min_y, max_x, max_y), group.transform))
 }
 
 fn vector_bounds(primitive: &VectorPrimitive) -> Option<(f64, f64, f64, f64)> {
@@ -727,6 +807,19 @@ fn translate_graphic_node(node: GraphicNode, dx: f64, dy: f64) -> GraphicNode {
     match node {
         GraphicNode::External(graphic) => GraphicNode::External(graphic),
         GraphicNode::Pdf(graphic) => GraphicNode::Pdf(graphic),
+        GraphicNode::Group(group) => GraphicNode::Group(GraphicGroup {
+            children: group.children,
+            default_stroke: group.default_stroke,
+            default_fill: group.default_fill,
+            default_line_width: group.default_line_width,
+            clip_path: group.clip_path,
+            transform: Transform2D {
+                x_shift: group.transform.x_shift + dx,
+                y_shift: group.transform.y_shift + dy,
+                scale: group.transform.scale,
+                rotate: group.transform.rotate,
+            },
+        }),
         GraphicNode::Vector(primitive) => GraphicNode::Vector(VectorPrimitive {
             path: primitive
                 .path
@@ -736,6 +829,7 @@ fn translate_graphic_node(node: GraphicNode, dx: f64, dy: f64) -> GraphicNode {
             stroke: primitive.stroke,
             fill: primitive.fill,
             line_width: primitive.line_width,
+            arrows: primitive.arrows,
         }),
         GraphicNode::Text(text) => GraphicNode::Text(GraphicText {
             position: translate_point(text.position, dx, dy),
@@ -765,6 +859,49 @@ fn translate_point(point: Point, dx: f64, dy: f64) -> Point {
     Point {
         x: point.x + dx,
         y: point.y + dy,
+    }
+}
+
+fn apply_transform_to_bounds(
+    (min_x, min_y, max_x, max_y): (f64, f64, f64, f64),
+    transform: Transform2D,
+) -> (f64, f64, f64, f64) {
+    let corners = [
+        transform_point(Point { x: min_x, y: min_y }, transform),
+        transform_point(Point { x: min_x, y: max_y }, transform),
+        transform_point(Point { x: max_x, y: min_y }, transform),
+        transform_point(Point { x: max_x, y: max_y }, transform),
+    ];
+
+    let mut transformed_min_x = f64::INFINITY;
+    let mut transformed_min_y = f64::INFINITY;
+    let mut transformed_max_x = f64::NEG_INFINITY;
+    let mut transformed_max_y = f64::NEG_INFINITY;
+    for point in corners {
+        transformed_min_x = transformed_min_x.min(point.x);
+        transformed_min_y = transformed_min_y.min(point.y);
+        transformed_max_x = transformed_max_x.max(point.x);
+        transformed_max_y = transformed_max_y.max(point.y);
+    }
+
+    (
+        transformed_min_x,
+        transformed_min_y,
+        transformed_max_x,
+        transformed_max_y,
+    )
+}
+
+fn transform_point(point: Point, transform: Transform2D) -> Point {
+    let radians = transform.rotate.to_radians();
+    let cos_theta = radians.cos();
+    let sin_theta = radians.sin();
+    let scaled_x = point.x * transform.scale;
+    let scaled_y = point.y * transform.scale;
+
+    Point {
+        x: (scaled_x * cos_theta) - (scaled_y * sin_theta) + transform.x_shift,
+        y: (scaled_x * sin_theta) + (scaled_y * cos_theta) + transform.y_shift,
     }
 }
 
@@ -821,10 +958,10 @@ mod tests {
 
     use super::{
         compile_graphics_scene, compile_includegraphics, extract_png_image_data, is_pdf_signature,
-        parse_image_metadata, parse_jpeg_metadata, parse_pdf_metadata, parse_png_metadata, Color,
-        ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicText, GraphicsScene,
-        ImageColorSpace, ImageMetadata, PathSegment, PdfGraphic, PdfGraphicMetadata, Point,
-        ResolvedGraphic, VectorPrimitive,
+        parse_image_metadata, parse_jpeg_metadata, parse_pdf_metadata, parse_png_metadata,
+        ArrowSpec, Color, ExternalGraphic, GraphicAssetResolver, GraphicGroup, GraphicNode,
+        GraphicText, GraphicsScene, ImageColorSpace, ImageMetadata, PathSegment, PdfGraphic,
+        PdfGraphicMetadata, Point, ResolvedGraphic, Transform2D, VectorPrimitive,
     };
     use crate::kernel::api::DimensionValue;
     use crate::parser::api::IncludeGraphicsOptions;
@@ -1028,6 +1165,7 @@ mod tests {
                     }),
                     fill: None,
                     line_width: 0.4,
+                    arrows: ArrowSpec::None,
                 }),
                 GraphicNode::Text(GraphicText {
                     position: Point { x: 12.0, y: 24.0 },
@@ -1054,12 +1192,81 @@ mod tests {
                         }),
                         fill: None,
                         line_width: 0.4,
+                        arrows: ArrowSpec::None,
                     }),
                     GraphicNode::Text(GraphicText {
                         position: Point { x: 2.0, y: 4.0 },
                         content: "Hi".to_string(),
                     }),
                 ],
+            })
+        );
+    }
+
+    #[test]
+    fn compile_graphics_scene_normalizes_group_bounds() {
+        let graphics_box = compile_graphics_scene(GraphicsScene {
+            nodes: vec![GraphicNode::Group(GraphicGroup {
+                children: vec![GraphicNode::Vector(VectorPrimitive {
+                    path: vec![
+                        PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                        PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                        PathSegment::LineTo(Point { x: 20.0, y: 10.0 }),
+                    ],
+                    stroke: Some(Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                    }),
+                    fill: None,
+                    line_width: 0.4,
+                    arrows: ArrowSpec::None,
+                })],
+                default_stroke: None,
+                default_fill: None,
+                default_line_width: Some(0.4),
+                clip_path: None,
+                transform: Transform2D {
+                    x_shift: 10.0,
+                    y_shift: 20.0,
+                    scale: 2.0,
+                    rotate: 0.0,
+                },
+            })],
+        });
+
+        assert_eq!(graphics_box.width, DimensionValue(40 * 65_536));
+        assert_eq!(graphics_box.height, DimensionValue(20 * 65_536));
+        assert_eq!(
+            graphics_box.scene,
+            Some(GraphicsScene {
+                nodes: vec![GraphicNode::Group(GraphicGroup {
+                    children: vec![GraphicNode::Vector(VectorPrimitive {
+                        path: vec![
+                            PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                            PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                            PathSegment::LineTo(Point { x: 20.0, y: 10.0 }),
+                        ],
+                        stroke: Some(Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                        }),
+                        fill: None,
+                        line_width: 0.4,
+                        arrows: ArrowSpec::None,
+                    })],
+                    default_stroke: None,
+                    default_fill: None,
+                    default_line_width: Some(0.4),
+                    clip_path: None,
+                    transform: Transform2D {
+                        x_shift: 0.0,
+                        y_shift: 0.0,
+                        scale: 2.0,
+                        rotate: 0.0,
+                    },
+                })],
             })
         );
     }

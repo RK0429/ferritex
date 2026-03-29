@@ -3397,7 +3397,7 @@ fn build_pdf_renderer_with_images(
                         display_height: image.display_height,
                     });
                 }
-                GraphicNode::Vector(_) | GraphicNode::Text(_) => {}
+                GraphicNode::Group(_) | GraphicNode::Vector(_) | GraphicNode::Text(_) => {}
             }
         }
         page_images.push(placements);

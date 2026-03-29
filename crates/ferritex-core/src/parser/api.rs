@@ -8000,6 +8000,7 @@ mod tests {
                     }),
                     fill: None,
                     line_width: 0.4,
+                    arrows: crate::graphics::api::ArrowSpec::None,
                 })]
                 .as_slice()
             )
@@ -8009,13 +8010,13 @@ mod tests {
     #[test]
     fn tikzpicture_unsupported_command_surfaces_diagnostic() {
         let output = MinimalLatexParser.parse_recovering(
-            "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\clip (0,0) rectangle (1,1);\n\\end{tikzpicture}\n\\end{document}\n",
+            "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\foo (0,0);\n\\end{tikzpicture}\n\\end{document}\n",
         );
 
         assert!(output.document.is_some());
         assert!(output.errors.contains(&ParseError::TikzDiagnostic {
             line: 3,
-            message: "tikz: unsupported command `clip`".to_string(),
+            message: "tikz: unsupported command `foo`".to_string(),
         }));
     }
 
