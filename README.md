@@ -31,7 +31,7 @@ cargo run -- compile hello.tex --asset-bundle builtin:basic  # uses the built-in
 | `ferritex-application` | Application services for compile/watch/lsp/preview orchestration, runtime options, scheduler, diagnostics/snapshot services |
 | `ferritex-core` | Domain modules and shared model for parser, typesetting, PDF, policy, compilation, diagnostics, kernel utilities |
 | `ferritex-infra` | OS/FS/network adapters (file access gate, shell command gateway, asset bundle loader, loopback preview transport, polling watcher) |
-| `ferritex-bench` | Benchmark harness (placeholder) |
+| `ferritex-bench` | Benchmark harness scaffold for `FTX-BENCH-001`, partition parallelism, and bundle bootstrap smoke |
 
 Dependency direction: `cli → application + core + infra`, `application → core`, `infra → application + core`.
 

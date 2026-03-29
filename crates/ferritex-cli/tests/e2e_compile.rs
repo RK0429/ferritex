@@ -838,6 +838,64 @@ fn compile_resolves_project_root_fallback_from_nested_input() {
     assert!(pdf.contains("Project root fallback."));
 }
 
+fn expanded_asset_bundle_fixture() -> tempfile::TempDir {
+    let bundle_dir = tempfile::tempdir().expect("create asset bundle tempdir");
+    let bundle_root = bundle_dir.path();
+    let texmf_root = bundle_root.join("texmf");
+    let package_sty = texmf_root.join("tex/latex/ferritex/bundlebootstrap.sty");
+    let bundled_tex = texmf_root.join("bundled.tex");
+    let custom_tex = texmf_root.join("shared/custom.tex");
+
+    std::fs::create_dir_all(package_sty.parent().expect("bundlebootstrap.sty parent"))
+        .expect("create package directory");
+    std::fs::create_dir_all(custom_tex.parent().expect("custom tex parent"))
+        .expect("create custom tex directory");
+
+    std::fs::write(
+        bundle_root.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "name": "expanded-basic",
+            "version": "2026.03.29",
+            "min_ferritex_version": "0.1.0",
+            "format_version": 1,
+            "asset_index_path": "asset-index.json",
+        }))
+        .expect("serialize bundle manifest"),
+    )
+    .expect("write bundle manifest");
+    std::fs::write(
+        bundle_root.join("asset-index.json"),
+        serde_json::to_vec(&json!({
+            "tex_inputs": {
+                "bundled": "texmf/bundled.tex",
+                "bundled.tex": "texmf/bundled.tex",
+                "shared/custom": "texmf/shared/custom.tex",
+                "shared/custom.tex": "texmf/shared/custom.tex",
+            },
+            "packages": {
+                "bundlebootstrap": "texmf/tex/latex/ferritex/bundlebootstrap.sty",
+                "bundlebootstrap.sty": "texmf/tex/latex/ferritex/bundlebootstrap.sty",
+            },
+            // TODO(REQ-FUNC-046): Add font entries when font precedence e2e testing is implemented.
+            "opentype_fonts": {},
+            "tfm_fonts": {},
+            "default_opentype_fonts": [],
+        }))
+        .expect("serialize bundle asset index"),
+    )
+    .expect("write bundle asset index");
+    std::fs::write(
+        &package_sty,
+        "% Minimal bundle package stub for asset index coverage.\n",
+    )
+    .expect("write bundlebootstrap.sty");
+    std::fs::write(&bundled_tex, "Bundled from expanded asset bundle.\n")
+        .expect("write bundled tex input");
+    std::fs::write(&custom_tex, "Bundle version of custom.\n").expect("write custom tex input");
+
+    bundle_dir
+}
+
 #[test]
 fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -883,6 +941,76 @@ fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
 }
 
 #[test]
+fn compile_bundle_only_bootstrap_succeeds() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\input{bundled}\nBundle bootstrap test.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.trim().is_empty());
+
+    let pdf = std::fs::read_to_string(dir.path().join("main.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Bundled from expanded asset bundle."));
+    assert!(pdf.contains("Bundle bootstrap test."));
+}
+
+#[test]
+fn compile_bundle_fallback_resolves_tex_input_not_in_project() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let project_root = dir.path().join("project");
+    let src_dir = project_root.join("src");
+    std::fs::create_dir_all(&src_dir).expect("create source tree");
+    std::fs::write(
+        src_dir.join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\n\\input{shared/custom}\n\\end{document}\n",
+    )
+    .expect("write main");
+    std::fs::write(
+        project_root.join("custom.tex"),
+        "Host version of custom should not resolve.\n",
+    )
+    .expect("write unmatched host tex input");
+
+    // tex_input resolution prefers project-local paths before the asset bundle, so this
+    // only verifies bundle fallback for a lookup key that is absent from the project tree.
+    let output = ferritex_bin()
+        .current_dir(&project_root)
+        .args([
+            "compile",
+            "src/main.tex",
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.trim().is_empty());
+
+    let pdf = std::fs::read_to_string(project_root.join("src/main.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Bundle version of custom."));
+    assert!(!pdf.contains("Host version of custom should not resolve."));
+}
+
+#[test]
 fn compile_accepts_builtin_asset_bundle_identifier() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -905,6 +1033,143 @@ fn compile_accepts_builtin_asset_bundle_identifier() {
     assert_eq!(output.status.code(), Some(0));
     let pdf = std::fs::read_to_string(dir.path().join("main.pdf")).expect("read output pdf");
     assert!(pdf.contains("Bundled from built-in asset bundle."));
+}
+
+#[test]
+fn compile_with_corrupted_manifest_reports_diagnostic() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nBroken manifest.\n\\end{document}\n",
+    )
+    .expect("write input file");
+    std::fs::write(bundle_dir.path().join("manifest.json"), "{ not valid json")
+        .expect("corrupt bundle manifest");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid manifest"));
+    assert!(stderr.contains("help: verify the asset bundle path and version"));
+}
+
+#[test]
+fn compile_with_incompatible_bundle_version_reports_diagnostic() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nIncompatible bundle.\n\\end{document}\n",
+    )
+    .expect("write input file");
+    std::fs::write(
+        bundle_dir.path().join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "name": "expanded-basic",
+            "version": "2026.03.29",
+            "min_ferritex_version": "99.0.0",
+            "format_version": 1,
+            "asset_index_path": "asset-index.json",
+        }))
+        .expect("serialize incompatible manifest"),
+    )
+    .expect("write incompatible bundle manifest");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("version incompatible"));
+    assert!(stderr.contains("required 99.0.0"));
+    assert!(stderr.contains("help: verify the asset bundle path and version"));
+}
+
+#[test]
+fn compile_with_missing_asset_index_reports_diagnostic() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nMissing index.\n\\end{document}\n",
+    )
+    .expect("write input file");
+    std::fs::remove_file(bundle_dir.path().join("asset-index.json"))
+        .expect("remove bundle asset index");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("asset index not found"));
+    assert!(stderr.contains("help: verify the asset bundle path and version"));
+}
+
+#[test]
+fn compile_with_unsupported_format_version_reports_diagnostic() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nUnsupported format.\n\\end{document}\n",
+    )
+    .expect("write input file");
+    std::fs::write(
+        bundle_dir.path().join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "name": "expanded-basic",
+            "version": "2026.03.29",
+            "min_ferritex_version": "0.1.0",
+            "format_version": 99,
+            "asset_index_path": "asset-index.json",
+        }))
+        .expect("serialize unsupported manifest"),
+    )
+    .expect("write unsupported bundle manifest");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported bundle format version"));
+    assert!(stderr.contains("help: verify the asset bundle path and version"));
 }
 
 #[test]
@@ -971,6 +1236,7 @@ fn compile_with_missing_asset_bundle_reports_validation_error() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("bundle not found"));
+    assert!(stderr.contains("help: verify the asset bundle path and version"));
 }
 
 #[test]

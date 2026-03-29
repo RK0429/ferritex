@@ -890,6 +890,7 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
             y: placement.y_position - line.y,
             links: line.links.clone(),
             font_index: line.font_index,
+            source_span: line.source_span,
         })
         .collect()
 }
@@ -1234,6 +1235,7 @@ mod tests {
                     y: points(720 - (index as i64 * 18)),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 })
                 .collect(),
             images: Vec::new(),
@@ -1265,6 +1267,7 @@ mod tests {
                 end_char,
             }],
             font_index: 0,
+            source_span: None,
         }
     }
 
@@ -1295,6 +1298,7 @@ mod tests {
                     y: points(0),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 }],
                 images: Vec::new(),
                 height: points(18),
@@ -1661,6 +1665,7 @@ mod tests {
                 },
             ],
             font_index: 0,
+            source_span: None,
         }];
         document.navigation.default_link_style = LinkStyle {
             color_links: true,
@@ -1726,18 +1731,21 @@ mod tests {
                 y: points(720),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
             TextLine {
                 text: "Sans".to_string(),
                 y: points(702),
                 links: Vec::new(),
                 font_index: 1,
+                source_span: None,
             },
             TextLine {
                 text: "Mono".to_string(),
                 y: points(684),
                 links: Vec::new(),
                 font_index: 2,
+                source_span: None,
             },
         ];
         let renderer = PdfRenderer::with_fonts(vec![

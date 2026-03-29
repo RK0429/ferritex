@@ -26,6 +26,37 @@ pub struct RenderedPageTrace {
     pub lines: Vec<RenderedLineTrace>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedTextNode {
+    pub text: String,
+    pub source_span: SourceSpan,
+    pub page: u32,
+    pub x_start: DimensionValue,
+    pub x_end: DimensionValue,
+    pub y_bottom: DimensionValue,
+    pub y_top: DimensionValue,
+}
+
+impl PlacedTextNode {
+    pub fn from_text_line(
+        text: String,
+        source_span: SourceSpan,
+        page: u32,
+        y: DimensionValue,
+    ) -> Self {
+        let (x_start, x_end, y_bottom, y_top) = placed_text_node_bounds(text.chars().count(), y);
+        Self {
+            text,
+            source_span,
+            page,
+            x_start,
+            x_end,
+            y_bottom,
+            y_top,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PdfPosition {
     pub page: u32,
@@ -83,6 +114,30 @@ impl SyncTexData {
                 }
             }
         }
+
+        Self { files, fragments }
+    }
+
+    pub fn build_from_placed_nodes(nodes: Vec<PlacedTextNode>) -> Self {
+        if nodes.is_empty() {
+            return Self::default();
+        }
+
+        let max_file_id = nodes
+            .iter()
+            .map(|node| {
+                node.source_span
+                    .start
+                    .file_id
+                    .max(node.source_span.end.file_id)
+            })
+            .max()
+            .unwrap_or(0);
+        let files = (0..=max_file_id).map(|_| String::new()).collect();
+        let fragments = nodes
+            .into_iter()
+            .map(fragment_for_placed_text_node)
+            .collect();
 
         Self { files, fragments }
     }
@@ -335,6 +390,18 @@ fn fragment_for_rendered_fragment(
     }
 }
 
+fn fragment_for_placed_text_node(node: PlacedTextNode) -> SyncTraceFragment {
+    SyncTraceFragment {
+        span: node.source_span,
+        page: node.page,
+        x_start: node.x_start,
+        x_end: node.x_end,
+        y_bottom: node.y_bottom,
+        y_top: node.y_top,
+        text: node.text,
+    }
+}
+
 fn file_id_for(files: &mut Vec<String>, file: &str) -> u32 {
     if let Some(index) = files.iter().position(|entry| entry == file) {
         index as u32
@@ -362,6 +429,22 @@ fn contains_pdf_position(fragment: &SyncTraceFragment, position: PdfPosition) ->
 
 fn points(value: i64) -> DimensionValue {
     DimensionValue(value * SCALED_POINTS_PER_POINT)
+}
+
+fn placed_text_node_bounds(
+    char_count: usize,
+    y: DimensionValue,
+) -> (
+    DimensionValue,
+    DimensionValue,
+    DimensionValue,
+    DimensionValue,
+) {
+    let x_start = points(LEFT_MARGIN_PT);
+    let x_end = points(LEFT_MARGIN_PT + char_count as i64 * DEFAULT_CHAR_WIDTH_PT);
+    let y_bottom = y - points(DEFAULT_LINE_DESCENT_PT);
+    let y_top = y + points(DEFAULT_LINE_TOP_OFFSET_PT);
+    (x_start, x_end, y_bottom, y_top)
 }
 
 fn normalized_chars(text: &str) -> Vec<char> {
@@ -436,9 +519,10 @@ fn leading_control_word(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        points, PdfPosition, RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData,
+        points, PdfPosition, PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace,
+        SyncTexData,
     };
-    use crate::kernel::api::SourceLocation;
+    use crate::kernel::api::{SourceLocation, SourceSpan};
 
     fn text_line(text: &str, y_pt: i64) -> RenderedLineTrace {
         RenderedLineTrace {
@@ -557,5 +641,102 @@ mod tests {
         assert_eq!(data.fragments[1].span.start.column, 7);
         assert_eq!(data.fragments[1].span.end.column, 12);
         assert_eq!(data.fragments[1].y_top, points(692));
+    }
+
+    #[test]
+    fn build_from_placed_nodes_builds_fragments_from_explicit_spans() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 12,
+            },
+        };
+        let data = SyncTexData::build_from_placed_nodes(vec![PlacedTextNode::from_text_line(
+            "Hello world".to_string(),
+            span,
+            2,
+            points(700),
+        )]);
+
+        assert_eq!(data.files, vec![String::new()]);
+        assert_eq!(data.fragments.len(), 1);
+        assert_eq!(data.fragments[0].span, span);
+        assert_eq!(data.fragments[0].page, 2);
+        assert_eq!(data.fragments[0].x_start, points(72));
+        assert_eq!(data.fragments[0].x_end, points(138));
+    }
+
+    #[test]
+    fn build_from_placed_nodes_keeps_wrapped_fragments_on_same_source_span() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 12,
+            },
+        };
+        let data = SyncTexData::build_from_placed_nodes(vec![
+            PlacedTextNode::from_text_line("Hello".to_string(), span, 1, points(700)),
+            PlacedTextNode::from_text_line("world".to_string(), span, 1, points(682)),
+        ]);
+
+        let forward = data.forward_search(SourceLocation {
+            file_id: 0,
+            line: 3,
+            column: 8,
+        });
+        assert_eq!(forward.len(), 2);
+        assert_eq!(forward[0].page, 1);
+        assert_eq!(forward[1].page, 1);
+
+        let inverse = data.inverse_search(PdfPosition {
+            page: 1,
+            x: points(72),
+            y: points(687),
+        });
+        assert_eq!(inverse, Some(span));
+    }
+
+    #[test]
+    fn build_from_placed_nodes_preserves_source_span_for_split_text() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 1,
+                line: 12,
+                column: 5,
+            },
+            end: SourceLocation {
+                file_id: 1,
+                line: 12,
+                column: 23,
+            },
+        };
+        let data = SyncTexData::build_from_placed_nodes(vec![
+            PlacedTextNode::from_text_line("Split".to_string(), span, 2, points(700)),
+            PlacedTextNode::from_text_line("text".to_string(), span, 2, points(682)),
+        ]);
+
+        assert_eq!(data.fragments.len(), 2);
+        assert!(data.fragments.iter().all(|fragment| fragment.span == span));
+        assert_eq!(
+            data.forward_search(SourceLocation {
+                file_id: 1,
+                line: 12,
+                column: 10,
+            })
+            .len(),
+            2
+        );
     }
 }

@@ -13,7 +13,7 @@ use crate::font::api::TfmMetrics;
 use crate::graphics::api::{
     compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
 };
-use crate::kernel::api::DimensionValue;
+use crate::kernel::api::{DimensionValue, SourceSpan};
 use crate::parser::api::{DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -48,6 +48,7 @@ pub struct TextLine {
     pub y: DimensionValue,
     pub links: Vec<TextLineLink>,
     pub font_index: u8,
+    pub source_span: Option<SourceSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +316,7 @@ pub enum VListItem {
         content: String,
         links: Vec<TextLineLink>,
         font_index: u8,
+        source_span: Option<SourceSpan>,
     },
     Image {
         graphics_box: GraphicsBox,
@@ -1124,6 +1126,7 @@ fn lines_to_vlist(lines: &[line_breaker::BrokenLine]) -> Vec<VListItem> {
             content: line.text.clone(),
             links: line.links.clone(),
             font_index: line.font_index,
+            source_span: None,
         })
         .collect()
 }
@@ -1164,12 +1167,14 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                 content,
                 links,
                 font_index,
+                source_span,
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
                     y: consumed_height,
                     links: links.clone(),
                     font_index: *font_index,
+                    source_span: *source_span,
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
@@ -1417,6 +1422,7 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
             y: placement.y_position - line.y,
             links: line.links.clone(),
             font_index: line.font_index,
+            source_span: line.source_span,
         })
         .collect()
 }
@@ -1751,12 +1757,14 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                 content,
                 links,
                 font_index,
+                source_span,
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
                     y: page_content_top(page_box) - consumed_height,
                     links: links.clone(),
                     font_index: *font_index,
+                    source_span: *source_span,
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
@@ -2194,6 +2202,7 @@ mod tests {
                 y: DimensionValue::zero(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             }],
             images: Vec::new(),
             height: points(height_pt),
@@ -2221,12 +2230,14 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 },
                 TextLine {
                     text: "Ferritex".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 },
             ]
         );
@@ -2279,6 +2290,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 }],
                 images: Vec::new(),
                 page_box: page_box.clone(),
@@ -2291,6 +2303,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 }],
                 images: Vec::new(),
                 page_box,
@@ -2330,12 +2343,14 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 },
                 TextLine {
                     text: "[1] Donald Knuth".to_string(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    source_span: None,
                 },
             ],
             images: Vec::new(),
@@ -2414,6 +2429,7 @@ mod tests {
                 content: format!("Line {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Glue {
@@ -2424,6 +2440,7 @@ mod tests {
             content: "Overflow".to_string(),
             links: Vec::new(),
             font_index: 0,
+            source_span: None,
         });
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2494,12 +2511,14 @@ mod tests {
                             y: DimensionValue::zero(),
                             links: Vec::new(),
                             font_index: 0,
+                            source_span: None,
                         },
                         TextLine {
                             text: "Figure 1: A caption".to_string(),
                             y: points(LINE_HEIGHT_PT),
                             links: Vec::new(),
                             font_index: 0,
+                            source_span: None,
                         },
                     ],
                     images: Vec::new(),
@@ -2661,6 +2680,7 @@ mod tests {
                 content: "Before".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
             VListItem::Float {
                 spec: PlacementSpec::parse(Some("h")),
@@ -2671,6 +2691,7 @@ mod tests {
                 content: "After".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
         ];
 
@@ -2702,6 +2723,7 @@ mod tests {
                 content: "Line 1".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
             VListItem::Float {
                 spec: PlacementSpec::parse(Some("t")),
@@ -2713,6 +2735,7 @@ mod tests {
             content: format!("Line {index}"),
             links: Vec::new(),
             font_index: 0,
+            source_span: None,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2740,6 +2763,7 @@ mod tests {
                 content: "Before".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
             VListItem::Float {
                 spec: PlacementSpec::parse(Some("t")),
@@ -2751,6 +2775,7 @@ mod tests {
                 content: "After".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
         ];
 
@@ -2849,6 +2874,7 @@ mod tests {
                 content: format!("Tall {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             })
             .collect::<Vec<_>>();
         vlist.extend((1..=5).map(|index| VListItem::Box {
@@ -2856,6 +2882,7 @@ mod tests {
             content: format!("Short {index}"),
             links: Vec::new(),
             font_index: 0,
+            source_span: None,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2879,6 +2906,7 @@ mod tests {
                 content: "First".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
             VListItem::Penalty {
                 value: PENALTY_FORCED,
@@ -2888,6 +2916,7 @@ mod tests {
                 content: "Second".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             },
         ];
 
@@ -2906,6 +2935,7 @@ mod tests {
                 content: format!("Line {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Penalty { value: 50 });
@@ -2914,6 +2944,7 @@ mod tests {
             content: format!("Line {index}"),
             links: Vec::new(),
             font_index: 0,
+            source_span: None,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -2939,6 +2970,7 @@ mod tests {
                 content: format!("Line {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                source_span: None,
             })
             .collect::<Vec<_>>();
         vlist.push(VListItem::Penalty {
@@ -2949,6 +2981,7 @@ mod tests {
             content: format!("Line {index}"),
             links: Vec::new(),
             font_index: 0,
+            source_span: None,
         }));
 
         let pages = paginate_vlist(&vlist, &page_box_for_class("article"));
@@ -3019,6 +3052,7 @@ mod tests {
             content: "Line".to_string(),
             links: Vec::new(),
             font_index: 0,
+            source_span: None,
         }];
         let vbox = VBox {
             tex_box: TeXBox::new(points(10), points(11), points(12)),
@@ -3036,6 +3070,7 @@ mod tests {
             content: "Line".to_string(),
             links: Vec::new(),
             font_index: 0,
+            source_span: None,
         };
 
         assert_eq!(vlist_item_height(&item), points(23));

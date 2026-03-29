@@ -152,6 +152,12 @@ dependencies = [
 [[package]]
 name = "ferritex-bench"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "ferritex-cli"

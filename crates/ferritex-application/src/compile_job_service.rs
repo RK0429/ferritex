@@ -23,13 +23,15 @@ use ferritex_core::graphics::api::{
     ImageMetadata,
 };
 use ferritex_core::incremental::{DependencyGraph, DocumentPartitionPlanner};
-use ferritex_core::kernel::api::DimensionValue;
+use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
 use ferritex_core::kernel::StableId;
 use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
 use ferritex_core::pdf::{FontResource, ImageFilter, PdfImageXObject, PdfRenderer, PlacedImage};
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
-use ferritex_core::synctex::{RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData};
+use ferritex_core::synctex::{
+    PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData,
+};
 use ferritex_core::typesetting::{
     resolve_page_labels, MinimalTypesetter, TextLine, TfmWidthProvider, TypesetDocument,
 };
@@ -103,6 +105,32 @@ struct ExpandedSourceBuilder {
     source_lines: Vec<SourceLineTrace>,
     current_line_text: String,
     current_line_origin: Option<(String, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceLineSpan {
+    normalized_text: String,
+    span: SourceSpan,
+    source_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSpanAnnotator {
+    files: Vec<String>,
+    line_spans: Vec<SourceLineSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedLineKey {
+    page_index: usize,
+    line_index: usize,
+    normalized_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleSourceChar {
+    ch: char,
+    column: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +269,126 @@ impl ExpandedSourceBuilder {
             text: self.text,
             source_lines: self.source_lines,
         }
+    }
+}
+
+impl SourceSpanAnnotator {
+    fn new(source_lines: &[SourceLineTrace]) -> Self {
+        let mut files = Vec::new();
+        let line_spans = source_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(source_index, line)| {
+                let visible_chars = visible_source_chars(&line.text);
+                let start = visible_chars.first()?;
+                let end = visible_chars.last()?;
+                let file_id = file_id_for_source(&mut files, &line.file);
+                Some(SourceLineSpan {
+                    normalized_text: visible_chars.iter().map(|entry| entry.ch).collect(),
+                    span: SourceSpan {
+                        start: SourceLocation {
+                            file_id,
+                            line: line.line,
+                            column: start.column,
+                        },
+                        end: SourceLocation {
+                            file_id,
+                            line: line.line,
+                            column: end.column + 1,
+                        },
+                    },
+                    source_index,
+                })
+            })
+            .collect();
+
+        Self { files, line_spans }
+    }
+
+    fn annotate_pages(&self, document: &mut TypesetDocument) -> BTreeSet<usize> {
+        let rendered_lines = collect_rendered_line_keys(document);
+        let mut assignments = vec![None; rendered_lines.len()];
+        let mut used_source_lines = BTreeSet::new();
+        let mut rendered_index = 0;
+        let mut source_index = 0;
+
+        while rendered_index < rendered_lines.len() {
+            let Some((candidate_index, end_rendered_index)) =
+                self.find_match(&rendered_lines, rendered_index, source_index)
+            else {
+                rendered_index += 1;
+                continue;
+            };
+
+            let candidate = &self.line_spans[candidate_index];
+            for assignment in assignments
+                .iter_mut()
+                .take(end_rendered_index + 1)
+                .skip(rendered_index)
+            {
+                *assignment = Some(candidate.span);
+            }
+            used_source_lines.insert(candidate.source_index);
+            rendered_index = end_rendered_index + 1;
+            source_index = candidate_index + 1;
+        }
+
+        for (assignment, rendered_line) in assignments.into_iter().zip(rendered_lines.iter()) {
+            if let Some(span) = assignment {
+                document.pages[rendered_line.page_index].lines[rendered_line.line_index]
+                    .source_span = Some(span);
+            }
+        }
+
+        used_source_lines
+    }
+
+    fn source_lines_without(
+        &self,
+        source_lines: &[SourceLineTrace],
+        used_source_lines: &BTreeSet<usize>,
+    ) -> Vec<SourceLineTrace> {
+        source_lines
+            .iter()
+            .enumerate()
+            .filter(|(source_index, _)| !used_source_lines.contains(source_index))
+            .map(|(_, source_line)| source_line.clone())
+            .collect()
+    }
+
+    fn find_match(
+        &self,
+        rendered_lines: &[RenderedLineKey],
+        rendered_index: usize,
+        source_start: usize,
+    ) -> Option<(usize, usize)> {
+        let rendered_text = rendered_lines.get(rendered_index)?.normalized_text.as_str();
+        if rendered_text.is_empty() {
+            return None;
+        }
+
+        for (candidate_index, candidate) in self.line_spans.iter().enumerate().skip(source_start) {
+            if candidate.normalized_text != rendered_text
+                && !candidate.normalized_text.starts_with(rendered_text)
+            {
+                continue;
+            }
+
+            let mut combined = String::new();
+            for (end_rendered_index, rendered_line) in
+                rendered_lines.iter().enumerate().skip(rendered_index)
+            {
+                combined.push_str(&rendered_line.normalized_text);
+                if combined == candidate.normalized_text {
+                    return Some((candidate_index, end_rendered_index));
+                }
+                if !candidate.normalized_text.starts_with(&combined) {
+                    break;
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -897,10 +1045,7 @@ impl<'a> CompileJobService<'a> {
             let synctex_path = options
                 .output_dir
                 .join(format!("{}.synctex", options.jobname));
-            let synctex = SyncTexData::build_line_based(
-                &synctex_pages_for(&typeset_document),
-                &source_tree.source_lines,
-            );
+            let synctex = synctex_data_for(&typeset_document, &source_tree.source_lines);
             match serde_json::to_vec_pretty(&synctex) {
                 Ok(bytes) => {
                     if let Err(error) = self.file_access_gate.write_file(&synctex_path, &bytes) {
@@ -2112,7 +2257,87 @@ fn diagnostic_for_output_error(error: FileAccessError, output_pdf: &Path) -> Dia
     }
 }
 
-fn synctex_pages_for(document: &TypesetDocument) -> Vec<RenderedPageTrace> {
+fn synctex_data_for(document: &TypesetDocument, source_lines: &[SourceLineTrace]) -> SyncTexData {
+    let mut annotated_document = document.clone();
+    let annotator = SourceSpanAnnotator::new(source_lines);
+    let used_source_lines = annotator.annotate_pages(&mut annotated_document);
+    let mut synctex =
+        SyncTexData::build_from_placed_nodes(placed_text_nodes_for(&annotated_document));
+    let remaining_source_lines = annotator.source_lines_without(source_lines, &used_source_lines);
+
+    if !remaining_source_lines.is_empty() {
+        let mut fallback = SyncTexData::build_line_based(
+            &synctex_pages_for_unannotated(&annotated_document),
+            &remaining_source_lines,
+        );
+        let (merged_files, fallback_file_ids) =
+            merged_synctex_files(&annotator.files, &fallback.files);
+        remap_synctex_file_ids(&mut fallback, &fallback_file_ids);
+        synctex.fragments.extend(fallback.fragments);
+        synctex.files = merged_files;
+    } else if !annotator.files.is_empty() {
+        synctex.files = annotator.files;
+    }
+
+    synctex
+}
+
+fn merged_synctex_files(
+    primary_files: &[String],
+    fallback_files: &[String],
+) -> (Vec<String>, Vec<u32>) {
+    let mut files = Vec::with_capacity(primary_files.len() + fallback_files.len());
+    for file in primary_files {
+        file_id_for_source(&mut files, file);
+    }
+    let fallback_file_ids = fallback_files
+        .iter()
+        .map(|file| file_id_for_source(&mut files, file))
+        .collect();
+    (files, fallback_file_ids)
+}
+
+fn remap_synctex_file_ids(synctex: &mut SyncTexData, file_id_map: &[u32]) {
+    for fragment in &mut synctex.fragments {
+        fragment.span.start.file_id =
+            remap_synctex_file_id(fragment.span.start.file_id, file_id_map);
+        fragment.span.end.file_id = remap_synctex_file_id(fragment.span.end.file_id, file_id_map);
+    }
+}
+
+fn remap_synctex_file_id(file_id: u32, file_id_map: &[u32]) -> u32 {
+    debug_assert!(
+        file_id_map.get(file_id as usize).is_some(),
+        "fallback SyncTeX file_id must reference fallback files"
+    );
+    file_id_map
+        .get(file_id as usize)
+        .copied()
+        .unwrap_or(file_id)
+}
+
+fn placed_text_nodes_for(document: &TypesetDocument) -> Vec<PlacedTextNode> {
+    document
+        .pages
+        .iter()
+        .enumerate()
+        .flat_map(|(page_index, page)| {
+            page.lines.iter().filter_map(move |line| {
+                let span = line.source_span?;
+                (!line.text.trim().is_empty()).then(|| {
+                    PlacedTextNode::from_text_line(
+                        line.text.clone(),
+                        span,
+                        page_index as u32 + 1,
+                        line.y,
+                    )
+                })
+            })
+        })
+        .collect()
+}
+
+fn synctex_pages_for_unannotated(document: &TypesetDocument) -> Vec<RenderedPageTrace> {
     document
         .pages
         .iter()
@@ -2120,6 +2345,7 @@ fn synctex_pages_for(document: &TypesetDocument) -> Vec<RenderedPageTrace> {
             lines: page
                 .lines
                 .iter()
+                .filter(|line| line.source_span.is_none())
                 .map(|line| RenderedLineTrace {
                     text: line.text.clone(),
                     y: line.y,
@@ -2127,6 +2353,105 @@ fn synctex_pages_for(document: &TypesetDocument) -> Vec<RenderedPageTrace> {
                 .collect(),
         })
         .collect()
+}
+
+fn collect_rendered_line_keys(document: &TypesetDocument) -> Vec<RenderedLineKey> {
+    document
+        .pages
+        .iter()
+        .enumerate()
+        .flat_map(|(page_index, page)| {
+            page.lines
+                .iter()
+                .enumerate()
+                .filter_map(move |(line_index, line)| {
+                    let normalized_text = normalized_rendered_text(&line.text);
+                    (!normalized_text.is_empty()).then_some(RenderedLineKey {
+                        page_index,
+                        line_index,
+                        normalized_text,
+                    })
+                })
+        })
+        .collect()
+}
+
+fn normalized_rendered_text(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn file_id_for_source(files: &mut Vec<String>, file: &str) -> u32 {
+    if let Some(index) = files.iter().position(|entry| entry == file) {
+        index as u32
+    } else {
+        files.push(file.to_string());
+        (files.len() - 1) as u32
+    }
+}
+
+fn visible_source_chars(text: &str) -> Vec<VisibleSourceChar> {
+    let trimmed = text.trim_start();
+    if let Some(command) = leading_control_word(trimmed) {
+        if matches!(
+            command,
+            "documentclass"
+                | "begin"
+                | "end"
+                | "usepackage"
+                | "RequirePackage"
+                | "InputIfFileExists"
+                | "input"
+                | "include"
+                | "bibliography"
+                | "tableofcontents"
+                | "listoffigures"
+                | "listoftables"
+                | "makeindex"
+                | "printindex"
+                | "hypersetup"
+        ) {
+            return Vec::new();
+        }
+    }
+
+    let mut visible = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut column = 1u32;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '%' => break,
+            '\\' => {
+                column += 1;
+                while chars.peek().is_some_and(|next| next.is_alphabetic()) {
+                    chars.next();
+                    column += 1;
+                }
+            }
+            '{' | '}' | '[' | ']' => {
+                column += 1;
+            }
+            _ if !ch.is_control() => {
+                if !ch.is_whitespace() {
+                    visible.push(VisibleSourceChar { ch, column });
+                }
+                column += 1;
+            }
+            _ => {
+                column += 1;
+            }
+        }
+    }
+
+    visible
+}
+
+fn leading_control_word(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('\\')?;
+    let end = rest
+        .find(|ch: char| !ch.is_alphabetic())
+        .unwrap_or(rest.len());
+    (end > 0).then_some(&rest[..end])
 }
 
 fn diagnostic_for_synctex_error(error: FileAccessError, synctex_path: &Path) -> Diagnostic {
@@ -3620,8 +3945,10 @@ mod tests {
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
     use ferritex_core::diagnostics::Severity;
     use ferritex_core::font::OpenTypeFont;
+    use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
     use ferritex_core::synctex::SyncTexData;
+    use ferritex_core::typesetting::{PageBox, TextLine, TypesetDocument, TypesetPage};
     use tempfile::tempdir;
 
     enum MockReadResult {
@@ -4054,6 +4381,32 @@ mod tests {
     fn read_synctex(path: &Path) -> SyncTexData {
         serde_json::from_slice(&fs::read(path).expect("read output synctex"))
             .expect("parse output synctex")
+    }
+
+    fn points(value: i64) -> DimensionValue {
+        DimensionValue(value * 65_536)
+    }
+
+    fn test_typeset_document(lines: Vec<TextLine>) -> TypesetDocument {
+        TypesetDocument {
+            pages: vec![TypesetPage {
+                lines,
+                images: Vec::new(),
+                page_box: PageBox {
+                    width: points(612),
+                    height: points(792),
+                },
+                float_placements: Vec::new(),
+                index_entries: Vec::new(),
+            }],
+            outlines: Vec::new(),
+            named_destinations: Vec::new(),
+            title: None,
+            author: None,
+            navigation: Default::default(),
+            index_entries: Vec::new(),
+            has_unresolved_index: false,
+        }
     }
 
     fn build_test_tfm() -> Vec<u8> {
@@ -4662,6 +5015,138 @@ mod tests {
         });
         assert!(!positions.is_empty());
         assert_eq!(positions[0].page, 1);
+        assert!(synctex.fragments.iter().any(|fragment| {
+            fragment.text == "Hello world"
+                && fragment.span.start.line == 3
+                && fragment.span.start.column == 1
+                && fragment.span.end.column == 12
+        }));
+    }
+
+    #[test]
+    fn synctex_data_for_remaps_fallback_fragments_into_merged_files() {
+        let main_file = "/tmp/main.tex".to_string();
+        let chapter_file = "/tmp/chapter.tex".to_string();
+        let source_lines = vec![
+            ferritex_core::synctex::SourceLineTrace {
+                file: main_file.clone(),
+                line: 3,
+                text: "Annotated text".to_string(),
+            },
+            ferritex_core::synctex::SourceLineTrace {
+                file: chapter_file.clone(),
+                line: 7,
+                text: "Original chapter".to_string(),
+            },
+        ];
+        let document = test_typeset_document(vec![
+            TextLine {
+                text: "Annotated text".to_string(),
+                y: points(720),
+                links: Vec::new(),
+                font_index: 0,
+                source_span: None,
+            },
+            TextLine {
+                text: "Rendered".to_string(),
+                y: points(702),
+                links: Vec::new(),
+                font_index: 0,
+                source_span: None,
+            },
+        ]);
+
+        let synctex = super::synctex_data_for(&document, &source_lines);
+
+        assert_eq!(synctex.files, vec![main_file, chapter_file]);
+        assert!(
+            synctex
+                .forward_search(SourceLocation {
+                    file_id: 1,
+                    line: 7,
+                    column: 1,
+                })
+                .len()
+                >= 1
+        );
+        assert!(
+            synctex
+                .forward_search(SourceLocation {
+                    file_id: 0,
+                    line: 3,
+                    column: 1,
+                })
+                .len()
+                >= 1
+        );
+        assert!(synctex
+            .forward_search(SourceLocation {
+                file_id: 0,
+                line: 7,
+                column: 1,
+            })
+            .is_empty());
+
+        let annotated_fragment = synctex
+            .fragments
+            .iter()
+            .find(|fragment| fragment.text == "Annotated text")
+            .expect("annotated fragment");
+        assert_eq!(annotated_fragment.span.start.file_id, 0);
+        assert_eq!(annotated_fragment.span.end.file_id, 0);
+
+        let fallback_fragment = synctex
+            .fragments
+            .iter()
+            .find(|fragment| fragment.text == "Rendered")
+            .expect("fallback fragment");
+        assert_eq!(fallback_fragment.span.start.file_id, 1);
+        assert_eq!(fallback_fragment.span.end.file_id, 1);
+        assert_eq!(fallback_fragment.span.start.line, 7);
+    }
+
+    #[test]
+    fn source_span_annotator_marks_wrapped_lines_with_same_span() {
+        let source_lines = vec![ferritex_core::synctex::SourceLineTrace {
+            file: "/tmp/main.tex".to_string(),
+            line: 3,
+            text: "Hello world".to_string(),
+        }];
+        let mut document = test_typeset_document(vec![
+            TextLine {
+                text: "Hello".to_string(),
+                y: points(720),
+                links: Vec::new(),
+                font_index: 0,
+                source_span: None,
+            },
+            TextLine {
+                text: "world".to_string(),
+                y: points(702),
+                links: Vec::new(),
+                font_index: 0,
+                source_span: None,
+            },
+        ]);
+
+        let annotator = super::SourceSpanAnnotator::new(&source_lines);
+        let used_source_lines = annotator.annotate_pages(&mut document);
+        let expected_span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 12,
+            },
+        };
+
+        assert_eq!(used_source_lines, BTreeSet::from([0]));
+        assert_eq!(document.pages[0].lines[0].source_span, Some(expected_span));
+        assert_eq!(document.pages[0].lines[1].source_span, Some(expected_span));
     }
 
     #[test]

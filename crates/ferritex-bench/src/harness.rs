@@ -1,0 +1,709 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use serde::Serialize;
+use thiserror::Error;
+
+pub trait CompileBackend: Send + Sync {
+    fn compile(
+        &self,
+        input: &Path,
+        asset_bundle: Option<&Path>,
+        jobs: u32,
+    ) -> Result<CompileOutput, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompileOutput {
+    pub duration: Duration,
+    pub output_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchProfile {
+    FullBench,
+    PartitionBench,
+    BundleBootstrap,
+}
+
+impl BenchProfile {
+    pub fn stable_id(&self) -> &'static str {
+        match self {
+            Self::FullBench => "FTX-BENCH-001",
+            Self::PartitionBench => "FTX-PARTITION-BENCH-001",
+            Self::BundleBootstrap => "bundle-bootstrap-smoke",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BenchCase {
+    pub name: String,
+    pub profile: BenchProfile,
+    pub input_fixture: PathBuf,
+    pub asset_bundle: Option<PathBuf>,
+    pub jobs: u32,
+}
+
+impl BenchCase {
+    fn comparison_key(&self) -> (String, String, String, String) {
+        (
+            self.name.clone(),
+            self.profile.stable_id().to_string(),
+            self.input_fixture.display().to_string(),
+            self.asset_bundle
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BenchRunConfig {
+    pub warmup_runs: u32,
+    pub measured_runs: u32,
+    pub compare_output_identity: bool,
+}
+
+impl Default for BenchRunConfig {
+    fn default() -> Self {
+        Self {
+            warmup_runs: 1,
+            measured_runs: 5,
+            compare_output_identity: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BenchTiming {
+    #[serde(with = "duration_ms")]
+    pub duration: Duration,
+    pub output_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BenchResult {
+    pub case: BenchCase,
+    pub config: BenchRunConfig,
+    pub timings: Vec<BenchTiming>,
+}
+
+impl BenchResult {
+    pub fn median_duration(&self) -> Option<Duration> {
+        let len = self.timings.len();
+        if len == 0 {
+            return None;
+        }
+
+        let mut durations = self
+            .timings
+            .iter()
+            .map(|timing| timing.duration)
+            .collect::<Vec<_>>();
+        durations.sort_unstable();
+
+        let mid = len / 2;
+        if len % 2 == 1 {
+            Some(durations[mid])
+        } else {
+            Some(Duration::from_secs_f64(
+                (durations[mid - 1].as_secs_f64() + durations[mid].as_secs_f64()) / 2.0,
+            ))
+        }
+    }
+
+    pub fn is_output_identical(&self) -> bool {
+        let mut timings = self.timings.iter();
+        let Some(first) = timings.next() else {
+            return true;
+        };
+
+        match &first.output_hash {
+            Some(expected) => timings.all(|timing| timing.output_hash.as_ref() == Some(expected)),
+            None => timings.all(|timing| timing.output_hash.is_none()),
+        }
+    }
+
+    fn representative_output_hash(&self) -> Option<&str> {
+        self.timings
+            .first()
+            .and_then(|timing| timing.output_hash.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BenchComparison {
+    pub baseline: BenchResult,
+    pub candidate: BenchResult,
+}
+
+impl BenchComparison {
+    pub fn speedup(&self) -> Option<f64> {
+        let baseline = self.baseline.median_duration()?;
+        let candidate = self.candidate.median_duration()?;
+        if candidate.is_zero() {
+            return None;
+        }
+
+        Some(baseline.as_secs_f64() / candidate.as_secs_f64())
+    }
+
+    pub fn output_identity_preserved(&self) -> bool {
+        if !self.baseline.is_output_identical() || !self.candidate.is_output_identical() {
+            return false;
+        }
+
+        match (
+            self.baseline.representative_output_hash(),
+            self.candidate.representative_output_hash(),
+        ) {
+            (Some(expected), Some(actual)) => expected == actual,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Error)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BenchFailure {
+    #[error("output mismatch for {case_name}: expected {expected_hash}, got {actual_hash}")]
+    OutputMismatch {
+        case_name: String,
+        expected_hash: String,
+        actual_hash: String,
+    },
+    #[error("timeout while compiling {case_name} after {limit:?}")]
+    Timeout {
+        case_name: String,
+        #[serde(with = "duration_ms")]
+        limit: Duration,
+    },
+    #[error("compile error for {case_name}: {message}")]
+    CompileError { case_name: String, message: String },
+    #[error("missing fixture: {}", path.display())]
+    MissingFixture { path: PathBuf },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct BenchReport {
+    pub results: Vec<BenchResult>,
+    pub comparisons: Vec<BenchComparison>,
+    pub failures: Vec<BenchFailure>,
+}
+
+impl BenchReport {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("bench report serialization should succeed")
+    }
+
+    pub fn summary(&self) -> String {
+        let mut lines = vec![format!(
+            "results: {}, comparisons: {}, failures: {}",
+            self.results.len(),
+            self.comparisons.len(),
+            self.failures.len()
+        )];
+
+        lines.extend(self.failures.iter().map(|failure| failure.to_string()));
+        lines.join("\n")
+    }
+}
+
+pub struct BenchHarness {
+    cases: Vec<BenchCase>,
+    config: BenchRunConfig,
+    backend: Arc<dyn CompileBackend>,
+}
+
+impl BenchHarness {
+    pub fn new(cases: Vec<BenchCase>, config: BenchRunConfig) -> Self {
+        Self {
+            cases,
+            config,
+            backend: Arc::new(UnconfiguredBackend),
+        }
+    }
+
+    pub fn with_backend<B>(mut self, backend: B) -> Self
+    where
+        B: CompileBackend + 'static,
+    {
+        self.backend = Arc::new(backend);
+        self
+    }
+
+    pub fn run(&self) -> BenchReport {
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+
+        for case in &self.cases {
+            match self.run_case(case) {
+                Ok(result) => results.push(result),
+                Err(failure) => failures.push(failure),
+            }
+        }
+
+        let comparisons = self.build_comparisons(&results);
+        BenchReport {
+            results,
+            comparisons,
+            failures,
+        }
+    }
+
+    pub fn run_case(&self, case: &BenchCase) -> Result<BenchResult, BenchFailure> {
+        self.ensure_fixture(case.input_fixture.as_path())?;
+        if let Some(bundle) = case.asset_bundle.as_deref() {
+            self.ensure_fixture(bundle)?;
+        }
+
+        for _ in 0..self.config.warmup_runs {
+            self.backend
+                .compile(
+                    case.input_fixture.as_path(),
+                    case.asset_bundle.as_deref(),
+                    case.jobs,
+                )
+                .map_err(|message| BenchFailure::CompileError {
+                    case_name: case.name.clone(),
+                    message,
+                })?;
+        }
+
+        let mut timings = Vec::with_capacity(self.config.measured_runs as usize);
+        for _ in 0..self.config.measured_runs {
+            let output = self
+                .backend
+                .compile(
+                    case.input_fixture.as_path(),
+                    case.asset_bundle.as_deref(),
+                    case.jobs,
+                )
+                .map_err(|message| BenchFailure::CompileError {
+                    case_name: case.name.clone(),
+                    message,
+                })?;
+
+            timings.push(BenchTiming {
+                duration: output.duration,
+                output_hash: Some(normalize_output_hash(&output.output_bytes)),
+            });
+        }
+
+        if self.config.compare_output_identity {
+            if let Some((expected_hash, actual_hash)) = find_output_mismatch(&timings) {
+                return Err(BenchFailure::OutputMismatch {
+                    case_name: case.name.clone(),
+                    expected_hash,
+                    actual_hash,
+                });
+            }
+        }
+
+        Ok(BenchResult {
+            case: case.clone(),
+            config: self.config.clone(),
+            timings,
+        })
+    }
+
+    pub fn compare(&self, baseline: &BenchResult, candidate: &BenchResult) -> BenchComparison {
+        BenchComparison {
+            baseline: baseline.clone(),
+            candidate: candidate.clone(),
+        }
+    }
+
+    fn build_comparisons(&self, results: &[BenchResult]) -> Vec<BenchComparison> {
+        let mut groups = BTreeMap::<(String, String, String, String), Vec<BenchResult>>::new();
+        for result in results {
+            groups
+                .entry(result.case.comparison_key())
+                .or_default()
+                .push(result.clone());
+        }
+
+        let mut comparisons = Vec::new();
+        for mut group in groups.into_values() {
+            group.sort_by_key(|result| result.case.jobs);
+            let Some(baseline) = group.iter().find(|result| result.case.jobs == 1).cloned() else {
+                continue;
+            };
+
+            for candidate in group.into_iter().filter(|result| result.case.jobs != 1) {
+                comparisons.push(self.compare(&baseline, &candidate));
+            }
+        }
+
+        comparisons
+    }
+
+    fn ensure_fixture(&self, path: &Path) -> Result<(), BenchFailure> {
+        if path.exists() {
+            Ok(())
+        } else {
+            Err(BenchFailure::MissingFixture {
+                path: path.to_path_buf(),
+            })
+        }
+    }
+}
+
+struct UnconfiguredBackend;
+
+impl CompileBackend for UnconfiguredBackend {
+    fn compile(
+        &self,
+        _input: &Path,
+        _asset_bundle: Option<&Path>,
+        _jobs: u32,
+    ) -> Result<CompileOutput, String> {
+        Err("compile backend is not configured".to_string())
+    }
+}
+
+fn normalize_output_hash(output_bytes: &[u8]) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let hash = output_bytes.iter().fold(FNV_OFFSET_BASIS, |acc, byte| {
+        let hashed = acc ^ u64::from(*byte);
+        hashed.wrapping_mul(FNV_PRIME)
+    });
+
+    format!("{hash:016x}")
+}
+
+fn find_output_mismatch(timings: &[BenchTiming]) -> Option<(String, String)> {
+    let mut timings = timings.iter();
+    let first = timings.next()?;
+    let expected = first
+        .output_hash
+        .clone()
+        .unwrap_or_else(|| "<missing>".to_string());
+
+    timings.find_map(|timing| {
+        let actual = timing
+            .output_hash
+            .clone()
+            .unwrap_or_else(|| "<missing>".to_string());
+        (actual != expected).then(|| (expected.clone(), actual))
+    })
+}
+
+mod duration_ms {
+    use std::time::Duration;
+
+    use serde::{ser::Error as _, Serializer};
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let millis = duration.as_secs_f64() * 1000.0;
+        if !millis.is_finite() {
+            return Err(S::Error::custom("duration must be finite"));
+        }
+
+        serializer.serialize_f64(millis)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use tempfile::tempdir;
+
+    use super::{
+        BenchCase, BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult,
+        BenchRunConfig, BenchTiming, CompileBackend, CompileOutput,
+    };
+
+    #[derive(Clone, Default)]
+    struct MockCompileBackend {
+        outputs: Arc<Mutex<VecDeque<Result<CompileOutput, String>>>>,
+        calls: Arc<Mutex<Vec<(PathBuf, Option<PathBuf>, u32)>>>,
+    }
+
+    impl MockCompileBackend {
+        fn with_outputs(outputs: Vec<Result<CompileOutput, String>>) -> Self {
+            Self {
+                outputs: Arc::new(Mutex::new(outputs.into())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().expect("calls lock").len()
+        }
+    }
+
+    impl CompileBackend for MockCompileBackend {
+        fn compile(
+            &self,
+            input: &Path,
+            asset_bundle: Option<&Path>,
+            jobs: u32,
+        ) -> Result<CompileOutput, String> {
+            self.calls.lock().expect("calls lock").push((
+                input.to_path_buf(),
+                asset_bundle.map(Path::to_path_buf),
+                jobs,
+            ));
+
+            self.outputs
+                .lock()
+                .expect("outputs lock")
+                .pop_front()
+                .unwrap_or_else(|| Err("mock backend ran out of outputs".to_string()))
+        }
+    }
+
+    #[test]
+    fn test_single_case_timing() {
+        let case = sample_case(
+            "single-case",
+            "minimal_article.tex",
+            BenchProfile::FullBench,
+            1,
+        );
+        let backend = MockCompileBackend::with_outputs(vec![
+            Ok(output(5, b"warmup")),
+            Ok(output(12, b"stable-output")),
+            Ok(output(18, b"stable-output")),
+        ]);
+        let harness = BenchHarness::new(
+            vec![case.clone()],
+            BenchRunConfig {
+                warmup_runs: 1,
+                measured_runs: 2,
+                compare_output_identity: true,
+            },
+        )
+        .with_backend(backend.clone());
+
+        let result = harness.run_case(&case).expect("case should succeed");
+
+        assert_eq!(result.timings.len(), 2);
+        assert_eq!(result.timings[0].duration, Duration::from_millis(12));
+        assert_eq!(result.timings[1].duration, Duration::from_millis(18));
+        assert_eq!(backend.call_count(), 3);
+    }
+
+    #[test]
+    fn test_median_calculation() {
+        let odd_result = sample_result(
+            "odd",
+            vec![timing(30, "same"), timing(10, "same"), timing(20, "same")],
+        );
+        let even_result = sample_result(
+            "even",
+            vec![
+                timing(10, "same"),
+                timing(40, "same"),
+                timing(20, "same"),
+                timing(30, "same"),
+            ],
+        );
+
+        assert_eq!(
+            odd_result.median_duration(),
+            Some(Duration::from_millis(20))
+        );
+        assert_eq!(
+            even_result.median_duration(),
+            Some(Duration::from_millis(25))
+        );
+    }
+
+    #[test]
+    fn test_output_identity_check() {
+        let identical = sample_result(
+            "identical",
+            vec![timing(10, "hash-a"), timing(20, "hash-a")],
+        );
+        let different = sample_result(
+            "different",
+            vec![timing(10, "hash-a"), timing(20, "hash-b")],
+        );
+
+        assert!(identical.is_output_identical());
+        assert!(!different.is_output_identical());
+
+        let case = sample_case(
+            "mismatch",
+            "minimal_article.tex",
+            BenchProfile::PartitionBench,
+            4,
+        );
+        let backend = MockCompileBackend::with_outputs(vec![
+            Ok(output(5, b"warmup")),
+            Ok(output(10, b"first")),
+            Ok(output(11, b"second")),
+        ]);
+        let harness = BenchHarness::new(
+            vec![case.clone()],
+            BenchRunConfig {
+                warmup_runs: 1,
+                measured_runs: 2,
+                compare_output_identity: true,
+            },
+        )
+        .with_backend(backend);
+
+        let failure = harness
+            .run_case(&case)
+            .expect_err("output mismatch should fail");
+
+        assert!(matches!(
+            failure,
+            BenchFailure::OutputMismatch { case_name, .. } if case_name == "mismatch"
+        ));
+    }
+
+    #[test]
+    fn test_comparison_speedup() {
+        let baseline = sample_result(
+            "partition-book",
+            vec![
+                timing(400, "same"),
+                timing(300, "same"),
+                timing(500, "same"),
+            ],
+        );
+        let candidate = BenchResult {
+            case: BenchCase {
+                jobs: 4,
+                ..baseline.case.clone()
+            },
+            config: baseline.config.clone(),
+            timings: vec![
+                timing(200, "same"),
+                timing(150, "same"),
+                timing(250, "same"),
+            ],
+        };
+        let comparison = BenchComparison {
+            baseline,
+            candidate,
+        };
+
+        let speedup = comparison.speedup().expect("speedup should exist");
+        assert!((speedup - 2.0).abs() < f64::EPSILON);
+        assert!(comparison.output_identity_preserved());
+    }
+
+    #[test]
+    fn test_missing_fixture_failure() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let missing_fixture = temp_dir.path().join("missing.tex");
+        let case = BenchCase {
+            name: "missing".to_string(),
+            profile: BenchProfile::BundleBootstrap,
+            input_fixture: missing_fixture.clone(),
+            asset_bundle: None,
+            jobs: 1,
+        };
+        let harness = BenchHarness::new(vec![case.clone()], BenchRunConfig::default())
+            .with_backend(MockCompileBackend::default());
+
+        let failure = harness
+            .run_case(&case)
+            .expect_err("missing fixture should fail");
+
+        assert!(matches!(
+            failure,
+            BenchFailure::MissingFixture { path } if path == missing_fixture
+        ));
+    }
+
+    #[test]
+    fn test_report_serialization_and_comparison_generation() {
+        let sequential = sample_case(
+            "partition-article",
+            "multi_section.tex",
+            BenchProfile::PartitionBench,
+            1,
+        );
+        let parallel = BenchCase {
+            jobs: 4,
+            ..sequential.clone()
+        };
+        let backend = MockCompileBackend::with_outputs(vec![
+            Ok(output(20, b"warmup")),
+            Ok(output(30, b"stable")),
+            Ok(output(32, b"stable")),
+            Ok(output(18, b"warmup")),
+            Ok(output(15, b"stable")),
+            Ok(output(14, b"stable")),
+        ]);
+        let harness = BenchHarness::new(
+            vec![sequential, parallel],
+            BenchRunConfig {
+                warmup_runs: 1,
+                measured_runs: 2,
+                compare_output_identity: true,
+            },
+        )
+        .with_backend(backend);
+
+        let report = harness.run();
+
+        assert_eq!(report.results.len(), 2);
+        assert_eq!(report.comparisons.len(), 1);
+        assert!(report.failures.is_empty());
+        assert!(report.to_json().contains("partition-article"));
+        assert!(report.summary().contains("results: 2"));
+    }
+
+    fn sample_case(name: &str, fixture_name: &str, profile: BenchProfile, jobs: u32) -> BenchCase {
+        BenchCase {
+            name: name.to_string(),
+            profile,
+            input_fixture: fixture_path(fixture_name),
+            asset_bundle: None,
+            jobs,
+        }
+    }
+
+    fn sample_result(name: &str, timings: Vec<BenchTiming>) -> BenchResult {
+        BenchResult {
+            case: sample_case(name, "minimal_article.tex", BenchProfile::FullBench, 1),
+            config: BenchRunConfig::default(),
+            timings,
+        }
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn output(duration_ms: u64, bytes: &[u8]) -> CompileOutput {
+        CompileOutput {
+            duration: Duration::from_millis(duration_ms),
+            output_bytes: bytes.to_vec(),
+        }
+    }
+
+    fn timing(duration_ms: u64, hash: &str) -> BenchTiming {
+        BenchTiming {
+            duration: Duration::from_millis(duration_ms),
+            output_hash: Some(hash.to_string()),
+        }
+    }
+}
