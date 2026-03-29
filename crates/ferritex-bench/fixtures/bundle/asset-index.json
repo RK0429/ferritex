@@ -1,0 +1,11 @@
+{
+  "tex_inputs": {},
+  "packages": {
+    "benchstub.sty": "texmf/tex/latex/benchstub.sty"
+  },
+  "opentype_fonts": {},
+  "tfm_fonts": {
+    "cmr10": "texmf/fonts/tfm/public/cm/cmr10.tfm"
+  },
+  "default_opentype_fonts": []
+}

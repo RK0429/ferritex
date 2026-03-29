@@ -41,6 +41,20 @@ impl BenchProfile {
     }
 }
 
+pub fn bench_fixtures_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+}
+
+pub fn bundle_bootstrap_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    vec![BenchCase {
+        name: "layout-core-article-bundle".to_string(),
+        profile: BenchProfile::BundleBootstrap,
+        input_fixture: fixture_base.join("layout-core/article.tex"),
+        asset_bundle: Some(fixture_base.join("bundle")),
+        jobs: 1,
+    }]
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BenchCase {
     pub name: String,
@@ -356,6 +370,52 @@ impl BenchHarness {
     }
 }
 
+pub struct CliCompileBackend {
+    binary_path: PathBuf,
+}
+
+impl CliCompileBackend {
+    pub fn new(binary_path: PathBuf) -> Self {
+        Self { binary_path }
+    }
+}
+
+impl CompileBackend for CliCompileBackend {
+    fn compile(
+        &self,
+        input: &Path,
+        asset_bundle: Option<&Path>,
+        _jobs: u32,
+    ) -> Result<CompileOutput, String> {
+        let start = std::time::Instant::now();
+        let mut cmd = std::process::Command::new(&self.binary_path);
+        cmd.arg("compile").arg(input);
+        if let Some(bundle) = asset_bundle {
+            cmd.args(["--asset-bundle", &bundle.to_string_lossy()]);
+        }
+
+        let output = cmd
+            .output()
+            .map_err(|e| format!("failed to run ferritex: {e}"))?;
+        let duration = start.elapsed();
+        if !output.status.success() {
+            return Err(format!(
+                "ferritex exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let pdf_path = input.with_extension("pdf");
+        let output_bytes = std::fs::read(&pdf_path)
+            .map_err(|e| format!("failed to read output PDF {}: {e}", pdf_path.display()))?;
+        Ok(CompileOutput {
+            duration,
+            output_bytes,
+        })
+    }
+}
+
 struct UnconfiguredBackend;
 
 impl CompileBackend for UnconfiguredBackend {
@@ -420,6 +480,7 @@ mod duration_ms {
 mod tests {
     use std::{
         collections::VecDeque,
+        fs,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::Duration,
@@ -428,9 +489,17 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        BenchCase, BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult,
-        BenchRunConfig, BenchTiming, CompileBackend, CompileOutput,
+        bundle_bootstrap_cases, BenchCase, BenchComparison, BenchFailure, BenchHarness,
+        BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend, CompileOutput,
     };
+
+    const EXPECTED_BUNDLE_TFM: [u8; 64] = [
+        0x00, 0x10, 0x00, 0x02, 0x00, 0x41, 0x00, 0x42, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xab, 0xcd, 0x12, 0x34, 0x00, 0xa0,
+        0x00, 0x00, 0x01, 0x10, 0x00, 0x00, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x05, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x99, 0x9a, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
 
     #[derive(Clone, Default)]
     struct MockCompileBackend {
@@ -631,6 +700,80 @@ mod tests {
     }
 
     #[test]
+    fn test_bundle_bootstrap_case_with_layout_core_fixture() {
+        let fixture_base = fixtures_root();
+        let bundle_dir = fixture_base.join("bundle");
+        let bundle_paths = [
+            bundle_dir.join("manifest.json"),
+            bundle_dir.join("asset-index.json"),
+            bundle_dir.join("texmf/tex/latex/benchstub.sty"),
+            bundle_dir.join("texmf/fonts/tfm/public/cm/cmr10.tfm"),
+        ];
+        let layout_paths = [
+            fixture_base.join("layout-core/article.tex"),
+            fixture_base.join("layout-core/report.tex"),
+            fixture_base.join("layout-core/book.tex"),
+            fixture_base.join("layout-core/letter.tex"),
+        ];
+
+        for path in bundle_paths.iter().chain(layout_paths.iter()) {
+            assert!(path.exists(), "fixture should exist: {}", path.display());
+        }
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("manifest.json"))
+                .expect("manifest fixture should be readable"),
+        )
+        .expect("manifest fixture should be valid json");
+        assert_eq!(manifest["asset_index_path"], "asset-index.json");
+
+        let asset_index: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("asset-index.json"))
+                .expect("asset index fixture should be readable"),
+        )
+        .expect("asset index fixture should be valid json");
+        assert_eq!(
+            asset_index["tfm_fonts"]["cmr10"],
+            "texmf/fonts/tfm/public/cm/cmr10.tfm"
+        );
+
+        let tfm_bytes = fs::read(bundle_dir.join("texmf/fonts/tfm/public/cm/cmr10.tfm"))
+            .expect("tfm fixture should be readable");
+        assert_eq!(tfm_bytes.as_slice(), EXPECTED_BUNDLE_TFM);
+
+        let cases = bundle_bootstrap_cases(&fixture_base);
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].profile, BenchProfile::BundleBootstrap);
+        assert_eq!(cases[0].asset_bundle.as_deref(), Some(bundle_dir.as_path()));
+
+        let harness = BenchHarness::new(
+            cases,
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: true,
+            },
+        )
+        .with_backend(MockCompileBackend::with_outputs(vec![Ok(output(
+            7,
+            b"bundle-output",
+        ))]));
+
+        let report = harness.run();
+
+        assert!(report.failures.is_empty());
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(
+            report.results[0].case.profile,
+            BenchProfile::BundleBootstrap
+        );
+        assert_eq!(
+            report.results[0].case.asset_bundle.as_deref(),
+            Some(bundle_dir.as_path())
+        );
+    }
+
+    #[test]
     fn test_report_serialization_and_comparison_generation() {
         let sequential = sample_case(
             "partition-article",
@@ -687,10 +830,12 @@ mod tests {
         }
     }
 
+    fn fixtures_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    }
+
     fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
-            .join(name)
+        fixtures_root().join(name)
     }
 
     fn output(duration_ms: u64, bytes: &[u8]) -> CompileOutput {

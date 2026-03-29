@@ -18,6 +18,50 @@ fn ferritex_bin() -> Command {
     Command::new(bin)
 }
 
+fn build_minimal_cmr10_tfm() -> Vec<u8> {
+    const BC: u16 = 65;
+    const EC: u16 = 66;
+    const LH: u16 = 2;
+    const NW: u16 = 2;
+    const NH: u16 = 2;
+    const ND: u16 = 1;
+    const NI: u16 = 1;
+    const CHECKSUM: u32 = 0xABCD_1234;
+    const DESIGN_SIZE_FIXWORD: i32 = 10_485_760;
+
+    let char_count = usize::from(EC - BC + 1);
+    let lf = 6
+        + usize::from(LH)
+        + char_count
+        + usize::from(NW)
+        + usize::from(NH)
+        + usize::from(ND)
+        + usize::from(NI);
+
+    let mut bytes = Vec::with_capacity(lf * 4);
+    for value in [lf as u16, LH, BC, EC, NW, NH, ND, NI, 0, 0, 0, 0] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    bytes.extend_from_slice(&CHECKSUM.to_be_bytes());
+    bytes.extend_from_slice(&DESIGN_SIZE_FIXWORD.to_be_bytes());
+
+    for _ in 0..char_count {
+        bytes.extend_from_slice(&[1, 0x10, 0, 0]);
+    }
+
+    for value in [0_i32, 349_525] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    for value in [0_i32, 104_858] {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    bytes.extend_from_slice(&0_i32.to_be_bytes());
+    bytes.extend_from_slice(&0_i32.to_be_bytes());
+
+    bytes
+}
+
 #[test]
 fn compile_nonexistent_file_exits_with_code_2() {
     let output = ferritex_bin()
@@ -901,11 +945,14 @@ fn expanded_asset_bundle_fixture() -> tempfile::TempDir {
     let package_sty = texmf_root.join("tex/latex/ferritex/bundlebootstrap.sty");
     let bundled_tex = texmf_root.join("bundled.tex");
     let custom_tex = texmf_root.join("shared/custom.tex");
+    let cmr10_tfm = texmf_root.join("fonts/tfm/public/cm/cmr10.tfm");
 
     std::fs::create_dir_all(package_sty.parent().expect("bundlebootstrap.sty parent"))
         .expect("create package directory");
     std::fs::create_dir_all(custom_tex.parent().expect("custom tex parent"))
         .expect("create custom tex directory");
+    std::fs::create_dir_all(cmr10_tfm.parent().expect("cmr10.tfm parent"))
+        .expect("create TFM font directory");
 
     std::fs::write(
         bundle_root.join("manifest.json"),
@@ -932,9 +979,10 @@ fn expanded_asset_bundle_fixture() -> tempfile::TempDir {
                 "bundlebootstrap": "texmf/tex/latex/ferritex/bundlebootstrap.sty",
                 "bundlebootstrap.sty": "texmf/tex/latex/ferritex/bundlebootstrap.sty",
             },
-            // TODO(REQ-FUNC-046): Add font entries when font precedence e2e testing is implemented.
             "opentype_fonts": {},
-            "tfm_fonts": {},
+            "tfm_fonts": {
+                "cmr10": "texmf/fonts/tfm/public/cm/cmr10.tfm",
+            },
             "default_opentype_fonts": [],
         }))
         .expect("serialize bundle asset index"),
@@ -948,6 +996,7 @@ fn expanded_asset_bundle_fixture() -> tempfile::TempDir {
     std::fs::write(&bundled_tex, "Bundled from expanded asset bundle.\n")
         .expect("write bundled tex input");
     std::fs::write(&custom_tex, "Bundle version of custom.\n").expect("write custom tex input");
+    std::fs::write(&cmr10_tfm, build_minimal_cmr10_tfm()).expect("write cmr10 TFM");
 
     bundle_dir
 }
@@ -1024,6 +1073,68 @@ fn compile_bundle_only_bootstrap_succeeds() {
     let pdf = std::fs::read_to_string(dir.path().join("main.pdf")).expect("read output pdf");
     assert!(pdf.contains("Bundled from expanded asset bundle."));
     assert!(pdf.contains("Bundle bootstrap test."));
+}
+
+#[test]
+fn compile_bundle_tfm_font_resolution() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("font-test.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nFont test.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read_to_string(dir.path().join("font-test.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Font test."));
+}
+
+#[test]
+fn compile_reproducible_with_asset_bundle() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nReproducible bundle output.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let run_compile = || {
+        ferritex_bin()
+            .args([
+                "compile",
+                "--reproducible",
+                tex_file.to_str().expect("utf-8 path"),
+                "--asset-bundle",
+                bundle_dir.path().to_str().expect("utf-8 bundle path"),
+            ])
+            .output()
+            .expect("failed to run ferritex")
+    };
+
+    let first = run_compile();
+    assert_eq!(first.status.code(), Some(0));
+    let first_pdf = std::fs::read(dir.path().join("main.pdf")).expect("read first output pdf");
+
+    let second = run_compile();
+    assert_eq!(second.status.code(), Some(0));
+    let second_pdf = std::fs::read(dir.path().join("main.pdf")).expect("read second output pdf");
+
+    assert_eq!(first_pdf, second_pdf);
 }
 
 #[test]

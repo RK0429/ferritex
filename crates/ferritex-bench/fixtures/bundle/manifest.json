@@ -1,0 +1,7 @@
+{
+  "name": "ferritex-bench-basic",
+  "version": "2026.03.30",
+  "min_ferritex_version": "0.1.0",
+  "format_version": 1,
+  "asset_index_path": "asset-index.json"
+}
