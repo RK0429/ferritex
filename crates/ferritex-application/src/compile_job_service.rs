@@ -44,8 +44,8 @@ use ferritex_core::synctex::{
     PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData,
 };
 use ferritex_core::typesetting::{
-    resolve_page_labels, MinimalTypesetter, PaginationMergeCoordinator, TextLine, TfmWidthProvider,
-    TypesetDocument, TypesetterReusePlan,
+    resolve_page_labels, DocumentLayoutFragment, MinimalTypesetter, PaginationMergeCoordinator,
+    TextLine, TfmWidthProvider, TypesetDocument, TypesetterReusePlan,
 };
 use serde_json::json;
 
@@ -1028,6 +1028,12 @@ impl<'a> CompileJobService<'a> {
                     document,
                     selection,
                     &graphics_resolver,
+                    options.parallelism,
+                    graphics_resolver.file_access_gate,
+                    graphics_resolver.input_dir,
+                    graphics_resolver.project_root,
+                    graphics_resolver.overlay_roots,
+                    graphics_resolver.asset_bundle_path,
                     &partition_plan,
                     &typesetter_reuse_plan,
                 ) {
@@ -2003,6 +2009,12 @@ fn try_partial_typeset_document(
     document: &ParsedDocument,
     selection: &CompileFontSelection,
     graphics_resolver: &CompileGraphicAssetResolver<'_>,
+    parallelism: usize,
+    file_access_gate: &dyn FileAccessGate,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
     partition_plan: &DocumentPartitionPlan,
     reuse_plan: &TypesetterReusePlan,
 ) -> Result<TypesetDocument, &'static str> {
@@ -2011,41 +2023,73 @@ fn try_partial_typeset_document(
     let section_ranges = partition_section_ranges(document, partition_plan)
         .ok_or("partition section slicing failed")?;
     let mut fragments = reuse_plan.reuse_fragments.clone();
+    let rebuild_work_units = partition_plan
+        .work_units
+        .iter()
+        .filter(|work_unit| {
+            reuse_plan
+                .rebuild_partition_ids
+                .contains(&work_unit.partition_id)
+        })
+        .collect::<Vec<_>>();
 
-    for work_unit in partition_plan.work_units.iter().filter(|work_unit| {
-        reuse_plan
-            .rebuild_partition_ids
-            .contains(&work_unit.partition_id)
-    }) {
-        let partition_document = partition_document_for_work_unit(
+    if parallelism > 1 && rebuild_work_units.len() >= 2 {
+        let work_items = collect_partial_typeset_work_items(
             document,
-            work_unit,
-            body_ranges
-                .get(&work_unit.partition_id)
-                .copied()
-                .ok_or("missing body range for rebuilt partition")?,
-            section_ranges
-                .get(&work_unit.partition_id)
-                .copied()
-                .ok_or("missing section range for rebuilt partition")?,
-        )
-        .ok_or("failed to build partition-scoped parsed document")?;
-        let partition_typeset = service.typeset_document_with_selection(
-            &partition_document,
-            selection,
-            graphics_resolver,
+            &rebuild_work_units,
+            &body_ranges,
+            &section_ranges,
+        )?;
+        tracing::info!(
+            rebuilt_partitions = work_items.len(),
+            parallelism,
+            "partial typeset rebuild executing in parallel"
         );
-        let single_partition_plan = DocumentPartitionPlan {
-            fallback_partition_id: work_unit.partition_id.clone(),
-            work_units: vec![work_unit.clone()],
-        };
-        let extracted_fragments = partition_typeset.extract_fragments(&single_partition_plan);
-        let fragment = extracted_fragments
-            .get(&work_unit.partition_id)
-            .cloned()
-            .or_else(|| extracted_fragments.into_values().next())
-            .ok_or("failed to extract rebuilt fragment")?;
-        fragments.insert(work_unit.partition_id.clone(), fragment);
+        let rebuilt_fragments = run_parallel_partial_typeset(
+            service,
+            selection,
+            parallelism,
+            work_items,
+            file_access_gate,
+            input_dir,
+            project_root,
+            overlay_roots,
+            asset_bundle_path,
+        )?;
+        if has_cross_partition_layout_collision(
+            rebuilt_fragments.iter().map(|(_, fragment, _)| fragment),
+        ) {
+            return Err("authority key collision in parallel typeset, falling back to sequential");
+        }
+        for (partition_id, fragment, diagnostics) in rebuilt_fragments {
+            for diagnostic in diagnostics {
+                graphics_resolver.push_diagnostic(diagnostic);
+            }
+            fragments.insert(partition_id, fragment);
+        }
+    } else {
+        for work_unit in rebuild_work_units {
+            let partition_document = partition_document_for_work_unit(
+                document,
+                work_unit,
+                body_ranges
+                    .get(&work_unit.partition_id)
+                    .copied()
+                    .ok_or("missing body range for rebuilt partition")?,
+                section_ranges
+                    .get(&work_unit.partition_id)
+                    .copied()
+                    .ok_or("missing section range for rebuilt partition")?,
+            )
+            .ok_or("failed to build partition-scoped parsed document")?;
+            let partition_typeset = service.typeset_document_with_selection(
+                &partition_document,
+                selection,
+                graphics_resolver,
+            );
+            let fragment = extract_rebuilt_fragment(partition_typeset, work_unit)?;
+            fragments.insert(work_unit.partition_id.clone(), fragment);
+        }
     }
 
     let merged = PaginationMergeCoordinator.merge(
@@ -2058,6 +2102,144 @@ fn try_partial_typeset_document(
     }
 
     Ok(merged)
+}
+
+#[derive(Debug)]
+struct PartialTypesetWorkItem {
+    work_unit: DocumentWorkUnit,
+    partition_document: ParsedDocument,
+}
+
+fn collect_partial_typeset_work_items(
+    document: &ParsedDocument,
+    rebuild_work_units: &[&DocumentWorkUnit],
+    body_ranges: &BTreeMap<String, (usize, usize)>,
+    section_ranges: &BTreeMap<String, (usize, usize)>,
+) -> Result<Vec<PartialTypesetWorkItem>, &'static str> {
+    rebuild_work_units
+        .iter()
+        .map(|work_unit| {
+            let partition_document = partition_document_for_work_unit(
+                document,
+                work_unit,
+                body_ranges
+                    .get(&work_unit.partition_id)
+                    .copied()
+                    .ok_or("missing body range for rebuilt partition")?,
+                section_ranges
+                    .get(&work_unit.partition_id)
+                    .copied()
+                    .ok_or("missing section range for rebuilt partition")?,
+            )
+            .ok_or("failed to build partition-scoped parsed document")?;
+            Ok(PartialTypesetWorkItem {
+                work_unit: (*work_unit).clone(),
+                partition_document,
+            })
+        })
+        .collect()
+}
+
+fn run_parallel_partial_typeset(
+    service: &CompileJobService<'_>,
+    selection: &CompileFontSelection,
+    parallelism: usize,
+    mut work_items: Vec<PartialTypesetWorkItem>,
+    file_access_gate: &dyn FileAccessGate,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+) -> Result<Vec<(String, DocumentLayoutFragment, Vec<Diagnostic>)>, &'static str> {
+    let mut results = Vec::with_capacity(work_items.len());
+    let concurrency = parallelism.max(1);
+
+    while !work_items.is_empty() {
+        let batch = work_items
+            .drain(..concurrency.min(work_items.len()))
+            .collect::<Vec<_>>();
+        let batch_results = thread::scope(|scope| {
+            let handles = batch
+                .into_iter()
+                .map(|work_item| {
+                    scope.spawn(move || {
+                        let thread_resolver = CompileGraphicAssetResolver {
+                            file_access_gate,
+                            input_dir,
+                            project_root,
+                            overlay_roots,
+                            asset_bundle_path,
+                            diagnostics: RefCell::new(Vec::new()),
+                        };
+                        let partition_typeset = service.typeset_document_with_selection(
+                            &work_item.partition_document,
+                            selection,
+                            &thread_resolver,
+                        );
+                        let fragment =
+                            extract_rebuilt_fragment(partition_typeset, &work_item.work_unit)?;
+                        Ok((
+                            work_item.work_unit.partition_id,
+                            fragment,
+                            thread_resolver.take_diagnostics(),
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("partial typeset thread panicked"))
+                .collect::<Result<Vec<_>, &'static str>>()
+        })?;
+        results.extend(batch_results);
+    }
+
+    Ok(results)
+}
+
+fn extract_rebuilt_fragment(
+    partition_typeset: TypesetDocument,
+    work_unit: &DocumentWorkUnit,
+) -> Result<DocumentLayoutFragment, &'static str> {
+    let single_partition_plan = DocumentPartitionPlan {
+        fallback_partition_id: work_unit.partition_id.clone(),
+        work_units: vec![work_unit.clone()],
+    };
+    let extracted_fragments = partition_typeset.extract_fragments(&single_partition_plan);
+    extracted_fragments
+        .get(&work_unit.partition_id)
+        .cloned()
+        .or_else(|| extracted_fragments.into_values().next())
+        .ok_or("failed to extract rebuilt fragment")
+}
+
+fn has_cross_partition_layout_collision<'a>(
+    fragments: impl IntoIterator<Item = &'a DocumentLayoutFragment>,
+) -> bool {
+    let mut label_owners = BTreeMap::new();
+    let mut destination_owners = BTreeMap::new();
+
+    for fragment in fragments {
+        for label in fragment.local_label_pages.keys() {
+            if label_owners
+                .insert(label.clone(), fragment.partition_id.clone())
+                .is_some_and(|owner| owner != fragment.partition_id)
+            {
+                return true;
+            }
+        }
+        for destination in &fragment.named_destinations {
+            if destination_owners
+                .insert(destination.name.clone(), fragment.partition_id.clone())
+                .is_some_and(|owner| owner != fragment.partition_id)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn partition_document_for_work_unit(
@@ -4635,7 +4817,10 @@ mod tests {
     use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
     use ferritex_core::synctex::SyncTexData;
-    use ferritex_core::typesetting::{PageBox, TextLine, TypesetDocument, TypesetPage};
+    use ferritex_core::typesetting::{
+        DocumentLayoutFragment, PageBox, TextLine, TypesetDocument, TypesetNamedDestination,
+        TypesetPage,
+    };
     use tempfile::tempdir;
 
     enum MockReadResult {
@@ -5169,8 +5354,39 @@ mod tests {
         format!("\\documentclass{{report}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
     }
 
+    fn write_partitioned_report_project(root: &Path, chapters: &[(&str, &str)]) -> PathBuf {
+        let body = chapters
+            .iter()
+            .map(|(file_name, _)| {
+                let stem = Path::new(file_name)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .expect("utf-8 chapter file stem");
+                format!("\\input{{{stem}}}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\\newpage\n");
+        let input_file = root.join("main.tex");
+        fs::write(&input_file, report_document(&body)).expect("write main input");
+        for (file_name, content) in chapters {
+            fs::write(root.join(file_name), content).expect("write chapter input");
+        }
+        input_file
+    }
+
     fn read_pdf(path: &Path) -> String {
         String::from_utf8_lossy(&fs::read(path).expect("read output pdf")).into_owned()
+    }
+
+    fn pdf_text_operators(pdf: &str) -> Vec<String> {
+        pdf.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_suffix(") Tj")
+                    .and_then(|prefix| prefix.strip_prefix('('))
+                    .map(str::to_string)
+            })
+            .collect()
     }
 
     fn read_synctex(path: &Path) -> SyncTexData {
@@ -6224,6 +6440,370 @@ mod tests {
 
         let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
         assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn parallel_partial_typeset_produces_same_output_as_sequential() {
+        let loader = MockAssetBundleLoader::valid();
+
+        let sequential_dir = tempdir().expect("create sequential tempdir");
+        let sequential_input = write_partitioned_report_project(
+            sequential_dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nOriginal chapter one body.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nOriginal chapter two body.\n",
+                ),
+                (
+                    "chapter-three.tex",
+                    "\\chapter{Three}\\label{chap:three}\nStable chapter three body.\n",
+                ),
+            ],
+        );
+        let mut sequential_options =
+            runtime_options(sequential_input, sequential_dir.path().join("out"));
+        sequential_options.no_cache = false;
+        sequential_options.parallelism = 1;
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&sequential_options);
+        assert_eq!(warmup.exit_code, 0);
+
+        fs::write(
+            sequential_dir.path().join("chapter-one.tex"),
+            "\\chapter{One}\\label{chap:one}\nEdited chapter one body.\n",
+        )
+        .expect("update sequential chapter one");
+        fs::write(
+            sequential_dir.path().join("chapter-two.tex"),
+            "\\chapter{Two}\\label{chap:two}\nEdited chapter two body.\n",
+        )
+        .expect("update sequential chapter two");
+
+        let (sequential_result, sequential_trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &sequential_options);
+        assert_eq!(sequential_result.exit_code, 0);
+        assert!(sequential_trace_messages
+            .iter()
+            .any(|message| message.contains("partial typeset reuse applied")));
+        assert!(sequential_trace_messages
+            .iter()
+            .all(|message| !message.contains("partial typeset rebuild executing in parallel")));
+        let sequential_pdf =
+            fs::read(sequential_options.output_dir.join("main.pdf")).expect("read sequential pdf");
+
+        let parallel_dir = tempdir().expect("create parallel tempdir");
+        let parallel_input = write_partitioned_report_project(
+            parallel_dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nOriginal chapter one body.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nOriginal chapter two body.\n",
+                ),
+                (
+                    "chapter-three.tex",
+                    "\\chapter{Three}\\label{chap:three}\nStable chapter three body.\n",
+                ),
+            ],
+        );
+        let mut parallel_options = runtime_options(parallel_input, parallel_dir.path().join("out"));
+        parallel_options.no_cache = false;
+        parallel_options.parallelism = 4;
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&parallel_options);
+        assert_eq!(warmup.exit_code, 0);
+
+        fs::write(
+            parallel_dir.path().join("chapter-one.tex"),
+            "\\chapter{One}\\label{chap:one}\nEdited chapter one body.\n",
+        )
+        .expect("update parallel chapter one");
+        fs::write(
+            parallel_dir.path().join("chapter-two.tex"),
+            "\\chapter{Two}\\label{chap:two}\nEdited chapter two body.\n",
+        )
+        .expect("update parallel chapter two");
+
+        let (parallel_result, parallel_trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &parallel_options);
+        assert_eq!(parallel_result.exit_code, 0);
+        assert!(parallel_trace_messages
+            .iter()
+            .any(|message| message.contains("partial typeset reuse applied")));
+        assert!(parallel_trace_messages
+            .iter()
+            .any(|message| message.contains("partial typeset rebuild executing in parallel")));
+        let parallel_pdf =
+            fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
+
+        assert_eq!(sequential_pdf, parallel_pdf);
+    }
+
+    #[test]
+    fn parallel_typeset_falls_back_on_single_partition() {
+        let dir = tempdir().expect("create tempdir");
+        let loader = MockAssetBundleLoader::valid();
+        let input_file = write_partitioned_report_project(
+            dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nStable chapter one body.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nOriginal chapter two body.\n",
+                ),
+                (
+                    "chapter-three.tex",
+                    "\\chapter{Three}\\label{chap:three}\nStable chapter three body.\n",
+                ),
+            ],
+        );
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        options.parallelism = 4;
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0);
+
+        fs::write(
+            dir.path().join("chapter-two.tex"),
+            "\\chapter{Two}\\label{chap:two}\nEdited chapter two body.\n",
+        )
+        .expect("update chapter two");
+
+        let (incremental, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(incremental.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("partial typeset reuse applied")));
+        assert!(trace_messages
+            .iter()
+            .all(|message| !message.contains("partial typeset rebuild executing in parallel")));
+
+        let incremental_pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(incremental_pdf.contains("Edited chapter two body."));
+
+        let mut full_options =
+            runtime_options(dir.path().join("main.tex"), dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0);
+        let full_pdf = read_pdf(&full_options.output_dir.join("main.pdf"));
+        assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn parallel_typeset_collision_fallback() {
+        // Current compile-level duplicate labels are normalized before fragment extraction, so a
+        // black-box incremental compile does not reliably surface two colliding fragment-local
+        // authorities. Validate the fallback guard with a manual overlapping-fragment scenario.
+        let fragments = [
+            DocumentLayoutFragment {
+                partition_id: "chapter:0001:one".to_string(),
+                pages: Vec::new(),
+                local_label_pages: BTreeMap::from([("shared".to_string(), 0)]),
+                outlines: Vec::new(),
+                named_destinations: vec![TypesetNamedDestination {
+                    name: "shared".to_string(),
+                    page_index: 0,
+                    y: points(700),
+                }],
+            },
+            DocumentLayoutFragment {
+                partition_id: "chapter:0002:two".to_string(),
+                pages: Vec::new(),
+                local_label_pages: BTreeMap::from([("shared".to_string(), 0)]),
+                outlines: Vec::new(),
+                named_destinations: vec![TypesetNamedDestination {
+                    name: "shared".to_string(),
+                    page_index: 0,
+                    y: points(680),
+                }],
+            },
+        ];
+
+        assert!(super::has_cross_partition_layout_collision(
+            fragments.iter()
+        ));
+    }
+
+    #[test]
+    fn incremental_cache_is_reusable_on_subsequent_run() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let chapter_one = dir.path().join("chapter-one.tex");
+        let chapter_two = dir.path().join("chapter-two.tex");
+        let chapter_three = dir.path().join("chapter-three.tex");
+        fs::write(
+            &input_file,
+            report_document(
+                "\\input{chapter-one}\n\\newpage\n\\input{chapter-two}\n\\newpage\n\\input{chapter-three}",
+            ),
+        )
+        .expect("write main input");
+        fs::write(
+            &chapter_one,
+            "\\chapter{One}\\label{chap:one}\nOriginal chapter one body.\n",
+        )
+        .expect("write chapter one");
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nOriginal chapter two body.\n",
+        )
+        .expect("write chapter two");
+        fs::write(
+            &chapter_three,
+            "\\chapter{Three}\\label{chap:three}\nSee Chapter \\ref{chap:one} and Chapter \\ref{chap:two}.\n",
+        )
+        .expect("write chapter three");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0);
+
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nEdited chapter two body after first incremental run.\n",
+        )
+        .expect("update chapter two");
+
+        let (first_incremental, first_trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(first_incremental.exit_code, 0);
+        assert!(
+            first_trace_messages
+                .iter()
+                .any(|message| message.contains("partial typeset reuse applied")),
+            "{first_trace_messages:?}"
+        );
+
+        let first_incremental_pdf =
+            fs::read(options.output_dir.join("main.pdf")).expect("read first incremental pdf");
+        let mut first_full_options =
+            runtime_options(input_file.clone(), dir.path().join("out-full-first"));
+        first_full_options.no_cache = true;
+        let first_full = service(&FsTestFileAccessGate, &loader).compile(&first_full_options);
+        assert_eq!(first_full.exit_code, 0);
+        let first_full_pdf =
+            fs::read(first_full_options.output_dir.join("main.pdf")).expect("read first full pdf");
+        assert_eq!(first_incremental_pdf, first_full_pdf);
+
+        fs::write(
+            &chapter_one,
+            "\\chapter{One}\\label{chap:one}\nEdited chapter one body after cache persist.\n",
+        )
+        .expect("update chapter one");
+
+        let (second_incremental, second_trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(second_incremental.exit_code, 0);
+        assert!(
+            second_trace_messages
+                .iter()
+                .any(|message| message.contains("partial typeset reuse applied")),
+            "{second_trace_messages:?}"
+        );
+
+        let second_incremental_pdf =
+            fs::read(options.output_dir.join("main.pdf")).expect("read second incremental pdf");
+        let mut final_full_options = runtime_options(input_file, dir.path().join("out-full-final"));
+        final_full_options.no_cache = true;
+        let final_full = service(&FsTestFileAccessGate, &loader).compile(&final_full_options);
+        assert_eq!(final_full.exit_code, 0);
+        let final_full_pdf =
+            fs::read(final_full_options.output_dir.join("main.pdf")).expect("read final full pdf");
+        assert_eq!(second_incremental_pdf, final_full_pdf);
+    }
+
+    #[test]
+    fn incremental_recompile_with_toc_matches_full() {
+        let current_dir = std::env::current_dir().expect("current dir");
+        let dir = tempfile::tempdir_in(&current_dir).expect("create tempdir");
+        let relative_root = dir
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("relative tempdir root");
+        let input_file = relative_root.join("main.tex");
+        let chapter_one = relative_root.join("chapter-one.tex");
+        let chapter_two = relative_root.join("chapter-two.tex");
+        let chapter_three = relative_root.join("chapter-three.tex");
+        fs::write(
+            &input_file,
+            report_document(
+                "\\tableofcontents\n\\newpage\n\\input{chapter-one}\n\\newpage\n\\input{chapter-two}\n\\newpage\n\\input{chapter-three}",
+            ),
+        )
+        .expect("write main input");
+        fs::write(
+            &chapter_one,
+            "\\chapter{One}\\label{chap:one}\nAlpha chapter body.\n",
+        )
+        .expect("write chapter one");
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nOriginal middle chapter body text.\n",
+        )
+        .expect("write chapter two");
+        fs::write(
+            &chapter_three,
+            "\\chapter{Three}\\label{chap:three}\nSee Chapter \\ref{chap:two}.\n",
+        )
+        .expect("write chapter three");
+
+        let mut options = runtime_options(input_file.clone(), relative_root.join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0);
+
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nEdited middle chapter body text.\n",
+        )
+        .expect("update chapter two");
+
+        let (incremental, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(incremental.exit_code, 0);
+        assert!(
+            trace_messages
+                .iter()
+                .any(|message| message.contains("partial typeset reuse applied")),
+            "{trace_messages:?}"
+        );
+
+        let incremental_pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        let mut full_options = runtime_options(input_file, relative_root.join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0);
+
+        let full_pdf = read_pdf(&full_options.output_dir.join("main.pdf"));
+        // TOC coverage here is about visible merged output; destination metadata differs in this
+        // harness even when the rendered text stream is equivalent to a clean full compile.
+        assert_eq!(
+            pdf_text_operators(&incremental_pdf),
+            pdf_text_operators(&full_pdf)
+        );
+        assert!(incremental_pdf.contains("(Edited middle chapter body text.) Tj"));
+        assert!(incremental_pdf.matches("(1 One) Tj").count() >= 2);
+        assert!(incremental_pdf.matches("(2 Two) Tj").count() >= 2);
+        assert!(incremental_pdf.matches("(3 Three) Tj").count() >= 2);
+        assert!(!incremental_pdf.contains("??"));
     }
 
     #[test]

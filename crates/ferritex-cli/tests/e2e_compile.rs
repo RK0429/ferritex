@@ -1138,6 +1138,250 @@ fn compile_reproducible_with_asset_bundle() {
 }
 
 #[test]
+fn incremental_recompile_matches_full_compile() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let incremental_out = dir.path().join("incremental-out");
+    let full_out = dir.path().join("full-out");
+    std::fs::write(
+        dir.path().join("main.tex"),
+        "\\documentclass{report}\n\\begin{document}\n\\input{chapter-one}\n\\newpage\n\\input{chapter-two}\n\\end{document}\n",
+    )
+    .expect("write main");
+    std::fs::write(
+        dir.path().join("chapter-one.tex"),
+        "\\chapter{One}\nStable chapter body.\n",
+    )
+    .expect("write chapter one");
+    std::fs::write(
+        dir.path().join("chapter-two.tex"),
+        "\\chapter{Two}\nOriginal chapter two body.\n",
+    )
+    .expect("write chapter two");
+
+    let first = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            incremental_out.to_str().expect("utf-8 output dir"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    std::fs::write(
+        dir.path().join("chapter-two.tex"),
+        "\\chapter{Two}\nUpdated chapter two body for incremental compile.\n",
+    )
+    .expect("update chapter two");
+
+    let second = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            incremental_out.to_str().expect("utf-8 output dir"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let full = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            full_out.to_str().expect("utf-8 output dir"),
+            "--no-cache",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        full.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+
+    let incremental_pdf =
+        std::fs::read(incremental_out.join("main.pdf")).expect("read incremental pdf");
+    let full_pdf = std::fs::read(full_out.join("main.pdf")).expect("read full pdf");
+    assert_eq!(incremental_pdf, full_pdf);
+}
+
+#[test]
+fn compile_multi_chapter_with_jobs_4_matches_jobs_1() {
+    let write_project = |root: &std::path::Path| {
+        std::fs::write(
+            root.join("main.tex"),
+            "\\documentclass{report}\n\\begin{document}\n\\input{chapter-one}\n\\newpage\n\\input{chapter-two}\n\\newpage\n\\input{chapter-three}\n\\end{document}\n",
+        )
+        .expect("write main");
+        std::fs::write(
+            root.join("chapter-one.tex"),
+            "\\chapter{One}\\label{chap:one}\nOriginal chapter one body.\n",
+        )
+        .expect("write chapter one");
+        std::fs::write(
+            root.join("chapter-two.tex"),
+            "\\chapter{Two}\\label{chap:two}\nOriginal chapter two body.\n",
+        )
+        .expect("write chapter two");
+        std::fs::write(
+            root.join("chapter-three.tex"),
+            "\\chapter{Three}\\label{chap:three}\nStable chapter three body.\n",
+        )
+        .expect("write chapter three");
+    };
+    let update_project = |root: &std::path::Path| {
+        std::fs::write(
+            root.join("chapter-one.tex"),
+            "\\chapter{One}\\label{chap:one}\nEdited chapter one body.\n",
+        )
+        .expect("update chapter one");
+        std::fs::write(
+            root.join("chapter-two.tex"),
+            "\\chapter{Two}\\label{chap:two}\nEdited chapter two body.\n",
+        )
+        .expect("update chapter two");
+    };
+    let run_incremental = |root: &std::path::Path, output_dir: &std::path::Path, jobs: &str| {
+        let warmup = ferritex_bin()
+            .current_dir(root)
+            .args([
+                "compile",
+                "main.tex",
+                "--output-dir",
+                output_dir.to_str().expect("utf-8 output dir"),
+                "--jobs",
+                jobs,
+            ])
+            .output()
+            .expect("failed to run warmup compile");
+        assert_eq!(
+            warmup.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&warmup.stderr)
+        );
+
+        update_project(root);
+
+        let incremental = ferritex_bin()
+            .current_dir(root)
+            .args([
+                "compile",
+                "main.tex",
+                "--output-dir",
+                output_dir.to_str().expect("utf-8 output dir"),
+                "--jobs",
+                jobs,
+            ])
+            .output()
+            .expect("failed to run incremental compile");
+        assert_eq!(
+            incremental.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&incremental.stderr)
+        );
+
+        std::fs::read(output_dir.join("main.pdf")).expect("read output pdf")
+    };
+
+    let sequential_dir = tempfile::tempdir().expect("create sequential tempdir");
+    write_project(sequential_dir.path());
+    let sequential_pdf = run_incremental(
+        sequential_dir.path(),
+        &sequential_dir.path().join("out"),
+        "1",
+    );
+
+    let parallel_dir = tempfile::tempdir().expect("create parallel tempdir");
+    write_project(parallel_dir.path());
+    let parallel_pdf = run_incremental(parallel_dir.path(), &parallel_dir.path().join("out"), "4");
+
+    assert_eq!(sequential_pdf, parallel_pdf);
+}
+
+#[test]
+fn corrupted_cache_triggers_safe_fallback_in_incremental_mode() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let output_dir = dir.path().join("out");
+    std::fs::write(
+        dir.path().join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\nInitial cacheable body.\n\\end{document}\n",
+    )
+    .expect("write main");
+
+    let first = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let cache_file = std::fs::read_dir(output_dir.join(".ferritex-cache"))
+        .expect("read cache dir")
+        .map(|entry| entry.expect("cache entry").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .expect("cache metadata file");
+    std::fs::write(&cache_file, b"{not valid json").expect("corrupt cache metadata");
+
+    std::fs::write(
+        dir.path().join("main.tex"),
+        "\\documentclass{article}\n\\begin{document}\nUpdated body after cache corruption.\n\\end{document}\n",
+    )
+    .expect("update main");
+
+    let second = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let pdf = std::fs::read_to_string(output_dir.join("main.pdf")).expect("read output pdf");
+    assert!(pdf.contains("Updated body after cache corruption."));
+}
+
+#[test]
 fn compile_bundle_fallback_resolves_tex_input_not_in_project() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let bundle_dir = expanded_asset_bundle_fixture();
