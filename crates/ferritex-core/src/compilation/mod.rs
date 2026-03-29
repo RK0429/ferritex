@@ -5,7 +5,11 @@ mod partition;
 mod session;
 mod snapshot;
 
-pub use commit_barrier::{CommitBarrier, StageCommitPayload, StageOrder};
+pub use commit_barrier::{
+    ArtifactCachePayload, AuthorityKey, AuthorityKeyCollision, CatcodeChange, CommitBarrier,
+    CommitEntry, DocumentReferencePayload, LayoutMergePayload, MacroSessionPayload, RegisterUpdate,
+    RegisterUpdateKind, StageCommitPayload, StageOrder,
+};
 pub use document_state::{
     DestinationAnchor, DocumentState, IndexEntry, IndexState, LinkStyle, NavigationState,
     OutlineDraftEntry, PdfMetadataDraft, SymbolLocation,
@@ -16,4 +20,7 @@ pub use partition::{
     PartitionLocator, SectionOutlineEntry,
 };
 pub use session::{CompilationSession, JobContext};
-pub use snapshot::CompilationSnapshot;
+pub use snapshot::{
+    CommandRegistryView, CompilationSnapshot, DocumentStateView, EnvironmentRegistryView,
+    RegisterBankView,
+};

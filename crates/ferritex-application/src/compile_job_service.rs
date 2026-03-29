@@ -28,7 +28,9 @@ use ferritex_core::graphics::api::{
 use ferritex_core::incremental::{DependencyGraph, DocumentPartitionPlanner, RecompilationScope};
 use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
 use ferritex_core::kernel::StableId;
-use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput, ParsedDocument};
+use ferritex_core::parser::{
+    MinimalLatexParser, ParseError, ParseOutput, ParsedDocument, RegisterStore,
+};
 use ferritex_core::pdf::{
     FontResource, ImageFilter, PdfFormXObject, PdfImageXObject, PdfRenderer, PlacedFormXObject,
     PlacedImage,
@@ -2142,8 +2144,13 @@ fn stable_compile_state(
     success: bool,
     diagnostics: Vec<Diagnostic>,
 ) -> StableCompileState {
+    let session = compilation_job.begin_pass(pass_count);
     StableCompileState {
-        snapshot: CompilationSnapshot::from_session(&compilation_job.begin_pass(pass_count)),
+        snapshot: CompilationSnapshot::derive_snapshot(
+            &session,
+            &RegisterStore::default(),
+            &document_state,
+        ),
         document_state,
         cross_reference_seed,
         page_count,

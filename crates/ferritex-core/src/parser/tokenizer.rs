@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CatCode {
     Escape = 0,
@@ -50,7 +51,7 @@ pub fn default_catcode_table() -> [CatCode; 256] {
     table
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TokenKind {
     ControlWord(String),
     ControlSymbol(char),
@@ -58,7 +59,7 @@ pub enum TokenKind {
     Parameter(u8),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Token {
     pub kind: TokenKind,
     pub line: u32,

@@ -15,6 +15,7 @@ pub use package_loading::{
     FontspecExtension, GeometryExtension, GraphicxExtension, OptionRegistry, PackageExtension,
     PackageInfo, PackageRegistry, XcolorExtension,
 };
+pub use registers::{CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX};
 pub use tokenizer::{
     default_catcode_table, CatCode, Token, TokenKind, Tokenizer, TokenizerDiagnostic,
 };

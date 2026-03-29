@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::stable_compile_state::StableCompileState;
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
 const CACHE_RECORD_EXTENSION: &str = "json";
 const MAX_CACHE_RECORD_FILES: usize = 64;
@@ -564,6 +564,10 @@ mod tests {
                 pass_number: 1,
                 primary_input: input.to_path_buf(),
                 jobname: "main".to_string(),
+                confirmed_registers: Default::default(),
+                confirmed_commands: Default::default(),
+                confirmed_environments: Default::default(),
+                confirmed_document_state: Default::default(),
             },
             document_state: DocumentState::default(),
             cross_reference_seed: Default::default(),

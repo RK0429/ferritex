@@ -1,6 +1,6 @@
 use std::thread;
 
-use crate::compilation::{CommitBarrier, DocumentPartitionPlan, LinkStyle, StageCommitPayload};
+use crate::compilation::{DocumentPartitionPlan, LinkStyle};
 use crate::graphics::api::{
     ArrowSpec, Color, GraphicGroup, GraphicNode, GraphicsScene, ImageColorSpace, PathSegment, Point,
 };
@@ -470,6 +470,7 @@ struct PageRenderPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PartitionRenderPayload {
+    partition_id: String,
     page_payloads: Vec<PageRenderPayload>,
 }
 
@@ -658,7 +659,7 @@ fn render_page_payloads(
     link_style: &LinkStyle,
     page_partition_ids: &[String],
     parallelism: usize,
-    pass_number: u32,
+    _pass_number: u32,
 ) -> Vec<PageRenderPayload> {
     let workloads = page_render_workloads(page_partition_ids, pages.len(), parallelism);
     if workloads.len() <= 1 {
@@ -722,10 +723,10 @@ fn render_page_payloads(
                     })
                     .collect::<Vec<_>>();
                 page_payloads.sort_by_key(|payload| payload.page_index);
-                StageCommitPayload::layout_merge(
-                    workload.partition_id,
-                    PartitionRenderPayload { page_payloads },
-                )
+                PartitionRenderPayload {
+                    partition_id: workload.partition_id,
+                    page_payloads,
+                }
             }));
         }
 
@@ -735,14 +736,11 @@ fn render_page_payloads(
             .map(|handle| handle.join().expect("page render worker should not panic"))
             .collect::<Vec<_>>()
     });
-    let mut barrier = CommitBarrier::new(pass_number);
-    for payload in payloads {
-        barrier.commit(payload);
-    }
-    barrier
-        .into_ordered()
+    let mut ordered_payloads = payloads;
+    ordered_payloads.sort_by(|left, right| left.partition_id.cmp(&right.partition_id));
+    ordered_payloads
         .into_iter()
-        .flat_map(|payload| payload.payload.page_payloads)
+        .flat_map(|payload| payload.page_payloads)
         .collect()
 }
 

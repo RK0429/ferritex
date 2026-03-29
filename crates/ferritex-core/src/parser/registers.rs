@@ -1,10 +1,12 @@
 use std::{collections::HashMap, hash::Hash};
 
+use serde::{Deserialize, Serialize};
+
 use super::Token;
 
 pub const MAX_REGISTER_INDEX: u16 = 32_767;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CompatIntRegister {
     PdfOutput,
     PdfTexVersion,
@@ -41,6 +43,30 @@ struct GroupSave {
 }
 
 impl RegisterStore {
+    pub fn counts_snapshot(&self) -> HashMap<u16, i32> {
+        self.counts.clone()
+    }
+
+    pub fn dimens_snapshot(&self) -> HashMap<u16, i32> {
+        self.dimens.clone()
+    }
+
+    pub fn skips_snapshot(&self) -> HashMap<u16, i32> {
+        self.skips.clone()
+    }
+
+    pub fn muskips_snapshot(&self) -> HashMap<u16, i32> {
+        self.muskips.clone()
+    }
+
+    pub fn toks_snapshot(&self) -> HashMap<u16, Vec<Token>> {
+        self.toks.clone()
+    }
+
+    pub fn compat_ints_snapshot(&self) -> HashMap<CompatIntRegister, i32> {
+        self.compat_ints.clone()
+    }
+
     pub fn push_group(&mut self) {
         self.save_stack.push(GroupSave::default());
     }
