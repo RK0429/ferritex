@@ -3087,6 +3087,9 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         ParseError::MacroExpansionLimit { .. } => diagnostic
             .with_context("macro expansion did not converge within the development safety limit")
             .with_suggestion("check for recursive macro definitions such as \\def\\foo{\\foo}"),
+        ParseError::TikzDiagnostic { .. } => diagnostic
+            .with_context("a problem was detected while parsing a tikzpicture environment")
+            .with_suggestion("check the TikZ commands in the tikzpicture environment"),
     }
 }
 
@@ -3345,7 +3348,10 @@ fn build_pdf_renderer_with_images(
         let mut placements = Vec::with_capacity(page.images.len());
         let mut form_placements = Vec::with_capacity(page.images.len());
         for image in &page.images {
-            match &image.graphic {
+            let Some(node) = (image.scene.nodes.len() == 1).then(|| &image.scene.nodes[0]) else {
+                continue;
+            };
+            match node {
                 GraphicNode::External(graphic) => {
                     let xobject_index =
                         if let Some(index) = image_indices.get(&graphic.asset_handle.id) {
@@ -3391,6 +3397,7 @@ fn build_pdf_renderer_with_images(
                         display_height: image.display_height,
                     });
                 }
+                GraphicNode::Vector(_) | GraphicNode::Text(_) => {}
             }
         }
         page_images.push(placements);

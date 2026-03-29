@@ -15,7 +15,7 @@ use crate::compilation::{
 };
 use crate::font::api::TfmMetrics;
 use crate::graphics::api::{
-    compile_includegraphics, GraphicAssetResolver, GraphicNode, GraphicsBox,
+    compile_includegraphics, GraphicAssetResolver, GraphicsBox, GraphicsScene,
 };
 use crate::kernel::api::{DimensionValue, SourceSpan};
 use crate::parser::api::{DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument};
@@ -93,7 +93,7 @@ pub struct TypesetNamedDestination {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypesetImage {
-    pub graphic: GraphicNode,
+    pub scene: GraphicsScene,
     pub x: DimensionValue,
     pub y: DimensionValue,
     pub display_width: DimensionValue,
@@ -1100,6 +1100,16 @@ fn document_nodes_to_hlist_with_font_config(
                     current_font_index,
                 );
             }
+            DocumentNode::TikzPicture { .. } => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                    current_font_index,
+                );
+            }
             DocumentNode::Float { .. } => {
                 flush_word(
                     &mut hlist,
@@ -1193,6 +1203,19 @@ fn document_nodes_to_vlist_with_state(
                         vlist.push(VListItem::Image { graphics_box });
                     }
                 }
+                segment_start = index + 1;
+            }
+            DocumentNode::TikzPicture { graphics_box } => {
+                append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                );
+                vlist.push(VListItem::Image {
+                    graphics_box: graphics_box.clone(),
+                });
                 segment_start = index + 1;
             }
             DocumentNode::IndexMarker(entry) => {
@@ -1414,9 +1437,9 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
             VListItem::Image { graphics_box } => {
-                if let Some(graphic) = graphics_box_node(graphics_box) {
+                if let Some(scene) = graphics_box_scene(graphics_box) {
                     images.push(TypesetImage {
-                        graphic,
+                        scene,
                         x: points(LEFT_MARGIN_PT),
                         y: consumed_height,
                         display_width: graphics_box.width,
@@ -1443,9 +1466,8 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
     }
 }
 
-fn graphics_box_node(graphics_box: &GraphicsBox) -> Option<GraphicNode> {
-    let scene = graphics_box.scene.as_ref()?;
-    scene.nodes.first().cloned()
+fn graphics_box_scene(graphics_box: &GraphicsBox) -> Option<GraphicsScene> {
+    graphics_box.scene.clone()
 }
 
 fn collect_outlines(document: &ParsedDocument, pages: &[TypesetPage]) -> Vec<TypesetOutline> {
@@ -2069,9 +2091,9 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
             VListItem::Image { graphics_box } => {
-                if let Some(graphic) = graphics_box_node(graphics_box) {
+                if let Some(scene) = graphics_box_scene(graphics_box) {
                     images.push(TypesetImage {
-                        graphic,
+                        scene,
                         x: points(LEFT_MARGIN_PT),
                         y: page_content_top(page_box) - consumed_height - graphics_box.height,
                         display_width: graphics_box.width,
@@ -2088,7 +2110,7 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                     y_position,
                 });
                 images.extend(content.images.iter().map(|image| TypesetImage {
-                    graphic: image.graphic.clone(),
+                    scene: image.scene.clone(),
                     x: image.x,
                     y: y_position - image.y - image.display_height,
                     display_width: image.display_width,
@@ -2791,8 +2813,17 @@ mod tests {
         assert_eq!(pages[0].images[0].display_height, points(200));
         assert_eq!(pages[0].images[0].x, points(LEFT_MARGIN_PT));
         assert!(matches!(
-            &pages[0].images[0].graphic,
-            GraphicNode::External(graphic) if graphic.path == "figure.png"
+            pages[0].images[0].scene.nodes.as_slice(),
+            [GraphicNode::External(ExternalGraphic {
+                path,
+                metadata: ImageMetadata {
+                    width: 10,
+                    height: 20,
+                    color_space: ImageColorSpace::DeviceRGB,
+                    bits_per_component: 8,
+                },
+                ..
+            })] if path == "figure.png"
         ));
     }
 

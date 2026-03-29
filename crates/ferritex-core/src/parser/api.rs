@@ -9,6 +9,9 @@ use thiserror::Error;
 
 use crate::bibliography::api::{parse_bbl, BibliographyState};
 use crate::compilation::{IndexEntry, SectionOutlineEntry};
+use crate::graphics::api::{
+    compile_graphics_scene, parse_tikzpicture, GraphicsBox, TikzDiagnostic, TikzParseResult,
+};
 use crate::kernel::api::DimensionValue;
 
 use super::{
@@ -52,6 +55,8 @@ const BODY_INCLUDEGRAPHICS_START: char = '\u{E012}';
 const BODY_INCLUDEGRAPHICS_END: char = '\u{E013}';
 const BODY_INCLUDEGRAPHICS_PATH_END: char = '\u{E014}';
 const BODY_INCLUDEGRAPHICS_FIELD_SEPARATOR: char = '\u{E015}';
+const BODY_TIKZPICTURE_START: char = '\u{E027}';
+const BODY_TIKZPICTURE_END: char = '\u{E028}';
 const BODY_FLOAT_START: char = '\u{E016}';
 const BODY_FLOAT_END: char = '\u{E017}';
 const BODY_FLOAT_CAPTION_SEP: char = '\u{E018}';
@@ -190,6 +195,7 @@ pub struct DocumentLabels {
 }
 
 impl DocumentLabels {
+    #[allow(clippy::too_many_arguments)]
     fn with_metadata(
         entries: BTreeMap<String, String>,
         citations: Vec<String>,
@@ -412,6 +418,9 @@ pub enum DocumentNode {
         path: String,
         options: IncludeGraphicsOptions,
     },
+    TikzPicture {
+        graphics_box: GraphicsBox,
+    },
     Float {
         float_type: FloatType,
         specifier: Option<String>,
@@ -465,6 +474,8 @@ pub enum ParseError {
     DivisionByZero { line: u32 },
     #[error("macro expansion limit exceeded")]
     MacroExpansionLimit { line: u32 },
+    #[error("{message}")]
+    TikzDiagnostic { line: u32, message: String },
     #[error("\\setmainfont, \\setsansfont, and \\setmonofont require \\usepackage{{fontspec}}")]
     FontspecNotLoaded { line: u32 },
     #[error("\\setmainfont, \\setsansfont, and \\setmonofont in document body are not supported; use them in the preamble")]
@@ -489,6 +500,7 @@ impl ParseError {
             | Self::UnexpectedFi { line }
             | Self::DivisionByZero { line }
             | Self::MacroExpansionLimit { line }
+            | Self::TikzDiagnostic { line, .. }
             | Self::FontspecNotLoaded { line }
             | Self::SetmainfontInBody { line } => Some(*line),
         }
@@ -536,6 +548,7 @@ impl MinimalLatexParser {
         parse_minimal_latex_with_labels(source, initial_labels, initial_page_labels)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_with_state(
         &self,
         source: &str,
@@ -557,6 +570,7 @@ impl MinimalLatexParser {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_with_context(
         &self,
         source: &str,
@@ -601,6 +615,7 @@ impl MinimalLatexParser {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_recovering_with_state(
         &self,
         source: &str,
@@ -624,6 +639,7 @@ impl MinimalLatexParser {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_recovering_with_context(
         &self,
         source: &str,
@@ -658,6 +674,7 @@ impl MinimalLatexParser {
         .run_recovering()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn parse_recovering_with_context_and_package_resolver(
         &self,
         source: &str,
@@ -752,6 +769,7 @@ fn parse_minimal_latex_with_state(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_minimal_latex_with_context(
     source: &str,
     initial_labels: BTreeMap<String, String>,
@@ -885,6 +903,7 @@ impl Default for ParserState {
 }
 
 impl ParserState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         initial_labels: BTreeMap<String, String>,
         initial_section_entries: Vec<SectionEntry>,
@@ -1096,6 +1115,7 @@ struct QueuedToken {
 }
 
 impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
+    #[allow(clippy::too_many_arguments)]
     fn new_with_context(
         source: &'a str,
         initial_labels: BTreeMap<String, String>,
@@ -2332,6 +2352,32 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     label: None,
                 }),
             });
+            return Ok(());
+        }
+
+        if name == "tikzpicture" {
+            let _ = self.read_optional_bracket_tokens()?;
+            let content = self.read_raw_environment_body(&name, line)?;
+            let parse_result = parse_tikzpicture(&content);
+            let TikzParseResult { scene, diagnostics } = parse_result;
+            for diag in diagnostics {
+                let message = match diag {
+                    TikzDiagnostic::UnsupportedCommand { command } => {
+                        format!("tikz: unsupported command `{command}`")
+                    }
+                    TikzDiagnostic::ParseError { message } => {
+                        format!("tikz: {message}")
+                    }
+                };
+                self.record_error(ParseError::TikzDiagnostic { line, message });
+            }
+            let graphics_box = compile_graphics_scene(scene);
+            self.emit_paragraph_break_before_block();
+            self.body.push(BODY_TIKZPICTURE_START);
+            self.body
+                .push_str(&serialize_tikzpicture_marker(&graphics_box));
+            self.body.push(BODY_TIKZPICTURE_END);
+            self.emit_paragraph_break_before_block();
             return Ok(());
         }
 
@@ -4752,6 +4798,45 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             .filter(|name| !name.is_empty()))
     }
 
+    fn read_raw_environment_body(&mut self, name: &str, line: u32) -> Result<String, ParseError> {
+        let mut depth = 1usize;
+        let mut body_tokens = Vec::new();
+
+        while let Some(token) = self.next_raw_token() {
+            match &token.kind {
+                TokenKind::ControlWord(command) if command == "begin" => {
+                    let Some(environment_name) = self.read_environment_name()? else {
+                        body_tokens.push(token);
+                        continue;
+                    };
+                    if environment_name == name {
+                        depth += 1;
+                    }
+                    body_tokens.extend(begin_environment_tokens(&environment_name, token.line));
+                }
+                TokenKind::ControlWord(command) if command == "end" => {
+                    let Some(environment_name) = self.read_environment_name()? else {
+                        body_tokens.push(token);
+                        continue;
+                    };
+                    if environment_name == name {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(tokens_to_text(&body_tokens));
+                        }
+                    }
+                    body_tokens.extend(end_environment_tokens(&environment_name, token.line));
+                }
+                _ => body_tokens.push(token),
+            }
+        }
+
+        Err(ParseError::UnclosedEnvironment {
+            line,
+            name: name.to_string(),
+        })
+    }
+
     fn read_required_braced_tokens(&mut self) -> Result<Option<Vec<Token>>, ParseError> {
         let Some(token) = self.next_significant_token() else {
             return Ok(None);
@@ -5229,6 +5314,42 @@ fn end_environment_tokens(name: &str, line: u32) -> Vec<Token> {
     let mut tokens = Vec::with_capacity(3 + name.chars().count());
     tokens.push(Token {
         kind: TokenKind::ControlWord("end".to_string()),
+        line,
+        column: 1,
+    });
+    tokens.push(Token {
+        kind: TokenKind::CharToken {
+            char: '{',
+            cat: CatCode::BeginGroup,
+        },
+        line,
+        column: 2,
+    });
+    for (offset, ch) in name.chars().enumerate() {
+        tokens.push(Token {
+            kind: TokenKind::CharToken {
+                char: ch,
+                cat: catcode_for_expanded_char(ch),
+            },
+            line,
+            column: (offset + 3) as u32,
+        });
+    }
+    tokens.push(Token {
+        kind: TokenKind::CharToken {
+            char: '}',
+            cat: CatCode::EndGroup,
+        },
+        line,
+        column: (name.chars().count() + 3) as u32,
+    });
+    tokens
+}
+
+fn begin_environment_tokens(name: &str, line: u32) -> Vec<Token> {
+    let mut tokens = Vec::with_capacity(3 + name.chars().count());
+    tokens.push(Token {
+        kind: TokenKind::ControlWord("begin".to_string()),
         line,
         column: 1,
     });
@@ -5861,6 +5982,14 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_TIKZPICTURE_START => {
+                let (content, next_index) =
+                    extract_single_marker_content(body, index, BODY_TIKZPICTURE_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(deserialize_tikzpicture_marker(content));
+                text.push(placeholder);
+                index = next_index;
+            }
             BODY_INLINE_MATH_START | BODY_DISPLAY_MATH_START => {
                 let (content, next_index) = extract_math_marker_content(body, index);
                 let placeholder = next_box_placeholder(placeholders.len());
@@ -6139,6 +6268,16 @@ fn deserialize_includegraphics_marker(content: &str) -> DocumentNode {
         path: path.to_string(),
         options,
     }
+}
+
+fn serialize_tikzpicture_marker(graphics_box: &GraphicsBox) -> String {
+    serde_json::to_string(graphics_box).expect("graphics box should serialize")
+}
+
+fn deserialize_tikzpicture_marker(content: &str) -> DocumentNode {
+    let graphics_box =
+        serde_json::from_str(content).expect("tikz graphics marker should deserialize");
+    DocumentNode::TikzPicture { graphics_box }
 }
 
 fn float_type_marker(float_type: FloatType) -> char {
@@ -7407,6 +7546,7 @@ mod tests {
     };
     use crate::bibliography::api::BibliographyState;
     use crate::compilation::IndexEntry;
+    use crate::graphics::api::{GraphicNode, PathSegment, Point};
     use crate::kernel::api::DimensionValue;
     use std::collections::BTreeMap;
 
@@ -7814,6 +7954,69 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn tikzpicture_environment_parses_to_graphics_box() {
+        let nodes =
+            parse_document(r"\begin{tikzpicture}\draw (0,0) rectangle (2,1);\end{tikzpicture}")
+                .body_nodes();
+
+        let [DocumentNode::TikzPicture { graphics_box }] = nodes.as_slice() else {
+            panic!("expected single tikzpicture node");
+        };
+        assert_eq!(
+            graphics_box.width,
+            DimensionValue((2.0_f64 * 28.3465_f64 * 65_536.0_f64).round() as i64)
+        );
+        assert_eq!(
+            graphics_box.height,
+            DimensionValue((28.3465_f64 * 65_536.0_f64).round() as i64)
+        );
+        assert_eq!(
+            graphics_box
+                .scene
+                .as_ref()
+                .map(|scene| scene.nodes.as_slice()),
+            Some(
+                [GraphicNode::Vector(crate::graphics::api::VectorPrimitive {
+                    path: vec![
+                        PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                        PathSegment::LineTo(Point {
+                            x: 2.0 * 28.3465,
+                            y: 0.0,
+                        }),
+                        PathSegment::LineTo(Point {
+                            x: 2.0 * 28.3465,
+                            y: 28.3465,
+                        }),
+                        PathSegment::LineTo(Point { x: 0.0, y: 28.3465 }),
+                        PathSegment::ClosePath,
+                    ],
+                    stroke: Some(crate::graphics::api::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                    }),
+                    fill: None,
+                    line_width: 0.4,
+                })]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn tikzpicture_unsupported_command_surfaces_diagnostic() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\clip (0,0) rectangle (1,1);\n\\end{tikzpicture}\n\\end{document}\n",
+        );
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::TikzDiagnostic {
+            line: 3,
+            message: "tikz: unsupported command `clip`".to_string(),
+        }));
     }
 
     #[test]

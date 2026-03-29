@@ -956,6 +956,9 @@ fn write_u32(data: &mut [u8], offset: usize, value: u32) {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{minimal_test_font_bytes, named_test_font_bytes};
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
@@ -1509,6 +1512,3 @@ mod tests {
         data
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::{minimal_test_font_bytes, named_test_font_bytes};

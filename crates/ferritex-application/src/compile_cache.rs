@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use ferritex_core::compilation::SymbolLocation;
 use ferritex_core::diagnostics::{Diagnostic, Severity};
@@ -13,6 +15,8 @@ use crate::stable_compile_state::StableCompileState;
 
 const CACHE_VERSION: u32 = 3;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
+const CACHE_RECORD_EXTENSION: &str = "json";
+const MAX_CACHE_RECORD_FILES: usize = 64;
 
 pub struct CompileCache<'a> {
     file_access_gate: &'a dyn FileAccessGate,
@@ -70,6 +74,12 @@ struct CompileCacheRecord {
     cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     #[serde(default)]
     cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedCacheRecordFile {
+    path: PathBuf,
+    modified: std::time::SystemTime,
 }
 
 impl<'a> CompileCache<'a> {
@@ -305,6 +315,14 @@ impl<'a> CompileCache<'a> {
                     &self.metadata_path,
                 )
             })
+            .or_else(|| {
+                self.evict_excess_records().err().map(|error| {
+                    cache_cleanup_diagnostic(
+                        format!("failed to evict old compile cache metadata: {error}"),
+                        &self.cache_dir,
+                    )
+                })
+            })
     }
 
     fn detect_changes(&self, dependency_graph: &DependencyGraph) -> ChangeSummary {
@@ -338,6 +356,80 @@ impl<'a> CompileCache<'a> {
             rebuild_paths,
             scope,
         }
+    }
+
+    fn evict_excess_records(&self) -> std::io::Result<()> {
+        let records = Self::owned_cache_record_files(&self.cache_dir)?;
+        Self::evict_oldest_records(records, MAX_CACHE_RECORD_FILES)
+    }
+
+    fn evict_oldest_records(
+        mut records: Vec<OwnedCacheRecordFile>,
+        max_records: usize,
+    ) -> std::io::Result<()> {
+        let excess = records.len().saturating_sub(max_records);
+        if excess == 0 {
+            return Ok(());
+        }
+
+        records.sort_by(|left, right| {
+            left.modified
+                .cmp(&right.modified)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+
+        let mut first_error = None;
+        for record in records.into_iter().take(excess) {
+            if let Err(error) = fs::remove_file(record.path) {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn owned_cache_record_files(cache_dir: &Path) -> std::io::Result<Vec<OwnedCacheRecordFile>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(cache_dir)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str())
+                != Some(CACHE_RECORD_EXTENSION)
+            {
+                continue;
+            }
+
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            if serde_json::from_slice::<CompileCacheRecord>(&bytes).is_err() {
+                continue;
+            }
+
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            records.push(OwnedCacheRecordFile { path, modified });
+        }
+
+        Ok(records)
     }
 }
 
@@ -373,6 +465,14 @@ fn cache_info_diagnostic(message: impl Into<String>, path: &Path) -> Diagnostic 
         .with_suggestion("Ferritex will ignore this cache entry and run a full compile")
 }
 
+fn cache_cleanup_diagnostic(message: impl Into<String>, path: &Path) -> Diagnostic {
+    Diagnostic::new(Severity::Info, message.into())
+        .with_file(path.to_string_lossy().into_owned())
+        .with_suggestion(
+            "Ferritex kept the current cache entry but could not clean up older metadata files",
+        )
+}
+
 pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
@@ -386,8 +486,10 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use ferritex_core::compilation::{CompilationSnapshot, DocumentState};
+    use ferritex_core::diagnostics::Severity;
     use ferritex_core::incremental::RecompilationScope;
     use ferritex_core::kernel::api::DimensionValue;
     use ferritex_core::typesetting::{
@@ -395,7 +497,10 @@ mod tests {
         TypesetPage,
     };
 
-    use super::{fingerprint_bytes, CachedTypesetFragment, CompileCache};
+    use super::{
+        fingerprint_bytes, CachedTypesetFragment, CompileCache, CompileCacheRecord,
+        OwnedCacheRecordFile, MAX_CACHE_RECORD_FILES,
+    };
     use crate::stable_compile_state::StableCompileState;
 
     struct FsGate;
@@ -629,6 +734,296 @@ mod tests {
         let lookup = cache.lookup();
 
         assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn evicts_oldest_owned_cache_records_and_keeps_newer_entries() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        let cache_dir = output_dir.join(super::CACHE_DIR_NAME);
+        let base_time = UNIX_EPOCH + Duration::from_secs(10_000);
+        let mut metadata_paths = Vec::new();
+
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(cache_dir.join("notes.txt"), "keep me").expect("write unrelated text file");
+        fs::write(cache_dir.join("foreign.json"), br#"{"kind":"foreign"}"#)
+            .expect("write unrelated json file");
+
+        for index in 0..=MAX_CACHE_RECORD_FILES {
+            let input = dir.path().join(format!("input-{index}.tex"));
+            fs::write(&input, format!("content-{index}")).expect("write input");
+            let cache = CompileCache::new(&FsGate, &output_dir, &input, &format!("job-{index:03}"));
+            cache
+                .store(
+                    &dependency_graph_for(&input, &format!("content-{index}")),
+                    &stable_state(&input),
+                    fingerprint_bytes(format!("pdf-{index}").as_bytes()),
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                )
+                .expect_none("cache stored");
+            metadata_paths.push(cache.metadata_path.clone());
+
+            if index < MAX_CACHE_RECORD_FILES {
+                set_modified_time(
+                    &cache.metadata_path,
+                    base_time + Duration::from_secs(index as u64),
+                );
+            }
+        }
+
+        assert!(
+            !metadata_paths[0].exists(),
+            "oldest cache record should be evicted"
+        );
+        for path in metadata_paths.iter().skip(1) {
+            assert!(path.exists(), "newer cache records should be retained");
+        }
+        assert!(
+            cache_dir.join("notes.txt").exists(),
+            "unrelated text file must remain"
+        );
+        assert!(
+            cache_dir.join("foreign.json").exists(),
+            "unrelated json file must remain"
+        );
+        assert_eq!(
+            CompileCache::owned_cache_record_files(&cache_dir)
+                .expect("owned cache record listing")
+                .len(),
+            MAX_CACHE_RECORD_FILES
+        );
+    }
+
+    #[test]
+    fn eviction_continues_after_individual_delete_failure() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let missing_path = dir.path().join("missing.json");
+        let retained_a = dir.path().join("retained-a.json");
+        let retained_b = dir.path().join("retained-b.json");
+        fs::write(&retained_a, "{}").expect("write record a");
+        fs::write(&retained_b, "{}").expect("write record b");
+
+        let error = CompileCache::evict_oldest_records(
+            vec![
+                OwnedCacheRecordFile {
+                    path: missing_path,
+                    modified: UNIX_EPOCH + Duration::from_secs(1),
+                },
+                OwnedCacheRecordFile {
+                    path: retained_a.clone(),
+                    modified: UNIX_EPOCH + Duration::from_secs(2),
+                },
+                OwnedCacheRecordFile {
+                    path: retained_b.clone(),
+                    modified: UNIX_EPOCH + Duration::from_secs(3),
+                },
+            ],
+            0,
+        )
+        .expect_err("missing record should surface a delete error");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !retained_a.exists(),
+            "later eviction candidates should still be attempted"
+        );
+        assert!(
+            !retained_b.exists(),
+            "all excess candidates should still be attempted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_cache_record_listing_skips_unreadable_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let cache_dir = dir.path().join("cache");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+
+        let valid_a_input = dir.path().join("valid-a.tex");
+        let unreadable_input = dir.path().join("unreadable.tex");
+        let valid_b_input = dir.path().join("valid-b.tex");
+        fs::write(&valid_a_input, "valid-a").expect("write valid input a");
+        fs::write(&unreadable_input, "unreadable").expect("write unreadable input");
+        fs::write(&valid_b_input, "valid-b").expect("write valid input b");
+
+        let valid_a_path = cache_dir.join("valid-a.json");
+        let unreadable_path = cache_dir.join("unreadable.json");
+        let valid_b_path = cache_dir.join("valid-b.json");
+
+        write_owned_cache_record(
+            &valid_a_path,
+            CompileCacheRecord {
+                version: super::CACHE_VERSION,
+                primary_input: valid_a_input.clone(),
+                jobname: "valid-a".to_string(),
+                output_pdf: output_dir.join("valid-a.pdf"),
+                output_pdf_hash: fingerprint_bytes(b"valid-a-pdf"),
+                dependency_graph: dependency_graph_for(&valid_a_input, "valid-a"),
+                stable_compile_state: stable_state(&valid_a_input),
+                cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::new(),
+            },
+        );
+        write_owned_cache_record(
+            &unreadable_path,
+            CompileCacheRecord {
+                version: super::CACHE_VERSION,
+                primary_input: unreadable_input.clone(),
+                jobname: "unreadable".to_string(),
+                output_pdf: output_dir.join("unreadable.pdf"),
+                output_pdf_hash: fingerprint_bytes(b"unreadable-pdf"),
+                dependency_graph: dependency_graph_for(&unreadable_input, "unreadable"),
+                stable_compile_state: stable_state(&unreadable_input),
+                cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::new(),
+            },
+        );
+        write_owned_cache_record(
+            &valid_b_path,
+            CompileCacheRecord {
+                version: super::CACHE_VERSION,
+                primary_input: valid_b_input.clone(),
+                jobname: "valid-b".to_string(),
+                output_pdf: output_dir.join("valid-b.pdf"),
+                output_pdf_hash: fingerprint_bytes(b"valid-b-pdf"),
+                dependency_graph: dependency_graph_for(&valid_b_input, "valid-b"),
+                stable_compile_state: stable_state(&valid_b_input),
+                cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::new(),
+            },
+        );
+
+        let mut permissions = fs::metadata(&unreadable_path)
+            .expect("unreadable record metadata")
+            .permissions();
+        let original_mode = permissions.mode();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&unreadable_path, permissions).expect("set unreadable record");
+
+        let records =
+            CompileCache::owned_cache_record_files(&cache_dir).expect("owned cache record listing");
+
+        let mut restored = fs::metadata(&unreadable_path)
+            .expect("restore unreadable record metadata")
+            .permissions();
+        restored.set_mode(original_mode);
+        fs::set_permissions(&unreadable_path, restored).expect("restore unreadable record");
+
+        let listed_paths = records
+            .into_iter()
+            .map(|record| record.path)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(listed_paths.len(), 2);
+        assert!(listed_paths.contains(&valid_a_path));
+        assert!(listed_paths.contains(&valid_b_path));
+        assert!(!listed_paths.contains(&unreadable_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_failure_is_reported_without_failing_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        let cache_dir = output_dir.join(super::CACHE_DIR_NAME);
+        let input = dir.path().join("main.tex");
+        fs::write(&input, "stable").expect("write input");
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+
+        cache
+            .store(
+                &dependency_graph_for(&input, "stable"),
+                &stable_state(&input),
+                fingerprint_bytes(b"pdf-main"),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .expect_none("initial cache stored");
+
+        for index in 0..MAX_CACHE_RECORD_FILES {
+            let extra_input = dir.path().join(format!("extra-{index}.tex"));
+            let record_path = cache_dir.join(format!("manual-{index:03}.json"));
+            fs::write(&extra_input, format!("extra-{index}")).expect("write extra input");
+            write_owned_cache_record(
+                &record_path,
+                CompileCacheRecord {
+                    version: super::CACHE_VERSION,
+                    primary_input: extra_input.clone(),
+                    jobname: format!("extra-{index:03}"),
+                    output_pdf: output_dir.join(format!("extra-{index:03}.pdf")),
+                    output_pdf_hash: fingerprint_bytes(format!("pdf-extra-{index}").as_bytes()),
+                    dependency_graph: dependency_graph_for(&extra_input, &format!("extra-{index}")),
+                    stable_compile_state: stable_state(&extra_input),
+                    cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: BTreeMap::new(),
+                },
+            );
+            set_modified_time(&record_path, UNIX_EPOCH + Duration::from_secs(index as u64));
+        }
+
+        let mut permissions = fs::metadata(&cache_dir)
+            .expect("cache dir metadata")
+            .permissions();
+        let original_mode = permissions.mode();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&cache_dir, permissions.clone()).expect("set read-only cache dir");
+
+        let diagnostic = cache.store(
+            &dependency_graph_for(&input, "stable"),
+            &stable_state(&input),
+            fingerprint_bytes(b"pdf-main-updated"),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+
+        permissions.set_mode(original_mode);
+        fs::set_permissions(&cache_dir, permissions).expect("restore cache dir permissions");
+
+        let diagnostic = diagnostic.expect("eviction failure diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Info);
+        assert!(
+            diagnostic
+                .message
+                .contains("failed to evict old compile cache metadata"),
+            "expected eviction failure diagnostic, got {:?}",
+            diagnostic.message
+        );
+        assert!(
+            cache.metadata_path.exists(),
+            "current cache record should still exist"
+        );
+    }
+
+    fn dependency_graph_for(
+        input: &std::path::Path,
+        content: &str,
+    ) -> ferritex_core::incremental::DependencyGraph {
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.to_path_buf(), fingerprint_bytes(content.as_bytes()));
+        graph
+    }
+
+    fn set_modified_time(path: &std::path::Path, modified: SystemTime) {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open file for timestamp update");
+        file.set_times(fs::FileTimes::new().set_modified(modified))
+            .expect("set file modified time");
+    }
+
+    fn write_owned_cache_record(path: &std::path::Path, record: CompileCacheRecord) {
+        let bytes = serde_json::to_vec_pretty(&record).expect("serialize cache record");
+        fs::write(path, bytes).expect("write cache record");
     }
 
     fn test_fragment(partition_id: &str) -> DocumentLayoutFragment {

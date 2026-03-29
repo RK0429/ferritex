@@ -1,7 +1,7 @@
 use std::thread;
 
 use crate::compilation::{CommitBarrier, DocumentPartitionPlan, LinkStyle, StageCommitPayload};
-pub use crate::graphics::api::ImageColorSpace;
+use crate::graphics::api::{Color, GraphicNode, GraphicsScene, ImageColorSpace, PathSegment};
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
     FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage,
@@ -312,15 +312,15 @@ impl PdfRenderer {
             );
         }
 
-        for page_index in 0..document.pages.len() {
+        for (page_index, payload) in page_payloads.iter().enumerate() {
             let content_object_id = content_object_start + page_index;
             append_object(
                 &mut pdf,
                 &mut offsets,
                 &format!(
                     "{content_object_id} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
-                    page_payloads[page_index].stream.len(),
-                    page_payloads[page_index].stream
+                    payload.stream.len(),
+                    payload.stream
                 ),
             );
         }
@@ -646,6 +646,7 @@ fn page_kids(page_count: usize, page_object_start: usize) -> String {
         .join(" ")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_page_payloads(
     pages: &[TypesetPage],
     page_images: &[Vec<PlacedImage>],
@@ -854,14 +855,31 @@ fn render_page_stream(
         stream.push_str(&render_text_lines(&lines, link_style));
     }
 
-    for placement in placed_images {
-        if image_objects.get(placement.xobject_index).is_some() {
-            stream.push_str(&render_image_placement(placement));
-        }
-    }
-    for placement in placed_form_xobjects {
-        if let Some(form_xobject) = form_xobjects.get(placement.xobject_index) {
-            stream.push_str(&render_form_xobject_placement(placement, form_xobject));
+    let mut image_index = 0usize;
+    let mut form_index = 0usize;
+    for image in &page.images {
+        match single_scene_node(&image.scene) {
+            Some(GraphicNode::External(_)) => {
+                if let Some(placement) = placed_images.get(image_index) {
+                    if image_objects.get(placement.xobject_index).is_some() {
+                        stream.push_str(&render_image_placement(placement));
+                    }
+                }
+                image_index += 1;
+            }
+            Some(GraphicNode::Pdf(_)) => {
+                if let Some(placement) = placed_form_xobjects.get(form_index) {
+                    if let Some(form_xobject) = form_xobjects.get(placement.xobject_index) {
+                        stream.push_str(&render_form_xobject_placement(placement, form_xobject));
+                    }
+                }
+                form_index += 1;
+            }
+            _ => stream.push_str(&render_graphics_scene_placement(
+                &image.scene,
+                image.x,
+                image.y,
+            )),
         }
     }
 
@@ -1001,6 +1019,10 @@ fn pdf_rgb_operator((red, green, blue): (f64, f64, f64)) -> String {
     format!("{red} {green} {blue} rg\n")
 }
 
+fn pdf_stroke_rgb_operator((red, green, blue): (f64, f64, f64)) -> String {
+    format!("{red} {green} {blue} RG\n")
+}
+
 fn char_boundaries(text: &str) -> Vec<usize> {
     let mut boundaries = text
         .char_indices()
@@ -1023,6 +1045,101 @@ fn render_image_placement(image: &PlacedImage) -> String {
         points_to_pdf_number(image.y),
         image.xobject_index + 1,
     )
+}
+
+fn single_scene_node(scene: &GraphicsScene) -> Option<&GraphicNode> {
+    (scene.nodes.len() == 1).then(|| &scene.nodes[0])
+}
+
+fn render_graphics_scene_placement(
+    scene: &GraphicsScene,
+    x: DimensionValue,
+    y: DimensionValue,
+) -> String {
+    let mut body = String::new();
+    for node in &scene.nodes {
+        match node {
+            GraphicNode::Vector(primitive) => body.push_str(&render_vector_primitive(primitive)),
+            GraphicNode::Text(text) => body.push_str(&render_graphic_text(text)),
+            GraphicNode::External(_) | GraphicNode::Pdf(_) => {}
+        }
+    }
+
+    if body.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "q 1 0 0 1 {} {} cm\n{}Q\n",
+        pdf_real(dimension_to_pdf_number(x)),
+        pdf_real(dimension_to_pdf_number(y)),
+        body
+    )
+}
+
+fn render_vector_primitive(primitive: &crate::graphics::api::VectorPrimitive) -> String {
+    if primitive.path.is_empty() {
+        return String::new();
+    }
+
+    let mut stream = String::new();
+    stream.push_str(&format!("{} w\n", pdf_real(primitive.line_width)));
+    if let Some(stroke) = primitive.stroke {
+        stream.push_str(&pdf_stroke_rgb_operator(color_components(stroke)));
+    }
+    if let Some(fill) = primitive.fill {
+        stream.push_str(&pdf_rgb_operator(color_components(fill)));
+    }
+
+    for segment in &primitive.path {
+        match segment {
+            PathSegment::MoveTo(point) => {
+                stream.push_str(&format!("{} {} m\n", pdf_real(point.x), pdf_real(point.y)));
+            }
+            PathSegment::LineTo(point) => {
+                stream.push_str(&format!("{} {} l\n", pdf_real(point.x), pdf_real(point.y)));
+            }
+            PathSegment::CurveTo {
+                control1,
+                control2,
+                end,
+            } => {
+                stream.push_str(&format!(
+                    "{} {} {} {} {} {} c\n",
+                    pdf_real(control1.x),
+                    pdf_real(control1.y),
+                    pdf_real(control2.x),
+                    pdf_real(control2.y),
+                    pdf_real(end.x),
+                    pdf_real(end.y),
+                ));
+            }
+            PathSegment::ClosePath => stream.push_str("h\n"),
+        }
+    }
+
+    stream.push_str(
+        match (primitive.stroke.is_some(), primitive.fill.is_some()) {
+            (true, true) => "B\n",
+            (true, false) => "S\n",
+            (false, true) => "f\n",
+            (false, false) => "n\n",
+        },
+    );
+    stream
+}
+
+fn render_graphic_text(text: &crate::graphics::api::GraphicText) -> String {
+    format!(
+        "BT\n/F1 12 Tf\n0 0 0 rg\n{} {} Td\n({}) Tj\nET\n",
+        pdf_real(text.position.x),
+        pdf_real(text.position.y),
+        escape_pdf_text(&text.content)
+    )
+}
+
+fn color_components(color: Color) -> (f64, f64, f64) {
+    (color.r, color.g, color.b)
 }
 
 fn render_form_xobject_placement(
@@ -1348,13 +1465,18 @@ mod tests {
         resolve_named_color, FontResource, ImageColorSpace, ImageFilter, PdfFormXObject,
         PdfImageXObject, PdfRenderer, PlacedFormXObject, PlacedImage,
     };
+    use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::compilation::{
         DocumentPartitionPlan, DocumentWorkUnit, LinkStyle, PartitionKind, PartitionLocator,
     };
-    use crate::kernel::api::DimensionValue;
+    use crate::graphics::api::{
+        Color, ExternalGraphic, GraphicNode, GraphicText, GraphicsScene, ImageMetadata,
+        PathSegment, PdfGraphic, PdfGraphicMetadata, Point, VectorPrimitive,
+    };
+    use crate::kernel::api::{DimensionValue, StableId};
     use crate::typesetting::api::{
-        FloatPlacement, PageBox, TextLine, TextLineLink, TypesetDocument, TypesetNamedDestination,
-        TypesetOutline, TypesetPage,
+        FloatPlacement, PageBox, TextLine, TextLineLink, TypesetDocument, TypesetImage,
+        TypesetNamedDestination, TypesetOutline, TypesetPage,
     };
 
     const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -1396,6 +1518,78 @@ mod tests {
             navigation: Default::default(),
             index_entries: Vec::new(),
             has_unresolved_index: false,
+        }
+    }
+
+    fn single_page_with_images(lines: &[&str], images: Vec<TypesetImage>) -> TypesetDocument {
+        let mut document = single_page(lines);
+        document.pages[0].images = images;
+        document
+    }
+
+    fn raster_scene() -> GraphicsScene {
+        GraphicsScene {
+            nodes: vec![GraphicNode::External(ExternalGraphic {
+                path: "image.png".to_string(),
+                asset_handle: AssetHandle {
+                    id: LogicalAssetId(StableId(1)),
+                },
+                metadata: ImageMetadata {
+                    width: 1,
+                    height: 1,
+                    color_space: ImageColorSpace::DeviceRGB,
+                    bits_per_component: 8,
+                },
+            })],
+        }
+    }
+
+    fn pdf_scene() -> GraphicsScene {
+        GraphicsScene {
+            nodes: vec![GraphicNode::Pdf(PdfGraphic {
+                path: "figure.pdf".to_string(),
+                asset_handle: AssetHandle {
+                    id: LogicalAssetId(StableId(2)),
+                },
+                metadata: PdfGraphicMetadata {
+                    media_box: [0.0, 0.0, 200.0, 100.0],
+                    page_data: b"0 0 m\n200 100 l\nS".to_vec(),
+                    resources_dict: Some("<< /ProcSet [/PDF] >>".to_string()),
+                },
+            })],
+        }
+    }
+
+    fn vector_scene() -> GraphicsScene {
+        GraphicsScene {
+            nodes: vec![GraphicNode::Vector(VectorPrimitive {
+                path: vec![
+                    PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                    PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                    PathSegment::LineTo(Point { x: 20.0, y: 20.0 }),
+                    PathSegment::ClosePath,
+                ],
+                stroke: Some(Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                }),
+                fill: Some(Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 1.0,
+                }),
+                line_width: 0.4,
+            })],
+        }
+    }
+
+    fn text_scene() -> GraphicsScene {
+        GraphicsScene {
+            nodes: vec![GraphicNode::Text(GraphicText {
+                position: Point { x: 10.0, y: 12.0 },
+                content: "Hello".to_string(),
+            })],
         }
     }
 
@@ -1501,7 +1695,16 @@ mod tests {
 
     #[test]
     fn emits_image_xobject_and_placement_commands() {
-        let document = single_page(&[]);
+        let document = single_page_with_images(
+            &[],
+            vec![TypesetImage {
+                scene: raster_scene(),
+                x: points(72),
+                y: points(600),
+                display_width: points(100),
+                display_height: points(100),
+            }],
+        );
         let renderer = PdfRenderer::default().with_images(
             vec![PdfImageXObject {
                 object_id: 0,
@@ -1533,7 +1736,16 @@ mod tests {
 
     #[test]
     fn emits_form_xobject_and_placement_commands() {
-        let document = single_page(&[]);
+        let document = single_page_with_images(
+            &[],
+            vec![TypesetImage {
+                scene: pdf_scene(),
+                x: points(72),
+                y: points(600),
+                display_width: points(100),
+                display_height: points(50),
+            }],
+        );
         let renderer = PdfRenderer::default().with_form_xobjects(
             vec![PdfFormXObject {
                 object_id: 0,
@@ -1561,6 +1773,56 @@ mod tests {
     }
 
     #[test]
+    fn emits_vector_graphics_pdf_operators() {
+        let document = single_page_with_images(
+            &[],
+            vec![TypesetImage {
+                scene: vector_scene(),
+                x: points(72),
+                y: points(600),
+                display_width: points(20),
+                display_height: points(20),
+            }],
+        );
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("q 1 0 0 1 72 600 cm"));
+        assert!(content.contains("0.4 w"));
+        assert!(content.contains("0 0 0 RG"));
+        assert!(content.contains("0 0 1 rg"));
+        assert!(content.contains("0 0 m"));
+        assert!(content.contains("20 0 l"));
+        assert!(content.contains("20 20 l"));
+        assert!(content.contains("h"));
+        assert!(content.contains("B"));
+    }
+
+    #[test]
+    fn emits_graphic_text_bt_et_block() {
+        let document = single_page_with_images(
+            &[],
+            vec![TypesetImage {
+                scene: text_scene(),
+                x: points(72),
+                y: points(600),
+                display_width: points(30),
+                display_height: points(12),
+            }],
+        );
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("BT"));
+        assert!(content.contains("/F1 12 Tf"));
+        assert!(content.contains("10 12 Td"));
+        assert!(content.contains("(Hello) Tj"));
+        assert!(content.contains("ET"));
+    }
+
+    #[test]
     fn render_with_parallelism_matches_sequential_output() {
         let mut document = single_page(&["Page 1 link", "Page 1 body"]);
         document.pages.push(page(&["Page 2 link", "Page 2 body"]));
@@ -1574,6 +1836,20 @@ mod tests {
             start_char: 0,
             end_char: 11,
         }];
+        document.pages[0].images.push(TypesetImage {
+            scene: raster_scene(),
+            x: points(72),
+            y: points(600),
+            display_width: points(40),
+            display_height: points(40),
+        });
+        document.pages[1].images.push(TypesetImage {
+            scene: raster_scene(),
+            x: points(120),
+            y: points(540),
+            display_width: points(60),
+            display_height: points(60),
+        });
         let renderer = PdfRenderer::default().with_images(
             vec![PdfImageXObject {
                 object_id: 0,

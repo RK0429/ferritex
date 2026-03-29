@@ -106,42 +106,6 @@ pub fn classify_symbol(symbol: &str) -> MathAtomKind {
         MathAtomKind::Op
     } else if matches!(symbol, "≤" | "≥" | "→" | "←" | "↔" | "∈" | "⊂" | "≠") {
         MathAtomKind::Rel
-    } else if matches!(
-        symbol,
-        "α" | "β"
-            | "γ"
-            | "δ"
-            | "ε"
-            | "ζ"
-            | "η"
-            | "θ"
-            | "ι"
-            | "κ"
-            | "λ"
-            | "μ"
-            | "ν"
-            | "ξ"
-            | "π"
-            | "ρ"
-            | "σ"
-            | "τ"
-            | "υ"
-            | "φ"
-            | "χ"
-            | "ψ"
-            | "ω"
-            | "Γ"
-            | "Δ"
-            | "Θ"
-            | "Λ"
-            | "Ξ"
-            | "Π"
-            | "Σ"
-            | "Φ"
-            | "Ψ"
-            | "Ω"
-    ) {
-        MathAtomKind::Ord
     } else {
         MathAtomKind::Ord
     }
@@ -283,14 +247,16 @@ pub fn typeset_equation_env(
             });
         }
 
-        for column_index in 0..column_count {
+        for (column_index, max_column_width) in
+            max_column_widths.iter().enumerate().take(column_count)
+        {
             let (segment_items, segment_width) = segments
                 .get(column_index)
                 .cloned()
                 .unwrap_or_else(|| (Vec::new(), DimensionValue::zero()));
             hlist.extend(segment_items);
 
-            let pad_width = max_column_widths[column_index] - segment_width;
+            let pad_width = *max_column_width - segment_width;
             if pad_width.0 > 0 {
                 hlist.push(HListItem::Kern { width: pad_width });
             }

@@ -172,9 +172,9 @@ fn collect_cluster_breaks(chars: &[char], breaks: &mut BTreeSet<usize>) {
         }
 
         let cluster_len = cluster_end - cluster_start;
-        let break_index = if cluster_len == 1 {
-            cluster_start
-        } else if cluster_len == 2 && is_digraph(chars[cluster_start], chars[cluster_start + 1]) {
+        let break_index = if cluster_len == 1
+            || (cluster_len == 2 && is_digraph(chars[cluster_start], chars[cluster_start + 1]))
+        {
             cluster_start
         } else {
             cluster_end - 1

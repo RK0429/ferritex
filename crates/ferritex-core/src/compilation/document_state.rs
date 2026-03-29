@@ -17,19 +17,10 @@ pub struct PdfMetadataDraft {
     pub author: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LinkStyle {
     pub color_links: bool,
     pub link_color: Option<String>,
-}
-
-impl Default for LinkStyle {
-    fn default() -> Self {
-        Self {
-            color_links: false,
-            link_color: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -46,11 +46,64 @@ pub struct PdfGraphic {
 
 impl Eq for PdfGraphic {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Eq for Point {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PathSegment {
+    MoveTo(Point),
+    LineTo(Point),
+    CurveTo {
+        control1: Point,
+        control2: Point,
+        end: Point,
+    },
+    ClosePath,
+}
+
+impl Eq for PathSegment {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Color {
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+}
+
+impl Eq for Color {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorPrimitive {
+    pub path: Vec<PathSegment>,
+    pub stroke: Option<Color>,
+    pub fill: Option<Color>,
+    pub line_width: f64,
+}
+
+impl Eq for VectorPrimitive {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphicText {
+    pub position: Point,
+    pub content: String,
+}
+
+impl Eq for GraphicText {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GraphicNode {
     External(ExternalGraphic),
     Pdf(PdfGraphic),
+    Vector(VectorPrimitive),
+    Text(GraphicText),
 }
+
+impl Eq for GraphicNode {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedGraphic {
@@ -58,17 +111,21 @@ pub enum ResolvedGraphic {
     Pdf(PdfGraphic),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphicsScene {
     pub nodes: Vec<GraphicNode>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Eq for GraphicsScene {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphicsBox {
     pub width: DimensionValue,
     pub height: DimensionValue,
     pub scene: Option<GraphicsScene>,
 }
+
+impl Eq for GraphicsBox {}
 
 pub trait GraphicAssetResolver {
     fn resolve(&self, path: &str) -> Option<ResolvedGraphic>;
@@ -103,6 +160,22 @@ pub fn compile_includegraphics(
         height,
         scene: Some(GraphicsScene { nodes: vec![node] }),
     })
+}
+
+pub fn compile_graphics_scene(scene: GraphicsScene) -> GraphicsBox {
+    let Some((normalized_scene, width, height)) = normalize_graphics_scene(scene) else {
+        return GraphicsBox {
+            width: DimensionValue::zero(),
+            height: DimensionValue::zero(),
+            scene: Some(GraphicsScene::default()),
+        };
+    };
+
+    GraphicsBox {
+        width,
+        height,
+        scene: Some(normalized_scene),
+    }
 }
 
 pub fn parse_image_metadata(data: &[u8]) -> Option<ImageMetadata> {
@@ -548,6 +621,153 @@ fn pdf_points_to_dimension(value: f64) -> Option<DimensionValue> {
         .then(|| DimensionValue((value * SCALED_POINTS_PER_POINT as f64).round() as i64))
 }
 
+fn normalize_graphics_scene(
+    scene: GraphicsScene,
+) -> Option<(GraphicsScene, DimensionValue, DimensionValue)> {
+    let bounds = scene_bounds(&scene)?;
+    let min_x = bounds.0;
+    let min_y = bounds.1;
+    let width = pdf_points_to_dimension(bounds.2 - min_x)?;
+    let height = pdf_points_to_dimension(bounds.3 - min_y)?;
+
+    let nodes = scene
+        .nodes
+        .into_iter()
+        .map(|node| translate_graphic_node(node, -min_x, -min_y))
+        .collect();
+    Some((GraphicsScene { nodes }, width, height))
+}
+
+fn scene_bounds(scene: &GraphicsScene) -> Option<(f64, f64, f64, f64)> {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut has_bounds = false;
+
+    for node in &scene.nodes {
+        let Some((node_min_x, node_min_y, node_max_x, node_max_y)) = graphic_node_bounds(node)
+        else {
+            continue;
+        };
+        min_x = min_x.min(node_min_x);
+        min_y = min_y.min(node_min_y);
+        max_x = max_x.max(node_max_x);
+        max_y = max_y.max(node_max_y);
+        has_bounds = true;
+    }
+
+    has_bounds.then_some((min_x, min_y, max_x, max_y))
+}
+
+fn graphic_node_bounds(node: &GraphicNode) -> Option<(f64, f64, f64, f64)> {
+    match node {
+        GraphicNode::External(_) | GraphicNode::Pdf(_) => None,
+        GraphicNode::Vector(primitive) => vector_bounds(primitive),
+        GraphicNode::Text(text) => text_bounds(text),
+    }
+}
+
+fn vector_bounds(primitive: &VectorPrimitive) -> Option<(f64, f64, f64, f64)> {
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut has_points = false;
+
+    for segment in &primitive.path {
+        match segment {
+            PathSegment::MoveTo(point) | PathSegment::LineTo(point) => {
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
+                has_points = true;
+            }
+            PathSegment::CurveTo {
+                control1,
+                control2,
+                end,
+            } => {
+                for point in [control1, control2, end] {
+                    min_x = min_x.min(point.x);
+                    min_y = min_y.min(point.y);
+                    max_x = max_x.max(point.x);
+                    max_y = max_y.max(point.y);
+                    has_points = true;
+                }
+            }
+            PathSegment::ClosePath => continue,
+        }
+    }
+
+    has_points.then_some((min_x, min_y, max_x, max_y))
+}
+
+fn text_bounds(text: &GraphicText) -> Option<(f64, f64, f64, f64)> {
+    if text.content.is_empty() {
+        return Some((
+            text.position.x,
+            text.position.y,
+            text.position.x,
+            text.position.y,
+        ));
+    }
+
+    let width = text.content.chars().count() as f64 * 6.0;
+    Some((
+        text.position.x,
+        text.position.y,
+        text.position.x + width,
+        text.position.y + 12.0,
+    ))
+}
+
+fn translate_graphic_node(node: GraphicNode, dx: f64, dy: f64) -> GraphicNode {
+    match node {
+        GraphicNode::External(graphic) => GraphicNode::External(graphic),
+        GraphicNode::Pdf(graphic) => GraphicNode::Pdf(graphic),
+        GraphicNode::Vector(primitive) => GraphicNode::Vector(VectorPrimitive {
+            path: primitive
+                .path
+                .into_iter()
+                .map(|segment| translate_path_segment(segment, dx, dy))
+                .collect(),
+            stroke: primitive.stroke,
+            fill: primitive.fill,
+            line_width: primitive.line_width,
+        }),
+        GraphicNode::Text(text) => GraphicNode::Text(GraphicText {
+            position: translate_point(text.position, dx, dy),
+            content: text.content,
+        }),
+    }
+}
+
+fn translate_path_segment(segment: PathSegment, dx: f64, dy: f64) -> PathSegment {
+    match segment {
+        PathSegment::MoveTo(point) => PathSegment::MoveTo(translate_point(point, dx, dy)),
+        PathSegment::LineTo(point) => PathSegment::LineTo(translate_point(point, dx, dy)),
+        PathSegment::CurveTo {
+            control1,
+            control2,
+            end,
+        } => PathSegment::CurveTo {
+            control1: translate_point(control1, dx, dy),
+            control2: translate_point(control2, dx, dy),
+            end: translate_point(end, dx, dy),
+        },
+        PathSegment::ClosePath => PathSegment::ClosePath,
+    }
+}
+
+fn translate_point(point: Point, dx: f64, dy: f64) -> Point {
+    Point {
+        x: point.x + dx,
+        y: point.y + dy,
+    }
+}
+
 fn graphic_layout(
     graphic: ResolvedGraphic,
 ) -> Option<(GraphicNode, DimensionValue, DimensionValue)> {
@@ -592,16 +812,19 @@ fn read_u16_be(data: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_be_bytes(bytes.try_into().ok()?))
 }
 
+pub use super::tikz::{parse_tikzpicture, TikzDiagnostic, TikzParseResult};
+
 #[cfg(test)]
 mod tests {
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::kernel::api::StableId;
 
     use super::{
-        compile_includegraphics, extract_png_image_data, is_pdf_signature, parse_image_metadata,
-        parse_jpeg_metadata, parse_pdf_metadata, parse_png_metadata, ExternalGraphic,
-        GraphicAssetResolver, GraphicNode, ImageColorSpace, ImageMetadata, PdfGraphic,
-        PdfGraphicMetadata, ResolvedGraphic,
+        compile_graphics_scene, compile_includegraphics, extract_png_image_data, is_pdf_signature,
+        parse_image_metadata, parse_jpeg_metadata, parse_pdf_metadata, parse_png_metadata, Color,
+        ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicText, GraphicsScene,
+        ImageColorSpace, ImageMetadata, PathSegment, PdfGraphic, PdfGraphicMetadata, Point,
+        ResolvedGraphic, VectorPrimitive,
     };
     use crate::kernel::api::DimensionValue;
     use crate::parser::api::IncludeGraphicsOptions;
@@ -787,5 +1010,57 @@ mod tests {
 
         assert_eq!(graphics_box.width, DimensionValue(150 * 65_536));
         assert_eq!(graphics_box.height, DimensionValue(75 * 65_536));
+    }
+
+    #[test]
+    fn compile_graphics_scene_normalizes_vector_and_text_bounds() {
+        let graphics_box = compile_graphics_scene(GraphicsScene {
+            nodes: vec![
+                GraphicNode::Vector(VectorPrimitive {
+                    path: vec![
+                        PathSegment::MoveTo(Point { x: 10.0, y: 20.0 }),
+                        PathSegment::LineTo(Point { x: 30.0, y: 20.0 }),
+                    ],
+                    stroke: Some(Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                    }),
+                    fill: None,
+                    line_width: 0.4,
+                }),
+                GraphicNode::Text(GraphicText {
+                    position: Point { x: 12.0, y: 24.0 },
+                    content: "Hi".to_string(),
+                }),
+            ],
+        });
+
+        assert_eq!(graphics_box.width, DimensionValue(20 * 65_536));
+        assert_eq!(graphics_box.height, DimensionValue(16 * 65_536));
+        assert_eq!(
+            graphics_box.scene,
+            Some(GraphicsScene {
+                nodes: vec![
+                    GraphicNode::Vector(VectorPrimitive {
+                        path: vec![
+                            PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                            PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                        ],
+                        stroke: Some(Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                        }),
+                        fill: None,
+                        line_width: 0.4,
+                    }),
+                    GraphicNode::Text(GraphicText {
+                        position: Point { x: 2.0, y: 4.0 },
+                        content: "Hi".to_string(),
+                    }),
+                ],
+            })
+        );
     }
 }

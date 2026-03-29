@@ -285,8 +285,7 @@ fn match_fragment_chars(
     cursor: &mut SourceCursor,
     fragment_chars: &[char],
 ) -> Option<MatchedSourceFragment> {
-    for line_index in cursor.line_index..source_lines.len() {
-        let line = &source_lines[line_index];
+    for (line_index, line) in source_lines.iter().enumerate().skip(cursor.line_index) {
         let search_start = if line_index == cursor.line_index {
             cursor.visible_index.min(line.visible_chars.len())
         } else {
