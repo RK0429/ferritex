@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -29,6 +30,7 @@ pub enum BenchProfile {
     FullBench,
     PartitionBench,
     BundleBootstrap,
+    CorpusCompat,
 }
 
 impl BenchProfile {
@@ -37,6 +39,7 @@ impl BenchProfile {
             Self::FullBench => "FTX-BENCH-001",
             Self::PartitionBench => "FTX-PARTITION-BENCH-001",
             Self::BundleBootstrap => "bundle-bootstrap-smoke",
+            Self::CorpusCompat => "FTX-CORPUS-COMPAT-001",
         }
     }
 }
@@ -70,6 +73,47 @@ pub fn partition_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
             input_fixture: input.clone(),
             asset_bundle: None,
             jobs,
+        })
+        .collect()
+}
+
+pub fn corpus_compat_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let corpus_dir = fixture_base.join("corpus/layout-core");
+    let mut fixtures = fs::read_dir(&corpus_dir)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read corpus fixtures from {}: {error}",
+                corpus_dir.display()
+            )
+        })
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("failed to enumerate corpus fixture entry: {error}"))
+                .path()
+        })
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("tex"))
+        .collect::<Vec<_>>();
+    fixtures.sort();
+
+    fixtures
+        .into_iter()
+        .map(|input_fixture| {
+            let stem = input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "invalid UTF-8 corpus fixture name: {}",
+                        input_fixture.display()
+                    )
+                });
+            BenchCase {
+                name: format!("corpus-layout-core-{stem}"),
+                profile: BenchProfile::CorpusCompat,
+                input_fixture,
+                asset_bundle: None,
+                jobs: 1,
+            }
         })
         .collect()
 }
@@ -506,11 +550,20 @@ mod tests {
         time::Duration,
     };
 
+    use ferritex_application::{
+        compile_job_service::CompileJobService,
+        ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput},
+    };
+    use ferritex_core::{
+        diagnostics::Severity,
+        policy::{FileAccessError, FileAccessGate, PathAccessDecision},
+    };
     use tempfile::tempdir;
 
     use super::{
-        bundle_bootstrap_cases, BenchCase, BenchComparison, BenchFailure, BenchHarness,
-        BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend, CompileOutput,
+        bundle_bootstrap_cases, corpus_compat_cases, BenchCase, BenchComparison, BenchFailure,
+        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend,
+        CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -560,6 +613,79 @@ mod tests {
                 .unwrap_or_else(|| Err("mock backend ran out of outputs".to_string()))
         }
     }
+
+    struct FsTestFileAccessGate;
+
+    impl FileAccessGate for FsTestFileAccessGate {
+        fn ensure_directory(&self, path: &Path) -> Result<(), FileAccessError> {
+            fs::create_dir_all(path).map_err(FileAccessError::from)
+        }
+
+        fn check_read(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_write(&self, _path: &Path) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn check_readback(
+            &self,
+            _path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> PathAccessDecision {
+            PathAccessDecision::Allowed
+        }
+
+        fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+
+        fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), FileAccessError> {
+            fs::write(path, content).map_err(FileAccessError::from)
+        }
+
+        fn read_readback(
+            &self,
+            path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> Result<Vec<u8>, FileAccessError> {
+            fs::read(path).map_err(FileAccessError::from)
+        }
+    }
+
+    struct NoopAssetBundleLoader;
+
+    impl AssetBundleLoaderPort for NoopAssetBundleLoader {
+        fn validate(&self, _bundle_path: &Path) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn resolve_tex_input(&self, _bundle_path: &Path, _relative_path: &str) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    struct NoopShellCommandGateway;
+
+    impl ShellCommandGatewayPort for NoopShellCommandGateway {
+        fn execute(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _working_dir: &Path,
+        ) -> Result<ShellCommandOutput, String> {
+            Ok(ShellCommandOutput {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    static NOOP_SHELL_COMMAND_GATEWAY: NoopShellCommandGateway = NoopShellCommandGateway;
 
     #[test]
     fn test_single_case_timing() {
@@ -869,6 +995,87 @@ mod tests {
         let calls = backend.calls.lock().expect("calls lock");
         let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs)| *jobs).collect();
         assert_eq!(jobs_values, vec![1, 1, 4, 4]);
+    }
+
+    #[test]
+    fn test_corpus_compat_cases_enumerate_layout_core_directory() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_compat_cases(&fixture_base);
+
+        assert!(cases.len() >= 10);
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::CorpusCompat));
+        assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases
+            .iter()
+            .all(|case| case.name.starts_with("corpus-layout-core-")));
+        assert!(cases.iter().all(|case| case.input_fixture.exists()));
+        assert!(cases.iter().all(|case| {
+            case.input_fixture.extension().and_then(|ext| ext.to_str()) == Some("tex")
+        }));
+
+        let names = cases
+            .iter()
+            .map(|case| case.name.clone())
+            .collect::<Vec<_>>();
+        let mut sorted_names = names.clone();
+        sorted_names.sort();
+        assert_eq!(names, sorted_names);
+        assert!(names.contains(&"corpus-layout-core-sectioning_article".to_string()));
+        assert!(names.contains(&"corpus-layout-core-sectioning_report".to_string()));
+        assert!(names.contains(&"corpus-layout-core-sectioning_book".to_string()));
+        assert!(names.contains(&"corpus-layout-core-letter_basic".to_string()));
+    }
+
+    #[test]
+    fn corpus_layout_core_documents_compile_successfully() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_compat_cases(&fixture_base);
+        let gate = FsTestFileAccessGate;
+        let loader = NoopAssetBundleLoader;
+        let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
+
+        assert!(cases.len() >= 10);
+
+        for case in cases {
+            let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", case.input_fixture.display())
+            });
+            let input_path = case.input_fixture.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "failed to canonicalize {}: {error}",
+                    case.input_fixture.display()
+                )
+            });
+            let uri = format!("file://{}", input_path.display());
+            let state = service.compile_from_source(&source, &uri);
+            let error_diagnostics = state
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                .map(|diagnostic| diagnostic.to_string())
+                .collect::<Vec<_>>();
+
+            assert!(
+                state.success,
+                "{} should compile successfully, diagnostics: {:?}",
+                case.name, state.diagnostics
+            );
+            assert!(
+                error_diagnostics.is_empty(),
+                "{} emitted error diagnostics: {:?}",
+                case.name,
+                error_diagnostics
+            );
+            assert!(
+                state.page_count >= 1,
+                "{} should produce at least one page, got {}",
+                case.name,
+                state.page_count
+            );
+        }
     }
 
     #[test]

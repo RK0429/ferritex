@@ -153,6 +153,8 @@ dependencies = [
 name = "ferritex-bench"
 version = "0.1.0"
 dependencies = [
+ "ferritex-application",
+ "ferritex-core",
  "serde",
  "serde_json",
  "tempfile",
