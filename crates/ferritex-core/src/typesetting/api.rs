@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 use super::{
     hyphenation::{Hyphenator, TexPatternHyphenator},
@@ -7,11 +10,12 @@ use super::{
 };
 
 use crate::compilation::{
-    DestinationAnchor, IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
+    DestinationAnchor, DocumentPartitionPlan, IndexEntry, LinkStyle, NavigationState,
+    OutlineDraftEntry, PdfMetadataDraft,
 };
 use crate::font::api::TfmMetrics;
 use crate::graphics::api::{
-    compile_includegraphics, ExternalGraphic, GraphicAssetResolver, GraphicNode, GraphicsBox,
+    compile_includegraphics, GraphicAssetResolver, GraphicNode, GraphicsBox,
 };
 use crate::kernel::api::{DimensionValue, SourceSpan};
 use crate::parser::api::{DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument};
@@ -29,20 +33,20 @@ const LINE_WIDTH_SAMPLE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 const MAX_LINE_WIDTH: DimensionValue =
     DimensionValue(MAX_LINE_CHARS as i64 * SCALED_POINTS_PER_POINT);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageBox {
     pub width: DimensionValue,
     pub height: DimensionValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextLineLink {
     pub url: String,
     pub start_char: usize,
     pub end_char: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextLine {
     pub text: String,
     pub y: DimensionValue,
@@ -51,7 +55,7 @@ pub struct TextLine {
     pub source_span: Option<SourceSpan>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypesetPage {
     pub lines: Vec<TextLine>,
     pub images: Vec<TypesetImage>,
@@ -72,7 +76,7 @@ pub struct TypesetDocument {
     pub has_unresolved_index: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypesetOutline {
     pub level: u8,
     pub title: String,
@@ -80,23 +84,23 @@ pub struct TypesetOutline {
     pub y: DimensionValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypesetNamedDestination {
     pub name: String,
     pub page_index: usize,
     pub y: DimensionValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypesetImage {
-    pub graphic: ExternalGraphic,
+    pub graphic: GraphicNode,
     pub x: DimensionValue,
     pub y: DimensionValue,
     pub display_width: DimensionValue,
     pub display_height: DimensionValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FloatRegion {
     Here,
     Top,
@@ -143,7 +147,7 @@ fn push_float_region(regions: &mut Vec<FloatRegion>, region: FloatRegion) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloatContent {
     pub lines: Vec<TextLine>,
     pub images: Vec<TypesetImage>,
@@ -157,11 +161,242 @@ pub struct FloatItem {
     pub defer_count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloatPlacement {
     pub region: FloatRegion,
     pub content: FloatContent,
     pub y_position: DimensionValue,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentLayoutFragment {
+    pub partition_id: String,
+    pub pages: Vec<TypesetPage>,
+    pub local_label_pages: BTreeMap<String, usize>,
+    pub outlines: Vec<TypesetOutline>,
+    pub named_destinations: Vec<TypesetNamedDestination>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypesetterReusePlan {
+    pub rebuild_partition_ids: BTreeSet<String>,
+    pub reuse_fragments: BTreeMap<String, DocumentLayoutFragment>,
+    pub requires_full_typeset: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaginationMergeCoordinator;
+
+impl TypesetterReusePlan {
+    pub fn create(
+        partition_plan: &DocumentPartitionPlan,
+        rebuild_paths: &BTreeSet<PathBuf>,
+        cached_fragments: &BTreeMap<String, DocumentLayoutFragment>,
+        preamble_changed: bool,
+    ) -> Self {
+        if preamble_changed || primary_input_changed(partition_plan, rebuild_paths) {
+            return Self {
+                rebuild_partition_ids: BTreeSet::new(),
+                reuse_fragments: BTreeMap::new(),
+                requires_full_typeset: true,
+            };
+        }
+
+        let mut rebuild_partition_ids = BTreeSet::new();
+        let mut reuse_fragments = BTreeMap::new();
+        let mut missing_cached_fragment = false;
+
+        for work_unit in &partition_plan.work_units {
+            if rebuild_paths.contains(&work_unit.locator.entry_file) {
+                rebuild_partition_ids.insert(work_unit.partition_id.clone());
+                continue;
+            }
+
+            if let Some(fragment) = cached_fragments.get(&work_unit.partition_id) {
+                reuse_fragments.insert(work_unit.partition_id.clone(), fragment.clone());
+            } else {
+                missing_cached_fragment = true;
+            }
+        }
+
+        Self {
+            rebuild_partition_ids,
+            reuse_fragments,
+            requires_full_typeset: missing_cached_fragment,
+        }
+    }
+}
+
+impl PaginationMergeCoordinator {
+    pub fn merge(
+        &self,
+        partition_plan: &DocumentPartitionPlan,
+        fragments: &BTreeMap<String, DocumentLayoutFragment>,
+        base_navigation: &NavigationState,
+    ) -> TypesetDocument {
+        let mut pages = Vec::new();
+        let mut outlines = Vec::new();
+        let mut named_destinations = BTreeMap::new();
+        let mut merged_label_pages = BTreeMap::new();
+        let mut page_offset = 0usize;
+
+        for work_unit in &partition_plan.work_units {
+            let Some(fragment) = fragments.get(&work_unit.partition_id) else {
+                continue;
+            };
+
+            pages.extend(fragment.pages.clone());
+
+            outlines.extend(fragment.outlines.iter().map(|outline| TypesetOutline {
+                level: outline.level,
+                title: outline.title.clone(),
+                page_index: outline.page_index + page_offset,
+                y: outline.y,
+            }));
+
+            for (label, page_index) in &fragment.local_label_pages {
+                merged_label_pages.insert(label.clone(), page_index + page_offset);
+            }
+
+            for destination in &fragment.named_destinations {
+                let adjusted_destination = TypesetNamedDestination {
+                    name: destination.name.clone(),
+                    page_index: merged_label_pages
+                        .get(&destination.name)
+                        .copied()
+                        .unwrap_or(destination.page_index + page_offset),
+                    y: destination.y,
+                };
+                named_destinations.insert(destination.name.clone(), adjusted_destination);
+            }
+
+            page_offset += fragment.pages.len();
+        }
+
+        let named_destinations = named_destinations.into_values().collect::<Vec<_>>();
+
+        let mut navigation_named_destinations = base_navigation.named_destinations.clone();
+        for name in merged_label_pages.keys() {
+            navigation_named_destinations
+                .entry(name.clone())
+                .or_insert_with(|| DestinationAnchor { name: name.clone() });
+        }
+        for destination in &named_destinations {
+            navigation_named_destinations
+                .entry(destination.name.clone())
+                .or_insert_with(|| DestinationAnchor {
+                    name: destination.name.clone(),
+                });
+        }
+
+        let navigation = NavigationState {
+            metadata: base_navigation.metadata.clone(),
+            outline_entries: outlines
+                .iter()
+                .map(|outline| OutlineDraftEntry {
+                    level: outline.level,
+                    title: outline.title.clone(),
+                })
+                .collect(),
+            named_destinations: navigation_named_destinations,
+            default_link_style: base_navigation.default_link_style.clone(),
+        };
+
+        let index_entries = resolve_index_entries(&pages);
+
+        TypesetDocument {
+            pages,
+            outlines,
+            named_destinations,
+            title: navigation.metadata.title.clone(),
+            author: navigation.metadata.author.clone(),
+            navigation,
+            index_entries,
+            has_unresolved_index: false,
+        }
+    }
+}
+
+impl TypesetDocument {
+    pub fn extract_fragments(
+        &self,
+        partition_plan: &DocumentPartitionPlan,
+    ) -> BTreeMap<String, DocumentLayoutFragment> {
+        if partition_plan.work_units.len() <= 1 {
+            let partition_id = partition_plan
+                .work_units
+                .first()
+                .map(|work_unit| work_unit.partition_id.clone())
+                .unwrap_or_else(|| partition_plan.fallback_partition_id.clone());
+            return BTreeMap::from([(
+                partition_id.clone(),
+                self.fragment_for_range(&partition_id, 0, self.pages.len()),
+            )]);
+        }
+
+        let Some(page_ranges) = partition_page_ranges(self, partition_plan) else {
+            let partition_id = partition_plan
+                .work_units
+                .first()
+                .map(|work_unit| work_unit.partition_id.clone())
+                .unwrap_or_else(|| partition_plan.fallback_partition_id.clone());
+            return BTreeMap::from([(
+                partition_id.clone(),
+                self.fragment_for_range(&partition_id, 0, self.pages.len()),
+            )]);
+        };
+
+        page_ranges
+            .into_iter()
+            .map(|(partition_id, (start, end))| {
+                (
+                    partition_id.clone(),
+                    self.fragment_for_range(&partition_id, start, end),
+                )
+            })
+            .collect()
+    }
+
+    fn fragment_for_range(
+        &self,
+        partition_id: &str,
+        start_page: usize,
+        end_page: usize,
+    ) -> DocumentLayoutFragment {
+        let pages = self.pages[start_page..end_page].to_vec();
+        let outlines = self
+            .outlines
+            .iter()
+            .filter(|outline| (start_page..end_page).contains(&outline.page_index))
+            .map(|outline| TypesetOutline {
+                level: outline.level,
+                title: outline.title.clone(),
+                page_index: outline.page_index - start_page,
+                y: outline.y,
+            })
+            .collect::<Vec<_>>();
+        let named_destinations = self
+            .named_destinations
+            .iter()
+            .filter(|destination| (start_page..end_page).contains(&destination.page_index))
+            .map(|destination| TypesetNamedDestination {
+                name: destination.name.clone(),
+                page_index: destination.page_index - start_page,
+                y: destination.y,
+            })
+            .collect::<Vec<_>>();
+
+        DocumentLayoutFragment {
+            partition_id: partition_id.to_string(),
+            pages,
+            local_label_pages: named_destinations
+                .iter()
+                .map(|destination| (destination.name.clone(), destination.page_index))
+                .collect(),
+            outlines,
+            named_destinations,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1179,7 +1414,7 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
             VListItem::Image { graphics_box } => {
-                if let Some(graphic) = graphics_box_external(graphics_box) {
+                if let Some(graphic) = graphics_box_node(graphics_box) {
                     images.push(TypesetImage {
                         graphic,
                         x: points(LEFT_MARGIN_PT),
@@ -1208,12 +1443,9 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
     }
 }
 
-fn graphics_box_external(graphics_box: &GraphicsBox) -> Option<ExternalGraphic> {
+fn graphics_box_node(graphics_box: &GraphicsBox) -> Option<GraphicNode> {
     let scene = graphics_box.scene.as_ref()?;
-    let node = scene.nodes.first()?;
-    match node {
-        GraphicNode::External(graphic) => Some(graphic.clone()),
-    }
+    scene.nodes.first().cloned()
 }
 
 fn collect_outlines(document: &ParsedDocument, pages: &[TypesetPage]) -> Vec<TypesetOutline> {
@@ -1397,6 +1629,74 @@ fn resolve_index_entries(pages: &[TypesetPage]) -> Vec<IndexEntry> {
             })
         })
         .collect()
+}
+
+fn primary_input_changed(
+    partition_plan: &DocumentPartitionPlan,
+    rebuild_paths: &BTreeSet<PathBuf>,
+) -> bool {
+    let mut entry_files = partition_plan
+        .work_units
+        .iter()
+        .map(|work_unit| work_unit.locator.entry_file.clone());
+    let Some(primary_input) = entry_files.next() else {
+        return false;
+    };
+
+    entry_files.all(|path| path == primary_input) && rebuild_paths.contains(&primary_input)
+}
+
+fn partition_page_ranges(
+    document: &TypesetDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> Option<Vec<(String, (usize, usize))>> {
+    if document.pages.is_empty() {
+        return Some(
+            partition_plan
+                .work_units
+                .iter()
+                .map(|work_unit| (work_unit.partition_id.clone(), (0, 0)))
+                .collect(),
+        );
+    }
+
+    let mut markers = Vec::new();
+    let mut outline_cursor = 0usize;
+    for work_unit in &partition_plan.work_units {
+        let offset = document.outlines[outline_cursor..]
+            .iter()
+            .position(|outline| {
+                outline.level == work_unit.locator.level && outline.title == work_unit.title
+            })?;
+        let outline_index = outline_cursor + offset;
+        markers.push((
+            work_unit.partition_id.clone(),
+            document.outlines[outline_index].page_index,
+        ));
+        outline_cursor = outline_index + 1;
+    }
+
+    if markers.is_empty() {
+        return None;
+    }
+
+    Some(
+        markers
+            .iter()
+            .enumerate()
+            .map(|(index, (partition_id, start_page))| {
+                let start = if index == 0 { 0 } else { *start_page };
+                let end = markers
+                    .get(index + 1)
+                    .map(|(_, next_start)| *next_start)
+                    .unwrap_or(document.pages.len());
+                (
+                    partition_id.clone(),
+                    (start.min(end), end.min(document.pages.len())),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn find_outline_anchor(
@@ -1769,7 +2069,7 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
             }
             VListItem::Image { graphics_box } => {
-                if let Some(graphic) = graphics_box_external(graphics_box) {
+                if let Some(graphic) = graphics_box_node(graphics_box) {
                     images.push(TypesetImage {
                         graphic,
                         x: points(LEFT_MARGIN_PT),
@@ -2113,18 +2413,23 @@ mod tests {
         default_fixed_width_provider, document_nodes_to_hlist,
         document_nodes_to_hlist_with_hyphenation, document_nodes_to_vlist_with_config,
         page_box_for_class, paginate_vlist, points, resolve_page_labels, vlist_item_height,
-        wrap_body, wrap_hlist, CharWidthProvider, FloatContent, FloatItem, FloatQueue, FloatRegion,
-        GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PlacementSpec, TeXBox,
-        TextLine, TfmWidthProvider, TypesetPage, VBox, VListItem, LEFT_MARGIN_PT, LINE_HEIGHT_PT,
-        MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED,
-        TOP_MARGIN_PT,
+        wrap_body, wrap_hlist, CharWidthProvider, DocumentLayoutFragment, FloatContent, FloatItem,
+        FloatQueue, FloatRegion, GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter,
+        PageBox, PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TfmWidthProvider,
+        TypesetNamedDestination, TypesetOutline, TypesetPage, TypesetterReusePlan, VBox, VListItem,
+        LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
+        PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::bibliography::api::{parse_bbl, BibliographyState};
-    use crate::compilation::IndexEntry;
+    use crate::compilation::{
+        DestinationAnchor, DocumentPartitionPlan, DocumentWorkUnit, IndexEntry, LinkStyle,
+        NavigationState, OutlineDraftEntry, PartitionKind, PartitionLocator, PdfMetadataDraft,
+    };
     use crate::font::api::TfmMetrics;
     use crate::graphics::api::{
-        ExternalGraphic, GraphicAssetResolver, ImageColorSpace, ImageMetadata,
+        ExternalGraphic, GraphicAssetResolver, GraphicNode, ImageColorSpace, ImageMetadata,
+        ResolvedGraphic,
     };
     use crate::kernel::api::DimensionValue;
     use crate::kernel::api::StableId;
@@ -2135,7 +2440,8 @@ mod tests {
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
 
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
@@ -2164,8 +2470,8 @@ mod tests {
     struct StubGraphicResolver;
 
     impl GraphicAssetResolver for StubGraphicResolver {
-        fn resolve(&self, path: &str) -> Option<ExternalGraphic> {
-            Some(ExternalGraphic {
+        fn resolve(&self, path: &str) -> Option<ResolvedGraphic> {
+            Some(ResolvedGraphic::Raster(ExternalGraphic {
                 path: path.to_string(),
                 asset_handle: AssetHandle {
                     id: LogicalAssetId(StableId(11)),
@@ -2176,7 +2482,7 @@ mod tests {
                     color_space: ImageColorSpace::DeviceRGB,
                     bits_per_component: 8,
                 },
-            })
+            }))
         }
     }
 
@@ -2484,7 +2790,10 @@ mod tests {
         assert_eq!(pages[0].images[0].display_width, points(100));
         assert_eq!(pages[0].images[0].display_height, points(200));
         assert_eq!(pages[0].images[0].x, points(LEFT_MARGIN_PT));
-        assert_eq!(pages[0].images[0].graphic.path, "figure.png".to_string());
+        assert!(matches!(
+            &pages[0].images[0].graphic,
+            GraphicNode::External(graphic) if graphic.path == "figure.png"
+        ));
     }
 
     #[test]
@@ -3969,6 +4278,266 @@ mod tests {
         assert_eq!(provider.char_width('A'), DimensionValue(327_680));
         assert_eq!(provider.char_width('😀'), points(1));
         assert_eq!(provider.space_width(), points(1));
+    }
+
+    #[test]
+    fn typesetter_reuse_plan_requires_full_when_preamble_changes() {
+        let plan = partition_plan();
+        let reuse_plan =
+            TypesetterReusePlan::create(&plan, &BTreeSet::new(), &BTreeMap::new(), true);
+
+        assert!(reuse_plan.requires_full_typeset);
+        assert!(reuse_plan.rebuild_partition_ids.is_empty());
+        assert!(reuse_plan.reuse_fragments.is_empty());
+    }
+
+    #[test]
+    fn typesetter_reuse_plan_marks_changed_partition_and_reuses_cached_fragments() {
+        let plan = partition_plan();
+        let rebuild_paths = BTreeSet::from([PathBuf::from("chapter-1.tex")]);
+        let cached_fragments = BTreeMap::from([(
+            "chapter:0002:results".to_string(),
+            fragment(
+                "chapter:0002:results",
+                1,
+                BTreeMap::from([("results".to_string(), 0)]),
+            ),
+        )]);
+
+        let reuse_plan =
+            TypesetterReusePlan::create(&plan, &rebuild_paths, &cached_fragments, false);
+
+        assert!(!reuse_plan.requires_full_typeset);
+        assert_eq!(
+            reuse_plan.rebuild_partition_ids,
+            BTreeSet::from(["chapter:0001:intro".to_string()])
+        );
+        assert_eq!(reuse_plan.reuse_fragments, cached_fragments);
+    }
+
+    #[test]
+    fn typesetter_reuse_plan_requires_full_when_unchanged_partition_lacks_cache() {
+        let plan = partition_plan();
+        let rebuild_paths = BTreeSet::from([PathBuf::from("chapter-1.tex")]);
+
+        let reuse_plan =
+            TypesetterReusePlan::create(&plan, &rebuild_paths, &BTreeMap::new(), false);
+
+        assert!(reuse_plan.requires_full_typeset);
+    }
+
+    #[test]
+    fn pagination_merge_coordinator_offsets_pages_and_label_destinations() {
+        let plan = partition_plan();
+        let fragments = BTreeMap::from([
+            (
+                "chapter:0001:intro".to_string(),
+                fragment(
+                    "chapter:0001:intro",
+                    1,
+                    BTreeMap::from([("intro".to_string(), 0)]),
+                ),
+            ),
+            (
+                "chapter:0002:results".to_string(),
+                DocumentLayoutFragment {
+                    partition_id: "chapter:0002:results".to_string(),
+                    pages: vec![page("results-body-1"), page("results-body-2")],
+                    local_label_pages: BTreeMap::from([("results".to_string(), 1)]),
+                    outlines: vec![TypesetOutline {
+                        level: 0,
+                        title: "Results".to_string(),
+                        page_index: 0,
+                        y: points(700),
+                    }],
+                    named_destinations: vec![TypesetNamedDestination {
+                        name: "results".to_string(),
+                        page_index: 0,
+                        y: points(680),
+                    }],
+                },
+            ),
+        ]);
+        let base_navigation = NavigationState {
+            metadata: PdfMetadataDraft {
+                title: Some("Merged".to_string()),
+                author: Some("Ferritex".to_string()),
+            },
+            outline_entries: vec![OutlineDraftEntry {
+                level: 0,
+                title: "Base".to_string(),
+            }],
+            named_destinations: BTreeMap::from([
+                (
+                    "intro".to_string(),
+                    DestinationAnchor {
+                        name: "intro".to_string(),
+                    },
+                ),
+                (
+                    "results".to_string(),
+                    DestinationAnchor {
+                        name: "results".to_string(),
+                    },
+                ),
+            ]),
+            default_link_style: LinkStyle::default(),
+        };
+
+        let merged = PaginationMergeCoordinator.merge(&plan, &fragments, &base_navigation);
+
+        assert_eq!(merged.pages.len(), 3);
+        assert_eq!(
+            merged
+                .outlines
+                .iter()
+                .map(|outline| outline.page_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            merged
+                .named_destinations
+                .iter()
+                .map(|destination| (destination.name.as_str(), destination.page_index))
+                .collect::<Vec<_>>(),
+            vec![("intro", 0), ("results", 2)]
+        );
+        assert_eq!(merged.title.as_deref(), Some("Merged"));
+        assert_eq!(merged.author.as_deref(), Some("Ferritex"));
+        assert_eq!(merged.navigation.outline_entries.len(), 2);
+        assert!(merged.navigation.named_destinations.contains_key("results"));
+    }
+
+    #[test]
+    fn extract_fragments_splits_pages_by_partition_markers() {
+        let plan = partition_plan();
+        let document = super::TypesetDocument {
+            pages: vec![page("intro-1"), page("intro-2"), page("results-1")],
+            outlines: vec![
+                TypesetOutline {
+                    level: 0,
+                    title: "Intro".to_string(),
+                    page_index: 0,
+                    y: points(700),
+                },
+                TypesetOutline {
+                    level: 0,
+                    title: "Results".to_string(),
+                    page_index: 2,
+                    y: points(700),
+                },
+            ],
+            named_destinations: vec![
+                TypesetNamedDestination {
+                    name: "intro".to_string(),
+                    page_index: 0,
+                    y: points(680),
+                },
+                TypesetNamedDestination {
+                    name: "results".to_string(),
+                    page_index: 2,
+                    y: points(680),
+                },
+            ],
+            title: None,
+            author: None,
+            navigation: NavigationState::default(),
+            index_entries: Vec::new(),
+            has_unresolved_index: false,
+        };
+
+        let fragments = document.extract_fragments(&plan);
+
+        assert_eq!(fragments["chapter:0001:intro"].pages.len(), 2);
+        assert_eq!(fragments["chapter:0002:results"].pages.len(), 1);
+        assert_eq!(
+            fragments["chapter:0002:results"].local_label_pages["results"],
+            0
+        );
+    }
+
+    fn partition_plan() -> DocumentPartitionPlan {
+        DocumentPartitionPlan {
+            fallback_partition_id: "document:0000:main".to_string(),
+            work_units: vec![
+                DocumentWorkUnit {
+                    partition_id: "chapter:0001:intro".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: PathBuf::from("chapter-1.tex"),
+                        level: 0,
+                        ordinal: 0,
+                        title: "Intro".to_string(),
+                    },
+                    title: "Intro".to_string(),
+                },
+                DocumentWorkUnit {
+                    partition_id: "chapter:0002:results".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: PathBuf::from("chapter-2.tex"),
+                        level: 0,
+                        ordinal: 1,
+                        title: "Results".to_string(),
+                    },
+                    title: "Results".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn fragment(
+        partition_id: &str,
+        page_count: usize,
+        local_label_pages: BTreeMap<String, usize>,
+    ) -> DocumentLayoutFragment {
+        let title = if partition_id.ends_with("intro") {
+            "Intro"
+        } else {
+            "Results"
+        };
+
+        DocumentLayoutFragment {
+            partition_id: partition_id.to_string(),
+            pages: (0..page_count)
+                .map(|index| page(&format!("{partition_id}-page-{index}")))
+                .collect(),
+            local_label_pages: local_label_pages.clone(),
+            outlines: vec![TypesetOutline {
+                level: 0,
+                title: title.to_string(),
+                page_index: 0,
+                y: points(700),
+            }],
+            named_destinations: local_label_pages
+                .keys()
+                .map(|name| TypesetNamedDestination {
+                    name: name.clone(),
+                    page_index: 0,
+                    y: points(680),
+                })
+                .collect(),
+        }
+    }
+
+    fn page(text: &str) -> TypesetPage {
+        TypesetPage {
+            lines: vec![TextLine {
+                text: text.to_string(),
+                y: points(700),
+                links: Vec::new(),
+                font_index: 0,
+                source_span: None,
+            }],
+            images: Vec::new(),
+            page_box: PageBox {
+                width: points(400),
+                height: points(600),
+            },
+            float_placements: Vec::new(),
+            index_entries: Vec::new(),
+        }
     }
 
     fn single_char_tfm(char_code: u16, design_size_fixword: i32, width_fixword: i32) -> Vec<u8> {

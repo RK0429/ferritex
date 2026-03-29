@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -10,8 +11,9 @@ use ferritex_core::bibliography::api::{
     BibliographyToolchain,
 };
 use ferritex_core::compilation::{
-    CompilationJob, CompilationSnapshot, DocumentState, IndexEntry, SectionOutlineEntry,
-    SymbolLocation,
+    CompilationJob, CompilationSnapshot, DestinationAnchor, DocumentPartitionPlan, DocumentState,
+    DocumentWorkUnit, IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
+    SectionOutlineEntry, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
@@ -19,25 +21,32 @@ use ferritex_core::font::{
     resolve_named_font, OpenTypeFont, ResolvedFont, TfmMetrics, OPENTYPE_FONT_SEARCH_ROOTS,
 };
 use ferritex_core::graphics::api::{
-    extract_png_image_data, parse_image_metadata, ExternalGraphic, GraphicAssetResolver,
-    ImageMetadata,
+    extract_png_image_data, is_pdf_signature, parse_image_metadata, parse_pdf_metadata,
+    ExternalGraphic, GraphicAssetResolver, GraphicNode, ImageMetadata, PdfGraphic,
+    PdfGraphicMetadata, ResolvedGraphic,
 };
-use ferritex_core::incremental::{DependencyGraph, DocumentPartitionPlanner};
+use ferritex_core::incremental::{DependencyGraph, DocumentPartitionPlanner, RecompilationScope};
 use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
 use ferritex_core::kernel::StableId;
-use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput};
-use ferritex_core::pdf::{FontResource, ImageFilter, PdfImageXObject, PdfRenderer, PlacedImage};
+use ferritex_core::parser::{MinimalLatexParser, ParseError, ParseOutput, ParsedDocument};
+use ferritex_core::pdf::{
+    FontResource, ImageFilter, PdfFormXObject, PdfImageXObject, PdfRenderer, PlacedFormXObject,
+    PlacedImage,
+};
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
 use ferritex_core::synctex::{
     PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData,
 };
 use ferritex_core::typesetting::{
-    resolve_page_labels, MinimalTypesetter, TextLine, TfmWidthProvider, TypesetDocument,
+    resolve_page_labels, MinimalTypesetter, PaginationMergeCoordinator, TextLine, TfmWidthProvider,
+    TypesetDocument, TypesetterReusePlan,
 };
 use serde_json::json;
 
-use crate::compile_cache::{fingerprint_bytes, CachedSourceSubtree, CompileCache};
+use crate::compile_cache::{
+    fingerprint_bytes, CachedSourceSubtree, CachedTypesetFragment, CompileCache,
+};
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
 use crate::runtime_options::{default_lsp_asset_bundle, RuntimeOptions};
@@ -180,10 +189,21 @@ struct CompileGraphicAssetResolver<'a> {
     project_root: &'a Path,
     overlay_roots: &'a [PathBuf],
     asset_bundle_path: Option<&'a Path>,
+    diagnostics: RefCell<Vec<Diagnostic>>,
+}
+
+impl CompileGraphicAssetResolver<'_> {
+    fn take_diagnostics(&self) -> Vec<Diagnostic> {
+        std::mem::take(&mut *self.diagnostics.borrow_mut())
+    }
+
+    fn push_diagnostic(&self, diagnostic: Diagnostic) {
+        self.diagnostics.borrow_mut().push(diagnostic);
+    }
 }
 
 impl GraphicAssetResolver for CompileGraphicAssetResolver<'_> {
-    fn resolve(&self, path: &str) -> Option<ExternalGraphic> {
+    fn resolve(&self, path: &str) -> Option<ResolvedGraphic> {
         let resolved_path = resolve_graphic_path(
             self.input_dir,
             self.project_root,
@@ -196,15 +216,43 @@ impl GraphicAssetResolver for CompileGraphicAssetResolver<'_> {
         }
 
         let bytes = self.file_access_gate.read_file(&resolved_path).ok()?;
-        let metadata = parse_image_metadata(&bytes)?;
+        if let Some(metadata) = parse_image_metadata(&bytes) {
+            return Some(ResolvedGraphic::Raster(ExternalGraphic {
+                path: resolved_path.to_string_lossy().into_owned(),
+                asset_handle: AssetHandle {
+                    id: LogicalAssetId(stable_id_for_path(&resolved_path)),
+                },
+                metadata,
+            }));
+        }
 
-        Some(ExternalGraphic {
+        let looks_like_pdf = resolved_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+            || is_pdf_signature(&bytes);
+        if !looks_like_pdf {
+            return None;
+        }
+
+        let Some(metadata) = parse_pdf_metadata(&bytes) else {
+            self.push_diagnostic(
+                Diagnostic::new(Severity::Error, "invalid PDF input for \\includegraphics")
+                    .with_file(resolved_path.to_string_lossy().into_owned())
+                    .with_suggestion(
+                        "use an unencrypted single-page PDF whose first page defines /MediaBox",
+                    ),
+            );
+            return None;
+        };
+
+        Some(ResolvedGraphic::Pdf(PdfGraphic {
             path: resolved_path.to_string_lossy().into_owned(),
             asset_handle: AssetHandle {
                 id: LogicalAssetId(stable_id_for_path(&resolved_path)),
             },
             metadata,
-        })
+        }))
     }
 }
 
@@ -664,6 +712,9 @@ impl<'a> CompileJobService<'a> {
         );
         let mut cache_diagnostics = Vec::new();
         let mut cached_cross_reference_seed = None;
+        let mut changed_paths = BTreeSet::new();
+        let mut cached_recompilation_scope = None;
+        let mut cached_typeset_fragments = BTreeMap::new();
         let mut source_tree_reuse_plan = None;
         if !options.no_cache {
             let lookup = compile_cache.lookup();
@@ -671,6 +722,9 @@ impl<'a> CompileJobService<'a> {
                 .baseline_state
                 .as_ref()
                 .map(|state| state.cross_reference_seed.clone());
+            changed_paths = lookup.changed_paths.iter().cloned().collect();
+            cached_recompilation_scope = lookup.scope;
+            cached_typeset_fragments = lookup.cached_typeset_fragments.clone();
             if let Some(cached_artifact) = lookup.artifact {
                 tracing::info!(
                     jobname = %options.jobname,
@@ -687,7 +741,7 @@ impl<'a> CompileJobService<'a> {
                 };
             }
 
-            if let Some(scope) = lookup.scope {
+            if let Some(scope) = cached_recompilation_scope {
                 tracing::info!(
                     jobname = %options.jobname,
                     input = %options.input_file.display(),
@@ -800,10 +854,13 @@ impl<'a> CompileJobService<'a> {
             project_root: &project_root,
             overlay_roots: &options.overlay_roots,
             asset_bundle_path: options.asset_bundle.as_deref(),
+            diagnostics: RefCell::new(Vec::new()),
         };
+        let normalized_input_file = normalize_existing_path(&options.input_file);
         let mut compile_font_selection = None;
         let mut font_family_selection = None;
         let mut font_diagnostics = Vec::new();
+        let mut typeset_callback_count = 0usize;
         let parse_pass_result = self.parse_document_with_cross_references(
             &source_tree.source,
             &project_root,
@@ -813,6 +870,7 @@ impl<'a> CompileJobService<'a> {
             source_tree.document_state.index_state.entries.clone(),
             cached_cross_reference_seed.as_ref(),
             |document| {
+                typeset_callback_count += 1;
                 if compile_font_selection.is_none() {
                     let (selection, families, diagnostics) = self.select_compile_fonts(
                         &input_path,
@@ -840,32 +898,85 @@ impl<'a> CompileJobService<'a> {
                     .as_ref()
                     .expect("font selection initialized");
 
-                match selection {
-                    CompileFontSelection::OpenType(loaded_font) => {
-                        let provider = OpenTypeWidthProvider {
-                            font: &loaded_font.font,
-                            fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
-                        };
-                        self.typesetter.typeset_with_provider_and_graphics_resolver(
-                            document,
-                            &provider,
-                            Some(&graphics_resolver),
-                        )
+                let full_typeset = || {
+                    self.typeset_document_with_selection(document, selection, &graphics_resolver)
+                };
+
+                let partial_typeset_available = cached_recompilation_scope
+                    == Some(RecompilationScope::LocalRegion)
+                    && !cached_typeset_fragments.is_empty();
+                if partial_typeset_available && typeset_callback_count > 1 {
+                    tracing::info!(
+                        jobname = %options.jobname,
+                        input = %options.input_file.display(),
+                        "partial typeset fallback to full typeset"
+                    );
+                    return full_typeset();
+                }
+                if !partial_typeset_available || typeset_callback_count != 1 {
+                    return full_typeset();
+                }
+
+                let Some(reuse_plan) = source_tree_reuse_plan.as_ref() else {
+                    return full_typeset();
+                };
+                let partition_plan =
+                    partition_plan_for_document(&options.input_file, document, &source_tree);
+                let usable_cached_fragments = cached_document_layout_fragments_for(
+                    &partition_plan,
+                    &source_tree,
+                    &cached_typeset_fragments,
+                );
+                let typesetter_reuse_plan = TypesetterReusePlan::create(
+                    &partition_plan,
+                    &reuse_plan.rebuild_paths,
+                    &usable_cached_fragments,
+                    changed_paths.contains(&normalized_input_file),
+                );
+
+                if typesetter_reuse_plan.requires_full_typeset {
+                    tracing::info!(
+                        jobname = %options.jobname,
+                        input = %options.input_file.display(),
+                        "partial typeset fallback to full typeset (reuse plan requires full)"
+                    );
+                    return full_typeset();
+                }
+                if typesetter_reuse_plan.rebuild_partition_ids.is_empty() {
+                    tracing::info!(
+                        jobname = %options.jobname,
+                        input = %options.input_file.display(),
+                        "partial typeset fallback to full typeset (no partitions to rebuild)"
+                    );
+                    return full_typeset();
+                }
+
+                match try_partial_typeset_document(
+                    self,
+                    document,
+                    selection,
+                    &graphics_resolver,
+                    &partition_plan,
+                    &typesetter_reuse_plan,
+                ) {
+                    Ok(document) => {
+                        tracing::info!(
+                            jobname = %options.jobname,
+                            input = %options.input_file.display(),
+                            rebuilt_partitions = ?typesetter_reuse_plan.rebuild_partition_ids,
+                            "partial typeset reuse applied"
+                        );
+                        document
                     }
-                    CompileFontSelection::Tfm(metrics) => {
-                        let provider = TfmWidthProvider {
-                            metrics,
-                            fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
-                        };
-                        self.typesetter.typeset_with_provider_and_graphics_resolver(
-                            document,
-                            &provider,
-                            Some(&graphics_resolver),
-                        )
+                    Err(reason) => {
+                        tracing::info!(
+                            jobname = %options.jobname,
+                            input = %options.input_file.display(),
+                            "{}",
+                            format!("partial typeset fallback to full typeset ({reason})")
+                        );
+                        full_typeset()
                     }
-                    CompileFontSelection::Basic => self
-                        .typesetter
-                        .typeset_with_graphics_resolver(document, &graphics_resolver),
                 }
             },
         );
@@ -976,6 +1087,21 @@ impl<'a> CompileJobService<'a> {
             }
         }
         let typeset_document = typeset_document.expect("parsed documents should always typeset");
+        let graphics_diagnostics = graphics_resolver.take_diagnostics();
+        if graphics_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
+        {
+            let mut diagnostics = cache_diagnostics.clone();
+            diagnostics.extend(parse_diagnostics.clone());
+            diagnostics.extend(graphics_diagnostics);
+            return CompileResult {
+                exit_code: exit_code_for(&diagnostics),
+                diagnostics,
+                output_pdf: None,
+                stable_compile_state: None,
+            };
+        }
         let cross_reference_seed =
             cross_reference_seed_from_document(&parsed_document, &typeset_document);
         persist_compiled_document_state(
@@ -1002,16 +1128,8 @@ impl<'a> CompileJobService<'a> {
                 };
             }
         };
-        let section_outline = parsed_document
-            .section_entries
-            .iter()
-            .map(SectionOutlineEntry::from)
-            .collect::<Vec<_>>();
-        let partition_plan = DocumentPartitionPlanner::plan(
-            &options.input_file,
-            &parsed_document.document_class,
-            &section_outline,
-        );
+        let partition_plan =
+            partition_plan_for_document(&options.input_file, &parsed_document, &source_tree);
         let pdf_document = pdf_renderer.render_with_partition_plan(
             &typeset_document,
             options.parallelism,
@@ -1026,6 +1144,8 @@ impl<'a> CompileJobService<'a> {
         let cacheable_diagnostics = parse_diagnostics;
         let mut diagnostics = cache_diagnostics;
         diagnostics.extend(cacheable_diagnostics.clone());
+        let cached_typeset_fragments =
+            cached_typeset_fragments_for(&typeset_document, &partition_plan, &source_tree);
 
         if let Err(error) = self
             .file_access_gate
@@ -1078,6 +1198,7 @@ impl<'a> CompileJobService<'a> {
                 &provisional_stable_state,
                 output_pdf_hash,
                 &source_tree.cached_source_subtrees,
+                &cached_typeset_fragments,
             ) {
                 diagnostics.push(diagnostic);
             }
@@ -1364,6 +1485,41 @@ impl<'a> CompileJobService<'a> {
         (CompileFontSelection::Basic, families, diagnostics)
     }
 
+    fn typeset_document_with_selection(
+        &self,
+        document: &ParsedDocument,
+        selection: &CompileFontSelection,
+        graphics_resolver: &CompileGraphicAssetResolver<'_>,
+    ) -> TypesetDocument {
+        match selection {
+            CompileFontSelection::OpenType(loaded_font) => {
+                let provider = OpenTypeWidthProvider {
+                    font: &loaded_font.font,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.typeset_with_provider_and_graphics_resolver(
+                    document,
+                    &provider,
+                    Some(graphics_resolver),
+                )
+            }
+            CompileFontSelection::Tfm(metrics) => {
+                let provider = TfmWidthProvider {
+                    metrics,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.typeset_with_provider_and_graphics_resolver(
+                    document,
+                    &provider,
+                    Some(graphics_resolver),
+                )
+            }
+            CompileFontSelection::Basic => self
+                .typesetter
+                .typeset_with_graphics_resolver(document, graphics_resolver),
+        }
+    }
+
     fn load_source_tree_with_root_source(
         &self,
         input_file: &Path,
@@ -1563,7 +1719,7 @@ impl<'a> CompileJobService<'a> {
                 initial_table_entries,
                 initial_bibliography,
                 initial_bibliography_state.clone(),
-                initial_page_labels,
+                initial_page_labels.clone(),
                 initial_index_entries.clone(),
                 Some(&sty_resolver),
             );
@@ -1575,6 +1731,8 @@ impl<'a> CompileJobService<'a> {
             };
         };
         let mut pass_count = 1;
+        let mut current_page_labels = initial_page_labels;
+        let mut current_index_entries = initial_index_entries.clone();
 
         if document.has_unresolved_refs
             || document.has_unresolved_toc
@@ -1605,14 +1763,16 @@ impl<'a> CompileJobService<'a> {
         let mut typeset_document = typeset_document_for(&document);
 
         while pass_count < 3 {
-            let page_labels = if document.has_pageref_markers() {
+            let page_labels = if document.has_pageref_markers() || !current_page_labels.is_empty() {
                 resolve_page_labels(&document, &typeset_document.pages)
             } else {
                 BTreeMap::new()
             };
             let index_entries = typeset_document.index_entries.clone();
-            let needs_pageref_pass = document.has_pageref_markers() && !page_labels.is_empty();
-            let needs_index_pass = document.has_unresolved_index && !index_entries.is_empty();
+            let needs_pageref_pass = !page_labels.is_empty() && page_labels != current_page_labels;
+            let needs_index_pass = document.has_unresolved_index
+                && !index_entries.is_empty()
+                && index_entries != current_index_entries;
 
             if !needs_pageref_pass && !needs_index_pass {
                 break;
@@ -1628,8 +1788,8 @@ impl<'a> CompileJobService<'a> {
                     document.table_entries.clone(),
                     document.bibliography.clone(),
                     Some(document.bibliography_state.clone()),
-                    page_labels,
-                    index_entries,
+                    page_labels.clone(),
+                    index_entries.clone(),
                     Some(&sty_resolver),
                 );
             let Some(next_document) = next.document.clone() else {
@@ -1638,6 +1798,8 @@ impl<'a> CompileJobService<'a> {
 
             output = next;
             document = next_document;
+            current_page_labels = page_labels;
+            current_index_entries = index_entries;
             pass_count += 1;
             typeset_document = typeset_document_for(&document);
         }
@@ -1648,6 +1810,327 @@ impl<'a> CompileJobService<'a> {
             pass_count,
         }
     }
+}
+
+fn partition_plan_for_document(
+    primary_input: &Path,
+    document: &ParsedDocument,
+    source_tree: &LoadedSourceTree,
+) -> DocumentPartitionPlan {
+    let section_outline = document
+        .section_entries
+        .iter()
+        .map(SectionOutlineEntry::from)
+        .collect::<Vec<_>>();
+    let mut partition_plan =
+        DocumentPartitionPlanner::plan(primary_input, &document.document_class, &section_outline);
+    assign_partition_entry_files(&mut partition_plan, &source_tree.source_lines);
+    partition_plan
+}
+
+fn assign_partition_entry_files(
+    partition_plan: &mut DocumentPartitionPlan,
+    source_lines: &[SourceLineTrace],
+) {
+    let Some(first_work_unit) = partition_plan.work_units.first() else {
+        return;
+    };
+    let Some(command_name) = command_name_for_partition_level(first_work_unit.locator.level) else {
+        return;
+    };
+
+    let entry_files = source_lines
+        .iter()
+        .filter_map(|line| {
+            let content = line.text.split('%').next().unwrap_or_default().trim_start();
+            matches_partition_command(content, command_name)
+                .then(|| normalize_existing_path(Path::new(&line.file)))
+        })
+        .collect::<Vec<_>>();
+    if entry_files.len() != partition_plan.work_units.len() {
+        return;
+    }
+
+    for (work_unit, entry_file) in partition_plan.work_units.iter_mut().zip(entry_files) {
+        work_unit.locator.entry_file = entry_file;
+    }
+}
+
+fn command_name_for_partition_level(level: u8) -> Option<&'static str> {
+    match level {
+        0 => Some("\\chapter"),
+        1 => Some("\\section"),
+        2 => Some("\\subsection"),
+        3 => Some("\\subsubsection"),
+        _ => None,
+    }
+}
+
+fn matches_partition_command(content: &str, command_name: &str) -> bool {
+    content
+        .strip_prefix(command_name)
+        .map(|rest| {
+            rest.starts_with('{')
+                || rest.starts_with('[')
+                || rest.starts_with('*')
+                || rest.starts_with(char::is_whitespace)
+        })
+        .unwrap_or(false)
+}
+
+fn cached_document_layout_fragments_for(
+    partition_plan: &DocumentPartitionPlan,
+    source_tree: &LoadedSourceTree,
+    cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
+) -> BTreeMap<String, ferritex_core::typesetting::DocumentLayoutFragment> {
+    partition_plan
+        .work_units
+        .iter()
+        .filter_map(|work_unit| {
+            let cached_fragment = cached_typeset_fragments.get(&work_unit.partition_id)?;
+            let current_hash = source_tree
+                .dependency_graph
+                .nodes
+                .get(&work_unit.locator.entry_file)
+                .map(|node| node.content_hash)?;
+            (current_hash == cached_fragment.source_hash).then(|| {
+                (
+                    work_unit.partition_id.clone(),
+                    cached_fragment.fragment.clone(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn try_partial_typeset_document(
+    service: &CompileJobService<'_>,
+    document: &ParsedDocument,
+    selection: &CompileFontSelection,
+    graphics_resolver: &CompileGraphicAssetResolver<'_>,
+    partition_plan: &DocumentPartitionPlan,
+    reuse_plan: &TypesetterReusePlan,
+) -> Result<TypesetDocument, &'static str> {
+    let body_ranges =
+        partition_body_ranges(document, partition_plan).ok_or("partition body slicing failed")?;
+    let section_ranges = partition_section_ranges(document, partition_plan)
+        .ok_or("partition section slicing failed")?;
+    let mut fragments = reuse_plan.reuse_fragments.clone();
+
+    for work_unit in partition_plan.work_units.iter().filter(|work_unit| {
+        reuse_plan
+            .rebuild_partition_ids
+            .contains(&work_unit.partition_id)
+    }) {
+        let partition_document = partition_document_for_work_unit(
+            document,
+            work_unit,
+            body_ranges
+                .get(&work_unit.partition_id)
+                .copied()
+                .ok_or("missing body range for rebuilt partition")?,
+            section_ranges
+                .get(&work_unit.partition_id)
+                .copied()
+                .ok_or("missing section range for rebuilt partition")?,
+        )
+        .ok_or("failed to build partition-scoped parsed document")?;
+        let partition_typeset = service.typeset_document_with_selection(
+            &partition_document,
+            selection,
+            graphics_resolver,
+        );
+        let single_partition_plan = DocumentPartitionPlan {
+            fallback_partition_id: work_unit.partition_id.clone(),
+            work_units: vec![work_unit.clone()],
+        };
+        let extracted_fragments = partition_typeset.extract_fragments(&single_partition_plan);
+        let fragment = extracted_fragments
+            .get(&work_unit.partition_id)
+            .cloned()
+            .or_else(|| extracted_fragments.into_values().next())
+            .ok_or("failed to extract rebuilt fragment")?;
+        fragments.insert(work_unit.partition_id.clone(), fragment);
+    }
+
+    let merged = PaginationMergeCoordinator.merge(
+        partition_plan,
+        &fragments,
+        &navigation_state_for_document(document),
+    );
+    if !merged_matches_reuse_expectations(&merged, partition_plan, &reuse_plan.reuse_fragments) {
+        return Err("merged reuse fragments did not preserve cached label/page counts");
+    }
+
+    Ok(merged)
+}
+
+fn partition_document_for_work_unit(
+    document: &ParsedDocument,
+    work_unit: &DocumentWorkUnit,
+    body_range: (usize, usize),
+    section_range: (usize, usize),
+) -> Option<ParsedDocument> {
+    let (body_start, body_end) = body_range;
+    let (section_start, section_end) = section_range;
+    let mut partition_document = document.clone();
+    partition_document.body = document.body.get(body_start..body_end)?.to_string();
+    partition_document.section_entries =
+        document.section_entries[section_start..section_end].to_vec();
+    if partition_document.section_entries.is_empty() {
+        partition_document.section_entries = vec![document
+            .section_entries
+            .get(work_unit.locator.ordinal)?
+            .clone()];
+    }
+    Some(partition_document)
+}
+
+fn partition_body_ranges(
+    document: &ParsedDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> Option<BTreeMap<String, (usize, usize)>> {
+    if partition_plan.work_units.len() <= 1 {
+        let partition_id = partition_plan
+            .work_units
+            .first()
+            .map(|work_unit| work_unit.partition_id.clone())
+            .unwrap_or_else(|| partition_plan.fallback_partition_id.clone());
+        return Some(BTreeMap::from([(partition_id, (0, document.body.len()))]));
+    }
+
+    let mut starts = vec![0usize; partition_plan.work_units.len()];
+    let mut upper_bound = document.body.len();
+    for index in (1..partition_plan.work_units.len()).rev() {
+        let title = &partition_plan.work_units[index].title;
+        let start = partition_heading_offset(&document.body[..upper_bound], title)?;
+        starts[index] = start;
+        upper_bound = start;
+    }
+
+    Some(
+        partition_plan
+            .work_units
+            .iter()
+            .enumerate()
+            .map(|(index, work_unit)| {
+                let end = starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(document.body.len());
+                (work_unit.partition_id.clone(), (starts[index], end))
+            })
+            .collect(),
+    )
+}
+
+fn partition_heading_offset(body: &str, title: &str) -> Option<usize> {
+    let heading_with_prefix = format!("\n{title}\n\n");
+    if let Some(offset) = body.rfind(&heading_with_prefix) {
+        return Some(offset + 1);
+    }
+
+    body.rfind(&format!("{title}\n\n"))
+}
+
+fn partition_section_ranges(
+    document: &ParsedDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> Option<BTreeMap<String, (usize, usize)>> {
+    let level = partition_plan.work_units.first()?.locator.level;
+    let top_level_indices = document
+        .section_entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.level == level).then_some(index))
+        .collect::<Vec<_>>();
+    if top_level_indices.len() != partition_plan.work_units.len() {
+        return None;
+    }
+
+    Some(
+        partition_plan
+            .work_units
+            .iter()
+            .enumerate()
+            .map(|(index, work_unit)| {
+                let start = top_level_indices[index];
+                let end = top_level_indices
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(document.section_entries.len());
+                (work_unit.partition_id.clone(), (start, end))
+            })
+            .collect(),
+    )
+}
+
+fn navigation_state_for_document(document: &ParsedDocument) -> NavigationState {
+    let mut named_destinations = document
+        .labels
+        .keys()
+        .map(|name| (name.clone(), DestinationAnchor { name: name.clone() }))
+        .collect::<BTreeMap<_, _>>();
+    for entry in &document.section_entries {
+        let title = entry.display_title();
+        if title.is_empty() {
+            continue;
+        }
+        let name = format!("section:{title}");
+        named_destinations
+            .entry(name.clone())
+            .or_insert_with(|| DestinationAnchor { name });
+    }
+    if let Some(snapshot) = document.bibliography_state.bbl.as_ref() {
+        for entry in &snapshot.entries {
+            let name = format!("bib:{}", entry.key);
+            named_destinations
+                .entry(name.clone())
+                .or_insert_with(|| DestinationAnchor { name });
+        }
+    }
+
+    NavigationState {
+        metadata: PdfMetadataDraft {
+            title: document
+                .labels
+                .pdf_title
+                .clone()
+                .or_else(|| document.title.clone()),
+            author: document
+                .labels
+                .pdf_author
+                .clone()
+                .or_else(|| document.author.clone()),
+        },
+        outline_entries: document
+            .section_entries
+            .iter()
+            .filter_map(|entry| {
+                let title = entry.display_title();
+                (!title.is_empty()).then_some(OutlineDraftEntry {
+                    level: entry.level,
+                    title,
+                })
+            })
+            .collect(),
+        named_destinations,
+        default_link_style: LinkStyle {
+            color_links: document.labels.color_links.unwrap_or(false),
+            link_color: document.labels.link_color.clone(),
+        },
+    }
+}
+
+fn merged_matches_reuse_expectations(
+    merged: &TypesetDocument,
+    partition_plan: &DocumentPartitionPlan,
+    reuse_fragments: &BTreeMap<String, ferritex_core::typesetting::DocumentLayoutFragment>,
+) -> bool {
+    let merged_fragments = merged.extract_fragments(partition_plan);
+    reuse_fragments
+        .iter()
+        .all(|(partition_id, _)| merged_fragments.contains_key(partition_id))
 }
 
 fn stable_compile_state(
@@ -1667,6 +2150,39 @@ fn stable_compile_state(
         success,
         diagnostics,
     }
+}
+
+fn cached_typeset_fragments_for(
+    document: &TypesetDocument,
+    partition_plan: &ferritex_core::compilation::DocumentPartitionPlan,
+    source_tree: &LoadedSourceTree,
+) -> BTreeMap<String, CachedTypesetFragment> {
+    document
+        .extract_fragments(partition_plan)
+        .into_iter()
+        .map(|(partition_id, fragment)| {
+            let source_hash = partition_plan
+                .work_units
+                .iter()
+                .find(|work_unit| work_unit.partition_id == partition_id)
+                .and_then(|work_unit| {
+                    source_tree
+                        .dependency_graph
+                        .nodes
+                        .get(&work_unit.locator.entry_file)
+                        .map(|node| node.content_hash)
+                })
+                .unwrap_or_default();
+
+            (
+                partition_id,
+                CachedTypesetFragment {
+                    fragment,
+                    source_hash,
+                },
+            )
+        })
+        .collect()
 }
 
 fn cross_reference_seed_from_document(
@@ -2819,41 +3335,71 @@ fn build_pdf_renderer_with_images(
     }
 
     let mut images = Vec::new();
+    let mut forms = Vec::new();
     let mut image_indices = std::collections::HashMap::new();
+    let mut form_indices = std::collections::HashMap::new();
     let mut page_images = Vec::with_capacity(document.pages.len());
+    let mut page_forms = Vec::with_capacity(document.pages.len());
 
     for page in &document.pages {
         let mut placements = Vec::with_capacity(page.images.len());
+        let mut form_placements = Vec::with_capacity(page.images.len());
         for image in &page.images {
-            let xobject_index = if let Some(index) =
-                image_indices.get(&image.graphic.asset_handle.id)
-            {
-                *index
-            } else {
-                let path = Path::new(&image.graphic.path);
-                let bytes = file_access_gate.read_file(path).map_err(|error| {
-                    diagnostic_for_input_error(error, image.graphic.path.clone())
-                })?;
-                let xobject =
-                    build_pdf_image_xobject(&image.graphic.path, &image.graphic.metadata, &bytes)?;
-                let index = images.len();
-                images.push(xobject);
-                image_indices.insert(image.graphic.asset_handle.id.clone(), index);
-                index
-            };
+            match &image.graphic {
+                GraphicNode::External(graphic) => {
+                    let xobject_index =
+                        if let Some(index) = image_indices.get(&graphic.asset_handle.id) {
+                            *index
+                        } else {
+                            let path = Path::new(&graphic.path);
+                            let bytes = file_access_gate.read_file(path).map_err(|error| {
+                                diagnostic_for_input_error(error, graphic.path.clone())
+                            })?;
+                            let xobject =
+                                build_pdf_image_xobject(&graphic.path, &graphic.metadata, &bytes)?;
+                            let index = images.len();
+                            images.push(xobject);
+                            image_indices.insert(graphic.asset_handle.id.clone(), index);
+                            index
+                        };
 
-            placements.push(PlacedImage {
-                xobject_index,
-                x: image.x,
-                y: image.y,
-                display_width: image.display_width,
-                display_height: image.display_height,
-            });
+                    placements.push(PlacedImage {
+                        xobject_index,
+                        x: image.x,
+                        y: image.y,
+                        display_width: image.display_width,
+                        display_height: image.display_height,
+                    });
+                }
+                GraphicNode::Pdf(graphic) => {
+                    let xobject_index =
+                        if let Some(index) = form_indices.get(&graphic.asset_handle.id) {
+                            *index
+                        } else {
+                            let xobject = build_pdf_form_xobject(&graphic.path, &graphic.metadata)?;
+                            let index = forms.len();
+                            forms.push(xobject);
+                            form_indices.insert(graphic.asset_handle.id.clone(), index);
+                            index
+                        };
+
+                    form_placements.push(PlacedFormXObject {
+                        xobject_index,
+                        x: image.x,
+                        y: image.y,
+                        display_width: image.display_width,
+                        display_height: image.display_height,
+                    });
+                }
+            }
         }
         page_images.push(placements);
+        page_forms.push(form_placements);
     }
 
-    Ok(renderer.with_images(images, page_images))
+    Ok(renderer
+        .with_images(images, page_images)
+        .with_form_xobjects(forms, page_forms))
 }
 
 fn build_pdf_image_xobject(
@@ -2891,6 +3437,28 @@ fn build_pdf_image_xobject(
     )
     .with_file(path.to_string())
     .with_suggestion("use a non-interlaced PNG or a baseline/progressive JPEG"))
+}
+
+fn build_pdf_form_xobject(
+    path: &str,
+    metadata: &PdfGraphicMetadata,
+) -> Result<PdfFormXObject, Diagnostic> {
+    let [llx, lly, urx, ury] = metadata.media_box;
+    if !metadata.page_data.is_empty() && urx > llx && ury > lly {
+        return Ok(PdfFormXObject {
+            object_id: 0,
+            media_box: metadata.media_box,
+            data: metadata.page_data.clone(),
+            resources_dict: metadata.resources_dict.clone(),
+        });
+    }
+
+    Err(Diagnostic::new(
+        Severity::Error,
+        "unsupported PDF input for \\includegraphics",
+    )
+    .with_file(path.to_string())
+    .with_suggestion("use an unencrypted single-page PDF whose first page defines /MediaBox"))
 }
 
 fn normalize_existing_path(path: &Path) -> PathBuf {
@@ -3939,6 +4507,9 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     use super::{run_font_tasks, CompileJobService};
     use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput};
@@ -4374,6 +4945,10 @@ mod tests {
         format!("\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
     }
 
+    fn report_document(body: &str) -> String {
+        format!("\\documentclass{{report}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n")
+    }
+
     fn read_pdf(path: &Path) -> String {
         String::from_utf8_lossy(&fs::read(path).expect("read output pdf")).into_owned()
     }
@@ -4385,6 +4960,76 @@ mod tests {
 
     fn points(value: i64) -> DimensionValue {
         DimensionValue(value * 65_536)
+    }
+
+    #[derive(Clone)]
+    struct CapturingSubscriber {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        message: Option<String>,
+    }
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}").trim_matches('"').to_string());
+            }
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = Some(value.to_string());
+            }
+        }
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.is_event()
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            if let Some(message) = visitor.message {
+                self.messages
+                    .lock()
+                    .expect("lock tracing messages")
+                    .push(message);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    fn compile_with_trace_messages(
+        gate: &dyn FileAccessGate,
+        loader: &dyn AssetBundleLoaderPort,
+        options: &RuntimeOptions,
+    ) -> (super::CompileResult, Vec<String>) {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = CapturingSubscriber {
+            messages: Arc::clone(&messages),
+        };
+        let result = tracing::subscriber::with_default(subscriber, || {
+            service(gate, loader).compile(options)
+        });
+        let trace_messages = messages.lock().expect("lock tracing messages").clone();
+
+        (result, trace_messages)
     }
 
     fn test_typeset_document(lines: Vec<TextLine>) -> TypesetDocument {
@@ -5287,6 +5932,211 @@ mod tests {
 
         let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
         assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn partial_recompile_single_file_edit_matches_full() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let chapter_one = dir.path().join("chapter-one.tex");
+        let chapter_two = dir.path().join("chapter-two.tex");
+        let chapter_three = dir.path().join("chapter-three.tex");
+        fs::write(
+            &input_file,
+            report_document(
+                "\\input{chapter-one}\n\\newpage\n\\input{chapter-two}\n\\newpage\n\\input{chapter-three}",
+            ),
+        )
+        .expect("write main input");
+        fs::write(
+            &chapter_one,
+            "\\chapter{One}\\label{chap:one}\nAlpha body.\n",
+        )
+        .expect("write chapter one");
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nOriginal body text.\n",
+        )
+        .expect("write chapter two");
+        fs::write(
+            &chapter_three,
+            "\\chapter{Three}\\label{chap:three}\nSee Chapter \\ref{chap:two}.\n",
+        )
+        .expect("write chapter three");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 0);
+
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nEdited body text after cache warmup.\n",
+        )
+        .expect("update chapter two");
+
+        let (second, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        let second_state = second
+            .stable_compile_state
+            .clone()
+            .expect("second stable state");
+        assert_eq!(second.exit_code, 0);
+        assert!(
+            trace_messages
+                .iter()
+                .any(|message| message.contains("partial typeset reuse applied")),
+            "{trace_messages:?}"
+        );
+        assert_eq!(second_state.snapshot.pass_number, 1);
+
+        let incremental_pdf =
+            fs::read(options.output_dir.join("main.pdf")).expect("read incremental pdf");
+        let incremental_pdf_text = String::from_utf8_lossy(&incremental_pdf);
+        assert!(incremental_pdf_text.contains("Edited body text after cache warmup."));
+
+        let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0);
+
+        let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
+        assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn preamble_change_forces_full_rebuild() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let chapter_one = dir.path().join("chapter-one.tex");
+        let chapter_two = dir.path().join("chapter-two.tex");
+        fs::write(
+            &input_file,
+            report_document(
+                "\\tableofcontents\n\\newpage\n\\input{chapter-one}\n\\newpage\n\\input{chapter-two}",
+            ),
+        )
+        .expect("write main input");
+        fs::write(
+            &chapter_one,
+            "\\chapter{One}\\label{chap:one}\nAlpha body.\n",
+        )
+        .expect("write chapter one");
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nSee Chapter \\ref{chap:one}.\n",
+        )
+        .expect("write chapter two");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 0);
+
+        fs::write(
+            &input_file,
+            "\\documentclass{report}\n\\usepackage{xcolor}\n\\begin{document}\n\\tableofcontents\n\\newpage\n\\input{chapter-one}\n\\newpage\n\\input{chapter-two}\n\\end{document}\n",
+        )
+        .expect("update main input");
+
+        let (second, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(second.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("partial typeset fallback to full typeset")));
+        assert!(trace_messages
+            .iter()
+            .all(|message| !message.contains("partial typeset reuse applied")));
+
+        let incremental_pdf =
+            fs::read(options.output_dir.join("main.pdf")).expect("read incremental pdf");
+        let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0);
+
+        let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
+        assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn stale_page_numbers_trigger_full_fallback() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let chapter_one = dir.path().join("chapter-one.tex");
+        let chapter_two = dir.path().join("chapter-two.tex");
+        let appendix = dir.path().join("appendix.tex");
+        fs::write(
+            &input_file,
+            report_document(
+                "\\input{chapter-one}\n\\newpage\n\\input{chapter-two}\n\\newpage\n\\input{appendix}",
+            ),
+        )
+        .expect("write main input");
+        fs::write(
+            &chapter_one,
+            "\\chapter{One}\\label{chap:one}\nIntro body.\n",
+        )
+        .expect("write chapter one");
+        fs::write(
+            &chapter_two,
+            "\\chapter{Two}\\label{chap:two}\nAppendix starts on page \\pageref{chap:appendix}.\n",
+        )
+        .expect("write chapter two");
+        fs::write(
+            &appendix,
+            "\\chapter{Appendix}\\label{chap:appendix}\nAppendix body.\n",
+        )
+        .expect("write appendix");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 0);
+        let first_pdf_text = read_pdf(&options.output_dir.join("main.pdf"));
+
+        fs::write(
+            &chapter_one,
+            "\\chapter{One}\\label{chap:one}\nIntro body.\n\\newpage\nInserted page.\n",
+        )
+        .expect("update chapter one");
+
+        let (second, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        let second_state = second
+            .stable_compile_state
+            .clone()
+            .expect("second stable state");
+        assert_eq!(second.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("partial typeset reuse applied")));
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("partial typeset fallback to full typeset")));
+        assert!(second_state.snapshot.pass_number >= 2);
+
+        let incremental_pdf =
+            fs::read(options.output_dir.join("main.pdf")).expect("read incremental pdf");
+        let incremental_pdf_text = String::from_utf8_lossy(&incremental_pdf);
+        assert_ne!(incremental_pdf_text, first_pdf_text);
+
+        let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0);
+
+        let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
+        let full_pdf_text = String::from_utf8_lossy(&full_pdf);
+        assert_eq!(incremental_pdf, full_pdf);
+        assert_eq!(incremental_pdf_text, full_pdf_text);
     }
 
     #[test]

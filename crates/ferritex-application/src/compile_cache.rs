@@ -6,11 +6,12 @@ use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::incremental::{DependencyGraph, RecompilationScope};
 use ferritex_core::policy::{FileAccessError, FileAccessGate};
 use ferritex_core::synctex::SourceLineTrace;
+use ferritex_core::typesetting::DocumentLayoutFragment;
 use serde::{Deserialize, Serialize};
 
 use crate::stable_compile_state::StableCompileState;
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
 
 pub struct CompileCache<'a> {
@@ -37,6 +38,7 @@ pub struct CacheLookupResult {
     pub rebuild_paths: BTreeSet<PathBuf>,
     pub cached_dependency_graph: Option<DependencyGraph>,
     pub cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
+    pub cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
     pub scope: Option<RecompilationScope>,
 }
 
@@ -47,6 +49,12 @@ pub struct CachedSourceSubtree {
     pub source_files: Vec<PathBuf>,
     pub labels: BTreeMap<String, SymbolLocation>,
     pub citations: BTreeMap<String, SymbolLocation>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedTypesetFragment {
+    pub fragment: DocumentLayoutFragment,
+    pub source_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +68,8 @@ struct CompileCacheRecord {
     stable_compile_state: StableCompileState,
     #[serde(default)]
     cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
+    #[serde(default)]
+    cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
 }
 
 impl<'a> CompileCache<'a> {
@@ -100,6 +110,7 @@ impl<'a> CompileCache<'a> {
                     rebuild_paths: BTreeSet::new(),
                     cached_dependency_graph: None,
                     cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -115,6 +126,7 @@ impl<'a> CompileCache<'a> {
                     rebuild_paths: BTreeSet::new(),
                     cached_dependency_graph: None,
                     cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -134,6 +146,7 @@ impl<'a> CompileCache<'a> {
                     rebuild_paths: BTreeSet::new(),
                     cached_dependency_graph: None,
                     cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -154,6 +167,7 @@ impl<'a> CompileCache<'a> {
                 rebuild_paths: BTreeSet::new(),
                 cached_dependency_graph: None,
                 cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -170,6 +184,7 @@ impl<'a> CompileCache<'a> {
                 rebuild_paths: BTreeSet::new(),
                 cached_dependency_graph: None,
                 cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -186,6 +201,7 @@ impl<'a> CompileCache<'a> {
                 rebuild_paths: change_summary.rebuild_paths,
                 cached_dependency_graph: Some(record.dependency_graph),
                 cached_source_subtrees: record.cached_source_subtrees,
+                cached_typeset_fragments: record.cached_typeset_fragments,
                 scope: Some(change_summary.scope),
             };
         }
@@ -204,6 +220,7 @@ impl<'a> CompileCache<'a> {
                     rebuild_paths: BTreeSet::new(),
                     cached_dependency_graph: None,
                     cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -221,6 +238,7 @@ impl<'a> CompileCache<'a> {
                 rebuild_paths: BTreeSet::new(),
                 cached_dependency_graph: None,
                 cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -236,6 +254,7 @@ impl<'a> CompileCache<'a> {
             rebuild_paths: BTreeSet::new(),
             cached_dependency_graph: Some(record.dependency_graph),
             cached_source_subtrees: record.cached_source_subtrees,
+            cached_typeset_fragments: record.cached_typeset_fragments,
             scope: None,
         }
     }
@@ -246,6 +265,7 @@ impl<'a> CompileCache<'a> {
         stable_compile_state: &StableCompileState,
         output_pdf_hash: u64,
         cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
+        cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
     ) -> Option<Diagnostic> {
         if let Err(error) = self.file_access_gate.ensure_directory(&self.cache_dir) {
             return Some(cache_info_diagnostic(
@@ -263,6 +283,7 @@ impl<'a> CompileCache<'a> {
             dependency_graph: dependency_graph.clone(),
             stable_compile_state: stable_compile_state.clone(),
             cached_source_subtrees: cached_source_subtrees.clone(),
+            cached_typeset_fragments: cached_typeset_fragments.clone(),
         };
 
         let bytes = match serde_json::to_vec_pretty(&record) {
@@ -368,8 +389,13 @@ mod tests {
 
     use ferritex_core::compilation::{CompilationSnapshot, DocumentState};
     use ferritex_core::incremental::RecompilationScope;
+    use ferritex_core::kernel::api::DimensionValue;
+    use ferritex_core::typesetting::{
+        DocumentLayoutFragment, PageBox, TextLine, TypesetNamedDestination, TypesetOutline,
+        TypesetPage,
+    };
 
-    use super::{fingerprint_bytes, CompileCache};
+    use super::{fingerprint_bytes, CachedTypesetFragment, CompileCache};
     use crate::stable_compile_state::StableCompileState;
 
     struct FsGate;
@@ -462,6 +488,7 @@ mod tests {
                 &stable_state(&input),
                 fingerprint_bytes(b"%PDF-1.4\n"),
                 &BTreeMap::new(),
+                &BTreeMap::new(),
             )
             .expect_none("cache stored");
 
@@ -501,6 +528,7 @@ mod tests {
                 &graph,
                 &expected_state,
                 fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
             )
             .expect_none("cache stored");
@@ -549,6 +577,7 @@ mod tests {
                 &stable_state(&input),
                 fingerprint_bytes(pdf_bytes),
                 &BTreeMap::new(),
+                &BTreeMap::new(),
             )
             .expect_none("cache stored");
 
@@ -564,6 +593,76 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
         );
         assert_eq!(lookup.scope, Some(RecompilationScope::LocalRegion));
+    }
+
+    #[test]
+    fn stores_and_restores_cached_typeset_fragments() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"stable"));
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+            },
+        )]);
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+            )
+            .expect_none("cache stored");
+
+        let lookup = cache.lookup();
+
+        assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    fn test_fragment(partition_id: &str) -> DocumentLayoutFragment {
+        DocumentLayoutFragment {
+            partition_id: partition_id.to_string(),
+            pages: vec![TypesetPage {
+                lines: vec![TextLine {
+                    text: "cached".to_string(),
+                    y: DimensionValue(0),
+                    links: Vec::new(),
+                    font_index: 0,
+                    source_span: None,
+                }],
+                images: Vec::new(),
+                page_box: PageBox {
+                    width: DimensionValue(100),
+                    height: DimensionValue(200),
+                },
+                float_placements: Vec::new(),
+                index_entries: Vec::new(),
+            }],
+            local_label_pages: BTreeMap::from([("intro".to_string(), 0)]),
+            outlines: vec![TypesetOutline {
+                level: 0,
+                title: "Intro".to_string(),
+                page_index: 0,
+                y: DimensionValue(0),
+            }],
+            named_destinations: vec![TypesetNamedDestination {
+                name: "intro".to_string(),
+                page_index: 0,
+                y: DimensionValue(0),
+            }],
+        }
     }
 
     trait ExpectNone<T> {

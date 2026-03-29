@@ -70,8 +70,27 @@ pub struct PdfImageXObject {
     pub filter: ImageFilter,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PdfFormXObject {
+    pub object_id: usize,
+    pub media_box: [f64; 4],
+    pub data: Vec<u8>,
+    pub resources_dict: Option<String>,
+}
+
+impl Eq for PdfFormXObject {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedImage {
+    pub xobject_index: usize,
+    pub x: DimensionValue,
+    pub y: DimensionValue,
+    pub display_width: DimensionValue,
+    pub display_height: DimensionValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedFormXObject {
     pub xobject_index: usize,
     pub x: DimensionValue,
     pub y: DimensionValue,
@@ -84,6 +103,8 @@ pub struct PdfRenderer {
     fonts: Vec<FontResource>,
     images: Vec<PdfImageXObject>,
     page_images: Vec<Vec<PlacedImage>>,
+    form_xobjects: Vec<PdfFormXObject>,
+    page_form_xobjects: Vec<Vec<PlacedFormXObject>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +135,8 @@ impl PdfRenderer {
             fonts: default_font_resources(),
             images: Vec::new(),
             page_images: Vec::new(),
+            form_xobjects: Vec::new(),
+            page_form_xobjects: Vec::new(),
         }
     }
 
@@ -126,6 +149,8 @@ impl PdfRenderer {
             },
             images: Vec::new(),
             page_images: Vec::new(),
+            form_xobjects: Vec::new(),
+            page_form_xobjects: Vec::new(),
         }
     }
 
@@ -136,6 +161,16 @@ impl PdfRenderer {
     ) -> Self {
         self.images = images;
         self.page_images = page_images;
+        self
+    }
+
+    pub fn with_form_xobjects(
+        mut self,
+        form_xobjects: Vec<PdfFormXObject>,
+        page_form_xobjects: Vec<Vec<PlacedFormXObject>>,
+    ) -> Self {
+        self.form_xobjects = form_xobjects;
+        self.page_form_xobjects = page_form_xobjects;
         self
     }
 
@@ -167,11 +202,14 @@ impl PdfRenderer {
         let content_object_start = page_object_start + page_count;
         let annotation_object_start = content_object_start + page_count;
         let mut image_objects = self.images.clone();
+        let mut form_xobjects = self.form_xobjects.clone();
         let page_partition_ids = page_partition_ids_for_plan(document, partition_plan);
         let page_payloads = render_page_payloads(
             &document.pages,
             &self.page_images,
             &image_objects,
+            &self.page_form_xobjects,
+            &form_xobjects,
             link_style,
             &page_partition_ids,
             parallelism,
@@ -207,8 +245,10 @@ impl PdfRenderer {
             .sum::<usize>();
         let image_object_start = font_object_start + font_object_count;
         assign_image_object_ids(&mut image_objects, image_object_start);
+        let form_object_start = image_object_start + image_objects.len();
+        assign_form_object_ids(&mut form_xobjects, form_object_start);
         let info_object_id =
-            build_info_dictionary(document).map(|_| image_object_start + image_objects.len());
+            build_info_dictionary(document).map(|_| form_object_start + form_xobjects.len());
         let page_font_resources = page_font_resources(&font_objects);
         let catalog_named_destinations = named_destination_object_id
             .map(|object_id| format!(" /Names << /Dests {object_id} 0 R >>"))
@@ -247,12 +287,18 @@ impl PdfRenderer {
                 .get(page_index)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
+            let page_forms = self
+                .page_form_xobjects
+                .get(page_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let annots_entry = if page_annots.is_empty() {
                 String::new()
             } else {
                 format!(" /Annots [{}]", page_annots.join(" "))
             };
-            let xobject_resources = page_xobject_resources(page_images, &image_objects);
+            let xobject_resources =
+                page_xobject_resources(page_images, &image_objects, page_forms, &form_xobjects);
             append_object(
                 &mut pdf,
                 &mut offsets,
@@ -316,6 +362,9 @@ impl PdfRenderer {
 
         for image in &image_objects {
             append_image_xobject(&mut pdf, &mut offsets, image);
+        }
+        for form_xobject in &form_xobjects {
+            append_form_xobject(&mut pdf, &mut offsets, form_xobject);
         }
 
         if let Some(object_id) = named_destination_object_id {
@@ -601,6 +650,8 @@ fn render_page_payloads(
     pages: &[TypesetPage],
     page_images: &[Vec<PlacedImage>],
     image_objects: &[PdfImageXObject],
+    page_form_xobjects: &[Vec<PlacedFormXObject>],
+    form_xobjects: &[PdfFormXObject],
     link_style: &LinkStyle,
     page_partition_ids: &[String],
     parallelism: usize,
@@ -624,6 +675,11 @@ fn render_page_payloads(
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[]),
                             image_objects,
+                            page_form_xobjects
+                                .get(page_index)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                            form_xobjects,
                             link_style,
                         ),
                     })
@@ -652,6 +708,11 @@ fn render_page_payloads(
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]),
                                 image_objects,
+                                page_form_xobjects
+                                    .get(page_index)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                                form_xobjects,
                                 link_style,
                             ),
                         }
@@ -781,6 +842,8 @@ fn render_page_stream(
     page: &TypesetPage,
     placed_images: &[PlacedImage],
     image_objects: &[PdfImageXObject],
+    placed_form_xobjects: &[PlacedFormXObject],
+    form_xobjects: &[PdfFormXObject],
     link_style: &LinkStyle,
 ) -> String {
     let mut stream = String::new();
@@ -794,6 +857,11 @@ fn render_page_stream(
     for placement in placed_images {
         if image_objects.get(placement.xobject_index).is_some() {
             stream.push_str(&render_image_placement(placement));
+        }
+    }
+    for placement in placed_form_xobjects {
+        if let Some(form_xobject) = form_xobjects.get(placement.xobject_index) {
+            stream.push_str(&render_form_xobject_placement(placement, form_xobject));
         }
     }
 
@@ -957,17 +1025,50 @@ fn render_image_placement(image: &PlacedImage) -> String {
     )
 }
 
+fn render_form_xobject_placement(
+    form: &PlacedFormXObject,
+    form_xobject: &PdfFormXObject,
+) -> String {
+    let natural_width = form_xobject.media_box[2] - form_xobject.media_box[0];
+    let natural_height = form_xobject.media_box[3] - form_xobject.media_box[1];
+    if natural_width <= 0.0 || natural_height <= 0.0 {
+        return String::new();
+    }
+
+    let scale_x = dimension_to_pdf_number(form.display_width) / natural_width;
+    let scale_y = dimension_to_pdf_number(form.display_height) / natural_height;
+    let translate_x = dimension_to_pdf_number(form.x) - form_xobject.media_box[0] * scale_x;
+    let translate_y = dimension_to_pdf_number(form.y) - form_xobject.media_box[1] * scale_y;
+
+    format!(
+        "q {} 0 0 {} {} {} cm /Fm{} Do Q\n",
+        pdf_real(scale_x),
+        pdf_real(scale_y),
+        pdf_real(translate_x),
+        pdf_real(translate_y),
+        form.xobject_index + 1,
+    )
+}
+
 fn assign_image_object_ids(images: &mut [PdfImageXObject], start_object_id: usize) {
     for (index, image) in images.iter_mut().enumerate() {
         image.object_id = start_object_id + index;
     }
 }
 
+fn assign_form_object_ids(forms: &mut [PdfFormXObject], start_object_id: usize) {
+    for (index, form) in forms.iter_mut().enumerate() {
+        form.object_id = start_object_id + index;
+    }
+}
+
 fn page_xobject_resources(
     page_images: &[PlacedImage],
     image_objects: &[PdfImageXObject],
+    page_forms: &[PlacedFormXObject],
+    form_xobjects: &[PdfFormXObject],
 ) -> String {
-    let resources = page_images
+    let mut resources = page_images
         .iter()
         .filter_map(|placement| {
             image_objects
@@ -975,6 +1076,11 @@ fn page_xobject_resources(
                 .map(|image| format!("/Im{} {} 0 R", placement.xobject_index + 1, image.object_id))
         })
         .collect::<std::collections::BTreeSet<_>>();
+    resources.extend(page_forms.iter().filter_map(|placement| {
+        form_xobjects
+            .get(placement.xobject_index)
+            .map(|form| format!("/Fm{} {} 0 R", placement.xobject_index + 1, form.object_id))
+    }));
 
     if resources.is_empty() {
         String::new()
@@ -1003,6 +1109,30 @@ fn append_image_xobject(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, image: &
         .as_bytes(),
     );
     buffer.extend_from_slice(&image.data);
+    buffer.extend_from_slice(b"\nendstream\nendobj\n");
+}
+
+fn append_form_xobject(
+    buffer: &mut Vec<u8>,
+    offsets: &mut Vec<usize>,
+    form_xobject: &PdfFormXObject,
+) {
+    offsets.push(buffer.len());
+    let resources_dict = form_xobject.resources_dict.as_deref().unwrap_or("<< >>");
+    buffer.extend_from_slice(
+        format!(
+            "{} 0 obj\n<< /Type /XObject /Subtype /Form /FormType 1 /BBox [{} {} {} {}] /Resources {} /Length {} >>\nstream\n",
+            form_xobject.object_id,
+            pdf_real(form_xobject.media_box[0]),
+            pdf_real(form_xobject.media_box[1]),
+            pdf_real(form_xobject.media_box[2]),
+            pdf_real(form_xobject.media_box[3]),
+            resources_dict,
+            form_xobject.data.len(),
+        )
+        .as_bytes(),
+    );
+    buffer.extend_from_slice(&form_xobject.data);
     buffer.extend_from_slice(b"\nendstream\nendobj\n");
 }
 
@@ -1173,6 +1303,18 @@ fn points_to_pdf_number(value: DimensionValue) -> i64 {
     value.0 / SCALED_POINTS_PER_POINT
 }
 
+fn dimension_to_pdf_number(value: DimensionValue) -> f64 {
+    value.0 as f64 / SCALED_POINTS_PER_POINT as f64
+}
+
+fn pdf_real(value: f64) -> String {
+    let formatted = format!("{value:.4}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
 fn points(value: i64) -> DimensionValue {
     DimensionValue(value * SCALED_POINTS_PER_POINT)
 }
@@ -1203,8 +1345,8 @@ fn escape_pdf_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_named_color, FontResource, ImageColorSpace, ImageFilter, PdfImageXObject,
-        PdfRenderer, PlacedImage,
+        resolve_named_color, FontResource, ImageColorSpace, ImageFilter, PdfFormXObject,
+        PdfImageXObject, PdfRenderer, PlacedFormXObject, PlacedImage,
     };
     use crate::compilation::{
         DocumentPartitionPlan, DocumentWorkUnit, LinkStyle, PartitionKind, PartitionLocator,
@@ -1387,6 +1529,35 @@ mod tests {
         assert!(content
             .contains("/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns 1 >>"));
         assert!(content.contains("q 100 0 0 100 72 600 cm /Im1 Do Q"));
+    }
+
+    #[test]
+    fn emits_form_xobject_and_placement_commands() {
+        let document = single_page(&[]);
+        let renderer = PdfRenderer::default().with_form_xobjects(
+            vec![PdfFormXObject {
+                object_id: 0,
+                media_box: [0.0, 0.0, 200.0, 100.0],
+                data: b"0 0 m\n200 100 l\nS".to_vec(),
+                resources_dict: Some("<< /ProcSet [/PDF] >>".to_string()),
+            }],
+            vec![vec![PlacedFormXObject {
+                xobject_index: 0,
+                x: points(72),
+                y: points(600),
+                display_width: points(100),
+                display_height: points(50),
+            }]],
+        );
+        let pdf = renderer.render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/XObject << /Fm1"));
+        assert!(content.contains("/Subtype /Form"));
+        assert!(content.contains("/BBox [0 0 200 100]"));
+        assert!(content.contains("/Resources << /ProcSet [/PDF] >>"));
+        assert!(content.contains("0 0 m\n200 100 l\nS"));
+        assert!(content.contains("q 0.5 0 0 0.5 72 600 cm /Fm1 Do Q"));
     }
 
     #[test]

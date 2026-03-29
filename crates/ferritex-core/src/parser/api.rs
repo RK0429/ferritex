@@ -4,6 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::bibliography::api::{parse_bbl, BibliographyState};
@@ -159,7 +160,7 @@ impl Default for CaptionEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRawEntry {
     pub sort_key: String,
     pub display: String,

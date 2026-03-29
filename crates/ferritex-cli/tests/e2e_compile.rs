@@ -10,6 +10,8 @@ const PNG_1X1_RGB: &[u8] = &[
     0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0, 3, 1,
     1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
+const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /ProcSet [/PDF] >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 18 >>\nstream\n0 0 m\n200 100 l\nS\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
+const CORRUPT_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /MediaBox [0 0 200] >>\n";
 
 fn ferritex_bin() -> Command {
     let bin = env!("CARGO_BIN_EXE_ferritex");
@@ -109,6 +111,60 @@ fn compile_includegraphics_embeds_image_xobject_into_pdf() {
     assert!(content.contains("/Filter /FlateDecode"));
     assert!(content.contains("/XObject << /Im1"));
     assert!(content.contains("/Im1 Do"));
+}
+
+#[test]
+fn compile_includegraphics_embeds_pdf_as_form_xobject() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("vector.tex");
+    let source_pdf = dir.path().join("diagram.pdf");
+    std::fs::write(&source_pdf, MINIMAL_PDF).expect("write source pdf");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nBefore\n\\includegraphics[width=100pt]{diagram.pdf}\nAfter\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf = std::fs::read(dir.path().join("vector.pdf")).expect("read output pdf");
+    let content = String::from_utf8_lossy(&pdf);
+    assert!(content.contains("/Subtype /Form"));
+    assert!(content.contains("/BBox [0 0 200 100]"));
+    assert!(content.contains("/Resources << /ProcSet [/PDF] >>"));
+    assert!(content.contains("/XObject << /Fm1"));
+    assert!(content.contains("/Fm1 Do"));
+    assert!(content.contains("0 0 m\n200 100 l\nS"));
+    assert_eq!(content.matches("%PDF-1.4").count(), 1);
+}
+
+#[test]
+fn compile_includegraphics_reports_invalid_pdf_input() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken.tex");
+    let source_pdf = dir.path().join("broken-asset.pdf");
+    std::fs::write(&source_pdf, CORRUPT_PDF).expect("write corrupt pdf");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\includegraphics{broken-asset.pdf}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid PDF input for \\includegraphics"));
+    assert!(stderr
+        .contains("help: use an unencrypted single-page PDF whose first page defines /MediaBox"));
 }
 
 #[test]
