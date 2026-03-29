@@ -12,10 +12,11 @@ use crate::compilation::{IndexEntry, SectionOutlineEntry};
 use crate::graphics::api::{
     compile_graphics_scene, parse_tikzpicture, GraphicsBox, TikzDiagnostic, TikzParseResult,
 };
-use crate::kernel::api::DimensionValue;
+use crate::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
 use crate::policy::{
     FileOperationHandler, FileOperationResult, ShellEscapeHandler, ShellEscapeResult,
 };
+use crate::synctex::api::SourceLineTrace;
 
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
@@ -395,7 +396,7 @@ pub enum FontFamilyRole {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocumentNode {
-    Text(String),
+    Text(String, Option<SourceSpan>),
     FontFamily {
         role: FontFamilyRole,
         children: Vec<DocumentNode>,
@@ -436,6 +437,18 @@ pub enum DocumentNode {
 impl ParsedDocument {
     pub fn body_nodes(&self) -> Vec<DocumentNode> {
         body_nodes_from_text(&self.body)
+    }
+
+    pub fn body_nodes_with_source_spans(
+        &self,
+        source_lines: &[SourceLineTrace],
+    ) -> Vec<DocumentNode> {
+        let nodes = body_nodes_from_text(&self.body);
+        if source_lines.is_empty() {
+            return nodes;
+        }
+
+        BodySourceSpanAnnotator::new(source_lines).annotate_nodes(nodes)
     }
 
     pub fn has_pageref_markers(&self) -> bool {
@@ -6104,6 +6117,254 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
     nodes
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedSourceLine {
+    visible_chars: Vec<char>,
+    span: SourceSpan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SourceLineCursor {
+    line_index: usize,
+    visible_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisibleSourceChar {
+    ch: char,
+    column: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BodySourceSpanAnnotator {
+    source_lines: Vec<PreparedSourceLine>,
+    cursor: SourceLineCursor,
+}
+
+impl BodySourceSpanAnnotator {
+    fn new(source_lines: &[SourceLineTrace]) -> Self {
+        let mut files = Vec::new();
+        let source_lines = source_lines
+            .iter()
+            .filter_map(|line| {
+                let visible_chars = visible_source_chars(&line.text);
+                let start = visible_chars.first()?;
+                let end = visible_chars.last()?;
+                let file_id = file_id_for_source(&mut files, &line.file);
+
+                Some(PreparedSourceLine {
+                    visible_chars: visible_chars.iter().map(|entry| entry.ch).collect(),
+                    span: SourceSpan {
+                        start: SourceLocation {
+                            file_id,
+                            line: line.line,
+                            column: start.column,
+                        },
+                        end: SourceLocation {
+                            file_id,
+                            line: line.line,
+                            column: end.column + 1,
+                        },
+                    },
+                })
+            })
+            .collect();
+
+        Self {
+            source_lines,
+            cursor: SourceLineCursor::default(),
+        }
+    }
+
+    fn annotate_nodes(&mut self, nodes: Vec<DocumentNode>) -> Vec<DocumentNode> {
+        nodes
+            .into_iter()
+            .map(|node| self.annotate_node(node))
+            .collect()
+    }
+
+    fn annotate_node(&mut self, node: DocumentNode) -> DocumentNode {
+        match node {
+            DocumentNode::Text(text, span) => {
+                let span = span.or_else(|| self.match_text(&text));
+                DocumentNode::Text(text, span)
+            }
+            DocumentNode::FontFamily { role, children } => DocumentNode::FontFamily {
+                role,
+                children: self.annotate_nodes(children),
+            },
+            DocumentNode::Link { url, children } => DocumentNode::Link {
+                url,
+                children: self.annotate_nodes(children),
+            },
+            DocumentNode::HBox(children) => DocumentNode::HBox(self.annotate_nodes(children)),
+            DocumentNode::VBox(children) => DocumentNode::VBox(self.annotate_nodes(children)),
+            DocumentNode::Float {
+                float_type,
+                specifier,
+                content,
+                caption,
+                label,
+            } => DocumentNode::Float {
+                float_type,
+                specifier,
+                content: self.annotate_nodes(content),
+                caption,
+                label,
+            },
+            other => other,
+        }
+    }
+
+    fn match_text(&mut self, text: &str) -> Option<SourceSpan> {
+        let visible_chars = text
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && !ch.is_control())
+            .collect::<Vec<_>>();
+        if visible_chars.is_empty() {
+            return None;
+        }
+
+        let mut candidate = self.cursor;
+        loop {
+            if let Some((span, next_cursor)) = self.match_from(candidate, &visible_chars) {
+                self.cursor = next_cursor;
+                return Some(span);
+            }
+            candidate = self.advance_cursor(candidate)?;
+        }
+    }
+
+    fn match_from(
+        &self,
+        cursor: SourceLineCursor,
+        target: &[char],
+    ) -> Option<(SourceSpan, SourceLineCursor)> {
+        let mut line_index = cursor.line_index;
+        let mut visible_index = cursor.visible_index;
+        let mut start_line_index = None;
+        let mut end_line_index = line_index;
+
+        for expected in target {
+            loop {
+                let line = self.source_lines.get(line_index)?;
+                if let Some(actual) = line.visible_chars.get(visible_index) {
+                    if actual != expected {
+                        return None;
+                    }
+                    start_line_index.get_or_insert(line_index);
+                    visible_index += 1;
+                    end_line_index = line_index;
+                    break;
+                }
+                line_index += 1;
+                visible_index = 0;
+            }
+        }
+        let start_line_index = start_line_index?;
+
+        Some((
+            SourceSpan {
+                start: self.source_lines.get(start_line_index)?.span.start,
+                end: self.source_lines.get(end_line_index)?.span.end,
+            },
+            SourceLineCursor {
+                line_index: end_line_index,
+                visible_index,
+            },
+        ))
+    }
+
+    fn advance_cursor(&self, cursor: SourceLineCursor) -> Option<SourceLineCursor> {
+        let line = self.source_lines.get(cursor.line_index)?;
+        if cursor.visible_index + 1 < line.visible_chars.len() {
+            Some(SourceLineCursor {
+                line_index: cursor.line_index,
+                visible_index: cursor.visible_index + 1,
+            })
+        } else {
+            Some(SourceLineCursor {
+                line_index: cursor.line_index + 1,
+                visible_index: 0,
+            })
+        }
+    }
+}
+
+fn file_id_for_source(files: &mut Vec<String>, file: &str) -> u32 {
+    if let Some(index) = files.iter().position(|entry| entry == file) {
+        index as u32
+    } else {
+        files.push(file.to_string());
+        (files.len() - 1) as u32
+    }
+}
+
+fn visible_source_chars(text: &str) -> Vec<VisibleSourceChar> {
+    let trimmed = text.trim_start();
+    if let Some(command) = leading_control_word(trimmed) {
+        if matches!(
+            command,
+            "documentclass"
+                | "begin"
+                | "end"
+                | "usepackage"
+                | "RequirePackage"
+                | "InputIfFileExists"
+                | "input"
+                | "include"
+                | "bibliography"
+                | "tableofcontents"
+                | "listoffigures"
+                | "listoftables"
+                | "makeindex"
+                | "printindex"
+                | "hypersetup"
+        ) {
+            return Vec::new();
+        }
+    }
+
+    let mut visible = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut column = 1u32;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '%' => break,
+            '\\' => {
+                column += 1;
+                while chars.peek().is_some_and(|next| next.is_alphabetic()) {
+                    chars.next();
+                    column += 1;
+                }
+            }
+            '{' | '}' | '[' | ']' => {
+                column += 1;
+            }
+            _ if !ch.is_control() => {
+                if !ch.is_whitespace() {
+                    visible.push(VisibleSourceChar { ch, column });
+                }
+                column += 1;
+            }
+            _ => {
+                column += 1;
+            }
+        }
+    }
+
+    visible
+}
+
+fn leading_control_word(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('\\')?;
+    let end = rest
+        .find(|ch: char| !ch.is_alphabetic())
+        .unwrap_or(rest.len());
+    (end > 0).then_some(&rest[..end])
+}
+
 fn body_text_nodes(body: &str, placeholders: &[DocumentNode]) -> Vec<DocumentNode> {
     if body.trim().is_empty() {
         return Vec::new();
@@ -6204,7 +6465,7 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 let placeholder = next_box_placeholder(placeholders.len());
                 placeholders.push(DocumentNode::Link {
                     url: url.to_string(),
-                    children: vec![DocumentNode::Text(url.to_string())],
+                    children: vec![DocumentNode::Text(url.to_string(), None)],
                 });
                 text.push(placeholder);
                 index = next_index;
@@ -6220,7 +6481,7 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
             BODY_PAGEREF_START => {
                 let (_, next_index) = extract_single_marker_content(body, index, BODY_PAGEREF_END);
                 let placeholder = next_box_placeholder(placeholders.len());
-                placeholders.push(DocumentNode::Text("??".to_string()));
+                placeholders.push(DocumentNode::Text("??".to_string(), None));
                 text.push(placeholder);
                 index = next_index;
             }
@@ -6841,7 +7102,7 @@ fn push_body_text_node(
     for ch in text.chars() {
         if let Some(index) = box_placeholder_index(ch, placeholders.len()) {
             if !plain_text.is_empty() {
-                nodes.push(DocumentNode::Text(std::mem::take(&mut plain_text)));
+                nodes.push(DocumentNode::Text(std::mem::take(&mut plain_text), None));
             }
             nodes.push(placeholders[index].clone());
         } else {
@@ -6850,7 +7111,7 @@ fn push_body_text_node(
     }
 
     if !plain_text.is_empty() {
-        nodes.push(DocumentNode::Text(plain_text));
+        nodes.push(DocumentNode::Text(plain_text, None));
     }
 }
 
@@ -7813,10 +8074,11 @@ mod tests {
     use crate::bibliography::api::BibliographyState;
     use crate::compilation::IndexEntry;
     use crate::graphics::api::{GraphicNode, PathSegment, Point};
-    use crate::kernel::api::DimensionValue;
+    use crate::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use crate::policy::{
         FileOperationHandler, FileOperationResult, ShellEscapeHandler, ShellEscapeResult,
     };
+    use crate::synctex::api::SourceLineTrace;
     use std::collections::BTreeMap;
 
     struct MockShellEscapeHandler {
@@ -8125,7 +8387,7 @@ mod tests {
     fn body_nodes_single_paragraph() {
         assert_eq!(
             parsed_document("Hello Ferritex").body_nodes(),
-            vec![DocumentNode::Text("Hello Ferritex".to_string())]
+            vec![DocumentNode::Text("Hello Ferritex".to_string(), None)]
         );
     }
 
@@ -8134,9 +8396,9 @@ mod tests {
         assert_eq!(
             parsed_document("First paragraph\n\nSecond paragraph").body_nodes(),
             vec![
-                DocumentNode::Text("First paragraph".to_string()),
+                DocumentNode::Text("First paragraph".to_string(), None),
                 DocumentNode::ParBreak,
-                DocumentNode::Text("Second paragraph".to_string()),
+                DocumentNode::Text("Second paragraph".to_string(), None),
             ]
         );
     }
@@ -8146,9 +8408,66 @@ mod tests {
         assert_eq!(
             parsed_document(r"First paragraph\par Second paragraph").body_nodes(),
             vec![
-                DocumentNode::Text("First paragraph".to_string()),
+                DocumentNode::Text("First paragraph".to_string(), None),
                 DocumentNode::ParBreak,
-                DocumentNode::Text("Second paragraph".to_string()),
+                DocumentNode::Text("Second paragraph".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn body_nodes_with_source_spans_tracks_duplicate_visible_text_in_order() {
+        let document = parse_document("Alpha \\href{https://example.com}{Beta}\n\nAlpha Beta");
+        let nodes = document.body_nodes_with_source_spans(&[
+            SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 3,
+                text: "Alpha \\href{https://example.com}{Beta}".to_string(),
+            },
+            SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 5,
+                text: "Alpha Beta".to_string(),
+            },
+        ]);
+        let first_line_span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 38,
+            },
+        };
+        let second_line_span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 5,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 5,
+                column: 11,
+            },
+        };
+
+        assert_eq!(
+            nodes,
+            vec![
+                DocumentNode::Text("Alpha ".to_string(), Some(first_line_span)),
+                DocumentNode::Link {
+                    url: "https://example.com".to_string(),
+                    children: vec![DocumentNode::Text(
+                        "Beta".to_string(),
+                        Some(first_line_span),
+                    )],
+                },
+                DocumentNode::ParBreak,
+                DocumentNode::Text("Alpha Beta".to_string(), Some(second_line_span)),
             ]
         );
     }
@@ -8166,9 +8485,9 @@ mod tests {
         assert_eq!(
             parse_document("First\n\\pagebreak\nSecond").body_nodes(),
             vec![
-                DocumentNode::Text("First".to_string()),
+                DocumentNode::Text("First".to_string(), None),
                 DocumentNode::PageBreak,
-                DocumentNode::Text("Second".to_string()),
+                DocumentNode::Text("Second".to_string(), None),
             ]
         );
     }
@@ -8178,9 +8497,9 @@ mod tests {
         assert_eq!(
             parse_document("First\n\\newpage\nSecond").body_nodes(),
             vec![
-                DocumentNode::Text("First".to_string()),
+                DocumentNode::Text("First".to_string(), None),
                 DocumentNode::PageBreak,
-                DocumentNode::Text("Second".to_string()),
+                DocumentNode::Text("Second".to_string(), None),
             ]
         );
     }
@@ -8190,9 +8509,9 @@ mod tests {
         assert_eq!(
             parse_document("First\n\\clearpage\nSecond").body_nodes(),
             vec![
-                DocumentNode::Text("First".to_string()),
+                DocumentNode::Text("First".to_string(), None),
                 DocumentNode::ClearPage,
-                DocumentNode::Text("Second".to_string()),
+                DocumentNode::Text("Second".to_string(), None),
             ]
         );
     }
@@ -8202,7 +8521,8 @@ mod tests {
         assert_eq!(
             parse_document(r"\hbox{hello}").body_nodes(),
             vec![DocumentNode::HBox(vec![DocumentNode::Text(
-                "hello".to_string()
+                "hello".to_string(),
+                None,
             )])]
         );
     }
@@ -8212,7 +8532,8 @@ mod tests {
         assert_eq!(
             parse_document(r"\vbox{hello}").body_nodes(),
             vec![DocumentNode::VBox(vec![DocumentNode::Text(
-                "hello".to_string()
+                "hello".to_string(),
+                None,
             )])]
         );
     }
@@ -8222,7 +8543,7 @@ mod tests {
         assert_eq!(
             parse_document(r"\vbox{\hbox{inner}}").body_nodes(),
             vec![DocumentNode::VBox(vec![DocumentNode::HBox(vec![
-                DocumentNode::Text("inner".to_string())
+                DocumentNode::Text("inner".to_string(), None)
             ])])]
         );
     }
@@ -8241,7 +8562,7 @@ mod tests {
             parse_document(r"\textsf{hello}").body_nodes(),
             vec![DocumentNode::FontFamily {
                 role: FontFamilyRole::Sans,
-                children: vec![DocumentNode::Text("hello".to_string())],
+                children: vec![DocumentNode::Text("hello".to_string(), None)],
             }]
         );
     }
@@ -8252,7 +8573,7 @@ mod tests {
             parse_document(r"\texttt{code}").body_nodes(),
             vec![DocumentNode::FontFamily {
                 role: FontFamilyRole::Mono,
-                children: vec![DocumentNode::Text("code".to_string())],
+                children: vec![DocumentNode::Text("code".to_string(), None)],
             }]
         );
     }
@@ -8420,8 +8741,7 @@ mod tests {
 
     #[test]
     fn immediate_write_space_18_without_handler_emits_warning() {
-        let output =
-            parse_recovering_with_handlers(r"\immediate\write 18{echo test}", None, None);
+        let output = parse_recovering_with_handlers(r"\immediate\write 18{echo test}", None, None);
 
         assert!(output.document.is_some());
         assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
@@ -8647,15 +8967,21 @@ mod tests {
                 aligned: false,
             })
         );
-        assert_eq!(nodes.get(1), Some(&DocumentNode::Text(" See ".to_string())));
+        assert_eq!(
+            nodes.get(1),
+            Some(&DocumentNode::Text(" See ".to_string(), None))
+        );
         assert_eq!(
             nodes.get(2),
             Some(&DocumentNode::Link {
                 url: "#eq:test".to_string(),
-                children: vec![DocumentNode::Text("1".to_string())],
+                children: vec![DocumentNode::Text("1".to_string(), None)],
             })
         );
-        assert_eq!(nodes.get(3), Some(&DocumentNode::Text(".".to_string())));
+        assert_eq!(
+            nodes.get(3),
+            Some(&DocumentNode::Text(".".to_string(), None))
+        );
         assert_eq!(
             document.labels.get("eq:test").map(String::as_str),
             Some("1")
@@ -8810,12 +9136,12 @@ mod tests {
                     label: Some("fig:1".to_string()),
                 },
                 DocumentNode::ParBreak,
-                DocumentNode::Text("See ".to_string()),
+                DocumentNode::Text("See ".to_string(), None),
                 DocumentNode::Link {
                     url: "#fig:1".to_string(),
-                    children: vec![DocumentNode::Text("1".to_string())],
+                    children: vec![DocumentNode::Text("1".to_string(), None)],
                 },
-                DocumentNode::Text(".".to_string()),
+                DocumentNode::Text(".".to_string(), None),
             ]
         );
         assert_eq!(document.labels.get("fig:1").map(String::as_str), Some("1"));
@@ -8831,7 +9157,7 @@ mod tests {
             vec![DocumentNode::Float {
                 float_type: FloatType::Figure,
                 specifier: Some("htbp!".to_string()),
-                content: vec![DocumentNode::Text("Body".to_string())],
+                content: vec![DocumentNode::Text("Body".to_string(), None)],
                 caption: None,
                 label: None,
             }]
@@ -9651,14 +9977,14 @@ mod tests {
         assert_eq!(
             document.body_nodes(),
             vec![
-                DocumentNode::Text("1 Intro".to_string()),
+                DocumentNode::Text("1 Intro".to_string(), None),
                 DocumentNode::ParBreak,
-                DocumentNode::Text("See ".to_string()),
+                DocumentNode::Text("See ".to_string(), None),
                 DocumentNode::Link {
                     url: "#sec:intro".to_string(),
-                    children: vec![DocumentNode::Text("1".to_string())],
+                    children: vec![DocumentNode::Text("1".to_string(), None)],
                 },
-                DocumentNode::Text(".".to_string()),
+                DocumentNode::Text(".".to_string(), None),
             ]
         );
         assert_eq!(
@@ -9711,12 +10037,12 @@ mod tests {
         assert_eq!(
             document.body_nodes(),
             vec![
-                DocumentNode::Text("See page ".to_string()),
+                DocumentNode::Text("See page ".to_string(), None),
                 DocumentNode::Link {
                     url: "#sec:later".to_string(),
-                    children: vec![DocumentNode::Text("5".to_string())],
+                    children: vec![DocumentNode::Text("5".to_string(), None)],
                 },
-                DocumentNode::Text(".".to_string()),
+                DocumentNode::Text(".".to_string(), None),
             ]
         );
         assert!(!document.has_pageref_markers());
@@ -9738,7 +10064,7 @@ mod tests {
             node,
             DocumentNode::Link { url, children }
                 if url == "#bib:key"
-                    && children == &vec![DocumentNode::Text("1".to_string())]
+                    && children == &vec![DocumentNode::Text("1".to_string(), None)]
         )));
     }
 
@@ -9764,17 +10090,17 @@ mod tests {
         assert_eq!(
             document.body_nodes(),
             vec![
-                DocumentNode::Text("See [".to_string()),
+                DocumentNode::Text("See [".to_string(), None),
                 DocumentNode::Link {
                     url: "#bib:a".to_string(),
-                    children: vec![DocumentNode::Text("1".to_string())],
+                    children: vec![DocumentNode::Text("1".to_string(), None)],
                 },
-                DocumentNode::Text(", ".to_string()),
+                DocumentNode::Text(", ".to_string(), None),
                 DocumentNode::Link {
                     url: "#bib:b".to_string(),
-                    children: vec![DocumentNode::Text("2".to_string())],
+                    children: vec![DocumentNode::Text("2".to_string(), None)],
                 },
-                DocumentNode::Text("].".to_string()),
+                DocumentNode::Text("].".to_string(), None),
             ]
         );
         assert_eq!(document.citations, vec!["a".to_string(), "b".to_string()]);
@@ -9829,12 +10155,12 @@ mod tests {
         assert_eq!(
             document.body_nodes(),
             vec![
-                DocumentNode::Text("See [".to_string()),
+                DocumentNode::Text("See [".to_string(), None),
                 DocumentNode::Link {
                     url: "#bib:knuth".to_string(),
-                    children: vec![DocumentNode::Text("1".to_string())],
+                    children: vec![DocumentNode::Text("1".to_string(), None)],
                 },
-                DocumentNode::Text("].".to_string()),
+                DocumentNode::Text("].".to_string(), None),
             ]
         );
         assert_eq!(document.citations, vec!["knuth".to_string()]);
@@ -9862,17 +10188,17 @@ mod tests {
         assert_eq!(
             document.body_nodes(),
             vec![
-                DocumentNode::Text("Ref ".to_string()),
+                DocumentNode::Text("Ref ".to_string(), None),
                 DocumentNode::Link {
                     url: "#shared".to_string(),
-                    children: vec![DocumentNode::Text("42".to_string())],
+                    children: vec![DocumentNode::Text("42".to_string(), None)],
                 },
-                DocumentNode::Text("; cite [".to_string()),
+                DocumentNode::Text("; cite [".to_string(), None),
                 DocumentNode::Link {
                     url: "#bib:shared".to_string(),
-                    children: vec![DocumentNode::Text("1".to_string())],
+                    children: vec![DocumentNode::Text("1".to_string(), None)],
                 },
-                DocumentNode::Text("].".to_string()),
+                DocumentNode::Text("].".to_string(), None),
             ]
         );
         assert_eq!(
@@ -9975,14 +10301,14 @@ mod tests {
         assert_eq!(
             second.body_nodes(),
             vec![
-                DocumentNode::Text("See [".to_string()),
+                DocumentNode::Text("See [".to_string(), None),
                 DocumentNode::Link {
                     url: "#bib:key".to_string(),
-                    children: vec![DocumentNode::Text("1".to_string())],
+                    children: vec![DocumentNode::Text("1".to_string(), None)],
                 },
-                DocumentNode::Text("].".to_string()),
+                DocumentNode::Text("].".to_string(), None),
                 DocumentNode::ParBreak,
-                DocumentNode::Text("[1] Reference text".to_string()),
+                DocumentNode::Text("[1] Reference text".to_string(), None),
             ]
         );
         assert!(!second.has_unresolved_refs);
@@ -9994,7 +10320,7 @@ mod tests {
             parse_document(r"\hyperref[sec:intro]{See intro}").body_nodes(),
             vec![DocumentNode::Link {
                 url: "#sec:intro".to_string(),
-                children: vec![DocumentNode::Text("See intro".to_string())],
+                children: vec![DocumentNode::Text("See intro".to_string(), None)],
             }]
         );
     }
@@ -10005,7 +10331,7 @@ mod tests {
             parse_document(r"\href{https://example.com}{Example}").body_nodes(),
             vec![DocumentNode::Link {
                 url: "https://example.com".to_string(),
-                children: vec![DocumentNode::Text("Example".to_string())],
+                children: vec![DocumentNode::Text("Example".to_string(), None)],
             }]
         );
     }
@@ -10016,7 +10342,7 @@ mod tests {
             parse_document(r"\url{https://example.com}").body_nodes(),
             vec![DocumentNode::Link {
                 url: "https://example.com".to_string(),
-                children: vec![DocumentNode::Text("https://example.com".to_string())],
+                children: vec![DocumentNode::Text("https://example.com".to_string(), None)],
             }]
         );
     }
@@ -10124,12 +10450,12 @@ mod tests {
             vec![
                 DocumentNode::Link {
                     url: "#section:1 Intro".to_string(),
-                    children: vec![DocumentNode::Text("1  Intro".to_string())],
+                    children: vec![DocumentNode::Text("1  Intro".to_string(), None)],
                 },
-                DocumentNode::Text("\n".to_string()),
+                DocumentNode::Text("\n".to_string(), None),
                 DocumentNode::Link {
                     url: "#section:1.1 Scope".to_string(),
-                    children: vec![DocumentNode::Text("1.1  Scope".to_string())],
+                    children: vec![DocumentNode::Text("1.1  Scope".to_string(), None)],
                 },
             ]
         );

@@ -1006,8 +1006,10 @@ fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let project_root = dir.path().join("project");
     let bundle_root = dir.path().join("bundle");
+    let cmr10_tfm = bundle_root.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
     std::fs::create_dir_all(project_root.join("src")).expect("create source tree");
     std::fs::create_dir_all(bundle_root.join("texmf")).expect("create bundle texmf");
+    std::fs::create_dir_all(cmr10_tfm.parent().expect("cmr10 parent")).expect("create tfm dir");
     std::fs::write(
         bundle_root.join("manifest.json"),
         r#"{"name":"default","version":"2026.03.18","min_ferritex_version":"0.1.0","format_version":1,"asset_index_path":"asset-index.json"}"#,
@@ -1015,7 +1017,7 @@ fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
     .expect("write bundle manifest");
     std::fs::write(
         bundle_root.join("asset-index.json"),
-        r#"{"tex_inputs":{"bundled.tex":"texmf/bundled.tex"},"packages":{},"opentype_fonts":{},"tfm_fonts":{},"default_opentype_fonts":[]}"#,
+        r#"{"tex_inputs":{"bundled.tex":"texmf/bundled.tex"},"packages":{},"opentype_fonts":{},"tfm_fonts":{"cmr10":"texmf/fonts/tfm/public/cm/cmr10.tfm"},"default_opentype_fonts":[]}"#,
     )
     .expect("write bundle asset index");
     std::fs::write(
@@ -1023,6 +1025,7 @@ fn compile_resolves_tex_input_from_asset_bundle_outside_project_root() {
         "Bundled from asset bundle.\n",
     )
     .expect("write bundled tex input");
+    std::fs::write(&cmr10_tfm, build_minimal_cmr10_tfm()).expect("write cmr10 TFM");
     std::fs::write(
         project_root.join("src/main.tex"),
         "\\documentclass{article}\n\\begin{document}\n\\input{bundled}\n\\end{document}\n",
@@ -1100,6 +1103,57 @@ fn compile_bundle_tfm_font_resolution() {
 
     let pdf = std::fs::read_to_string(dir.path().join("font-test.pdf")).expect("read output pdf");
     assert!(pdf.contains("Font test."));
+}
+
+#[test]
+fn compile_bundle_only_fails_when_required_tfm_removed() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tfm_path = bundle_dir
+        .path()
+        .join("texmf/fonts/tfm/public/cm/cmr10.tfm");
+    let asset_index_path = bundle_dir.path().join("asset-index.json");
+    let tex_file = dir.path().join("article.tex");
+    let pdf_file = dir.path().join("article.pdf");
+
+    std::fs::remove_file(&tfm_path).expect("remove cmr10.tfm from bundle");
+
+    let mut asset_index: Value =
+        serde_json::from_slice(&std::fs::read(&asset_index_path).expect("read bundle asset index"))
+            .expect("parse bundle asset index");
+    asset_index["tfm_fonts"]
+        .as_object_mut()
+        .expect("tfm_fonts should be an object")
+        .remove("cmr10");
+    std::fs::write(
+        &asset_index_path,
+        serde_json::to_vec(&asset_index).expect("serialize modified asset index"),
+    )
+    .expect("write modified asset index");
+
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nBundle-only font failure.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("required asset bundle font metrics \"cmr10\" could not be resolved"));
+    assert!(
+        !pdf_file.exists(),
+        "bundle-only failure must not emit a PDF"
+    );
 }
 
 #[test]
@@ -1581,6 +1635,47 @@ fn compile_with_unsupported_format_version_reports_diagnostic() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported bundle format version"));
     assert!(stderr.contains("help: verify the asset bundle path and version"));
+}
+
+#[test]
+fn compile_with_corrupted_bundle_format_produces_no_pdf() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    let tex_file = dir.path().join("main.tex");
+    let pdf_file = dir.path().join("main.pdf");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nCorrupted format.\n\\end{document}\n",
+    )
+    .expect("write input file");
+    std::fs::write(
+        bundle_dir.path().join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "name": "expanded-basic",
+            "version": "2026.03.29",
+            "min_ferritex_version": "0.1.0",
+            "format_version": 99,
+            "asset_index_path": "asset-index.json",
+        }))
+        .expect("serialize unsupported manifest"),
+    )
+    .expect("write corrupted bundle manifest");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported bundle format version"));
+    assert!(stderr.contains("help: verify the asset bundle path and version"));
+    assert!(!pdf_file.exists(), "corrupted bundle must not emit a PDF");
 }
 
 #[test]

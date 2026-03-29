@@ -46,13 +46,32 @@ pub fn bench_fixtures_root() -> PathBuf {
 }
 
 pub fn bundle_bootstrap_cases(fixture_base: &Path) -> Vec<BenchCase> {
-    vec![BenchCase {
-        name: "layout-core-article-bundle".to_string(),
-        profile: BenchProfile::BundleBootstrap,
-        input_fixture: fixture_base.join("layout-core/article.tex"),
-        asset_bundle: Some(fixture_base.join("bundle")),
-        jobs: 1,
-    }]
+    let bundle_dir = fixture_base.join("bundle");
+
+    ["article", "book", "report", "letter"]
+        .into_iter()
+        .map(|class| BenchCase {
+            name: format!("layout-core-{class}-bundle"),
+            profile: BenchProfile::BundleBootstrap,
+            input_fixture: fixture_base.join(format!("layout-core/{class}.tex")),
+            asset_bundle: Some(bundle_dir.clone()),
+            jobs: 1,
+        })
+        .collect()
+}
+
+pub fn partition_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let input = fixture_base.join("multi_section.tex");
+    [1, 4]
+        .into_iter()
+        .map(|jobs| BenchCase {
+            name: format!("partition-multi-section-jobs{jobs}"),
+            profile: BenchProfile::PartitionBench,
+            input_fixture: input.clone(),
+            asset_bundle: None,
+            jobs,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -385,7 +404,7 @@ impl CompileBackend for CliCompileBackend {
         &self,
         input: &Path,
         asset_bundle: Option<&Path>,
-        _jobs: u32,
+        jobs: u32,
     ) -> Result<CompileOutput, String> {
         let start = std::time::Instant::now();
         let mut cmd = std::process::Command::new(&self.binary_path);
@@ -393,6 +412,7 @@ impl CompileBackend for CliCompileBackend {
         if let Some(bundle) = asset_bundle {
             cmd.args(["--asset-bundle", &bundle.to_string_lossy()]);
         }
+        cmd.args(["--jobs", &jobs.to_string()]);
 
         let output = cmd
             .output()
@@ -742,9 +762,25 @@ mod tests {
         assert_eq!(tfm_bytes.as_slice(), EXPECTED_BUNDLE_TFM);
 
         let cases = bundle_bootstrap_cases(&fixture_base);
-        assert_eq!(cases.len(), 1);
-        assert_eq!(cases[0].profile, BenchProfile::BundleBootstrap);
-        assert_eq!(cases[0].asset_bundle.as_deref(), Some(bundle_dir.as_path()));
+        assert_eq!(cases.len(), 4);
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "layout-core-article-bundle",
+                "layout-core-book-bundle",
+                "layout-core-report-bundle",
+                "layout-core-letter-bundle",
+            ]
+        );
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::BundleBootstrap));
+        assert!(cases
+            .iter()
+            .all(|case| case.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
 
         let harness = BenchHarness::new(
             cases,
@@ -754,23 +790,85 @@ mod tests {
                 compare_output_identity: true,
             },
         )
-        .with_backend(MockCompileBackend::with_outputs(vec![Ok(output(
-            7,
-            b"bundle-output",
-        ))]));
+        .with_backend(MockCompileBackend::with_outputs(vec![
+            Ok(output(7, b"bundle-output-article")),
+            Ok(output(8, b"bundle-output-book")),
+            Ok(output(9, b"bundle-output-report")),
+            Ok(output(10, b"bundle-output-letter")),
+        ]));
 
         let report = harness.run();
 
         assert!(report.failures.is_empty());
-        assert_eq!(report.results.len(), 1);
-        assert_eq!(
-            report.results[0].case.profile,
-            BenchProfile::BundleBootstrap
-        );
-        assert_eq!(
-            report.results[0].case.asset_bundle.as_deref(),
-            Some(bundle_dir.as_path())
-        );
+        assert_eq!(report.results.len(), 4);
+        assert!(report
+            .results
+            .iter()
+            .all(|result| result.case.profile == BenchProfile::BundleBootstrap));
+        assert!(report
+            .results
+            .iter()
+            .all(|result| result.case.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
+    }
+
+    #[test]
+    fn test_partition_bench_cases_generate_paired_jobs() {
+        let fixture_base = fixtures_root();
+        let cases = super::partition_bench_cases(&fixture_base);
+
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].name, "partition-multi-section-jobs1");
+        assert_eq!(cases[1].name, "partition-multi-section-jobs4");
+        assert_eq!(cases[0].jobs, 1);
+        assert_eq!(cases[1].jobs, 4);
+        assert!(cases
+            .iter()
+            .all(|c| c.profile == BenchProfile::PartitionBench));
+        assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
+        assert!(cases[0].input_fixture.ends_with("multi_section.tex"));
+        assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
+    }
+
+    #[test]
+    fn test_partition_bench_harness_passes_jobs_to_backend() {
+        let cases = vec![
+            sample_case(
+                "partition-seq",
+                "multi_section.tex",
+                BenchProfile::PartitionBench,
+                1,
+            ),
+            sample_case(
+                "partition-par",
+                "multi_section.tex",
+                BenchProfile::PartitionBench,
+                4,
+            ),
+        ];
+        let backend = MockCompileBackend::with_outputs(vec![
+            Ok(output(10, b"stable")),
+            Ok(output(10, b"stable")),
+            Ok(output(8, b"stable")),
+            Ok(output(8, b"stable")),
+        ]);
+        let harness = BenchHarness::new(
+            cases,
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 2,
+                compare_output_identity: true,
+            },
+        )
+        .with_backend(backend.clone());
+
+        let report = harness.run();
+
+        assert!(report.failures.is_empty());
+        assert_eq!(report.results.len(), 2);
+
+        let calls = backend.calls.lock().expect("calls lock");
+        let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs)| *jobs).collect();
+        assert_eq!(jobs_values, vec![1, 1, 4, 4]);
     }
 
     #[test]

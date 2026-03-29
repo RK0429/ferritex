@@ -44,8 +44,8 @@ use ferritex_core::synctex::{
     PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData,
 };
 use ferritex_core::typesetting::{
-    resolve_page_labels, DocumentLayoutFragment, MinimalTypesetter, PaginationMergeCoordinator,
-    TextLine, TfmWidthProvider, TypesetDocument, TypesetterReusePlan,
+    resolve_page_labels, DocumentLayoutFragment, FixedWidthProvider, MinimalTypesetter,
+    PaginationMergeCoordinator, TextLine, TfmWidthProvider, TypesetDocument, TypesetterReusePlan,
 };
 use serde_json::json;
 
@@ -472,6 +472,26 @@ impl SourceSpanAnnotator {
             .filter(|(source_index, _)| !used_source_lines.contains(source_index))
             .map(|(_, source_line)| source_line.clone())
             .collect()
+    }
+
+    fn used_source_lines_for_document(&self, document: &TypesetDocument) -> BTreeSet<usize> {
+        let mut used_source_lines = BTreeSet::new();
+
+        for line in document.pages.iter().flat_map(|page| page.lines.iter()) {
+            let Some(span) = line.source_span else {
+                continue;
+            };
+            for source_index in self
+                .line_spans
+                .iter()
+                .filter(|candidate| source_span_contains_span(span, candidate.span))
+                .map(|candidate| candidate.source_index)
+            {
+                used_source_lines.insert(source_index);
+            }
+        }
+
+        used_source_lines
     }
 
     fn find_match(
@@ -930,6 +950,7 @@ impl<'a> CompileJobService<'a> {
         let mut compile_font_selection = None;
         let mut font_family_selection = None;
         let mut font_diagnostics = Vec::new();
+        let mut font_resolution_fatal = false;
         let mut typeset_callback_count = 0usize;
         let parse_pass_result = self.parse_document_with_cross_references(
             &source_tree.source,
@@ -944,7 +965,7 @@ impl<'a> CompileJobService<'a> {
             |document| {
                 typeset_callback_count += 1;
                 if compile_font_selection.is_none() {
-                    let (selection, families, diagnostics) = self.select_compile_fonts(
+                    let (selection, families, diagnostics, fatal) = self.select_compile_fonts(
                         &input_path,
                         document.main_font_name.as_deref(),
                         document.sans_font_name.as_deref(),
@@ -962,6 +983,7 @@ impl<'a> CompileJobService<'a> {
                         options.trace_font_tasks,
                     );
                     font_diagnostics.extend(diagnostics);
+                    font_resolution_fatal = fatal;
                     compile_font_selection = Some(selection);
                     font_family_selection = Some(families);
                 }
@@ -971,7 +993,12 @@ impl<'a> CompileJobService<'a> {
                     .expect("font selection initialized");
 
                 let full_typeset = || {
-                    self.typeset_document_with_selection(document, selection, &graphics_resolver)
+                    self.typeset_document_with_selection(
+                        document,
+                        Some(&source_tree.source_lines),
+                        selection,
+                        &graphics_resolver,
+                    )
                 };
 
                 let partial_typeset_available = cached_recompilation_scope
@@ -1026,6 +1053,7 @@ impl<'a> CompileJobService<'a> {
                 match try_partial_typeset_document(
                     self,
                     document,
+                    &source_tree.source_lines,
                     selection,
                     &graphics_resolver,
                     options.parallelism,
@@ -1088,6 +1116,16 @@ impl<'a> CompileJobService<'a> {
             .collect();
         parse_diagnostics.extend(font_diagnostics);
         parse_diagnostics.extend(bibliography_diagnostics);
+        if font_resolution_fatal {
+            let mut diagnostics = cache_diagnostics.clone();
+            diagnostics.extend(parse_diagnostics.clone());
+            return CompileResult {
+                exit_code: exit_code_for(&diagnostics),
+                diagnostics,
+                output_pdf: None,
+                stable_compile_state: None,
+            };
+        }
         if let Some(loaded_bibliography_state) = &loaded_bibliography_state {
             if let Some(diagnostic) = check_bbl_freshness(
                 loaded_bibliography_state,
@@ -1427,7 +1465,12 @@ impl<'a> CompileJobService<'a> {
         host_font_roots: &[PathBuf],
         parallelism: usize,
         trace_font_tasks: bool,
-    ) -> (CompileFontSelection, FontFamilySelection, Vec<Diagnostic>) {
+    ) -> (
+        CompileFontSelection,
+        FontFamilySelection,
+        Vec<Diagnostic>,
+        bool,
+    ) {
         let mut diagnostics = Vec::new();
         let resolution_surface = if host_font_roots.is_empty() {
             "project directory, overlay roots, or asset bundle"
@@ -1533,6 +1576,7 @@ impl<'a> CompileJobService<'a> {
                 CompileFontSelection::OpenType(loaded_font),
                 families,
                 diagnostics,
+                false,
             );
         }
 
@@ -1549,7 +1593,26 @@ impl<'a> CompileJobService<'a> {
                 )
             },
         ) {
-            return (CompileFontSelection::Tfm(metrics), families, diagnostics);
+            return (
+                CompileFontSelection::Tfm(metrics),
+                families,
+                diagnostics,
+                false,
+            );
+        }
+
+        if asset_bundle_path.is_some() {
+            diagnostics.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    "required asset bundle font metrics \"cmr10\" could not be resolved",
+                )
+                .with_file(input_path.to_string())
+                .with_suggestion(
+                    "restore the cmr10.tfm asset (and matching asset-index entry) or add a default OpenType font to the asset bundle",
+                ),
+            );
+            return (CompileFontSelection::Basic, families, diagnostics, true);
         }
 
         if trace_font_tasks {
@@ -1562,17 +1625,33 @@ impl<'a> CompileJobService<'a> {
                 0,
             );
         }
-        (CompileFontSelection::Basic, families, diagnostics)
+        (CompileFontSelection::Basic, families, diagnostics, false)
     }
 
     fn typeset_document_with_selection(
         &self,
         document: &ParsedDocument,
+        source_lines: Option<&[SourceLineTrace]>,
         selection: &CompileFontSelection,
         graphics_resolver: &CompileGraphicAssetResolver<'_>,
     ) -> TypesetDocument {
-        match selection {
-            CompileFontSelection::OpenType(loaded_font) => {
+        let body_nodes =
+            source_lines.map(|source_lines| document.body_nodes_with_source_spans(source_lines));
+
+        match (selection, body_nodes) {
+            (CompileFontSelection::OpenType(loaded_font), Some(body_nodes)) => {
+                let provider = OpenTypeWidthProvider {
+                    font: &loaded_font.font,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.typeset_with_body_nodes(
+                    document,
+                    body_nodes,
+                    &provider,
+                    Some(graphics_resolver),
+                )
+            }
+            (CompileFontSelection::OpenType(loaded_font), None) => {
                 let provider = OpenTypeWidthProvider {
                     font: &loaded_font.font,
                     fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
@@ -1583,7 +1662,19 @@ impl<'a> CompileJobService<'a> {
                     Some(graphics_resolver),
                 )
             }
-            CompileFontSelection::Tfm(metrics) => {
+            (CompileFontSelection::Tfm(metrics), Some(body_nodes)) => {
+                let provider = TfmWidthProvider {
+                    metrics,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.typeset_with_body_nodes(
+                    document,
+                    body_nodes,
+                    &provider,
+                    Some(graphics_resolver),
+                )
+            }
+            (CompileFontSelection::Tfm(metrics), None) => {
                 let provider = TfmWidthProvider {
                     metrics,
                     fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
@@ -1594,7 +1685,19 @@ impl<'a> CompileJobService<'a> {
                     Some(graphics_resolver),
                 )
             }
-            CompileFontSelection::Basic => self
+            (CompileFontSelection::Basic, Some(body_nodes)) => {
+                let provider = FixedWidthProvider {
+                    char_width: DimensionValue(65_536),
+                    space_width: DimensionValue(65_536),
+                };
+                self.typesetter.typeset_with_body_nodes(
+                    document,
+                    body_nodes,
+                    &provider,
+                    Some(graphics_resolver),
+                )
+            }
+            (CompileFontSelection::Basic, None) => self
                 .typesetter
                 .typeset_with_graphics_resolver(document, graphics_resolver),
         }
@@ -2007,6 +2110,7 @@ fn cached_document_layout_fragments_for(
 fn try_partial_typeset_document(
     service: &CompileJobService<'_>,
     document: &ParsedDocument,
+    source_lines: &[SourceLineTrace],
     selection: &CompileFontSelection,
     graphics_resolver: &CompileGraphicAssetResolver<'_>,
     parallelism: usize,
@@ -2047,6 +2151,7 @@ fn try_partial_typeset_document(
         );
         let rebuilt_fragments = run_parallel_partial_typeset(
             service,
+            source_lines,
             selection,
             parallelism,
             work_items,
@@ -2084,6 +2189,7 @@ fn try_partial_typeset_document(
             .ok_or("failed to build partition-scoped parsed document")?;
             let partition_typeset = service.typeset_document_with_selection(
                 &partition_document,
+                Some(source_lines),
                 selection,
                 graphics_resolver,
             );
@@ -2142,6 +2248,7 @@ fn collect_partial_typeset_work_items(
 
 fn run_parallel_partial_typeset(
     service: &CompileJobService<'_>,
+    source_lines: &[SourceLineTrace],
     selection: &CompileFontSelection,
     parallelism: usize,
     mut work_items: Vec<PartialTypesetWorkItem>,
@@ -2173,6 +2280,7 @@ fn run_parallel_partial_typeset(
                         };
                         let partition_typeset = service.typeset_document_with_selection(
                             &work_item.partition_document,
+                            Some(source_lines),
                             selection,
                             &thread_resolver,
                         );
@@ -3058,7 +3166,8 @@ fn diagnostic_for_output_error(error: FileAccessError, output_pdf: &Path) -> Dia
 fn synctex_data_for(document: &TypesetDocument, source_lines: &[SourceLineTrace]) -> SyncTexData {
     let mut annotated_document = document.clone();
     let annotator = SourceSpanAnnotator::new(source_lines);
-    let used_source_lines = annotator.annotate_pages(&mut annotated_document);
+    let mut used_source_lines = annotator.used_source_lines_for_document(document);
+    used_source_lines.extend(annotator.annotate_pages(&mut annotated_document));
     let mut synctex =
         SyncTexData::build_from_placed_nodes(placed_text_nodes_for(&annotated_document));
     let remaining_source_lines = annotator.source_lines_without(source_lines, &used_source_lines);
@@ -3114,6 +3223,14 @@ fn remap_synctex_file_id(file_id: u32, file_id_map: &[u32]) -> u32 {
         .unwrap_or(file_id)
 }
 
+fn source_span_contains_span(outer: SourceSpan, inner: SourceSpan) -> bool {
+    source_location_lte(outer.start, inner.start) && source_location_lte(inner.end, outer.end)
+}
+
+fn source_location_lte(left: SourceLocation, right: SourceLocation) -> bool {
+    (left.file_id, left.line, left.column) <= (right.file_id, right.line, right.column)
+}
+
 fn placed_text_nodes_for(document: &TypesetDocument) -> Vec<PlacedTextNode> {
     document
         .pages
@@ -3163,6 +3280,9 @@ fn collect_rendered_line_keys(document: &TypesetDocument) -> Vec<RenderedLineKey
                 .iter()
                 .enumerate()
                 .filter_map(move |(line_index, line)| {
+                    if line.source_span.is_some() {
+                        return None;
+                    }
                     let normalized_text = normalized_rendered_text(&line.text);
                     (!normalized_text.is_empty()).then_some(RenderedLineKey {
                         page_index,
@@ -6105,6 +6225,70 @@ mod tests {
     }
 
     #[test]
+    fn compile_with_synctex_preserves_duplicate_visible_text_source_order() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\begin{document}\nAlpha \\href{https://example.com}{Beta}\n\nAlpha Beta\n\\end{document}\n",
+        )
+        .expect("write input");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.synctex = true;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let synctex = read_synctex(&options.output_dir.join("main.synctex"));
+        let linked_positions = synctex.forward_search(SourceLocation {
+            file_id: 0,
+            line: 3,
+            column: 20,
+        });
+        let plain_positions = synctex.forward_search(SourceLocation {
+            file_id: 0,
+            line: 5,
+            column: 7,
+        });
+
+        assert_eq!(linked_positions.len(), 1);
+        assert_eq!(plain_positions.len(), 1);
+        assert_ne!(linked_positions[0], plain_positions[0]);
+        assert_eq!(
+            synctex.inverse_search(linked_positions[0]),
+            Some(SourceSpan {
+                start: SourceLocation {
+                    file_id: 0,
+                    line: 3,
+                    column: 1,
+                },
+                end: SourceLocation {
+                    file_id: 0,
+                    line: 3,
+                    column: 38,
+                },
+            })
+        );
+        assert_eq!(
+            synctex.inverse_search(plain_positions[0]),
+            Some(SourceSpan {
+                start: SourceLocation {
+                    file_id: 0,
+                    line: 5,
+                    column: 1,
+                },
+                end: SourceLocation {
+                    file_id: 0,
+                    line: 5,
+                    column: 11,
+                },
+            })
+        );
+    }
+
+    #[test]
     fn synctex_data_for_remaps_fallback_fragments_into_merged_files() {
         let main_file = "/tmp/main.tex".to_string();
         let chapter_file = "/tmp/chapter.tex".to_string();
@@ -7822,7 +8006,10 @@ mod tests {
         let input_file = dir.path().join("main.tex");
         let output_dir = dir.path().join("out");
         let bundle_path = dir.path().join("bundle");
+        let tfm_path = bundle_path.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
         fs::create_dir_all(&bundle_path).expect("create bundle dir");
+        fs::create_dir_all(tfm_path.parent().expect("cmr10 parent")).expect("create tfm dir");
+        fs::write(&tfm_path, build_test_tfm()).expect("write cmr10.tfm");
         write_asset_bundle_fixture(&bundle_path);
         fs::write(&input_file, document("Hello")).expect("write input");
 
@@ -8392,9 +8579,12 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let bundle_root = dir.path().join("bundle");
         let bundled_file = bundle_root.join("texmf/bundled.tex");
+        let tfm_path = bundle_root.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
         fs::create_dir_all(bundled_file.parent().expect("bundle texmf parent"))
             .expect("create bundle texmf");
+        fs::create_dir_all(tfm_path.parent().expect("cmr10 parent")).expect("create tfm dir");
         fs::write(&bundled_file, "BUNDLED FILE CONTENT\n").expect("write bundled file");
+        fs::write(&tfm_path, build_test_tfm()).expect("write cmr10.tfm");
         fs::write(
             dir.path().join("main.tex"),
             document("\\InputIfFileExists{bundled}{AFTER BUNDLE INPUT}{FALLBACK}"),
@@ -8425,9 +8615,12 @@ mod tests {
         let dir = tempdir().expect("create tempdir");
         let bundle_root = dir.path().join("bundle");
         let bundled_file = bundle_root.join("texmf/bundled.tex");
+        let tfm_path = bundle_root.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
         fs::create_dir_all(bundled_file.parent().expect("bundle texmf parent"))
             .expect("create bundle texmf");
+        fs::create_dir_all(tfm_path.parent().expect("cmr10 parent")).expect("create tfm dir");
         fs::write(&bundled_file, "BUNDLED CONTENT\n").expect("write bundled file");
+        fs::write(&tfm_path, build_test_tfm()).expect("write cmr10.tfm");
         fs::write(dir.path().join("main.tex"), document("\\input{bundled}")).expect("write main");
 
         let mut options = runtime_options(dir.path().join("main.tex"), dir.path().join("out"));
@@ -8484,7 +8677,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_fixed_width_typesetting_when_bundle_has_no_cmr10_tfm() {
+    fn fails_when_bundle_has_no_cmr10_tfm() {
         let dir = tempdir().expect("create tempdir");
         let bundle_root = dir.path().join("bundle");
         fs::create_dir_all(&bundle_root).expect("create bundle");
@@ -8498,10 +8691,13 @@ mod tests {
 
         let result = service(&gate, &loader).compile(&options);
 
-        assert_eq!(result.exit_code, 0);
-        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
-        assert!(pdf.contains("(AA) Tj"));
-        assert!(!pdf.contains("(A) Tj\n0 -18 Td\n(A) Tj"));
+        assert_eq!(result.exit_code, 2);
+        assert_eq!(result.output_pdf, None);
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message
+                    == "required asset bundle font metrics \"cmr10\" could not be resolved"
+        }));
     }
 
     #[test]

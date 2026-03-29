@@ -691,12 +691,21 @@ impl MinimalTypesetter {
         provider: &dyn CharWidthProvider,
         graphics_resolver: Option<&dyn GraphicAssetResolver>,
     ) -> TypesetDocument {
+        self.typeset_with_body_nodes(document, document.body_nodes(), provider, graphics_resolver)
+    }
+
+    pub fn typeset_with_body_nodes(
+        &self,
+        document: &ParsedDocument,
+        body_nodes: Vec<DocumentNode>,
+        provider: &dyn CharWidthProvider,
+        graphics_resolver: Option<&dyn GraphicAssetResolver>,
+    ) -> TypesetDocument {
         let page_box = page_box_for_class(&document.document_class);
-        let nodes = document.body_nodes();
         let params = break_params_for_provider(provider);
         let hyphenator = TexPatternHyphenator::english();
         let vlist = document_nodes_to_vlist_with_config(
-            &nodes,
+            &body_nodes,
             provider,
             Some(&hyphenator),
             &params,
@@ -875,7 +884,7 @@ fn document_nodes_to_hlist_with_font_config(
 
     for node in nodes {
         match node {
-            DocumentNode::Text(text) => {
+            DocumentNode::Text(text, _) => {
                 for codepoint in text.chars() {
                     match codepoint {
                         '\n' => {
@@ -1166,6 +1175,23 @@ fn document_nodes_to_vlist_with_state(
 
     for (index, node) in nodes.iter().enumerate() {
         match node {
+            DocumentNode::ParBreak => {
+                append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                );
+                vlist.push(VListItem::Box {
+                    tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+                    content: String::new(),
+                    links: Vec::new(),
+                    font_index: 0,
+                    source_span: None,
+                });
+                segment_start = index + 1;
+            }
             DocumentNode::PageBreak => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
@@ -1262,7 +1288,7 @@ fn document_nodes_to_vlist_with_state(
                         FloatType::Table => "Table",
                     };
                     let caption_line = format!("{prefix} {number}: {caption}");
-                    let caption_nodes = [DocumentNode::Text(caption_line)];
+                    let caption_nodes = [DocumentNode::Text(caption_line, None)];
                     append_nodes_segment_to_vlist(
                         &mut float_vlist,
                         &caption_nodes,
@@ -1305,6 +1331,11 @@ fn append_nodes_segment_to_vlist(
         return;
     }
 
+    let segment_source_span = nodes.iter().find_map(|node| match node {
+        DocumentNode::Text(_, span) => *span,
+        _ => None,
+    });
+
     let hlist = document_nodes_to_hlist_with_config(
         nodes,
         provider,
@@ -1317,7 +1348,7 @@ fn append_nodes_segment_to_vlist(
     }
 
     let wrapped_lines = line_breaker::break_paragraph_with_links(&hlist, params);
-    vlist.extend(lines_to_vlist(&wrapped_lines));
+    vlist.extend(lines_to_vlist(&wrapped_lines, segment_source_span));
 }
 
 pub(crate) fn push_forced_break_if_needed(hlist: &mut Vec<HListItem>) {
@@ -1376,7 +1407,10 @@ fn flush_word(
     word_items.clear();
 }
 
-fn lines_to_vlist(lines: &[line_breaker::BrokenLine]) -> Vec<VListItem> {
+fn lines_to_vlist(
+    lines: &[line_breaker::BrokenLine],
+    source_span: Option<SourceSpan>,
+) -> Vec<VListItem> {
     lines
         .iter()
         .map(|line| VListItem::Box {
@@ -1384,7 +1418,7 @@ fn lines_to_vlist(lines: &[line_breaker::BrokenLine]) -> Vec<VListItem> {
             content: line.text.clone(),
             links: line.links.clone(),
             font_index: line.font_index,
-            source_span: None,
+            source_span,
         })
         .collect()
 }
@@ -2453,8 +2487,8 @@ mod tests {
         ExternalGraphic, GraphicAssetResolver, GraphicNode, ImageColorSpace, ImageMetadata,
         ResolvedGraphic,
     };
-    use crate::kernel::api::DimensionValue;
     use crate::kernel::api::StableId;
+    use crate::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use crate::parser::api::{
         DocumentNode, FloatType, IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine,
         MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser, SectionEntry,
@@ -2784,7 +2818,7 @@ mod tests {
         let provider = default_fixed_width_provider();
         let params = super::break_params_for_provider(&provider);
         let nodes = vec![
-            DocumentNode::Text("Before".to_string()),
+            DocumentNode::Text("Before".to_string(), None),
             DocumentNode::IncludeGraphics {
                 path: "figure.png".to_string(),
                 options: IncludeGraphicsOptions {
@@ -2793,7 +2827,7 @@ mod tests {
                     scale: None,
                 },
             },
-            DocumentNode::Text("After".to_string()),
+            DocumentNode::Text("After".to_string(), None),
         ];
 
         let vlist = document_nodes_to_vlist_with_config(
@@ -2834,7 +2868,7 @@ mod tests {
         let nodes = vec![DocumentNode::Float {
             float_type: FloatType::Figure,
             specifier: Some("h".to_string()),
-            content: vec![DocumentNode::Text("Body".to_string())],
+            content: vec![DocumentNode::Text("Body".to_string(), None)],
             caption: Some("A caption".to_string()),
             label: Some("fig:test".to_string()),
         }];
@@ -2866,6 +2900,33 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn typeset_with_body_nodes_propagates_text_source_span() {
+        let document = parsed_document("Alpha Beta");
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 11,
+            },
+        };
+        let typeset = MinimalTypesetter.typeset_with_body_nodes(
+            &document,
+            vec![DocumentNode::Text("Alpha Beta".to_string(), Some(span))],
+            &default_fixed_width_provider(),
+            None,
+        );
+
+        assert_eq!(typeset.pages.len(), 1);
+        assert_eq!(typeset.pages[0].lines.len(), 1);
+        assert_eq!(typeset.pages[0].lines[0].source_span, Some(span));
     }
 
     #[test]
@@ -3446,7 +3507,7 @@ mod tests {
     #[test]
     fn document_nodes_to_hlist_produces_chars_and_glue() {
         let hlist = document_nodes_to_hlist(
-            &[DocumentNode::Text("A B".to_string())],
+            &[DocumentNode::Text("A B".to_string(), None)],
             &default_fixed_width_provider(),
         );
 
@@ -3498,7 +3559,7 @@ mod tests {
     fn document_nodes_to_hlist_renders_inline_math_readably() {
         let hlist = document_nodes_to_hlist(
             &[
-                DocumentNode::Text("Area ".to_string()),
+                DocumentNode::Text("Area ".to_string(), None),
                 DocumentNode::InlineMath(vec![
                     MathNode::Ordinary('x'),
                     MathNode::Superscript(Box::new(MathNode::Ordinary('2'))),
@@ -3517,7 +3578,7 @@ mod tests {
     fn document_nodes_to_hlist_renders_extended_math_nodes_readably() {
         let hlist = document_nodes_to_hlist(
             &[
-                DocumentNode::Text("f = ".to_string()),
+                DocumentNode::Text("f = ".to_string(), None),
                 DocumentNode::InlineMath(vec![
                     MathNode::MathFont {
                         cmd: "mathrm".to_string(),
@@ -3577,12 +3638,12 @@ mod tests {
     fn document_nodes_to_hlist_puts_display_math_on_separate_lines() {
         let hlist = document_nodes_to_hlist(
             &[
-                DocumentNode::Text("Before".to_string()),
+                DocumentNode::Text("Before".to_string(), None),
                 DocumentNode::DisplayMath(vec![
                     MathNode::Ordinary('a'),
                     MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
                 ]),
-                DocumentNode::Text("After".to_string()),
+                DocumentNode::Text("After".to_string(), None),
             ],
             &default_fixed_width_provider(),
         );
@@ -3597,13 +3658,13 @@ mod tests {
     fn document_nodes_to_hlist_centers_display_math_with_invisible_kerns() {
         let hlist = document_nodes_to_hlist(
             &[
-                DocumentNode::Text("Before".to_string()),
+                DocumentNode::Text("Before".to_string(), None),
                 DocumentNode::DisplayMath(vec![
                     MathNode::Ordinary('x'),
                     MathNode::Ordinary('+'),
                     MathNode::Ordinary('y'),
                 ]),
-                DocumentNode::Text("After".to_string()),
+                DocumentNode::Text("After".to_string(), None),
             ],
             &default_fixed_width_provider(),
         );
@@ -3634,7 +3695,7 @@ mod tests {
     fn document_nodes_to_hlist_puts_equation_environment_on_separate_lines() {
         let hlist = document_nodes_to_hlist(
             &[
-                DocumentNode::Text("Before".to_string()),
+                DocumentNode::Text("Before".to_string(), None),
                 DocumentNode::EquationEnv {
                     lines: vec![
                         MathLine {
@@ -3659,7 +3720,7 @@ mod tests {
                     numbered: true,
                     aligned: true,
                 },
-                DocumentNode::Text("After".to_string()),
+                DocumentNode::Text("After".to_string(), None),
             ],
             &default_fixed_width_provider(),
         );
@@ -3742,7 +3803,7 @@ mod tests {
     fn document_nodes_to_hlist_with_hyphenation_inserts_penalties_inside_words() {
         let hyphenator = TexPatternHyphenator::english();
         let hlist = document_nodes_to_hlist_with_hyphenation(
-            &[DocumentNode::Text("basket".to_string())],
+            &[DocumentNode::Text("basket".to_string(), None)],
             &default_fixed_width_provider(),
             &hyphenator,
         );
