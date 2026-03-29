@@ -247,21 +247,13 @@ fn parse_statement(
         return;
     };
 
-    let command_len = rest
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphabetic())
-        .map(char::len_utf8)
-        .sum::<usize>();
-    if command_len == 0 {
+    let Some((command, remainder)) = split_tikz_command(rest) else {
         emit_parse_error(
             diagnostics,
             format!("missing command name in `{statement}`"),
         );
         return;
-    }
-
-    let command = &rest[..command_len];
-    let remainder = &rest[command_len..];
+    };
     match command {
         "draw" => {
             if let Some(node) =
@@ -296,6 +288,39 @@ fn parse_statement(
         }
         unsupported => emit_unsupported(diagnostics, unsupported.to_string()),
     }
+}
+
+fn split_tikz_command(rest: &str) -> Option<(&str, &str)> {
+    // The outer parser strips whitespace between \node and `at`, producing \nodeat.
+    if let Some(remainder) = rest.strip_prefix("nodeat") {
+        if remainder
+            .chars()
+            .next()
+            .map_or(true, |ch| !ch.is_ascii_alphabetic())
+        {
+            return Some(("node", &rest["node".len()..]));
+        }
+    }
+
+    for command in ["filldraw", "draw", "fill", "clip", "node"] {
+        let Some(remainder) = rest.strip_prefix(command) else {
+            continue;
+        };
+        if remainder
+            .chars()
+            .next()
+            .map_or(true, |ch| !ch.is_ascii_alphabetic())
+        {
+            return Some((command, remainder));
+        }
+    }
+
+    let command_len = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    (command_len > 0).then(|| (&rest[..command_len], &rest[command_len..]))
 }
 
 fn parse_path_statement(
@@ -1341,6 +1366,35 @@ mod tests {
                 },
                 content: "Hello".to_string(),
             })]
+        );
+    }
+
+    #[test]
+    fn parses_text_node_without_control_word_space() {
+        let result = parse_tikzpicture(r"\nodeat (1,1) {Hello};");
+
+        assert_eq!(
+            result.scene.nodes,
+            vec![GraphicNode::Text(GraphicText {
+                position: Point {
+                    x: CM_IN_PT,
+                    y: CM_IN_PT,
+                },
+                content: "Hello".to_string(),
+            })]
+        );
+    }
+
+    #[test]
+    fn nodeat_boundary_rejects_nodeatom() {
+        let result = parse_tikzpicture(r"\nodeatom at (0,0) {text};");
+
+        assert!(
+            result.diagnostics.iter().any(|d| {
+                matches!(d, TikzDiagnostic::UnsupportedCommand { command } if command == "nodeatom")
+            }),
+            "expected unsupported command diagnostic for nodeatom, got: {:?}",
+            result.diagnostics
         );
     }
 

@@ -1,6 +1,7 @@
 mod artifact_registry;
 mod execution_policy;
 mod file_access_gate;
+mod operation_handlers;
 mod path_access;
 
 use std::path::{Component, Path, PathBuf};
@@ -8,6 +9,9 @@ use std::path::{Component, Path, PathBuf};
 pub use artifact_registry::{ArtifactKind, OutputArtifactRecord, OutputArtifactRegistry};
 pub use execution_policy::{ExecutionPolicy, PreviewPublicationPolicy};
 pub use file_access_gate::{FileAccessError, FileAccessGate};
+pub use operation_handlers::{
+    FileOperationHandler, FileOperationResult, ShellEscapeHandler, ShellEscapeResult,
+};
 pub use path_access::{PathAccessDecision, PathAccessPolicy};
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {

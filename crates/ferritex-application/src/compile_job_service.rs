@@ -36,7 +36,10 @@ use ferritex_core::pdf::{
     PlacedImage,
 };
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
-use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
+use ferritex_core::policy::{
+    FileAccessError, FileAccessGate, FileOperationHandler, FileOperationResult, PathAccessDecision,
+    ShellEscapeHandler, ShellEscapeResult,
+};
 use ferritex_core::synctex::{
     PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData,
 };
@@ -192,6 +195,71 @@ struct CompileGraphicAssetResolver<'a> {
     overlay_roots: &'a [PathBuf],
     asset_bundle_path: Option<&'a Path>,
     diagnostics: RefCell<Vec<Diagnostic>>,
+}
+
+struct ShellEscapeAdapter<'a> {
+    gateway: &'a dyn ShellCommandGatewayPort,
+    working_dir: PathBuf,
+}
+
+impl ShellEscapeHandler for ShellEscapeAdapter<'_> {
+    fn execute_write18(&self, command: &str, _line: u32) -> ShellEscapeResult {
+        let mut parts = command.split_whitespace();
+        let Some(program) = parts.next() else {
+            return ShellEscapeResult::Error("empty \\write18 command".to_string());
+        };
+        let args = parts.collect::<Vec<_>>();
+        match self.gateway.execute(program, &args, &self.working_dir) {
+            Ok(output) => ShellEscapeResult::Success {
+                exit_code: output.exit_code,
+            },
+            Err(error) if error == "shell escape is not allowed" => ShellEscapeResult::Denied,
+            Err(error) => ShellEscapeResult::Error(error),
+        }
+    }
+}
+
+struct FileOperationAdapter<'a> {
+    gate: &'a dyn FileAccessGate,
+    base_dir: PathBuf,
+}
+
+impl FileOperationAdapter<'_> {
+    fn resolve(&self, path: &str) -> PathBuf {
+        let candidate = Path::new(path);
+        if candidate.is_absolute() {
+            normalize_existing_path(candidate)
+        } else {
+            normalize_existing_path(&self.base_dir.join(candidate))
+        }
+    }
+
+    fn check(&self, path: &str, write: bool) -> FileOperationResult {
+        let resolved = self.resolve(path);
+        let decision = if write {
+            self.gate.check_write(&resolved)
+        } else {
+            self.gate.check_read(&resolved)
+        };
+        if decision == PathAccessDecision::Allowed {
+            FileOperationResult::Allowed
+        } else {
+            FileOperationResult::Denied {
+                path: resolved.to_string_lossy().into_owned(),
+                reason: "outside allowed read/write roots".to_string(),
+            }
+        }
+    }
+}
+
+impl FileOperationHandler for FileOperationAdapter<'_> {
+    fn check_open_read(&self, path: &str, _line: u32) -> FileOperationResult {
+        self.check(path, false)
+    }
+
+    fn check_open_write(&self, path: &str, _line: u32) -> FileOperationResult {
+        self.check(path, true)
+    }
 }
 
 impl CompileGraphicAssetResolver<'_> {
@@ -865,9 +933,11 @@ impl<'a> CompileJobService<'a> {
         let mut typeset_callback_count = 0usize;
         let parse_pass_result = self.parse_document_with_cross_references(
             &source_tree.source,
+            &options.input_file,
             &project_root,
             &options.overlay_roots,
             options.asset_bundle.as_deref(),
+            execution_policy.shell_escape_allowed,
             initial_bibliography_state.clone(),
             source_tree.document_state.index_state.entries.clone(),
             cached_cross_reference_seed.as_ref(),
@@ -1271,9 +1341,11 @@ impl<'a> CompileJobService<'a> {
             pass_count,
         } = self.parse_document_with_cross_references(
             &source_tree.source,
+            &primary_input,
             &project_root,
             &[],
             asset_bundle.as_deref(),
+            false,
             source_tree.document_state.bibliography_state.clone().into(),
             source_tree.document_state.index_state.entries.clone(),
             None,
@@ -1665,9 +1737,11 @@ impl<'a> CompileJobService<'a> {
     fn parse_document_with_cross_references<F>(
         &self,
         source: &str,
+        primary_input: &Path,
         project_root: &Path,
         overlay_roots: &[PathBuf],
         asset_bundle_path: Option<&Path>,
+        shell_escape_allowed: bool,
         initial_bibliography_state: Option<BibliographyState>,
         initial_index_entries: Vec<IndexEntry>,
         cached_cross_reference_seed: Option<&CrossReferenceSeed>,
@@ -1711,20 +1785,35 @@ impl<'a> CompileJobService<'a> {
         } else {
             initial_index_entries
         };
-        let mut output = self
-            .parser
-            .parse_recovering_with_context_and_package_resolver(
-                source,
-                initial_labels,
-                initial_section_entries,
-                initial_figure_entries,
-                initial_table_entries,
-                initial_bibliography,
-                initial_bibliography_state.clone(),
-                initial_page_labels.clone(),
-                initial_index_entries.clone(),
-                Some(&sty_resolver),
-            );
+        let base_dir = primary_input
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(normalize_existing_path)
+            .unwrap_or_else(|| project_root.to_path_buf());
+        let shell_escape_adapter = shell_escape_allowed.then(|| ShellEscapeAdapter {
+            gateway: self.shell_command_gateway,
+            working_dir: base_dir.clone(),
+        });
+        let file_operation_adapter = FileOperationAdapter {
+            gate: self.file_access_gate,
+            base_dir,
+        };
+        let mut output = self.parser.parse_recovering_with_context_and_handlers(
+            source,
+            initial_labels,
+            initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
+            initial_bibliography,
+            initial_bibliography_state.clone(),
+            initial_page_labels.clone(),
+            initial_index_entries.clone(),
+            Some(&sty_resolver),
+            shell_escape_adapter
+                .as_ref()
+                .map(|adapter| adapter as &dyn ShellEscapeHandler),
+            Some(&file_operation_adapter),
+        );
         let Some(mut document) = output.document.clone() else {
             return ParsePassResult {
                 output,
@@ -1741,20 +1830,22 @@ impl<'a> CompileJobService<'a> {
             || document.has_unresolved_lof
             || document.has_unresolved_lot
         {
-            let second = self
-                .parser
-                .parse_recovering_with_context_and_package_resolver(
-                    source,
-                    document.labels.clone().into_inner(),
-                    document.section_entries.clone(),
-                    document.figure_entries.clone(),
-                    document.table_entries.clone(),
-                    document.bibliography.clone(),
-                    Some(document.bibliography_state.clone()),
-                    BTreeMap::new(),
-                    initial_index_entries,
-                    Some(&sty_resolver),
-                );
+            let second = self.parser.parse_recovering_with_context_and_handlers(
+                source,
+                document.labels.clone().into_inner(),
+                document.section_entries.clone(),
+                document.figure_entries.clone(),
+                document.table_entries.clone(),
+                document.bibliography.clone(),
+                Some(document.bibliography_state.clone()),
+                BTreeMap::new(),
+                initial_index_entries,
+                Some(&sty_resolver),
+                shell_escape_adapter
+                    .as_ref()
+                    .map(|adapter| adapter as &dyn ShellEscapeHandler),
+                Some(&file_operation_adapter),
+            );
             if let Some(next_document) = second.document.clone() {
                 output = second;
                 document = next_document;
@@ -1780,20 +1871,22 @@ impl<'a> CompileJobService<'a> {
                 break;
             }
 
-            let next = self
-                .parser
-                .parse_recovering_with_context_and_package_resolver(
-                    source,
-                    document.labels.clone().into_inner(),
-                    document.section_entries.clone(),
-                    document.figure_entries.clone(),
-                    document.table_entries.clone(),
-                    document.bibliography.clone(),
-                    Some(document.bibliography_state.clone()),
-                    page_labels.clone(),
-                    index_entries.clone(),
-                    Some(&sty_resolver),
-                );
+            let next = self.parser.parse_recovering_with_context_and_handlers(
+                source,
+                document.labels.clone().into_inner(),
+                document.section_entries.clone(),
+                document.figure_entries.clone(),
+                document.table_entries.clone(),
+                document.bibliography.clone(),
+                Some(document.bibliography_state.clone()),
+                page_labels.clone(),
+                index_entries.clone(),
+                Some(&sty_resolver),
+                shell_escape_adapter
+                    .as_ref()
+                    .map(|adapter| adapter as &dyn ShellEscapeHandler),
+                Some(&file_operation_adapter),
+            );
             let Some(next_document) = next.document.clone() else {
                 break;
             };
@@ -3021,9 +3114,9 @@ fn diagnostic_for_bibliography(
 
 fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnostic {
     let severity = match error {
-        ParseError::FontspecNotLoaded { .. } | ParseError::SetmainfontInBody { .. } => {
-            Severity::Warning
-        }
+        ParseError::FontspecNotLoaded { .. }
+        | ParseError::SetmainfontInBody { .. }
+        | ParseError::ShellEscapeNotAllowed { .. } => Severity::Warning,
         _ => Severity::Error,
     };
     let diagnostic = Diagnostic::new(severity, error.to_string()).with_file(input_path);
@@ -3097,6 +3190,11 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         ParseError::TikzDiagnostic { .. } => diagnostic
             .with_context("a problem was detected while parsing a tikzpicture environment")
             .with_suggestion("check the TikZ commands in the tikzpicture environment"),
+        ParseError::ShellEscapeNotAllowed { .. } => {
+            diagnostic.with_suggestion("use --shell-escape to enable external command execution")
+        }
+        ParseError::ShellEscapeError { .. } => diagnostic,
+        ParseError::FileOperationDenied { reason, .. } => diagnostic.with_context(reason),
     }
 }
 
@@ -4500,13 +4598,17 @@ fn diagnostic_for_nested_input_error(
     line: u32,
     input_value: &str,
 ) -> Diagnostic {
+    let detail = match diagnostic.file {
+        Some(file) => format!("{} ({file})", diagnostic.message),
+        None => diagnostic.message,
+    };
     Diagnostic::new(
         Severity::Error,
         format!("failed to resolve \\input/\\include target `{input_value}`"),
     )
     .with_file(source_path.to_string_lossy().into_owned())
     .with_line(line)
-    .with_context(diagnostic.message)
+    .with_context(detail)
     .with_suggestion("verify the referenced file path and access policy")
 }
 
@@ -4659,6 +4761,110 @@ mod tests {
             _jobname: &str,
         ) -> Result<Vec<u8>, FileAccessError> {
             fs::read(path).map_err(FileAccessError::from)
+        }
+    }
+
+    struct ScopedFsFileAccessGate {
+        allowed_read_root: PathBuf,
+        allowed_write_root: PathBuf,
+    }
+
+    impl ScopedFsFileAccessGate {
+        fn allows(path: &Path, root: &Path) -> bool {
+            let resolved_path = canonicalize_with_missing(path);
+            let resolved_root = canonicalize_with_missing(root);
+            resolved_path.starts_with(&resolved_root)
+        }
+    }
+
+    impl FileAccessGate for ScopedFsFileAccessGate {
+        fn ensure_directory(&self, path: &Path) -> Result<(), FileAccessError> {
+            if self.check_write(path) == PathAccessDecision::Denied {
+                return Err(FileAccessError::AccessDenied {
+                    path: path.to_path_buf(),
+                });
+            }
+
+            fs::create_dir_all(path).map_err(FileAccessError::from)
+        }
+
+        fn check_read(&self, path: &Path) -> PathAccessDecision {
+            if Self::allows(path, &self.allowed_read_root) {
+                PathAccessDecision::Allowed
+            } else {
+                PathAccessDecision::Denied
+            }
+        }
+
+        fn check_write(&self, path: &Path) -> PathAccessDecision {
+            if Self::allows(path, &self.allowed_write_root) {
+                PathAccessDecision::Allowed
+            } else {
+                PathAccessDecision::Denied
+            }
+        }
+
+        fn check_readback(
+            &self,
+            path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> PathAccessDecision {
+            self.check_read(path)
+        }
+
+        fn read_file(&self, path: &Path) -> Result<Vec<u8>, FileAccessError> {
+            if self.check_read(path) == PathAccessDecision::Denied {
+                return Err(FileAccessError::AccessDenied {
+                    path: path.to_path_buf(),
+                });
+            }
+
+            fs::read(path).map_err(FileAccessError::from)
+        }
+
+        fn write_file(&self, path: &Path, content: &[u8]) -> Result<(), FileAccessError> {
+            if self.check_write(path) == PathAccessDecision::Denied {
+                return Err(FileAccessError::AccessDenied {
+                    path: path.to_path_buf(),
+                });
+            }
+
+            fs::write(path, content).map_err(FileAccessError::from)
+        }
+
+        fn read_readback(
+            &self,
+            path: &Path,
+            _primary_input: &Path,
+            _jobname: &str,
+        ) -> Result<Vec<u8>, FileAccessError> {
+            self.read_file(path)
+        }
+    }
+
+    fn canonicalize_with_missing(path: &Path) -> PathBuf {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().expect("current dir").join(path)
+        };
+
+        let mut missing_suffix = Vec::new();
+        let mut cursor = absolute.as_path();
+        loop {
+            if cursor.exists() {
+                let mut resolved = cursor.canonicalize().expect("canonicalize existing path");
+                for segment in missing_suffix.iter().rev() {
+                    resolved.push(segment);
+                }
+                return resolved;
+            }
+
+            if let Some(name) = cursor.file_name() {
+                missing_suffix.push(name.to_os_string());
+            }
+            cursor = cursor.parent().unwrap_or_else(|| Path::new("."));
         }
     }
 
@@ -6487,6 +6693,60 @@ mod tests {
     }
 
     #[test]
+    fn write18_emits_warning_when_shell_escape_is_disabled() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("\\write18{echo ok}\nHello")).expect("write input");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+        let shell_gateway = MockShellCommandGateway::default();
+
+        let result =
+            service_with_shell(&FsTestFileAccessGate, &loader, &shell_gateway).compile(&options);
+
+        assert_eq!(result.exit_code, 1);
+        assert!(shell_gateway.commands().is_empty());
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("\\write18{echo ok}"))
+            .expect("shell escape diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.suggestion.as_deref(),
+            Some("use --shell-escape to enable external command execution")
+        );
+    }
+
+    #[test]
+    fn write18_executes_through_shell_gateway_when_enabled() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("\\write18{echo ok}\nHello")).expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.shell_escape = ShellEscapeMode::Enabled;
+        let loader = MockAssetBundleLoader::valid();
+        let shell_gateway = MockShellCommandGateway::default();
+
+        let result =
+            service_with_shell(&FsTestFileAccessGate, &loader, &shell_gateway).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let expected_working_dir = super::normalize_existing_path(dir.path());
+        assert_eq!(
+            shell_gateway.commands(),
+            vec![(
+                "echo".to_string(),
+                vec!["ok".to_string()],
+                expected_working_dir
+            )]
+        );
+    }
+
+    #[test]
     fn missing_bbl_emits_warning_when_citations_are_present() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -7263,6 +7523,39 @@ mod tests {
     }
 
     #[test]
+    fn nested_input_access_denied_context_includes_denied_path() {
+        let dir = tempdir().expect("create tempdir");
+        let src = dir.path().join("src");
+        let outside = dir.path().join("outside");
+        let out = dir.path().join("out");
+        fs::create_dir_all(&src).expect("create src");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::write(src.join("main.tex"), document("\\input{../outside/secret}"))
+            .expect("write main");
+        let denied_path = outside.join("secret.tex");
+        fs::write(&denied_path, "SECRET\n").expect("write denied input");
+
+        let gate = ScopedFsFileAccessGate {
+            allowed_read_root: src.clone(),
+            allowed_write_root: out.clone(),
+        };
+        let loader = MockAssetBundleLoader::valid();
+        let options = runtime_options(src.join("main.tex"), out);
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 2);
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("\\input/\\include target"))
+            .expect("nested input diagnostic");
+        let context = diagnostic.context.as_deref().expect("nested input context");
+        assert!(context.contains("input file access denied"));
+        assert!(context.contains(denied_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
     fn current_file_relative_takes_precedence_over_project_root() {
         let dir = tempdir().expect("create tempdir");
         let subdir = dir.path().join("subdir");
@@ -7373,9 +7666,11 @@ mod tests {
         let compile_service = service(&gate, &loader);
         let parse_result = compile_service.parse_document_with_cross_references(
             source,
+            &project_root.join("main.tex"),
             &project_root,
             &[],
             None,
+            false,
             None,
             Vec::new(),
             None,
@@ -7437,9 +7732,11 @@ mod tests {
         let compile_service = service(&gate, &loader);
         let parse_result = compile_service.parse_document_with_cross_references(
             source,
+            &project_root.join("main.tex"),
             &project_root,
             &[overlay_root],
             None,
+            false,
             None,
             Vec::new(),
             None,
@@ -7568,6 +7865,42 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         let pdf = read_pdf(&options.output_dir.join("main.pdf"));
         assert!(pdf.contains("BUNDLED CONTENT"));
+    }
+
+    #[test]
+    fn openout_outside_allowed_root_emits_access_denied_diagnostic() {
+        let dir = tempdir().expect("create tempdir");
+        let src = dir.path().join("src");
+        let outside = dir.path().join("outside");
+        let out = dir.path().join("out");
+        fs::create_dir_all(&src).expect("create src");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::write(
+            src.join("main.tex"),
+            document("\\openout1=../outside/output.txt\nHello"),
+        )
+        .expect("write main");
+
+        let gate = ScopedFsFileAccessGate {
+            allowed_read_root: src.clone(),
+            allowed_write_root: out.clone(),
+        };
+        let loader = MockAssetBundleLoader::valid();
+        let options = runtime_options(src.join("main.tex"), out);
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 2);
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("file access denied: \\openout"))
+            .expect("openout denied diagnostic");
+        assert_eq!(
+            diagnostic.context.as_deref(),
+            Some("outside allowed read/write roots")
+        );
+        assert!(diagnostic.message.contains("outside/output.txt"));
     }
 
     #[test]

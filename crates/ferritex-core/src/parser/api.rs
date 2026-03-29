@@ -13,6 +13,9 @@ use crate::graphics::api::{
     compile_graphics_scene, parse_tikzpicture, GraphicsBox, TikzDiagnostic, TikzParseResult,
 };
 use crate::kernel::api::DimensionValue;
+use crate::policy::{
+    FileOperationHandler, FileOperationResult, ShellEscapeHandler, ShellEscapeResult,
+};
 
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
@@ -480,6 +483,38 @@ pub enum ParseError {
     FontspecNotLoaded { line: u32 },
     #[error("\\setmainfont, \\setsansfont, and \\setmonofont in document body are not supported; use them in the preamble")]
     SetmainfontInBody { line: u32 },
+    #[error("shell escape is not allowed: \\write18{{{command}}}")]
+    ShellEscapeNotAllowed { line: u32, command: String },
+    #[error("{message}")]
+    ShellEscapeError { line: u32, message: String },
+    #[error("file access denied: \\{operation} {path}")]
+    FileOperationDenied {
+        line: u32,
+        operation: FileOperationKind,
+        path: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOperationKind {
+    OpenIn,
+    OpenOut,
+}
+
+impl FileOperationKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenIn => "openin",
+            Self::OpenOut => "openout",
+        }
+    }
+}
+
+impl std::fmt::Display for FileOperationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl ParseError {
@@ -502,7 +537,10 @@ impl ParseError {
             | Self::MacroExpansionLimit { line }
             | Self::TikzDiagnostic { line, .. }
             | Self::FontspecNotLoaded { line }
-            | Self::SetmainfontInBody { line } => Some(*line),
+            | Self::SetmainfontInBody { line }
+            | Self::ShellEscapeNotAllowed { line, .. }
+            | Self::ShellEscapeError { line, .. }
+            | Self::FileOperationDenied { line, .. } => Some(*line),
         }
     }
 }
@@ -688,14 +726,7 @@ impl MinimalLatexParser {
         initial_index_entries: Vec<IndexEntry>,
         sty_resolver: Option<&StyPackageResolver<'_>>,
     ) -> ParseOutput {
-        if source.trim().is_empty() {
-            return ParseOutput {
-                document: None,
-                errors: vec![ParseError::EmptyInput],
-            };
-        }
-
-        ParserDriver::new_with_context(
+        self.parse_recovering_with_context_and_handlers(
             source,
             initial_labels,
             initial_section_entries,
@@ -706,6 +737,47 @@ impl MinimalLatexParser {
             initial_page_labels,
             initial_index_entries,
             sty_resolver,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_recovering_with_context_and_handlers(
+        &self,
+        source: &str,
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
+        initial_bibliography: BTreeMap<String, String>,
+        initial_bibliography_state: Option<BibliographyState>,
+        initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
+        sty_resolver: Option<&StyPackageResolver<'_>>,
+        shell_escape_handler: Option<&dyn ShellEscapeHandler>,
+        file_operation_handler: Option<&dyn FileOperationHandler>,
+    ) -> ParseOutput {
+        if source.trim().is_empty() {
+            return ParseOutput {
+                document: None,
+                errors: vec![ParseError::EmptyInput],
+            };
+        }
+
+        ParserDriver::new_with_context_and_handlers(
+            source,
+            initial_labels,
+            initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
+            initial_bibliography,
+            initial_bibliography_state,
+            initial_page_labels,
+            initial_index_entries,
+            sty_resolver,
+            shell_escape_handler,
+            file_operation_handler,
         )
         .run_recovering()
     }
@@ -1105,6 +1177,8 @@ struct ParserDriver<'a, 'resolver> {
     alloc_count: u32,
     alloc_toks: u32,
     sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
+    shell_escape_handler: Option<&'a dyn ShellEscapeHandler>,
+    file_operation_handler: Option<&'a dyn FileOperationHandler>,
     sty_interpreter_mode: bool,
 }
 
@@ -1127,6 +1201,37 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         initial_page_labels: BTreeMap<String, u32>,
         initial_index_entries: Vec<IndexEntry>,
         sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
+    ) -> Self {
+        Self::new_with_context_and_handlers(
+            source,
+            initial_labels,
+            initial_section_entries,
+            initial_figure_entries,
+            initial_table_entries,
+            initial_bibliography,
+            initial_bibliography_state,
+            initial_page_labels,
+            initial_index_entries,
+            sty_resolver,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_context_and_handlers(
+        source: &'a str,
+        initial_labels: BTreeMap<String, String>,
+        initial_section_entries: Vec<SectionEntry>,
+        initial_figure_entries: Vec<CaptionEntry>,
+        initial_table_entries: Vec<CaptionEntry>,
+        initial_bibliography: BTreeMap<String, String>,
+        initial_bibliography_state: Option<BibliographyState>,
+        initial_page_labels: BTreeMap<String, u32>,
+        initial_index_entries: Vec<IndexEntry>,
+        sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
+        shell_escape_handler: Option<&'a dyn ShellEscapeHandler>,
+        file_operation_handler: Option<&'a dyn FileOperationHandler>,
     ) -> Self {
         Self {
             tokenizer: Tokenizer::new(source.as_bytes()),
@@ -1174,6 +1279,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             alloc_count: 10,
             alloc_toks: 10,
             sty_resolver,
+            shell_escape_handler,
+            file_operation_handler,
             sty_interpreter_mode: false,
         }
     }
@@ -1894,6 +2001,131 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
     }
 
+    fn handle_write18_command(&mut self, line: u32) -> Result<(), ParseError> {
+        let command = self
+            .read_required_braced_tokens()?
+            .map(|tokens| tokens_to_text(&tokens).trim().to_string())
+            .unwrap_or_default();
+        let Some(handler) = self.shell_escape_handler else {
+            self.record_error(ParseError::ShellEscapeNotAllowed { line, command });
+            return Ok(());
+        };
+
+        match handler.execute_write18(&command, line) {
+            ShellEscapeResult::Denied => {
+                self.record_error(ParseError::ShellEscapeNotAllowed { line, command });
+            }
+            ShellEscapeResult::Success { .. } => {}
+            ShellEscapeResult::Error(message) => {
+                self.record_error(ParseError::ShellEscapeError { line, message });
+            }
+        }
+        Ok(())
+    }
+
+    fn try_handle_write18(&mut self, line: u32) -> Result<bool, ParseError> {
+        let Some((mut leading, first)) = self.next_non_space_token_with_leading() else {
+            return Ok(false);
+        };
+        let TokenKind::CharToken { char, .. } = first.kind else {
+            self.push_back_with_leading(leading, first);
+            return Ok(false);
+        };
+        if !char.is_ascii_digit() {
+            self.push_back_with_leading(leading, first);
+            return Ok(false);
+        }
+
+        let mut digits = String::new();
+        digits.push(char);
+        let mut consumed = vec![first];
+        while let Some(token) = self.next_raw_token() {
+            match token.kind {
+                TokenKind::CharToken { char, .. } if char.is_ascii_digit() => {
+                    digits.push(char);
+                    consumed.push(token);
+                }
+                _ => {
+                    self.push_front_token(token);
+                    break;
+                }
+            }
+        }
+
+        if digits == "18" {
+            self.handle_write18_command(line)?;
+            Ok(true)
+        } else {
+            leading.extend(consumed);
+            self.push_front_plain_tokens(leading);
+            Ok(false)
+        }
+    }
+
+    fn handle_file_operation(
+        &mut self,
+        line: u32,
+        operation: FileOperationKind,
+    ) -> Result<(), ParseError> {
+        let _ = self.parse_unsigned_integer()?;
+        let _ = self.consume_optional_equals();
+        let path = self.read_file_operation_path()?;
+        // A missing handler means the parser is running without an application-layer
+        // FileOperationAdapter. The parser itself never performs I/O, so in this mode
+        // file operations are parsed without diagnostics; real gating happens where the
+        // adapter is always supplied.
+        let Some(handler) = self.file_operation_handler else {
+            return Ok(());
+        };
+
+        let result = match operation {
+            FileOperationKind::OpenIn => handler.check_open_read(&path, line),
+            FileOperationKind::OpenOut => handler.check_open_write(&path, line),
+        };
+        if let FileOperationResult::Denied { path, reason } = result {
+            self.record_error(ParseError::FileOperationDenied {
+                line,
+                operation,
+                path,
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_file_operation_path(&mut self) -> Result<String, ParseError> {
+        let Some(first) = self.next_significant_token() else {
+            return Ok(String::new());
+        };
+        let mut tokens = match first.kind {
+            TokenKind::CharToken {
+                cat: CatCode::BeginGroup,
+                ..
+            } => {
+                return Ok(tokens_to_text(&self.read_group_contents(first.line)?)
+                    .trim()
+                    .to_string())
+            }
+            TokenKind::CharToken {
+                cat: CatCode::EndGroup,
+                ..
+            } => return Err(ParseError::UnexpectedClosingBrace { line: first.line }),
+            _ => vec![first],
+        };
+        while let Some(token) = self.next_raw_token() {
+            match token.kind {
+                TokenKind::CharToken {
+                    cat: CatCode::Space,
+                    ..
+                } => break,
+                TokenKind::ControlWord(ref name) if name == "par" => break,
+                _ => tokens.push(token),
+            }
+        }
+
+        Ok(tokens_to_text(&tokens).trim().to_string())
+    }
+
     fn handle_runtime_group_token(&mut self, token: &Token) -> Result<bool, ParseError> {
         match token.kind {
             TokenKind::CharToken {
@@ -1987,6 +2219,40 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
             "global" => {
                 self.global_prefix = true;
+                Ok(true)
+            }
+            "immediate" => {
+                let _ = self.take_global_prefix();
+                if let Some(next) = self.next_significant_token() {
+                    match control_sequence_name(&next).as_deref() {
+                        Some("write18") => self.handle_write18_command(next.line)?,
+                        Some("write") => {
+                            if !self.try_handle_write18(next.line)? {
+                                self.push_front_token(next);
+                            }
+                        }
+                        _ => self.push_front_token(next),
+                    }
+                }
+                Ok(true)
+            }
+            "write18" => {
+                let _ = self.take_global_prefix();
+                self.handle_write18_command(token.line)?;
+                Ok(true)
+            }
+            "write" => {
+                let _ = self.take_global_prefix();
+                self.try_handle_write18(token.line)
+            }
+            "openin" => {
+                let _ = self.take_global_prefix();
+                self.handle_file_operation(token.line, FileOperationKind::OpenIn)?;
+                Ok(true)
+            }
+            "openout" => {
+                let _ = self.take_global_prefix();
+                self.handle_file_operation(token.line, FileOperationKind::OpenOut)?;
                 Ok(true)
             }
             "noexpand" => {
@@ -7548,7 +7814,35 @@ mod tests {
     use crate::compilation::IndexEntry;
     use crate::graphics::api::{GraphicNode, PathSegment, Point};
     use crate::kernel::api::DimensionValue;
+    use crate::policy::{
+        FileOperationHandler, FileOperationResult, ShellEscapeHandler, ShellEscapeResult,
+    };
     use std::collections::BTreeMap;
+
+    struct MockShellEscapeHandler {
+        result: ShellEscapeResult,
+    }
+
+    impl ShellEscapeHandler for MockShellEscapeHandler {
+        fn execute_write18(&self, _command: &str, _line: u32) -> ShellEscapeResult {
+            self.result.clone()
+        }
+    }
+
+    struct MockFileOperationHandler {
+        read_result: FileOperationResult,
+        write_result: FileOperationResult,
+    }
+
+    impl FileOperationHandler for MockFileOperationHandler {
+        fn check_open_read(&self, _path: &str, _line: u32) -> FileOperationResult {
+            self.read_result.clone()
+        }
+
+        fn check_open_write(&self, _path: &str, _line: u32) -> FileOperationResult {
+            self.write_result.clone()
+        }
+    }
 
     fn parsed_document(body: &str) -> ParsedDocument {
         ParsedDocument {
@@ -7564,6 +7858,29 @@ mod tests {
             bibliography_state: BibliographyState::default(),
             has_unresolved_refs: false,
         }
+    }
+
+    fn parse_recovering_with_handlers(
+        source_body: &str,
+        shell_escape_handler: Option<&dyn ShellEscapeHandler>,
+        file_operation_handler: Option<&dyn FileOperationHandler>,
+    ) -> super::ParseOutput {
+        MinimalLatexParser.parse_recovering_with_context_and_handlers(
+            &format!(
+                "\\documentclass{{article}}\n\\begin{{document}}\n{source_body}\n\\end{{document}}\n"
+            ),
+            BTreeMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+            Vec::new(),
+            None,
+            shell_escape_handler,
+            file_operation_handler,
+        )
     }
 
     #[test]
@@ -8018,6 +8335,163 @@ mod tests {
             line: 3,
             message: "tikz: unsupported command `foo`".to_string(),
         }));
+    }
+
+    #[test]
+    fn write18_without_handler_emits_warning() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\n\\write18{echo test}\n\\end{document}\n",
+        );
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
+            line: 3,
+            command: "echo test".to_string(),
+        }));
+    }
+
+    #[test]
+    fn immediate_write18_without_handler_emits_warning() {
+        let output = parse_recovering_with_handlers(r"\immediate\write18{echo test}", None, None);
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
+            line: 3,
+            command: "echo test".to_string(),
+        }));
+    }
+
+    #[test]
+    fn write18_with_denied_handler_emits_warning() {
+        let handler = MockShellEscapeHandler {
+            result: ShellEscapeResult::Denied,
+        };
+
+        let output = parse_recovering_with_handlers(r"\write18{echo test}", Some(&handler), None);
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
+            line: 3,
+            command: "echo test".to_string(),
+        }));
+    }
+
+    #[test]
+    fn immediate_write18_with_success_handler_emits_no_diagnostic() {
+        let handler = MockShellEscapeHandler {
+            result: ShellEscapeResult::Success { exit_code: 0 },
+        };
+
+        let output =
+            parse_recovering_with_handlers(r"\immediate\write18{echo test}", Some(&handler), None);
+
+        assert!(output.document.is_some());
+        assert!(!output.errors.iter().any(|error| matches!(
+            error,
+            ParseError::ShellEscapeNotAllowed { .. } | ParseError::ShellEscapeError { .. }
+        )));
+    }
+
+    #[test]
+    fn write18_with_success_handler_emits_no_diagnostic() {
+        let handler = MockShellEscapeHandler {
+            result: ShellEscapeResult::Success { exit_code: 0 },
+        };
+
+        let output = parse_recovering_with_handlers(r"\write18{echo test}", Some(&handler), None);
+
+        assert!(output.document.is_some());
+        assert!(!output.errors.iter().any(|error| matches!(
+            error,
+            ParseError::ShellEscapeNotAllowed { .. } | ParseError::ShellEscapeError { .. }
+        )));
+    }
+
+    #[test]
+    fn write_space_18_without_handler_emits_warning() {
+        let output = parse_recovering_with_handlers(r"\write 18{echo test}", None, None);
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
+            line: 3,
+            command: "echo test".to_string(),
+        }));
+    }
+
+    #[test]
+    fn immediate_write_space_18_without_handler_emits_warning() {
+        let output =
+            parse_recovering_with_handlers(r"\immediate\write 18{echo test}", None, None);
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
+            line: 3,
+            command: "echo test".to_string(),
+        }));
+    }
+
+    #[test]
+    fn openin_denied_handler_emits_diagnostic() {
+        let handler = MockFileOperationHandler {
+            read_result: FileOperationResult::Denied {
+                path: "/tmp/secret.tex".to_string(),
+                reason: "outside allowed read/write roots".to_string(),
+            },
+            write_result: FileOperationResult::Allowed,
+        };
+
+        let output =
+            parse_recovering_with_handlers(r"\openin1=/tmp/secret.tex", None, Some(&handler));
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::FileOperationDenied {
+            line: 3,
+            operation: super::FileOperationKind::OpenIn,
+            path: "/tmp/secret.tex".to_string(),
+            reason: "outside allowed read/write roots".to_string(),
+        }));
+    }
+
+    #[test]
+    fn openout_denied_handler_emits_diagnostic() {
+        let handler = MockFileOperationHandler {
+            read_result: FileOperationResult::Allowed,
+            write_result: FileOperationResult::Denied {
+                path: "/tmp/output.tex".to_string(),
+                reason: "outside allowed read/write roots".to_string(),
+            },
+        };
+
+        let output =
+            parse_recovering_with_handlers(r"\openout1=/tmp/output.tex", None, Some(&handler));
+
+        assert!(output.document.is_some());
+        assert!(output.errors.contains(&ParseError::FileOperationDenied {
+            line: 3,
+            operation: super::FileOperationKind::OpenOut,
+            path: "/tmp/output.tex".to_string(),
+            reason: "outside allowed read/write roots".to_string(),
+        }));
+    }
+
+    #[test]
+    fn openin_and_openout_allowed_emit_no_diagnostic() {
+        let handler = MockFileOperationHandler {
+            read_result: FileOperationResult::Allowed,
+            write_result: FileOperationResult::Allowed,
+        };
+
+        let output = parse_recovering_with_handlers(
+            "\\openin1=allowed.tex\n\\openout1=allowed.out",
+            None,
+            Some(&handler),
+        );
+
+        assert!(output.document.is_some());
+        assert!(!output
+            .errors
+            .iter()
+            .any(|error| matches!(error, ParseError::FileOperationDenied { .. })));
     }
 
     #[test]

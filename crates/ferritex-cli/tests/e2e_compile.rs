@@ -1864,6 +1864,90 @@ fn lsp_diagnostics_include_compile_errors() {
     assert!(child.wait().expect("wait lsp").success());
 }
 
+#[test]
+fn compile_tikz_basic_shapes_emits_vector_pdf_operators() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("tikz-basic.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\draw (0,0) -- (2,1);\n\\draw (0,0) rectangle (3,2);\n\\draw (1,1) circle (0.5cm);\n\\node at (1.5,1) {TikzLabel};\n\\end{tikzpicture}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.trim().is_empty());
+
+    let pdf_file = dir.path().join("tikz-basic.pdf");
+    let pdf_bytes = std::fs::read(&pdf_file).expect("read output pdf");
+    let pdf = String::from_utf8_lossy(&pdf_bytes);
+    assert!(pdf.starts_with("%PDF-1.4"), "pdf: {pdf}");
+    assert!(pdf.contains("q 1 0 0 1 "), "pdf: {pdf}");
+    assert!(pdf.contains(" cm\n"), "pdf: {pdf}");
+    assert!(pdf.contains(" m\n"), "pdf: {pdf}");
+    assert!(pdf.contains(" l\n"), "pdf: {pdf}");
+    assert!(pdf.contains(" c\n"), "pdf: {pdf}");
+    assert!(pdf.contains("\nS\n"), "pdf: {pdf}");
+    assert!(pdf.contains("h\n"), "pdf: {pdf}");
+    assert!(pdf.contains(" w\n"), "pdf: {pdf}");
+    assert!(pdf.contains("BT\n"), "pdf: {pdf}");
+    assert!(pdf.contains("(TikzLabel) Tj"), "pdf: {pdf}");
+    assert!(pdf.contains("\nET\n"), "pdf: {pdf}");
+    assert!(pdf.contains("Q\n"), "pdf: {pdf}");
+    assert!(!pdf.contains("Ferritex placeholder PDF"), "pdf: {pdf}");
+}
+
+#[test]
+fn compile_tikz_nested_style_transform_clip_arrow_emits_pdf_operators() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("tikz-nested.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\begin{tikzpicture}\n\\draw[->] (0,0) -- (3,0);\n\\begin{scope}[xshift=10pt,yshift=5pt]\n\\fill[red] (0,0) rectangle (1,1);\n\\clip (0,0) rectangle (2,2);\n\\draw[blue] (0,0) -- (1,1);\n\\end{scope}\n\\end{tikzpicture}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.trim().is_empty());
+
+    let pdf_file = dir.path().join("tikz-nested.pdf");
+    let pdf_bytes = std::fs::read(&pdf_file).expect("read output pdf");
+    let pdf = String::from_utf8_lossy(&pdf_bytes);
+    assert!(pdf.starts_with("%PDF-1.4"), "pdf: {pdf}");
+    assert!(pdf.matches("q 1 0 0 1 ").count() >= 1, "pdf: {pdf}");
+    assert!(pdf.matches("q\n").count() >= 1, "pdf: {pdf}");
+    assert!(pdf.matches("Q\n").count() >= 2, "pdf: {pdf}");
+    assert!(
+        pdf.lines().any(|line| line.ends_with("10 5 cm")),
+        "pdf: {pdf}"
+    );
+    assert!(pdf.contains("W n"), "pdf: {pdf}");
+    assert!(pdf.contains("1 0 0 rg"), "pdf: {pdf}");
+    assert!(
+        pdf.contains("0 0 0 rg"),
+        "arrowhead fill color missing: {pdf}"
+    );
+    assert!(pdf.contains("0 0 1 RG"), "pdf: {pdf}");
+    assert!(pdf.contains("\nf\n"), "pdf: {pdf}");
+    assert!(pdf.contains("\nS\n"), "pdf: {pdf}");
+    assert!(
+        pdf.matches("h\nf\n").count() >= 2,
+        "expected at least 2 closepath+fill sequences (rectangle + arrowhead): {pdf}"
+    );
+    assert!(!pdf.contains("Ferritex placeholder PDF"), "pdf: {pdf}");
+}
+
 fn pdf_page_count(pdf: &str) -> usize {
     let marker = "/Count ";
     let start = pdf.find(marker).expect("pdf page count marker");
