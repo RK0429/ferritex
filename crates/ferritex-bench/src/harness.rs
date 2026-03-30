@@ -123,7 +123,23 @@ pub fn partition_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
 }
 
 pub fn corpus_compat_cases(fixture_base: &Path) -> Vec<BenchCase> {
-    let corpus_dir = fixture_base.join("corpus/layout-core");
+    corpus_subset_cases(fixture_base, "layout-core")
+}
+
+pub fn corpus_navigation_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    corpus_subset_cases(fixture_base, "navigation-features")
+}
+
+pub fn corpus_embedded_assets_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    corpus_subset_cases(fixture_base, "embedded-assets")
+}
+
+pub fn corpus_bibliography_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    corpus_subset_cases(fixture_base, "bibliography")
+}
+
+fn corpus_subset_cases(fixture_base: &Path, subset: &str) -> Vec<BenchCase> {
+    let corpus_dir = fixture_base.join(format!("corpus/{subset}"));
     let mut fixtures = fs::read_dir(&corpus_dir)
         .unwrap_or_else(|error| {
             panic!(
@@ -153,7 +169,7 @@ pub fn corpus_compat_cases(fixture_base: &Path) -> Vec<BenchCase> {
                     )
                 });
             BenchCase {
-                name: format!("corpus-layout-core-{stem}"),
+                name: format!("corpus-{subset}-{stem}"),
                 profile: BenchProfile::CorpusCompat,
                 input_fixture,
                 asset_bundle: None,
@@ -606,7 +622,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        bundle_bootstrap_cases, bundle_package_loading_cases, corpus_compat_cases, BenchCase,
+        bundle_bootstrap_cases, bundle_package_loading_cases, corpus_bibliography_cases,
+        corpus_compat_cases, corpus_embedded_assets_cases, corpus_navigation_cases, BenchCase,
         BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig,
         BenchTiming, CompileBackend, CompileOutput,
     };
@@ -1105,6 +1122,204 @@ mod tests {
         let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
 
         assert!(cases.len() >= 10);
+
+        for case in cases {
+            let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", case.input_fixture.display())
+            });
+            let input_path = case.input_fixture.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "failed to canonicalize {}: {error}",
+                    case.input_fixture.display()
+                )
+            });
+            let uri = format!("file://{}", input_path.display());
+            let state = service.compile_from_source(&source, &uri);
+            let error_diagnostics = state
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                .map(|diagnostic| diagnostic.to_string())
+                .collect::<Vec<_>>();
+
+            assert!(
+                state.success,
+                "{} should compile successfully, diagnostics: {:?}",
+                case.name, state.diagnostics
+            );
+            assert!(
+                error_diagnostics.is_empty(),
+                "{} emitted error diagnostics: {:?}",
+                case.name,
+                error_diagnostics
+            );
+            assert!(
+                state.page_count >= 1,
+                "{} should produce at least one page, got {}",
+                case.name,
+                state.page_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_corpus_navigation_cases_enumerate_fixtures() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_navigation_cases(&fixture_base);
+
+        assert!(cases.len() >= 3);
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::CorpusCompat));
+        assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases
+            .iter()
+            .all(|case| case.name.starts_with("corpus-navigation-features-")));
+        assert!(cases.iter().all(|case| case.input_fixture.exists()));
+    }
+
+    #[test]
+    fn corpus_navigation_documents_compile_successfully() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_navigation_cases(&fixture_base);
+        let gate = FsTestFileAccessGate;
+        let loader = NoopAssetBundleLoader;
+        let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
+
+        assert!(cases.len() >= 3);
+
+        for case in cases {
+            let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", case.input_fixture.display())
+            });
+            let input_path = case.input_fixture.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "failed to canonicalize {}: {error}",
+                    case.input_fixture.display()
+                )
+            });
+            let uri = format!("file://{}", input_path.display());
+            let state = service.compile_from_source(&source, &uri);
+            let error_diagnostics = state
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                .map(|diagnostic| diagnostic.to_string())
+                .collect::<Vec<_>>();
+
+            assert!(
+                state.success,
+                "{} should compile successfully, diagnostics: {:?}",
+                case.name, state.diagnostics
+            );
+            assert!(
+                error_diagnostics.is_empty(),
+                "{} emitted error diagnostics: {:?}",
+                case.name,
+                error_diagnostics
+            );
+            assert!(
+                state.page_count >= 1,
+                "{} should produce at least one page, got {}",
+                case.name,
+                state.page_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_corpus_embedded_assets_cases_enumerate_fixtures() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_embedded_assets_cases(&fixture_base);
+
+        assert!(cases.len() >= 2);
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::CorpusCompat));
+        assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases
+            .iter()
+            .all(|case| case.name.starts_with("corpus-embedded-assets-")));
+        assert!(cases.iter().all(|case| case.input_fixture.exists()));
+    }
+
+    #[test]
+    fn corpus_embedded_assets_documents_compile_successfully() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_embedded_assets_cases(&fixture_base);
+        let gate = FsTestFileAccessGate;
+        let loader = NoopAssetBundleLoader;
+        let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
+
+        assert!(cases.len() >= 2);
+
+        for case in cases {
+            let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", case.input_fixture.display())
+            });
+            let input_path = case.input_fixture.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "failed to canonicalize {}: {error}",
+                    case.input_fixture.display()
+                )
+            });
+            let uri = format!("file://{}", input_path.display());
+            let state = service.compile_from_source(&source, &uri);
+            let error_diagnostics = state
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                .map(|diagnostic| diagnostic.to_string())
+                .collect::<Vec<_>>();
+
+            assert!(
+                state.success,
+                "{} should compile successfully, diagnostics: {:?}",
+                case.name, state.diagnostics
+            );
+            assert!(
+                error_diagnostics.is_empty(),
+                "{} emitted error diagnostics: {:?}",
+                case.name,
+                error_diagnostics
+            );
+            assert!(
+                state.page_count >= 1,
+                "{} should produce at least one page, got {}",
+                case.name,
+                state.page_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_corpus_bibliography_cases_enumerate_fixtures() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_bibliography_cases(&fixture_base);
+
+        assert!(cases.len() >= 2);
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::CorpusCompat));
+        assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases
+            .iter()
+            .all(|case| case.name.starts_with("corpus-bibliography-")));
+        assert!(cases.iter().all(|case| case.input_fixture.exists()));
+    }
+
+    #[test]
+    fn corpus_bibliography_documents_compile_successfully() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_bibliography_cases(&fixture_base);
+        let gate = FsTestFileAccessGate;
+        let loader = NoopAssetBundleLoader;
+        let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
+
+        assert!(cases.len() >= 2);
 
         for case in cases {
             let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {

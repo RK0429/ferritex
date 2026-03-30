@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use ferritex_bench::{
     bench_fixtures_root, bundle_bootstrap_cases, bundle_package_loading_cases,
+    corpus_bibliography_cases, corpus_embedded_assets_cases, corpus_navigation_cases,
     partition_bench_cases, BenchCase, BenchHarness, BenchProfile, BenchRunConfig,
     CliCompileBackend,
 };
@@ -253,4 +254,274 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
         sequential.timings[0].output_hash, parallel.timings[0].output_hash,
         "partition bench output should stay identical across jobs=1 and jobs=4"
     );
+}
+
+#[test]
+fn corpus_navigation_compiles_and_verifies_content() {
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = corpus_navigation_cases(&bench_fixtures);
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let mut cases = Vec::with_capacity(base_cases.len());
+    for case in &base_cases {
+        let fixture_name = case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename");
+        let temp_input = temp_dir.path().join(fixture_name);
+        std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        cases.push(BenchCase {
+            name: case.name.clone(),
+            profile: case.profile.clone(),
+            input_fixture: temp_input,
+            asset_bundle: case.asset_bundle.clone(),
+            jobs: case.jobs,
+        });
+    }
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases.clone(),
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "corpus navigation compilation failed: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        report.results.len(),
+        cases.len(),
+        "all navigation corpus cases should run"
+    );
+
+    for case in &cases {
+        let pdf_path = case.input_fixture.with_extension("pdf");
+        let pdf_content = std::fs::read_to_string(&pdf_path)
+            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+
+        match case.name.as_str() {
+            "corpus-navigation-features-external_links" => {
+                assert!(
+                    pdf_content.contains("/URI (https://example.com)"),
+                    "external_links PDF should contain example.com URI annotation"
+                );
+            }
+            "corpus-navigation-features-hyperref_basic" => {
+                assert!(
+                    pdf_content.contains("/Subtype /Link"),
+                    "hyperref_basic PDF should contain link annotations"
+                );
+            }
+            "corpus-navigation-features-outlines_sections" => {
+                assert!(
+                    pdf_content.contains("/Outlines"),
+                    "outlines_sections PDF should contain PDF outlines"
+                );
+            }
+            "corpus-navigation-features-pdf_metadata" => {
+                assert!(
+                    pdf_content.contains("/Title (Custom PDF Title)"),
+                    "pdf_metadata PDF should contain custom title metadata"
+                );
+                assert!(
+                    pdf_content.contains("/Author (Custom Author)"),
+                    "pdf_metadata PDF should contain custom author metadata"
+                );
+            }
+            "corpus-navigation-features-mixed_navigation" => {
+                assert!(
+                    pdf_content.contains("/Outlines"),
+                    "mixed_navigation PDF should contain outlines"
+                );
+                assert!(
+                    pdf_content.contains("/URI (https://example.com)"),
+                    "mixed_navigation PDF should contain external URI"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn corpus_embedded_assets_compiles_and_verifies_content() {
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = corpus_embedded_assets_cases(&bench_fixtures);
+    let corpus_dir = bench_fixtures.join("corpus/embedded-assets");
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    // Copy asset files (PNG, PDF) needed by the fixtures
+    for asset in &["pixel.png", "diagram.pdf"] {
+        let src = corpus_dir.join(asset);
+        let dst = temp_dir.path().join(asset);
+        std::fs::copy(&src, &dst).unwrap_or_else(|e| {
+            panic!("copy asset {} to tempdir: {e}", src.display())
+        });
+    }
+
+    let mut cases = Vec::with_capacity(base_cases.len());
+    for case in &base_cases {
+        let fixture_name = case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename");
+        let temp_input = temp_dir.path().join(fixture_name);
+        std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        cases.push(BenchCase {
+            name: case.name.clone(),
+            profile: case.profile.clone(),
+            input_fixture: temp_input,
+            asset_bundle: case.asset_bundle.clone(),
+            jobs: case.jobs,
+        });
+    }
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases.clone(),
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "corpus embedded-assets compilation failed: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        report.results.len(),
+        cases.len(),
+        "all embedded-assets corpus cases should run"
+    );
+
+    for case in &cases {
+        let pdf_path = case.input_fixture.with_extension("pdf");
+        let pdf_bytes = std::fs::read(&pdf_path)
+            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+
+        match case.name.as_str() {
+            "corpus-embedded-assets-png_embed" => {
+                assert!(
+                    pdf_bytes.len() > 100,
+                    "png_embed PDF should have substantial content"
+                );
+            }
+            "corpus-embedded-assets-pdf_embed" => {
+                assert!(
+                    pdf_bytes.len() > 100,
+                    "pdf_embed PDF should have substantial content"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn corpus_bibliography_compiles_and_verifies_content() {
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = corpus_bibliography_cases(&bench_fixtures);
+    let corpus_dir = bench_fixtures.join("corpus/bibliography");
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    // Copy .bbl files needed by bibliography fixtures
+    for entry in std::fs::read_dir(&corpus_dir).expect("read bibliography corpus dir") {
+        let entry = entry.expect("read dir entry");
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("bbl") {
+            let dst = temp_dir.path().join(path.file_name().unwrap());
+            std::fs::copy(&path, &dst).expect("copy bbl to temp dir");
+        }
+    }
+
+    let mut cases = Vec::with_capacity(base_cases.len());
+    for case in &base_cases {
+        let fixture_name = case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename");
+        let temp_input = temp_dir.path().join(fixture_name);
+        std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        cases.push(BenchCase {
+            name: case.name.clone(),
+            profile: case.profile.clone(),
+            input_fixture: temp_input,
+            asset_bundle: case.asset_bundle.clone(),
+            jobs: case.jobs,
+        });
+    }
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases.clone(),
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "corpus bibliography compilation failed: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        report.results.len(),
+        cases.len(),
+        "all bibliography corpus cases should run"
+    );
+
+    for case in &cases {
+        let pdf_path = case.input_fixture.with_extension("pdf");
+        let pdf_content = std::fs::read_to_string(&pdf_path)
+            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+        let pdf_text = extract_pdf_text(&pdf_content);
+
+        match case.name.as_str() {
+            "corpus-bibliography-single_cite" => {
+                assert!(
+                    pdf_text.contains("[1]"),
+                    "single_cite PDF should contain citation marker [1], got: {pdf_text}"
+                );
+            }
+            "corpus-bibliography-multi_cite" => {
+                assert!(
+                    pdf_text.contains("[1]") && pdf_text.contains("[2]"),
+                    "multi_cite PDF should contain citation markers [1] and [2], got: {pdf_text}"
+                );
+            }
+            "corpus-bibliography-custom_labels" => {
+                assert!(
+                    pdf_text.contains("[Knu84]"),
+                    "custom_labels PDF should contain custom label [Knu84], got: {pdf_text}"
+                );
+            }
+            "corpus-bibliography-inline_thebibliography" => {
+                assert!(
+                    pdf_text.contains("[1]") && pdf_text.contains("[2]"),
+                    "inline_thebibliography PDF should contain citation markers, got: {pdf_text}"
+                );
+            }
+            _ => {}
+        }
+    }
 }

@@ -1,0 +1,21 @@
+\documentclass{article}
+\usepackage{hyperref}
+\title{Navigation Mix}
+\author{Test Author}
+\begin{document}
+\tableofcontents
+
+\section{Introduction}\label{sec:intro}
+This document exercises internal links, external links, and outlines together.
+
+\section{References}\label{sec:refs}
+See Section \ref{sec:intro} and \hyperref[sec:intro]{the introduction}.
+Visit \href{https://example.com}{Example} and \url{https://ctan.org}.
+
+\section{Citations}\label{sec:cites}
+Reference \cite{knuth}.
+
+\begin{thebibliography}{99}
+\bibitem{knuth} Donald Knuth, The TeXbook.
+\end{thebibliography}
+\end{document}
