@@ -893,6 +893,7 @@ impl<'a> Cursor<'a> {
     fn consume_arrow_spec(&mut self) -> Option<ArrowSpec> {
         for (token, arrows) in [
             ("<->", ArrowSpec::Both),
+            ("->>", ArrowSpec::Forward),
             ("->", ArrowSpec::Forward),
             ("<-", ArrowSpec::Backward),
         ] {
@@ -1070,6 +1071,7 @@ fn split_option(option: &str) -> (&str, Option<&str>) {
 
 fn parse_arrow_option(option: &str) -> Option<ArrowSpec> {
     match option.trim() {
+        "->>" => Some(ArrowSpec::Forward),
         "->" => Some(ArrowSpec::Forward),
         "<-" => Some(ArrowSpec::Backward),
         "<->" => Some(ArrowSpec::Both),
@@ -1564,17 +1566,19 @@ mod tests {
     fn parses_arrow_options() {
         let result = parse_tikzpicture(
             r"\draw[->] (0,0) -- (1,0);
+               \draw[->>] (0,0.5) -- (1,0.5);
                \draw[<-] (0,1) -- (1,1);
                \draw[<->] (0,2) -- (1,2);",
         );
 
         assert!(result.diagnostics.is_empty());
-        let [GraphicNode::Vector(forward), GraphicNode::Vector(backward), GraphicNode::Vector(both)] =
+        let [GraphicNode::Vector(forward), GraphicNode::Vector(double_forward), GraphicNode::Vector(backward), GraphicNode::Vector(both)] =
             result.scene.nodes.as_slice()
         else {
-            panic!("expected three vector nodes");
+            panic!("expected four vector nodes");
         };
         assert_eq!(forward.arrows, ArrowSpec::Forward);
+        assert_eq!(double_forward.arrows, ArrowSpec::Forward);
         assert_eq!(backward.arrows, ArrowSpec::Backward);
         assert_eq!(both.arrows, ArrowSpec::Both);
     }

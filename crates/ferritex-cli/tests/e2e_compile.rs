@@ -1,8 +1,10 @@
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use ferritex_bench::bench_fixtures_root;
 use serde_json::{json, Value};
 
 const PNG_1X1_RGB: &[u8] = &[
@@ -2285,6 +2287,351 @@ fn compile_tikz_nested_style_transform_clip_arrow_emits_pdf_operators() {
         "expected at least 2 closepath+fill sequences (rectangle + arrowhead): {pdf}"
     );
     assert!(!pdf.contains("Ferritex placeholder PDF"), "pdf: {pdf}");
+}
+
+#[test]
+fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
+    let fixtures = corpus_tex_fixtures("tikz/basic-shapes");
+    assert!(fixtures.len() >= 5);
+
+    for fixture in fixtures {
+        let stem = fixture
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("utf-8 fixture stem");
+        let (stderr, pdf) = compile_fixture_via_cli(&fixture, None);
+
+        assert!(
+            stderr.trim().is_empty(),
+            "fixture {} stderr: {stderr}",
+            fixture.display()
+        );
+        assert!(
+            pdf.starts_with("%PDF-1.4"),
+            "fixture {} pdf: {pdf}",
+            fixture.display()
+        );
+
+        match stem {
+            "line" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("\nS\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "rectangle" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("h\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("\nS\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "circle" => {
+                assert!(
+                    pdf.contains(" c\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("\nS\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "text_node" => {
+                assert!(
+                    pdf.contains("BT\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("(NodeText) Tj"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("\nET\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "mixed_shapes" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" c\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("BT\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("(NodeText) Tj"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("\nET\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            other => panic!("unexpected tikz basic fixture stem: {other}"),
+        }
+    }
+}
+
+#[test]
+fn corpus_tikz_nested_fixtures_emit_expected_operators() {
+    let fixtures = corpus_tex_fixtures("tikz/nested-style-transform-clip-arrow");
+    assert!(fixtures.len() >= 5);
+
+    for fixture in fixtures {
+        let stem = fixture
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("utf-8 fixture stem");
+        let (stderr, pdf) = compile_fixture_via_cli(&fixture, None);
+
+        assert!(
+            stderr.trim().is_empty(),
+            "fixture {} stderr: {stderr}",
+            fixture.display()
+        );
+        assert!(
+            pdf.starts_with("%PDF-1.4"),
+            "fixture {} pdf: {pdf}",
+            fixture.display()
+        );
+        assert!(
+            pdf.contains("q\n") || pdf.contains("q 1 0 0 1 "),
+            "fixture {} pdf: {pdf}",
+            fixture.display()
+        );
+        assert!(
+            pdf.contains("Q\n"),
+            "fixture {} pdf: {pdf}",
+            fixture.display()
+        );
+
+        match stem {
+            "scope_style_inherit" => {
+                assert!(
+                    pdf.contains("1 0 0 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 1 rg"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "transform_shift" => {
+                assert!(
+                    pdf.lines().any(|line| line.ends_with("10 5 cm")),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 1 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "clip_rect" => {
+                assert!(
+                    pdf.contains("W n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("1 0 0 rg"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "arrow_styles" => {
+                assert!(
+                    pdf.contains("\nS\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 0 rg"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.matches("h\nf\n").count() >= 2,
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "combined_nested" => {
+                assert!(
+                    pdf.lines().any(|line| line.ends_with("10 5 cm")),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("W n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("1 0 0 rg"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 1 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            other => panic!("unexpected tikz nested fixture stem: {other}"),
+        }
+    }
+}
+
+#[test]
+fn corpus_partition_book_fixtures_compile_via_cli() {
+    let fixtures = corpus_tex_fixtures("partition-book");
+    assert!(fixtures.len() >= 3);
+
+    for fixture in fixtures {
+        let (stderr, pdf) = compile_fixture_via_cli(&fixture, Some("4"));
+
+        assert!(
+            stderr.trim().is_empty(),
+            "fixture {} stderr: {stderr}",
+            fixture.display()
+        );
+        assert!(
+            pdf.starts_with("%PDF-1.4"),
+            "fixture {} pdf: {pdf}",
+            fixture.display()
+        );
+        assert!(
+            pdf_page_count(&pdf) >= 10,
+            "fixture {} page count: {}, pdf: {pdf}",
+            fixture.display(),
+            pdf_page_count(&pdf)
+        );
+    }
+}
+
+#[test]
+fn corpus_partition_article_fixtures_compile_via_cli() {
+    let fixtures = corpus_tex_fixtures("partition-article");
+    assert!(fixtures.len() >= 3);
+
+    for fixture in fixtures {
+        let (stderr, pdf) = compile_fixture_via_cli(&fixture, None);
+
+        assert!(
+            stderr.trim().is_empty(),
+            "fixture {} stderr: {stderr}",
+            fixture.display()
+        );
+        assert!(
+            pdf.starts_with("%PDF-1.4"),
+            "fixture {} pdf: {pdf}",
+            fixture.display()
+        );
+        assert!(
+            pdf_page_count(&pdf) >= 1,
+            "fixture {} page count: {}, pdf: {pdf}",
+            fixture.display(),
+            pdf_page_count(&pdf)
+        );
+    }
+}
+
+fn corpus_tex_fixtures(subset: &str) -> Vec<PathBuf> {
+    let mut fixtures = std::fs::read_dir(bench_fixtures_root().join("corpus").join(subset))
+        .unwrap_or_else(|error| panic!("failed to read corpus fixtures for {subset}: {error}"))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("failed to enumerate corpus fixture entry: {error}"))
+                .path()
+        })
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("tex"))
+        .collect::<Vec<_>>();
+    fixtures.sort();
+    fixtures
+}
+
+fn compile_fixture_via_cli(fixture: &Path, jobs: Option<&str>) -> (String, String) {
+    let output_dir = tempfile::tempdir().expect("create output tempdir");
+    let mut command = ferritex_bin();
+    command.args([
+        "compile",
+        fixture.to_str().expect("utf-8 fixture path"),
+        "--output-dir",
+        output_dir.path().to_str().expect("utf-8 output path"),
+    ]);
+    if let Some(jobs) = jobs {
+        command.args(["--jobs", jobs]);
+    }
+
+    let output = command.output().expect("failed to run ferritex");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fixture {} failed, stderr: {stderr}",
+        fixture.display()
+    );
+
+    let pdf_path = output_dir.path().join(format!(
+        "{}.pdf",
+        fixture
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("utf-8 fixture stem")
+    ));
+    let pdf_bytes = std::fs::read(&pdf_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", pdf_path.display()));
+    (stderr, String::from_utf8_lossy(&pdf_bytes).into_owned())
 }
 
 fn pdf_page_count(pdf: &str) -> usize {
