@@ -154,6 +154,7 @@ pub struct StyInterpreter<'a, 'resolver> {
     options: &'a [String],
     registry: &'a mut PackageRegistry,
     engine: &'a mut MacroEngine,
+    active_class: Option<ClassInfo>,
     sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
 }
 
@@ -163,6 +164,7 @@ impl<'a, 'resolver> StyInterpreter<'a, 'resolver> {
         options: &'a [String],
         registry: &'a mut PackageRegistry,
         engine: &'a mut MacroEngine,
+        active_class: Option<ClassInfo>,
         sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
     ) -> Self {
         Self {
@@ -170,6 +172,7 @@ impl<'a, 'resolver> StyInterpreter<'a, 'resolver> {
             options,
             registry,
             engine,
+            active_class,
             sty_resolver,
         }
     }
@@ -180,6 +183,7 @@ impl<'a, 'resolver> StyInterpreter<'a, 'resolver> {
             self.options,
             self.registry,
             self.engine,
+            self.active_class,
             self.sty_resolver,
         )
     }
@@ -315,10 +319,14 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
     }
 
     register_noop_command(engine, "author", 1);
+    register_noop_command(engine, "@gobble", 1);
+    register_noop_command(engine, "@gobbletwo", 2);
     register_noop_command(engine, "maketitle", 0);
     register_noop_command(engine, "title", 1);
     register_noop_command(engine, "textsf", 1);
     register_noop_command(engine, "texttt", 1);
+    register_passthrough_command(engine, "@firstoftwo", 2, 1);
+    register_passthrough_command(engine, "@secondoftwo", 2, 2);
 }
 
 pub fn load_package(
@@ -326,6 +334,7 @@ pub fn load_package(
     options: &[String],
     registry: &mut PackageRegistry,
     engine: &mut MacroEngine,
+    active_class: Option<ClassInfo>,
     sty_resolver: Option<&StyPackageResolver<'_>>,
 ) -> Result<bool, String> {
     if registry.is_loaded(name) {
@@ -343,7 +352,8 @@ pub fn load_package(
         Ok(())
     } else if let Some(resolve_sty) = sty_resolver {
         if let Some(source) = resolve_sty(name) {
-            StyInterpreter::new(&source, options, registry, engine, sty_resolver).interpret()
+            StyInterpreter::new(&source, options, registry, engine, active_class, sty_resolver)
+                .interpret()
         } else {
             Ok(())
         }
@@ -493,13 +503,15 @@ mod tests {
         let mut engine = MacroEngine::default();
 
         assert!(
-            load_package("xcolor", &[], &mut registry, &mut engine, None).expect("load xcolor")
+            load_package("xcolor", &[], &mut registry, &mut engine, None, None)
+                .expect("load xcolor")
         );
         assert!(!load_package(
             "xcolor",
             &["dvipsnames".to_string()],
             &mut registry,
             &mut engine,
+            None,
             None,
         )
         .expect("duplicate xcolor load"));
@@ -515,7 +527,8 @@ mod tests {
         let mut engine = MacroEngine::default();
 
         assert!(
-            load_package("fontspec", &[], &mut registry, &mut engine, None).expect("load fontspec")
+            load_package("fontspec", &[], &mut registry, &mut engine, None, None)
+                .expect("load fontspec")
         );
 
         assert!(engine.lookup("setmainfont").is_some());
@@ -555,11 +568,12 @@ mod tests {
             &["bold".to_string()],
             &mut registry,
             &mut engine,
+            None,
             Some(&resolver),
         )
         .expect("load mypkg"));
         assert!(
-            !load_package("mypkg", &[], &mut registry, &mut engine, Some(&resolver))
+            !load_package("mypkg", &[], &mut registry, &mut engine, None, Some(&resolver))
                 .expect("duplicate mypkg load")
         );
 
@@ -601,7 +615,8 @@ mod tests {
         };
 
         assert!(
-            load_package("xcolor", &[], &mut registry, &mut engine, None).expect("load xcolor")
+            load_package("xcolor", &[], &mut registry, &mut engine, None, None)
+                .expect("load xcolor")
         );
         engine.define_global(
             "survivor".to_string(),
@@ -618,6 +633,7 @@ mod tests {
             &[],
             &mut registry,
             &mut engine,
+            None,
             Some(&resolver),
         )
         .expect_err("broken .sty should fail");

@@ -21,7 +21,7 @@ use crate::synctex::api::SourceLineTrace;
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
     package_loading::{
-        load_document_class, load_package, ClassRegistry, OptionRegistry, PackageInfo,
+        load_document_class, load_package, ClassInfo, ClassRegistry, OptionRegistry, PackageInfo,
         PackageRegistry, StyPackageResolver,
     },
     registers::{CompatDimenRegister, CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX},
@@ -76,6 +76,7 @@ const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
 const EQUATION_ENV_SEGMENT_SEPARATOR: char = '\u{001D}';
 const PDF_CREATION_DATE_PLACEHOLDER: &str = "D:20700101000000+00'00'";
+const MAX_KERNEL_LOOP_ITERATIONS: usize = 1_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SectionEntry {
@@ -892,6 +893,7 @@ pub(crate) fn interpret_sty_package_source(
     current_package_options: &[String],
     registry: &mut PackageRegistry,
     engine: &mut MacroEngine,
+    active_class: Option<ClassInfo>,
     sty_resolver: Option<&StyPackageResolver<'_>>,
 ) -> Result<(), String> {
     if source.trim().is_empty() {
@@ -903,6 +905,7 @@ pub(crate) fn interpret_sty_package_source(
         engine.clone(),
         registry.clone(),
         current_package_options.to_vec(),
+        active_class,
         sty_resolver,
     );
     let (next_engine, next_registry) = driver
@@ -1306,6 +1309,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         macro_engine: MacroEngine,
         package_registry: PackageRegistry,
         current_package_options: Vec<String>,
+        active_class: Option<ClassInfo>,
         sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
     ) -> Self {
         let mut driver = Self::new_with_context(
@@ -1324,6 +1328,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         driver.package_registry = package_registry;
         driver.current_package_options = current_package_options;
         driver.sty_interpreter_mode = true;
+        if let Some(active_class) = active_class {
+            driver.class_registry.set_class(active_class);
+        }
         driver.macro_engine.set_catcode(b'@', CatCode::Letter);
         driver.sync_tokenizer_catcodes();
         driver
@@ -1720,13 +1727,49 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 let _ = self.take_global_prefix();
                 self.parse_ifpackageloaded()?;
             }
+            "@ifclassloaded" => {
+                let _ = self.take_global_prefix();
+                self.parse_ifclassloaded()?;
+            }
+            "@ifl@aded" => {
+                let _ = self.take_global_prefix();
+                self.parse_ifloaded_extension()?;
+            }
+            "@ifnextchar" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_ifnextchar()?;
+            }
+            "@ifstar" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_ifstar()?;
+            }
             "@namedef" => {
                 let is_global = self.take_global_prefix();
                 self.parse_at_namedef(is_global)?;
             }
+            "@nameuse" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_nameuse(token.line)?;
+            }
             "@ifundefined" => {
                 let _ = self.take_global_prefix();
                 self.parse_ifundefined()?;
+            }
+            "@for" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_for_loop(false)?;
+            }
+            "@tfor" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_for_loop(true)?;
+            }
+            "@gobble" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_gobble(1)?;
+            }
+            "@gobbletwo" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_gobble(2)?;
             }
             "newif" => {
                 let is_global = self.take_global_prefix();
@@ -2186,6 +2229,18 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.protected_prefix = true;
                 Ok(true)
             }
+            "makeatletter" => {
+                let _ = self.take_global_prefix();
+                self.macro_engine.set_catcode(b'@', CatCode::Letter);
+                self.sync_tokenizer_catcodes();
+                Ok(true)
+            }
+            "makeatother" => {
+                let _ = self.take_global_prefix();
+                self.macro_engine.set_catcode(b'@', CatCode::Other);
+                self.sync_tokenizer_catcodes();
+                Ok(true)
+            }
             "unless" => {
                 let _ = self.take_global_prefix();
                 self.process_unless_primitive(token.line)?;
@@ -2219,6 +2274,71 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             "newenvironment" | "renewenvironment" => {
                 let _ = self.take_global_prefix();
                 self.parse_newenvironment()?;
+                Ok(true)
+            }
+            "@ifpackageloaded" => {
+                let _ = self.take_global_prefix();
+                self.parse_ifpackageloaded()?;
+                Ok(true)
+            }
+            "@ifclassloaded" => {
+                let _ = self.take_global_prefix();
+                self.parse_ifclassloaded()?;
+                Ok(true)
+            }
+            "@ifl@aded" => {
+                let _ = self.take_global_prefix();
+                self.parse_ifloaded_extension()?;
+                Ok(true)
+            }
+            "@ifnextchar" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_ifnextchar()?;
+                Ok(true)
+            }
+            "@ifstar" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_ifstar()?;
+                Ok(true)
+            }
+            "@namedef" => {
+                let is_global = self.take_global_prefix();
+                self.parse_at_namedef(is_global)?;
+                Ok(true)
+            }
+            "@nameuse" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_nameuse(token.line)?;
+                Ok(true)
+            }
+            "@ifundefined" => {
+                let _ = self.take_global_prefix();
+                self.parse_ifundefined()?;
+                Ok(true)
+            }
+            "@for" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_for_loop(false)?;
+                Ok(true)
+            }
+            "@tfor" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_for_loop(true)?;
+                Ok(true)
+            }
+            "@gobble" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_gobble(1)?;
+                Ok(true)
+            }
+            "@gobbletwo" => {
+                let _ = self.take_global_prefix();
+                self.parse_at_gobble(2)?;
+                Ok(true)
+            }
+            "newif" => {
+                let is_global = self.take_global_prefix();
+                self.parse_newif(token.line, is_global)?;
                 Ok(true)
             }
             "DeclareOption" => {
@@ -2385,6 +2505,25 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 let _ = self.take_global_prefix();
                 let value = self.parse_pdfunescapehex_value()?;
                 self.push_front_plain_tokens(tokens_from_bytes(&value, token.line));
+                Ok(true)
+            }
+            "pdfliteral" => {
+                let _ = self.take_global_prefix();
+                let _ = self.read_required_braced_tokens()?;
+                Ok(true)
+            }
+            "pdfsavepos" => {
+                let _ = self.take_global_prefix();
+                Ok(true)
+            }
+            "pdflastxpos" => {
+                let _ = self.take_global_prefix();
+                self.push_front_tokens(tokens_from_text("0", token.line));
+                Ok(true)
+            }
+            "pdflastypos" => {
+                let _ = self.take_global_prefix();
+                self.push_front_tokens(tokens_from_text("0", token.line));
                 Ok(true)
             }
             "numexpr" => {
@@ -4504,6 +4643,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 &options,
                 &mut self.package_registry,
                 &mut self.macro_engine,
+                self.class_registry.active_class().cloned(),
                 self.sty_resolver,
             )
             .map_err(|_| ParseError::InvalidDocumentClass { line })?;
@@ -4583,6 +4723,125 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         Ok(())
     }
 
+    fn parse_ifclassloaded(&mut self) -> Result<(), ParseError> {
+        let Some(class_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(true_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(false_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let class_name = tokens_to_text(&class_tokens)
+            .trim()
+            .trim_end_matches(".cls")
+            .to_string();
+        let selected = if self
+            .class_registry
+            .active_class()
+            .is_some_and(|active_class| !class_name.is_empty() && active_class.name == class_name)
+        {
+            true_tokens
+        } else {
+            false_tokens
+        };
+        self.push_front_plain_tokens(selected);
+        Ok(())
+    }
+
+    fn parse_ifloaded_extension(&mut self) -> Result<(), ParseError> {
+        let Some(extension_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(name_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(true_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(false_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let extension = tokens_to_text(&extension_tokens)
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let target_name = tokens_to_text(&name_tokens).trim().to_string();
+        let is_loaded = match extension.as_str() {
+            "cls" => {
+                let class_name = target_name.trim_end_matches(".cls");
+                self.class_registry.active_class().is_some_and(|active_class| {
+                    !class_name.is_empty() && active_class.name == class_name
+                })
+            }
+            "sty" => {
+                let package_name = target_name.trim_end_matches(".sty");
+                !package_name.is_empty() && self.package_registry.is_loaded(package_name)
+            }
+            _ => false,
+        };
+
+        self.push_front_plain_tokens(if is_loaded { true_tokens } else { false_tokens });
+        Ok(())
+    }
+
+    fn parse_at_ifnextchar(&mut self) -> Result<(), ParseError> {
+        let target_token = self
+            .collect_macro_arguments(1)?
+            .into_iter()
+            .next()
+            .and_then(|tokens| tokens.into_iter().next());
+        let Some(true_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(false_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let peeked = self.next_significant_token();
+        let matched = matches!(
+            (target_token.as_ref(), peeked.as_ref()),
+            (Some(target), Some(next)) if tokens_equal(target, next)
+        );
+
+        if let Some(token) = peeked {
+            self.push_front_token(token);
+        }
+        self.push_front_plain_tokens(if matched { true_tokens } else { false_tokens });
+        Ok(())
+    }
+
+    fn parse_at_ifstar(&mut self) -> Result<(), ParseError> {
+        let Some(star_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let Some(nostar_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        match self.next_significant_token() {
+            Some(token) if token_as_char(&token) == Some('*') => {
+                self.push_front_plain_tokens(star_tokens);
+            }
+            Some(token) => {
+                self.push_front_token(token);
+                self.push_front_plain_tokens(nostar_tokens);
+            }
+            None => self.push_front_plain_tokens(nostar_tokens),
+        }
+        Ok(())
+    }
+
+    fn parse_at_gobble(&mut self, argument_count: usize) -> Result<(), ParseError> {
+        for _ in 0..argument_count {
+            let _ = self.read_required_braced_tokens()?;
+        }
+        Ok(())
+    }
+
     fn parse_at_namedef(&mut self, is_global: bool) -> Result<(), ParseError> {
         let Some(name_tokens) = self.read_required_braced_tokens()? else {
             return Ok(());
@@ -4631,6 +4890,80 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             false_tokens
         };
         self.push_front_plain_tokens(selected);
+        Ok(())
+    }
+
+    fn parse_at_nameuse(&mut self, line: u32) -> Result<(), ParseError> {
+        let Some(name_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+        let name = tokens_to_text(&name_tokens)
+            .trim()
+            .trim_start_matches('\\')
+            .to_string();
+        if name.is_empty() || self.macro_engine.lookup(&name).is_none() {
+            return Ok(());
+        }
+
+        if let Some(expansion) = self.expand_defined_control_sequence_token(&control_word_token(
+            &name, line,
+        ))? {
+            self.push_front_tokens(expansion);
+        }
+        Ok(())
+    }
+
+    fn parse_at_for_loop(&mut self, tokenwise: bool) -> Result<(), ParseError> {
+        let Some(variable_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        let Some(variable_name) = control_sequence_name(&variable_token) else {
+            return Ok(());
+        };
+
+        let Some(colon_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        if !matches!(colon_token.kind, TokenKind::CharToken { char: ':', .. }) {
+            self.push_front_token(colon_token);
+            return Ok(());
+        }
+
+        let Some(equals_token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        if !matches!(equals_token.kind, TokenKind::CharToken { char: '=', .. }) {
+            self.push_front_token(equals_token);
+            return Ok(());
+        }
+
+        let Some(loop_tokens) = self.read_until_do_tokens() else {
+            return Ok(());
+        };
+        let Some(body_tokens) = self.read_required_braced_tokens()? else {
+            return Ok(());
+        };
+
+        let items: Vec<Vec<Token>> = if tokenwise {
+            loop_tokens.into_iter().map(|token| vec![token]).collect()
+        } else {
+            split_comma_separated_token_lists(&loop_tokens)
+                .into_iter()
+                .map(trim_surrounding_space_tokens)
+                .collect()
+        };
+
+        let mut expansion = Vec::new();
+        for item in items.into_iter().take(MAX_KERNEL_LOOP_ITERATIONS) {
+            expansion.extend(macro_definition_tokens(
+                &variable_name,
+                item,
+                variable_token.line,
+            ));
+            expansion.extend(body_tokens.clone());
+        }
+
+        self.push_front_plain_tokens(expansion);
         Ok(())
     }
 
@@ -4683,6 +5016,36 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 .define_local(false_setter_name, false_setter);
         }
         Ok(())
+    }
+
+    fn read_until_do_tokens(&mut self) -> Option<Vec<Token>> {
+        let mut depth = 0usize;
+        let mut tokens = Vec::new();
+
+        while let Some(token) = self.next_raw_token() {
+            match token.kind {
+                TokenKind::CharToken {
+                    cat: CatCode::BeginGroup,
+                    ..
+                } => {
+                    depth += 1;
+                    tokens.push(token);
+                }
+                TokenKind::CharToken {
+                    cat: CatCode::EndGroup,
+                    ..
+                } => {
+                    depth = depth.saturating_sub(1);
+                    tokens.push(token);
+                }
+                _ if depth == 0 && control_sequence_name(&token).as_deref() == Some("do") => {
+                    return Some(tokens);
+                }
+                _ => tokens.push(token),
+            }
+        }
+
+        None
     }
 
     fn parse_def(&mut self, is_global: bool) -> Result<(), ParseError> {
@@ -5300,6 +5663,16 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     let value = self.parse_pdfunescapehex_value()?;
                     body.extend(tokens_from_bytes(&value, token.line));
                 }
+                TokenKind::ControlWord(ref name) if name == "pdfliteral" => {
+                    let _ = self.read_required_braced_tokens()?;
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfsavepos" => {}
+                TokenKind::ControlWord(ref name) if name == "pdflastxpos" => {
+                    body.extend(tokens_from_text("0", token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdflastypos" => {
+                    body.extend(tokens_from_text("0", token.line));
+                }
                 TokenKind::ControlWord(ref name) if name == "numexpr" => {
                     let value = self.parse_numexpr_value(token.line)?;
                     body.extend(tokens_from_text(&value.to_string(), token.line));
@@ -5876,6 +6249,93 @@ fn detokenized_tokens(tokens: &[Token], line: u32) -> Vec<Token> {
             column: (offset + 1) as u32,
         })
         .collect()
+}
+
+fn split_comma_separated_token_lists(tokens: &[Token]) -> Vec<Vec<Token>> {
+    let mut parts = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0usize;
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::CharToken {
+                cat: CatCode::BeginGroup,
+                ..
+            } => {
+                depth += 1;
+                current.push(token.clone());
+            }
+            TokenKind::CharToken {
+                cat: CatCode::EndGroup,
+                ..
+            } => {
+                depth = depth.saturating_sub(1);
+                current.push(token.clone());
+            }
+            TokenKind::CharToken { char: ',', .. } if depth == 0 => {
+                parts.push(current);
+                current = Vec::new();
+            }
+            _ => current.push(token.clone()),
+        }
+    }
+
+    parts.push(current);
+    parts
+}
+
+fn trim_surrounding_space_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    let start = tokens
+        .iter()
+        .position(|token| {
+            !matches!(
+                token.kind,
+                TokenKind::CharToken {
+                    cat: CatCode::Space,
+                    ..
+                }
+            )
+        })
+        .unwrap_or(tokens.len());
+    let end = tokens
+        .iter()
+        .rposition(|token| {
+            !matches!(
+                token.kind,
+                TokenKind::CharToken {
+                    cat: CatCode::Space,
+                    ..
+                }
+            )
+        })
+        .map(|index| index + 1)
+        .unwrap_or(start);
+
+    tokens[start..end].to_vec()
+}
+
+fn macro_definition_tokens(name: &str, body: Vec<Token>, line: u32) -> Vec<Token> {
+    let mut tokens = Vec::with_capacity(body.len() + 4);
+    tokens.push(control_word_token("def", line));
+    tokens.push(control_word_token(name, line));
+    tokens.push(Token {
+        kind: TokenKind::CharToken {
+            char: '{',
+            cat: CatCode::BeginGroup,
+        },
+        line,
+        column: 1,
+    });
+    tokens.extend(body);
+    tokens.push(Token {
+        kind: TokenKind::CharToken {
+            char: '}',
+            cat: CatCode::EndGroup,
+        },
+        line,
+        column: 1,
+    });
+    tokens
 }
 
 fn pdf_escape_string(text: &str) -> String {
@@ -8421,7 +8881,8 @@ mod tests {
         parse_bbl_input, render_math_nodes_for_anchor, render_math_nodes_for_encoding,
         CaptionEntry, DocumentLabels, DocumentNode, FloatType, FontFamilyRole,
         IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine, MathNode, MinimalLatexParser,
-        OverUnderKind, PackageInfo, ParseError, ParsedDocument, Parser, ParserDriver, SectionEntry,
+        OverUnderKind, PackageInfo, ParseError, ParsedDocument, Parser, ParserDriver,
+        SectionEntry, MAX_KERNEL_LOOP_ITERATIONS,
     };
     use crate::bibliography::api::BibliographyState;
     use crate::compilation::IndexEntry;
@@ -8830,6 +9291,31 @@ mod tests {
                 "\\documentclass{{article}}\n\\begin{{document}}\n{source_body}\n\\end{{document}}\n"
             ))
             .expect("parse document")
+    }
+
+    fn parse_document_with_package_resolver(
+        source: &str,
+        sty_resolver: Option<&crate::parser::package_loading::StyPackageResolver<'_>>,
+    ) -> ParsedDocument {
+        let output = MinimalLatexParser.parse_recovering_with_context_and_package_resolver(
+            source,
+            BTreeMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+            Vec::new(),
+            sty_resolver,
+        );
+
+        assert!(
+            output.errors.is_empty(),
+            "unexpected parser errors: {:?}",
+            output.errors
+        );
+        output.document.expect("parsed document")
     }
 
     #[test]
@@ -11247,6 +11733,124 @@ mod tests {
         let document = parse_document("\\ifdim\\dimexpr1pt+2pt\\relax=3pt T\\else F\\fi");
 
         assert_eq!(document.body, "T");
+    }
+
+    #[test]
+    fn at_ifnextchar_matches_optional_bracket_and_preserves_false_path() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\makeatletter\n\\def\\peek{\\@ifnextchar[{T}{F}}\n\\makeatother\n\\begin{document}\n\\peek[abc]/\\peek z\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "T[abc]/Fz");
+    }
+
+    #[test]
+    fn at_ifstar_dispatches_starred_and_unstarred_forms() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\makeatletter\n\\def\\peekstar{\\@ifstar{S}{N}}\n\\makeatother\n\\begin{document}\n\\peekstar*X/\\peekstar Y\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "SX/NY");
+    }
+
+    #[test]
+    fn gobble_commands_discard_braced_arguments() {
+        let document = parse_document("\\makeatletter\\@gobble{drop}A/\\@gobbletwo{one}{two}B\\makeatother");
+
+        assert_eq!(document.body, "A/B");
+    }
+
+    #[test]
+    fn firstoftwo_and_secondoftwo_select_expected_branch() {
+        let document =
+            parse_document("\\makeatletter\\@firstoftwo{A}{B}/\\@secondoftwo{A}{B}\\makeatother");
+
+        assert_eq!(document.body, "A/B");
+    }
+
+    #[test]
+    fn at_nameuse_matches_csname_expansion() {
+        let document = parse_document(
+            "\\makeatletter\\def\\foo#1{[#1]}\\@nameuse{foo}{x}/\\csname foo\\endcsname{y}\\makeatother",
+        );
+
+        assert_eq!(document.body, "[x]/[y]");
+    }
+
+    #[test]
+    fn at_for_and_at_tfor_expand_each_iteration_with_current_binding() {
+        let document = parse_document(
+            "\\makeatletter\\def\\acc{}\\@for\\item:=a,b,c\\do{\\edef\\acc{\\acc[\\item]}}\\def\\tacc{}\\@tfor\\tok:=xy\\do{\\edef\\tacc{\\tacc(\\tok)}}\\acc/\\tacc\\makeatother",
+        );
+
+        assert_eq!(document.body, "[a][b][c]/(x)(y)");
+    }
+
+    #[test]
+    fn at_for_and_at_tfor_are_bounded_to_1000_iterations() {
+        let csv_items = vec!["x"; MAX_KERNEL_LOOP_ITERATIONS + 5].join(",");
+        let token_items = "x".repeat(MAX_KERNEL_LOOP_ITERATIONS + 5);
+        let document = parse_document(&format!(
+            "\\makeatletter\\newcount\\forcount\\newcount\\tforcount\\@for\\item:={csv_items}\\do{{\\advance\\forcount by 1}}\\@tfor\\tok:={token_items}\\do{{\\advance\\tforcount by 1}}\\the\\forcount/\\the\\tforcount\\makeatother"
+        ));
+
+        assert_eq!(document.body, "1000/1000");
+    }
+
+    #[test]
+    fn class_and_extension_loaded_checks_use_active_registries() {
+        let document = MinimalLatexParser
+            .parse(
+                "\\documentclass{article}\n\\usepackage{xcolor}\n\\begin{document}\n\\makeatletter\\@ifclassloaded{article}{A}{a}/\\@ifclassloaded{report}{R}{r}/\\@ifl@aded{.cls}{article}{C}{c}/\\@ifl@aded{.sty}{xcolor}{P}{p}/\\@ifl@aded{.sty}{missing}{M}{m}\\makeatother\n\\end{document}\n",
+            )
+            .expect("parse document");
+
+        assert_eq!(document.body, "A/r/C/P/m");
+    }
+
+    #[test]
+    fn pdftex_stub_primitives_are_accepted_without_output_side_effects() {
+        let document =
+            parse_document("\\pdfliteral{q 1 0 0 1 0 0 cm}\\pdfsavepos\\pdflastxpos/\\pdflastypos");
+
+        assert_eq!(document.body, "0/0");
+    }
+
+    #[test]
+    fn sty_fallback_can_use_kernel_internal_helpers_together() {
+        let resolver = |name: &str| match name {
+            "waveforty" => Some(
+                "\\NeedsTeXFormat{LaTeX2e}\n\
+                 \\ProvidesPackage{waveforty}[2026/03/30 Wave 40 compat test]\n\
+                 \\makeatletter\n\
+                 \\@ifclassloaded{article}{\\def\\wave@class{article}}{\\def\\wave@class{other}}\n\
+                 \\@ifl@aded{.sty}{xcolor}{\\def\\wave@pkg{xcolor}}{\\def\\wave@pkg{missing}}\n\
+                 \\@namedef{wave@name}{NAME}\n\
+                 \\def\\wavepick{\\@ifstar{STAR}{\\@ifnextchar[{OPT}{PLAIN}}}\n\
+                 \\def\\waveuse{\\@nameuse{wave@name}}\n\
+                 \\def\\wavefor{}\n\
+                 \\@for\\waveitem:=a,b,c\\do{\\edef\\wavefor{\\wavefor[\\waveitem]}}\n\
+                 \\def\\wavetfor{}\n\
+                 \\@tfor\\wavetok:=xy\\do{\\edef\\wavetfor{\\wavetfor(\\wavetok)}}\n\
+                 \\def\\waveinfo{\\wave@class/\\wave@pkg/\\wavefor/\\wavetfor}\n\
+                 \\makeatother\n"
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        let document = parse_document_with_package_resolver(
+            "\\documentclass{article}\n\\usepackage{xcolor}\n\\usepackage{waveforty}\n\\begin{document}\n\\wavepick*[z]/\\wavepick[z]/\\wavepick q/\\waveuse/\\waveinfo/\\pdfliteral{q}\\pdfsavepos\\pdflastxpos/\\pdflastypos\n\\end{document}\n",
+            Some(&resolver),
+        );
+
+        assert_eq!(
+            document.body,
+            "STAR[z]/OPT[z]/PLAINq/NAME/article/xcolor/[a][b][c]/(x)(y)/0/0"
+        );
     }
 
     #[test]
