@@ -250,6 +250,30 @@ impl DocumentLabels {
     pub fn into_inner(self) -> BTreeMap<String, String> {
         self.entries
     }
+
+    pub fn clone_with_section_entries(&self, section_entries: Vec<SectionEntry>) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            citations: self.citations.clone(),
+            bibliography: self.bibliography.clone(),
+            section_entries,
+            figure_entries: self.figure_entries.clone(),
+            table_entries: self.table_entries.clone(),
+            page_label_anchors: self.page_label_anchors.clone(),
+            title: self.title.clone(),
+            author: self.author.clone(),
+            pdf_title: self.pdf_title.clone(),
+            pdf_author: self.pdf_author.clone(),
+            color_links: self.color_links,
+            link_color: self.link_color.clone(),
+            index_enabled: self.index_enabled,
+            index_entries: self.index_entries.clone(),
+            has_unresolved_toc: self.has_unresolved_toc,
+            has_unresolved_lof: self.has_unresolved_lof,
+            has_unresolved_lot: self.has_unresolved_lot,
+            has_unresolved_index: self.has_unresolved_index,
+        }
+    }
 }
 
 impl From<BTreeMap<String, String>> for DocumentLabels {

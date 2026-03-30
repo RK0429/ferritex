@@ -11,10 +11,9 @@ use ferritex_core::bibliography::api::{
     BibliographyToolchain,
 };
 use ferritex_core::compilation::{
-    commit_layout_fragment, CommitBarrier, CommitEntry, CompilationJob, CompilationSnapshot,
-    DestinationAnchor, DocumentPartitionPlan, DocumentState, DocumentWorkUnit, IndexEntry,
-    LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft, SectionOutlineEntry,
-    StageCommitPayload, SymbolLocation,
+    CompilationJob, CompilationSnapshot, DestinationAnchor, DocumentPartitionPlan, DocumentState,
+    DocumentWorkUnit, IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
+    SectionOutlineEntry, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
@@ -1031,11 +1030,7 @@ impl<'a> CompileJobService<'a> {
                         graphics_resolver.project_root,
                         graphics_resolver.overlay_roots,
                         graphics_resolver.asset_bundle_path,
-                        &options.input_file,
-                        &options.jobname,
-                        &execution_policy,
                         typeset_callback_count as u32,
-                        &source_tree.document_state,
                     ) {
                         Ok(document) => document,
                         Err(reason) => {
@@ -2272,44 +2267,36 @@ fn try_parallel_full_typeset(
     project_root: &Path,
     overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
-    primary_input: &Path,
-    jobname: &str,
-    execution_policy: &ExecutionPolicy,
     pass_number: u32,
-    document_state: &DocumentState,
 ) -> Result<TypesetDocument, &'static str> {
     if parallelism <= 1 || partition_plan.work_units.len() < 2 {
         return Err("parallel full typeset requires at least two partitions");
     }
 
-    let snapshot_job = compilation_job(
-        primary_input.to_path_buf(),
-        jobname.to_string(),
-        execution_policy.clone(),
-    );
-    let snapshot_session = snapshot_job.begin_pass(pass_number);
-    let snapshot = CompilationSnapshot::derive_snapshot(
-        &snapshot_session,
-        &RegisterStore::default(),
-        document_state,
-    );
     let body_ranges =
         partition_body_ranges(document, partition_plan).ok_or("partition body slicing failed")?;
     let section_ranges = partition_section_ranges(document, partition_plan)
         .ok_or("partition section slicing failed")?;
+    let (coalesced_plan, coalesced_body_ranges, coalesced_section_ranges) =
+        coalesce_full_typeset_partitions(
+            partition_plan,
+            &body_ranges,
+            &section_ranges,
+            parallelism,
+        )?;
     let work_items = collect_full_typeset_work_items(
         document,
-        partition_plan,
-        &body_ranges,
-        &section_ranges,
-        &snapshot,
+        &coalesced_plan,
+        &coalesced_body_ranges,
+        &coalesced_section_ranges,
     )?;
 
     tracing::info!(
-        partitions = work_items.len(),
+        original_partitions = partition_plan.work_units.len(),
+        coalesced_groups = work_items.len(),
         parallelism,
-        pass_number = snapshot.pass_number,
-        "full typeset executing in parallel"
+        pass_number,
+        "full typeset executing in parallel with coalesced partitions"
     );
 
     let parallel_results = run_parallel_full_typeset(
@@ -2324,42 +2311,36 @@ fn try_parallel_full_typeset(
         overlay_roots,
         asset_bundle_path,
     )?;
-    let mut barrier = CommitBarrier::new(snapshot.pass_number);
-    for (partition_id, fragment, _) in &parallel_results {
-        commit_layout_fragment(&mut barrier, partition_id, fragment);
-    }
     if should_force_parallel_full_typeset_collision() {
         tracing::warn!(
-            pass_number = snapshot.pass_number,
+            pass_number,
             "parallel full typeset authority key collision; falling back to sequential"
         );
         return Err("authority key collision in parallel full typeset");
     }
-    let ordered_entries = match barrier.into_ordered_or_collisions() {
-        Ok(entries) => entries,
-        Err((_ordered_entries, collisions)) => {
-            tracing::warn!(
-                pass_number = snapshot.pass_number,
-                collisions = ?collisions,
-                "parallel full typeset authority key collision; falling back to sequential"
-            );
-            return Err("authority key collision in parallel full typeset");
-        }
-    };
+    if has_cross_partition_layout_collision(
+        parallel_results.iter().map(|(_, fragment, _)| fragment),
+    ) {
+        tracing::warn!(
+            pass_number,
+            "parallel full typeset authority key collision; falling back to sequential"
+        );
+        return Err("authority key collision in parallel full typeset");
+    }
 
-    for (_, _, diagnostics) in parallel_results {
+    let mut fragments = BTreeMap::new();
+    for (partition_id, fragment, diagnostics) in parallel_results {
         for diagnostic in diagnostics {
             graphics_resolver.push_diagnostic(diagnostic);
         }
+        fragments.insert(partition_id, fragment);
     }
-
-    let fragments = layout_fragments_from_commit_entries(ordered_entries)?;
-    if fragments.len() < partition_plan.work_units.len() {
+    if fragments.len() < coalesced_plan.work_units.len() {
         return Err("parallel full typeset produced incomplete layout fragments");
     }
 
     Ok(PaginationMergeCoordinator.merge(
-        partition_plan,
+        &coalesced_plan,
         &fragments,
         &navigation_state_for_document(document),
     ))
@@ -2375,7 +2356,19 @@ struct PartialTypesetWorkItem {
 struct FullTypesetWorkItem {
     work_unit: DocumentWorkUnit,
     partition_document: ParsedDocument,
-    snapshot: CompilationSnapshot,
+}
+
+fn distribute_round_robin<T>(items: Vec<T>, concurrency: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let worker_count = concurrency.max(1).min(items.len());
+    let mut groups = (0..worker_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (index, item) in items.into_iter().enumerate() {
+        groups[index % worker_count].push(item);
+    }
+    groups
 }
 
 fn collect_partial_typeset_work_items(
@@ -2413,33 +2406,32 @@ fn run_parallel_partial_typeset(
     source_lines: &[SourceLineTrace],
     selection: &CompileFontSelection,
     parallelism: usize,
-    mut work_items: Vec<PartialTypesetWorkItem>,
+    work_items: Vec<PartialTypesetWorkItem>,
     file_access_gate: &dyn FileAccessGate,
     input_dir: &Path,
     project_root: &Path,
     overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
 ) -> Result<Vec<(String, DocumentLayoutFragment, Vec<Diagnostic>)>, &'static str> {
-    let mut results = Vec::with_capacity(work_items.len());
     let concurrency = parallelism.max(1);
+    let work_item_count = work_items.len();
+    let groups = distribute_round_robin(work_items, concurrency);
 
-    while !work_items.is_empty() {
-        let batch = work_items
-            .drain(..concurrency.min(work_items.len()))
-            .collect::<Vec<_>>();
-        let batch_results = thread::scope(|scope| {
-            let handles = batch
-                .into_iter()
-                .map(|work_item| {
-                    scope.spawn(move || {
-                        let thread_resolver = CompileGraphicAssetResolver {
-                            file_access_gate,
-                            input_dir,
-                            project_root,
-                            overlay_roots,
-                            asset_bundle_path,
-                            diagnostics: RefCell::new(Vec::new()),
-                        };
+    let results = thread::scope(|scope| -> Result<Vec<_>, &'static str> {
+        let handles = groups
+            .into_iter()
+            .map(|group| {
+                scope.spawn(move || {
+                    let thread_resolver = CompileGraphicAssetResolver {
+                        file_access_gate,
+                        input_dir,
+                        project_root,
+                        overlay_roots,
+                        asset_bundle_path,
+                        diagnostics: RefCell::new(Vec::new()),
+                    };
+                    let mut worker_results = Vec::with_capacity(group.len());
+                    for work_item in group {
                         let partition_typeset = service.typeset_document_with_selection(
                             &work_item.partition_document,
                             Some(source_lines),
@@ -2448,22 +2440,24 @@ fn run_parallel_partial_typeset(
                         );
                         let fragment =
                             extract_rebuilt_fragment(partition_typeset, &work_item.work_unit)?;
-                        Ok((
+                        worker_results.push((
                             work_item.work_unit.partition_id,
                             fragment,
                             thread_resolver.take_diagnostics(),
-                        ))
-                    })
+                        ));
+                    }
+                    Ok(worker_results)
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
 
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("partial typeset thread panicked"))
-                .collect::<Result<Vec<_>, &'static str>>()
-        })?;
-        results.extend(batch_results);
-    }
+        let mut results = Vec::with_capacity(work_item_count);
+        for handle in handles {
+            let worker_results = handle.join().expect("partial typeset thread panicked")?;
+            results.extend(worker_results);
+        }
+        Ok(results)
+    })?;
 
     Ok(results)
 }
@@ -2473,7 +2467,6 @@ fn collect_full_typeset_work_items(
     partition_plan: &DocumentPartitionPlan,
     body_ranges: &BTreeMap<String, (usize, usize)>,
     section_ranges: &BTreeMap<String, (usize, usize)>,
-    snapshot: &CompilationSnapshot,
 ) -> Result<Vec<FullTypesetWorkItem>, &'static str> {
     partition_plan
         .work_units
@@ -2495,10 +2488,73 @@ fn collect_full_typeset_work_items(
             Ok(FullTypesetWorkItem {
                 work_unit: work_unit.clone(),
                 partition_document,
-                snapshot: snapshot.clone(),
             })
         })
         .collect()
+}
+
+fn coalesce_full_typeset_partitions(
+    partition_plan: &DocumentPartitionPlan,
+    body_ranges: &BTreeMap<String, (usize, usize)>,
+    section_ranges: &BTreeMap<String, (usize, usize)>,
+    parallelism: usize,
+) -> Result<
+    (
+        DocumentPartitionPlan,
+        BTreeMap<String, (usize, usize)>,
+        BTreeMap<String, (usize, usize)>,
+    ),
+    &'static str,
+> {
+    let group_count = parallelism.max(1).min(partition_plan.work_units.len());
+    let chunk_size = partition_plan.work_units.len().div_ceil(group_count);
+    let mut coalesced_work_units = Vec::with_capacity(group_count);
+    let mut coalesced_body_ranges = BTreeMap::new();
+    let mut coalesced_section_ranges = BTreeMap::new();
+
+    for chunk in partition_plan.work_units.chunks(chunk_size) {
+        let first = chunk
+            .first()
+            .ok_or("parallel full typeset requires at least one partition chunk")?;
+        let last = chunk
+            .last()
+            .ok_or("parallel full typeset requires at least one partition chunk")?;
+        let first_body = body_ranges
+            .get(&first.partition_id)
+            .copied()
+            .ok_or("missing body range for coalesced partition")?;
+        let last_body = body_ranges
+            .get(&last.partition_id)
+            .copied()
+            .ok_or("missing body range for coalesced partition")?;
+        let first_section = section_ranges
+            .get(&first.partition_id)
+            .copied()
+            .ok_or("missing section range for coalesced partition")?;
+        let last_section = section_ranges
+            .get(&last.partition_id)
+            .copied()
+            .ok_or("missing section range for coalesced partition")?;
+        let group_id = first.partition_id.clone();
+
+        coalesced_body_ranges.insert(group_id.clone(), (first_body.0, last_body.1));
+        coalesced_section_ranges.insert(group_id.clone(), (first_section.0, last_section.1));
+        coalesced_work_units.push(DocumentWorkUnit {
+            partition_id: group_id,
+            kind: first.kind,
+            locator: first.locator.clone(),
+            title: first.title.clone(),
+        });
+    }
+
+    Ok((
+        DocumentPartitionPlan {
+            fallback_partition_id: partition_plan.fallback_partition_id.clone(),
+            work_units: coalesced_work_units,
+        },
+        coalesced_body_ranges,
+        coalesced_section_ranges,
+    ))
 }
 
 fn run_parallel_full_typeset(
@@ -2506,34 +2562,32 @@ fn run_parallel_full_typeset(
     source_lines: &[SourceLineTrace],
     selection: &CompileFontSelection,
     parallelism: usize,
-    mut work_items: Vec<FullTypesetWorkItem>,
+    work_items: Vec<FullTypesetWorkItem>,
     file_access_gate: &dyn FileAccessGate,
     input_dir: &Path,
     project_root: &Path,
     overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
 ) -> Result<Vec<(String, DocumentLayoutFragment, Vec<Diagnostic>)>, &'static str> {
-    let mut results = Vec::with_capacity(work_items.len());
     let concurrency = parallelism.max(1);
+    let work_item_count = work_items.len();
+    let groups = distribute_round_robin(work_items, concurrency);
 
-    while !work_items.is_empty() {
-        let batch = work_items
-            .drain(..concurrency.min(work_items.len()))
-            .collect::<Vec<_>>();
-        let batch_results = thread::scope(|scope| {
-            let handles = batch
-                .into_iter()
-                .map(|work_item| {
-                    scope.spawn(move || {
-                        let _pass_number = work_item.snapshot.pass_number;
-                        let thread_resolver = CompileGraphicAssetResolver {
-                            file_access_gate,
-                            input_dir,
-                            project_root,
-                            overlay_roots,
-                            asset_bundle_path,
-                            diagnostics: RefCell::new(Vec::new()),
-                        };
+    let results = thread::scope(|scope| -> Result<Vec<_>, &'static str> {
+        let handles = groups
+            .into_iter()
+            .map(|group| {
+                scope.spawn(move || {
+                    let thread_resolver = CompileGraphicAssetResolver {
+                        file_access_gate,
+                        input_dir,
+                        project_root,
+                        overlay_roots,
+                        asset_bundle_path,
+                        diagnostics: RefCell::new(Vec::new()),
+                    };
+                    let mut worker_results = Vec::with_capacity(group.len());
+                    for work_item in group {
                         let partition_typeset = service.typeset_document_with_selection(
                             &work_item.partition_document,
                             Some(source_lines),
@@ -2542,52 +2596,32 @@ fn run_parallel_full_typeset(
                         );
                         let fragment =
                             extract_rebuilt_fragment(partition_typeset, &work_item.work_unit)?;
-                        Ok((
-                            work_item.work_unit.partition_id,
+                        worker_results.push((
+                            work_item.work_unit.partition_id.clone(),
                             fragment,
                             thread_resolver.take_diagnostics(),
-                        ))
-                    })
+                        ));
+                    }
+                    Ok(worker_results)
                 })
-                .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
 
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("full typeset thread panicked"))
-                .collect::<Result<Vec<_>, &'static str>>()
-        })?;
-        results.extend(batch_results);
-    }
+        let mut results = Vec::with_capacity(work_item_count);
+        for handle in handles {
+            let worker_results = handle.join().expect("full typeset thread panicked")?;
+            results.extend(worker_results);
+        }
+        Ok(results)
+    })?;
 
     Ok(results)
-}
-
-fn layout_fragments_from_commit_entries(
-    entries: Vec<CommitEntry>,
-) -> Result<BTreeMap<String, DocumentLayoutFragment>, &'static str> {
-    let mut fragments = BTreeMap::new();
-
-    for entry in entries {
-        let StageCommitPayload::LayoutMerge(payload) = entry.payload else {
-            return Err("unexpected non-layout commit entry");
-        };
-        if payload.fragments.is_empty() {
-            return Err("layout merge entry missing fragment");
-        }
-        for fragment in payload.fragments {
-            fragments.insert(fragment.partition_id.clone(), fragment);
-        }
-    }
-
-    Ok(fragments)
 }
 
 fn should_force_parallel_full_typeset_collision() -> bool {
     #[cfg(test)]
     {
-        return FORCE_PARALLEL_FULL_TYPESET_COLLISION.load(
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        return FORCE_PARALLEL_FULL_TYPESET_COLLISION.load(std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(not(test))]
@@ -2648,17 +2682,28 @@ fn partition_document_for_work_unit(
 ) -> Option<ParsedDocument> {
     let (body_start, body_end) = body_range;
     let (section_start, section_end) = section_range;
-    let mut partition_document = document.clone();
-    partition_document.body = document.body.get(body_start..body_end)?.to_string();
-    partition_document.section_entries =
-        document.section_entries[section_start..section_end].to_vec();
-    if partition_document.section_entries.is_empty() {
-        partition_document.section_entries = vec![document
+    let mut labels = document
+        .labels
+        .clone_with_section_entries(document.section_entries[section_start..section_end].to_vec());
+    if labels.section_entries.is_empty() {
+        labels.section_entries = vec![document
             .section_entries
             .get(work_unit.locator.ordinal)?
             .clone()];
     }
-    Some(partition_document)
+    Some(ParsedDocument {
+        document_class: document.document_class.clone(),
+        class_options: document.class_options.clone(),
+        loaded_packages: document.loaded_packages.clone(),
+        package_count: document.package_count,
+        main_font_name: document.main_font_name.clone(),
+        sans_font_name: document.sans_font_name.clone(),
+        mono_font_name: document.mono_font_name.clone(),
+        body: document.body.get(body_start..body_end)?.to_string(),
+        labels,
+        bibliography_state: document.bibliography_state.clone(),
+        has_unresolved_refs: document.has_unresolved_refs,
+    })
 }
 
 fn partition_body_ranges(
@@ -7175,14 +7220,20 @@ mod tests {
         let (parallel, trace_messages) =
             compile_with_trace_messages(&FsTestFileAccessGate, &loader, &parallel_options);
         assert_eq!(parallel.exit_code, 0);
-        assert!(trace_messages
-            .iter()
-            .any(|message| message.contains("full typeset executing in parallel")), "{trace_messages:?}");
-        assert!(trace_messages.iter().any(|message| {
-            message.contains(
-                "parallel full typeset authority key collision; falling back to sequential",
-            )
-        }), "{trace_messages:?}");
+        assert!(
+            trace_messages
+                .iter()
+                .any(|message| message.contains("full typeset executing in parallel")),
+            "{trace_messages:?}"
+        );
+        assert!(
+            trace_messages.iter().any(|message| {
+                message.contains(
+                    "parallel full typeset authority key collision; falling back to sequential",
+                )
+            }),
+            "{trace_messages:?}"
+        );
         let parallel_pdf =
             fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
 

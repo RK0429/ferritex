@@ -339,6 +339,40 @@ fn partition_bench_docs_protocol_median_and_timing_proof() {
         "[FTX-PARTITION-BENCH-001 TIMING] protocol proof complete for {} cases",
         report.results.len()
     );
+
+    let has_benchmark_precondition =
+        std::thread::available_parallelism().map_or(false, |n| n.get() >= 4);
+    if has_benchmark_precondition {
+        assert!(
+            !report.comparisons.is_empty(),
+            "REQ-FUNC-032: expected partition bench comparisons to be built"
+        );
+        for comparison in &report.comparisons {
+            let speedup = comparison
+                .speedup()
+                .expect("median durations should exist for comparison");
+            let baseline_secs = comparison.baseline.median_duration().unwrap().as_secs_f64();
+            let candidate_secs = comparison
+                .candidate
+                .median_duration()
+                .unwrap()
+                .as_secs_f64();
+            assert!(
+                speedup > 1.0,
+                "[REQ-FUNC-032] '{}' speedup proof failed: jobs=4 median ({:.3}s) >= jobs=1 median ({:.3}s)",
+                comparison.baseline.case.name,
+                candidate_secs,
+                baseline_secs
+            );
+            eprintln!(
+                "[REQ-FUNC-032 PROVEN] '{}': speedup {:.3}x \
+                 (jobs=1 median {:.3}s, jobs=4 median {:.3}s)",
+                comparison.baseline.case.name, speedup, baseline_secs, candidate_secs
+            );
+        }
+    } else {
+        eprintln!("[REQ-FUNC-032] speedup proof skipped: available_parallelism < 4");
+    }
 }
 
 #[test]

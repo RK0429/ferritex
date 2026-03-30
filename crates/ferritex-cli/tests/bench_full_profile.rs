@@ -283,6 +283,24 @@ fn full_bench_docs_protocol_median_and_timing_proof() {
         assert!(median_ms > 0.0, "median should be positive");
     }
 
+    let has_benchmark_precondition =
+        std::thread::available_parallelism().map_or(false, |n| n.get() >= 4);
+    if has_benchmark_precondition {
+        assert!(
+            par_median < seq_median,
+            "[REQ-FUNC-031] speedup proof failed: jobs=4 median ({:.3}s) >= jobs=1 median ({:.3}s)",
+            par_median.as_secs_f64(),
+            seq_median.as_secs_f64()
+        );
+        eprintln!(
+            "[REQ-FUNC-031 PROVEN] speedup: jobs=4 median ({:.3}s) < jobs=1 median ({:.3}s)",
+            par_median.as_secs_f64(),
+            seq_median.as_secs_f64()
+        );
+    } else {
+        eprintln!("[REQ-FUNC-031] speedup proof skipped: available_parallelism < 4");
+    }
+
     let threshold_secs = 1.0;
     if seq_median.as_secs_f64() > threshold_secs {
         eprintln!(
