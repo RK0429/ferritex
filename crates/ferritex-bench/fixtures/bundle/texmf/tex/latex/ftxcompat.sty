@@ -1,0 +1,10 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{ftxcompat}[2026/03/30 Ferritex compat test package]
+\newif\ifftxcompatdraft
+\DeclareOption{draft}{\ftxcompatdrafttrue}
+\DeclareOption*{}
+\ProcessOptions*
+\RequirePackage{ftxutils}
+\@ifpackageloaded{ftxutils}{\def\ftxcompatdep{compat-loaded-ftxutils}}{\def\ftxcompatdep{compat-missing-ftxutils}}
+\ifftxcompatdraft\def\ftxcompatstyle{draft-mode}\else\def\ftxcompatstyle{final-mode}\fi
+\newcommand{\ftxcompatinfo}{COMPAT:\ftxcompatdep:\ftxcompatstyle}

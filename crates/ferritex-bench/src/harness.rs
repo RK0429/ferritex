@@ -63,6 +63,51 @@ pub fn bundle_bootstrap_cases(fixture_base: &Path) -> Vec<BenchCase> {
         .collect()
 }
 
+pub fn bundle_package_loading_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let bundle_dir = fixture_base.join("bundle");
+    let pkg_dir = fixture_base.join("bundle-packages");
+
+    let mut fixtures = fs::read_dir(&pkg_dir)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read bundle-packages fixtures from {}: {error}",
+                pkg_dir.display()
+            )
+        })
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| {
+                    panic!("failed to enumerate bundle-packages entry: {error}")
+                })
+                .path()
+        })
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("tex"))
+        .collect::<Vec<_>>();
+    fixtures.sort();
+
+    fixtures
+        .into_iter()
+        .map(|input_fixture| {
+            let stem = input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "invalid UTF-8 bundle-packages fixture name: {}",
+                        input_fixture.display()
+                    )
+                });
+            BenchCase {
+                name: format!("bundle-pkg-{stem}"),
+                profile: BenchProfile::BundleBootstrap,
+                input_fixture,
+                asset_bundle: Some(bundle_dir.clone()),
+                jobs: 1,
+            }
+        })
+        .collect()
+}
+
 pub fn partition_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
     let input = fixture_base.join("multi_section.tex");
     [1, 4]
@@ -561,9 +606,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        bundle_bootstrap_cases, corpus_compat_cases, BenchCase, BenchComparison, BenchFailure,
-        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend,
-        CompileOutput,
+        bundle_bootstrap_cases, bundle_package_loading_cases, corpus_compat_cases, BenchCase,
+        BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig,
+        BenchTiming, CompileBackend, CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -995,6 +1040,27 @@ mod tests {
         let calls = backend.calls.lock().expect("calls lock");
         let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs)| *jobs).collect();
         assert_eq!(jobs_values, vec![1, 1, 4, 4]);
+    }
+
+    #[test]
+    fn test_bundle_package_loading_cases_enumerate_fixtures() {
+        let fixture_base = fixtures_root();
+        let cases = bundle_package_loading_cases(&fixture_base);
+
+        assert_eq!(cases.len(), 2);
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::BundleBootstrap));
+        assert!(cases.iter().all(|case| case.asset_bundle.is_some()));
+        assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases
+            .iter()
+            .all(|case| case.name.starts_with("bundle-pkg-")));
+        assert!(cases.iter().all(|case| case.input_fixture.exists()));
+
+        let names: Vec<_> = cases.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"bundle-pkg-compat_options"));
+        assert!(names.contains(&"bundle-pkg-depchain_recursive"));
     }
 
     #[test]

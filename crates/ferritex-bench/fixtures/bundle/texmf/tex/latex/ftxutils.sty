@@ -1,0 +1,7 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{ftxutils}[2026/03/30 Ferritex utils test package]
+\makeatletter
+\@namedef{ftxutils@version}{v1.0}
+\@ifundefined{ftxutils@missing}{\def\ftxutilscheck{utils-defined-ok}}{\def\ftxutilscheck{utils-already-exists}}
+\makeatother
+\newcommand{\ftxutilsinfo}{UTILS:\ftxutilscheck}

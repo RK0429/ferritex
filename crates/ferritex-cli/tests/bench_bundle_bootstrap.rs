@@ -1,12 +1,23 @@
 use std::path::PathBuf;
 
 use ferritex_bench::{
-    bench_fixtures_root, bundle_bootstrap_cases, partition_bench_cases, BenchCase, BenchHarness,
-    BenchProfile, BenchRunConfig, CliCompileBackend,
+    bench_fixtures_root, bundle_bootstrap_cases, bundle_package_loading_cases,
+    partition_bench_cases, BenchCase, BenchHarness, BenchProfile, BenchRunConfig,
+    CliCompileBackend,
 };
 
 fn ferritex_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ferritex"))
+}
+
+fn extract_pdf_text(pdf: &str) -> String {
+    pdf.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_suffix(") Tj")
+                .and_then(|line| line.strip_prefix('('))
+        })
+        .collect()
 }
 
 #[test]
@@ -85,6 +96,89 @@ fn bundle_bootstrap_compiles_layout_core_classes_with_real_backend() {
             "layout-core-letter-bundle",
         ]
         .into_iter()));
+}
+
+#[test]
+fn bundle_package_loading_compiles_and_verifies_content() {
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = bundle_package_loading_cases(&bench_fixtures);
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let mut cases = Vec::with_capacity(base_cases.len());
+    for case in &base_cases {
+        let fixture_name = case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename");
+        let temp_input = temp_dir.path().join(fixture_name);
+        std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        cases.push(BenchCase {
+            name: case.name.clone(),
+            profile: case.profile.clone(),
+            input_fixture: temp_input,
+            asset_bundle: case.asset_bundle.clone(),
+            jobs: case.jobs,
+        });
+    }
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases.clone(),
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "bundle package loading compilation failed: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        report.results.len(),
+        cases.len(),
+        "all bundle package loading cases should run"
+    );
+
+    for case in &cases {
+        let pdf_path = case.input_fixture.with_extension("pdf");
+        let pdf_content = std::fs::read_to_string(&pdf_path)
+            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+        let pdf_text = extract_pdf_text(&pdf_content);
+
+        match case.name.as_str() {
+            "bundle-pkg-compat_options" => {
+                assert!(
+                    pdf_text.contains("COMPAT:compat-loaded-ftxutils:draft-mode"),
+                    "compat_options PDF should contain option processing result"
+                );
+                assert!(
+                    pdf_text.contains("UTILS:utils-defined-ok"),
+                    "compat_options PDF should contain utils check result"
+                );
+            }
+            "bundle-pkg-depchain_recursive" => {
+                assert!(
+                    pdf_text.contains("DEPCHAIN:chain-loaded-compat:chain-has-utils"),
+                    "depchain PDF should contain recursive loading result"
+                );
+                assert!(
+                    pdf_text.contains("COMPAT:compat-loaded-ftxutils:final-mode"),
+                    "depchain PDF should contain compat info (no draft option)"
+                );
+                assert!(
+                    pdf_text.contains("UTILS:utils-defined-ok"),
+                    "depchain PDF should contain utils check result"
+                );
+            }
+            other => panic!("unexpected bundle package loading case: {other}"),
+        }
+    }
 }
 
 #[test]

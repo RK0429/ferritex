@@ -1,7 +1,10 @@
 {
   "tex_inputs": {},
   "packages": {
-    "benchstub.sty": "texmf/tex/latex/benchstub.sty"
+    "benchstub.sty": "texmf/tex/latex/benchstub.sty",
+    "ftxcompat.sty": "texmf/tex/latex/ftxcompat.sty",
+    "ftxdepchain.sty": "texmf/tex/latex/ftxdepchain.sty",
+    "ftxutils.sty": "texmf/tex/latex/ftxutils.sty"
   },
   "opentype_fonts": {},
   "tfm_fonts": {
