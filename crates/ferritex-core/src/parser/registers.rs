@@ -21,6 +21,21 @@ impl CompatIntRegister {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CompatDimenRegister {
+    PdfPageWidth,
+    PdfPageHeight,
+}
+
+impl CompatDimenRegister {
+    fn default_value(self) -> i32 {
+        match self {
+            Self::PdfPageWidth => 40_258_355,
+            Self::PdfPageHeight => 52_101_554,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegisterStore {
     counts: HashMap<u16, i32>,
@@ -29,6 +44,7 @@ pub struct RegisterStore {
     muskips: HashMap<u16, i32>,
     toks: HashMap<u16, Vec<Token>>,
     compat_ints: HashMap<CompatIntRegister, i32>,
+    compat_dimens: HashMap<CompatDimenRegister, i32>,
     save_stack: Vec<GroupSave>,
 }
 
@@ -40,6 +56,7 @@ struct GroupSave {
     muskips: HashMap<u16, Option<i32>>,
     toks: HashMap<u16, Option<Vec<Token>>>,
     compat_ints: HashMap<CompatIntRegister, Option<i32>>,
+    compat_dimens: HashMap<CompatDimenRegister, Option<i32>>,
 }
 
 impl RegisterStore {
@@ -65,6 +82,10 @@ impl RegisterStore {
 
     pub fn compat_ints_snapshot(&self) -> HashMap<CompatIntRegister, i32> {
         self.compat_ints.clone()
+    }
+
+    pub fn compat_dimens_snapshot(&self) -> HashMap<CompatDimenRegister, i32> {
+        self.compat_dimens.clone()
     }
 
     pub fn push_group(&mut self) {
@@ -93,6 +114,9 @@ impl RegisterStore {
         }
         for (register, previous) in group_save.compat_ints {
             restore_register(&mut self.compat_ints, register, previous);
+        }
+        for (register, previous) in group_save.compat_dimens {
+            restore_register(&mut self.compat_dimens, register, previous);
         }
     }
 
@@ -174,6 +198,31 @@ impl RegisterStore {
                 .or_insert_with(|| self.compat_ints.get(&register).copied());
         }
         set_sparse_compat_register(&mut self.compat_ints, register, value);
+    }
+
+    pub fn get_compat_dimen(&self, register: CompatDimenRegister) -> i32 {
+        self.compat_dimens
+            .get(&register)
+            .copied()
+            .unwrap_or_else(|| register.default_value())
+    }
+
+    pub fn set_compat_dimen(&mut self, register: CompatDimenRegister, value: i32, global: bool) {
+        if global {
+            set_sparse_compat_dimen_register(&mut self.compat_dimens, register, value);
+            for group_save in &mut self.save_stack {
+                let _ = group_save.compat_dimens.remove(&register);
+            }
+            return;
+        }
+
+        if let Some(group_save) = self.save_stack.last_mut() {
+            group_save
+                .compat_dimens
+                .entry(register)
+                .or_insert_with(|| self.compat_dimens.get(&register).copied());
+        }
+        set_sparse_compat_dimen_register(&mut self.compat_dimens, register, value);
     }
 
     fn set_register(&mut self, index: u16, value: i32, global: bool, kind: RegisterKind) {
@@ -306,11 +355,23 @@ fn set_sparse_compat_register(
     }
 }
 
+fn set_sparse_compat_dimen_register(
+    registers: &mut HashMap<CompatDimenRegister, i32>,
+    register: CompatDimenRegister,
+    value: i32,
+) {
+    if value == register.default_value() {
+        let _ = registers.remove(&register);
+    } else {
+        let _ = registers.insert(register, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::parser::{CatCode, Token, TokenKind};
 
-    use super::{CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX};
+    use super::{CompatDimenRegister, CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX};
 
     #[test]
     fn register_families_default_to_zero_or_empty() {
@@ -325,6 +386,14 @@ mod tests {
         assert_eq!(
             registers.get_compat_int(CompatIntRegister::PdfTexVersion),
             140
+        );
+        assert_eq!(
+            registers.get_compat_dimen(CompatDimenRegister::PdfPageWidth),
+            40_258_355
+        );
+        assert_eq!(
+            registers.get_compat_dimen(CompatDimenRegister::PdfPageHeight),
+            52_101_554
         );
     }
 
@@ -351,11 +420,21 @@ mod tests {
         registers.push_group();
         registers.set_compat_int(CompatIntRegister::PdfOutput, 0, false);
         registers.set_compat_int(CompatIntRegister::PdfTexVersion, 150, false);
+        registers.set_compat_dimen(CompatDimenRegister::PdfPageWidth, 12_345, false);
+        registers.set_compat_dimen(CompatDimenRegister::PdfPageHeight, 67_890, false);
 
         assert_eq!(registers.get_compat_int(CompatIntRegister::PdfOutput), 0);
         assert_eq!(
             registers.get_compat_int(CompatIntRegister::PdfTexVersion),
             150
+        );
+        assert_eq!(
+            registers.get_compat_dimen(CompatDimenRegister::PdfPageWidth),
+            12_345
+        );
+        assert_eq!(
+            registers.get_compat_dimen(CompatDimenRegister::PdfPageHeight),
+            67_890
         );
 
         registers.pop_group();
@@ -364,6 +443,14 @@ mod tests {
         assert_eq!(
             registers.get_compat_int(CompatIntRegister::PdfTexVersion),
             140
+        );
+        assert_eq!(
+            registers.get_compat_dimen(CompatDimenRegister::PdfPageWidth),
+            40_258_355
+        );
+        assert_eq!(
+            registers.get_compat_dimen(CompatDimenRegister::PdfPageHeight),
+            52_101_554
         );
     }
 

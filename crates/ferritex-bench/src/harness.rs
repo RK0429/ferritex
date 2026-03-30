@@ -1027,6 +1027,7 @@ mod tests {
         assert!(names.contains(&"corpus-layout-core-sectioning_report".to_string()));
         assert!(names.contains(&"corpus-layout-core-sectioning_book".to_string()));
         assert!(names.contains(&"corpus-layout-core-letter_basic".to_string()));
+        assert!(names.contains(&"corpus-layout-core-compat_primitives".to_string()));
     }
 
     #[test]

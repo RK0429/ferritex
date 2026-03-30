@@ -24,7 +24,7 @@ use super::{
         load_document_class, load_package, ClassRegistry, OptionRegistry, PackageInfo,
         PackageRegistry, StyPackageResolver,
     },
-    registers::{CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX},
+    registers::{CompatDimenRegister, CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX},
     CatCode, EnvironmentDef, MacroDef, MacroEngine, Token, TokenKind, Tokenizer,
 };
 
@@ -70,10 +70,12 @@ const BODY_FLOAT_SPECIFIER_SEP: char = '\u{E01C}';
 const BODY_INDEX_ENTRY_START: char = '\u{E01D}';
 const BODY_INDEX_ENTRY_END: char = '\u{E01E}';
 const BODY_INDEX_ENTRY_FIELD_SEP: char = '\u{E01F}';
+const BODY_TRAILING_SPACE_SENTINEL: char = '\u{E029}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
 const EQUATION_ENV_SEGMENT_SEPARATOR: char = '\u{001D}';
+const PDF_CREATION_DATE_PLACEHOLDER: &str = "D:20700101000000+00'00'";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SectionEntry {
@@ -924,6 +926,7 @@ enum RegisterKind {
     Skip,
     Muskip,
     CompatInt(CompatIntRegister),
+    CompatDimen(CompatDimenRegister),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1553,7 +1556,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             main_font_name: self.main_font_name.clone(),
             sans_font_name: self.sans_font_name.clone(),
             mono_font_name: self.mono_font_name.clone(),
-            body: self.body.trim().to_string(),
+            body: self
+                .body
+                .trim()
+                .replace(BODY_TRAILING_SPACE_SENTINEL, ""),
             labels: DocumentLabels::with_metadata(
                 self.state.labels.clone(),
                 self.state.citations.clone(),
@@ -2180,6 +2186,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.protected_prefix = true;
                 Ok(true)
             }
+            "unless" => {
+                let _ = self.take_global_prefix();
+                self.process_unless_primitive(token.line)?;
+                Ok(true)
+            }
             "def" => {
                 let is_global = self.take_global_prefix();
                 self.parse_def(is_global)?;
@@ -2310,10 +2321,30 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.parse_compat_int_primitive(CompatIntRegister::PdfTexVersion, token.line)?;
                 Ok(true)
             }
+            "pdfshellescape" => {
+                let _ = self.take_global_prefix();
+                let value = self.pdfshellescape_value();
+                self.push_front_tokens(tokens_from_text(&value.to_string(), token.line));
+                Ok(true)
+            }
+            "pdfpagewidth" => {
+                self.parse_compat_dimen_primitive(CompatDimenRegister::PdfPageWidth, token.line)?;
+                Ok(true)
+            }
+            "pdfpageheight" => {
+                self.parse_compat_dimen_primitive(CompatDimenRegister::PdfPageHeight, token.line)?;
+                Ok(true)
+            }
             "pdfstrcmp" => {
                 let _ = self.take_global_prefix();
                 let value = self.parse_pdfstrcmp_value(token.line)?;
                 self.push_front_tokens(tokens_from_text(&value.to_string(), token.line));
+                Ok(true)
+            }
+            "pdfmdfivesum" => {
+                let _ = self.take_global_prefix();
+                let value = self.parse_pdfmdfivesum_value()?;
+                self.push_front_tokens(tokens_from_text(&value, token.line));
                 Ok(true)
             }
             "pdffilesize" => {
@@ -2325,6 +2356,35 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             "pdftexbanner" => {
                 let _ = self.take_global_prefix();
                 self.push_front_tokens(tokens_from_text("This is ferritex", token.line));
+                Ok(true)
+            }
+            "pdfcreationdate" => {
+                let _ = self.take_global_prefix();
+                self.push_front_tokens(tokens_from_text(PDF_CREATION_DATE_PLACEHOLDER, token.line));
+                Ok(true)
+            }
+            "pdfescapestring" => {
+                let _ = self.take_global_prefix();
+                let value = self.parse_pdfescapestring_value()?;
+                self.push_front_tokens(tokens_from_text(&value, token.line));
+                Ok(true)
+            }
+            "pdfescapename" => {
+                let _ = self.take_global_prefix();
+                let value = self.parse_pdfescapename_value()?;
+                self.push_front_tokens(tokens_from_text(&value, token.line));
+                Ok(true)
+            }
+            "pdfescapehex" => {
+                let _ = self.take_global_prefix();
+                let value = self.parse_pdfescapehex_value()?;
+                self.push_front_tokens(tokens_from_text(&value, token.line));
+                Ok(true)
+            }
+            "pdfunescapehex" => {
+                let _ = self.take_global_prefix();
+                let value = self.parse_pdfunescapehex_value()?;
+                self.push_front_plain_tokens(tokens_from_bytes(&value, token.line));
                 Ok(true)
             }
             "numexpr" => {
@@ -2418,113 +2478,39 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
             "iftrue" => {
                 let _ = self.take_global_prefix();
-                self.conditionals.process_if_at(true, token.line);
-                Ok(true)
+                self.process_conditional_primitive("iftrue", token.line, false)
             }
             "iffalse" => {
                 let _ = self.take_global_prefix();
-                self.conditionals.process_if_at(false, token.line);
-                self.skip_current_false_branch();
-                Ok(true)
+                self.process_conditional_primitive("iffalse", token.line, false)
             }
             "ifnum" => {
                 let _ = self.take_global_prefix();
-                let left = self.parse_integer_value()?.unwrap_or(0);
-                let relation = self.parse_relation_token().unwrap_or('=');
-                let right = self.parse_integer_value()?.unwrap_or(0);
-                self.conditionals
-                    .process_if_at(evaluate_ifnum(left, relation, right), token.line);
-                if self.conditionals.is_skipping() {
-                    self.skip_current_false_branch();
-                }
-                Ok(true)
+                self.process_conditional_primitive("ifnum", token.line, false)
             }
             "if" => {
                 let _ = self.take_global_prefix();
-                let left = self.next_significant_token();
-                let right = self.next_significant_token();
-                let condition = match (left.as_ref(), right.as_ref()) {
-                    (Some(left), Some(right)) => {
-                        matches!(
-                            (char_code_of(left), char_code_of(right)),
-                            (Some(left_code), Some(right_code)) if left_code == right_code
-                        )
-                    }
-                    _ => false,
-                };
-                self.conditionals.process_if_at(condition, token.line);
-                if self.conditionals.is_skipping() {
-                    self.skip_current_false_branch();
-                }
-                Ok(true)
+                self.process_conditional_primitive("if", token.line, false)
             }
             "ifcat" => {
                 let _ = self.take_global_prefix();
-                let left = self.next_significant_token();
-                let right = self.next_significant_token();
-                let condition = match (left.as_ref(), right.as_ref()) {
-                    (Some(left), Some(right)) => {
-                        matches!(
-                            (cat_code_of(left), cat_code_of(right)),
-                            (Some(left_cat), Some(right_cat)) if left_cat == right_cat
-                        )
-                    }
-                    _ => false,
-                };
-                self.conditionals.process_if_at(condition, token.line);
-                if self.conditionals.is_skipping() {
-                    self.skip_current_false_branch();
-                }
-                Ok(true)
+                self.process_conditional_primitive("ifcat", token.line, false)
             }
             "ifdim" => {
                 let _ = self.take_global_prefix();
-                let left = self.parse_dimension_value()?.unwrap_or(0);
-                let relation = self.parse_relation_token().unwrap_or('=');
-                let right = self.parse_dimension_value()?.unwrap_or(0);
-                self.conditionals
-                    .process_if_at(evaluate_ifnum(left, relation, right), token.line);
-                if self.conditionals.is_skipping() {
-                    self.skip_current_false_branch();
-                }
-                Ok(true)
+                self.process_conditional_primitive("ifdim", token.line, false)
             }
             "ifx" => {
                 let _ = self.take_global_prefix();
-                let left = self.next_significant_token();
-                let right = self.next_significant_token();
-                let condition = match (left.as_ref(), right.as_ref()) {
-                    (Some(left), Some(right)) => self.tokens_match_for_ifx(left, right),
-                    _ => false,
-                };
-                self.conditionals.process_if_at(condition, token.line);
-                if self.conditionals.is_skipping() {
-                    self.skip_current_false_branch();
-                }
-                Ok(true)
+                self.process_conditional_primitive("ifx", token.line, false)
             }
             "ifdefined" => {
                 let _ = self.take_global_prefix();
-                let condition = self
-                    .next_significant_token()
-                    .and_then(|name_token| control_sequence_name(&name_token))
-                    .map(|name| self.macro_engine.lookup(&name).is_some())
-                    .unwrap_or(false);
-                self.conditionals.process_if_at(condition, token.line);
-                if self.conditionals.is_skipping() {
-                    self.skip_current_false_branch();
-                }
-                Ok(true)
+                self.process_conditional_primitive("ifdefined", token.line, false)
             }
             "ifcsname" => {
                 let _ = self.take_global_prefix();
-                let name = self.read_csname_name(token.line)?;
-                let condition = !name.is_empty() && self.macro_engine.lookup(&name).is_some();
-                self.conditionals.process_if_at(condition, token.line);
-                if self.conditionals.is_skipping() {
-                    self.skip_current_false_branch();
-                }
-                Ok(true)
+                self.process_conditional_primitive("ifcsname", token.line, false)
             }
             "ifcase" => {
                 let _ = self.take_global_prefix();
@@ -3567,6 +3553,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             RegisterKind::CompatInt(_) => {
                 unreachable!("compat integer registers do not use \\count-style indices")
             }
+            RegisterKind::CompatDimen(_) => {
+                unreachable!("compat dimension registers do not use \\dimen-style indices")
+            }
         }
 
         Ok(())
@@ -3596,6 +3585,25 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     self.push_front_tokens(tokens_from_text(&value.to_string(), line));
                     return Ok(());
                 }
+                Some("pdfshellescape") => {
+                    let value = self.pdfshellescape_value();
+                    self.push_front_tokens(tokens_from_text(&value.to_string(), line));
+                    return Ok(());
+                }
+                Some("pdfpagewidth") => {
+                    let value = self
+                        .registers
+                        .get_compat_dimen(CompatDimenRegister::PdfPageWidth);
+                    self.push_front_tokens(tokens_from_text(&format_dimen(value), line));
+                    return Ok(());
+                }
+                Some("pdfpageheight") => {
+                    let value = self
+                        .registers
+                        .get_compat_dimen(CompatDimenRegister::PdfPageHeight);
+                    self.push_front_tokens(tokens_from_text(&format_dimen(value), line));
+                    return Ok(());
+                }
                 _ => {
                     if let Some(expansion) = self.expand_defined_control_sequence_token(&token)? {
                         self.push_front_tokens(expansion);
@@ -3619,6 +3627,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
             RegisterKind::CompatInt(register) => {
                 self.registers.get_compat_int(register).to_string()
+            }
+            RegisterKind::CompatDimen(register) => {
+                format_dimen(self.registers.get_compat_dimen(register))
             }
             RegisterKind::Dimen => {
                 let index = self.parse_register_index(line)?;
@@ -3650,7 +3661,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             | RegisterKind::Dimen
             | RegisterKind::Skip
             | RegisterKind::Muskip => Some(self.parse_register_index(line)?),
-            RegisterKind::CompatInt(_) => None,
+            RegisterKind::CompatInt(_) | RegisterKind::CompatDimen(_) => None,
         };
         let _ = self.read_keyword("by");
 
@@ -3668,6 +3679,17 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 let operand = self.parse_integer_value()?.unwrap_or(0);
                 let value = apply_integer_arithmetic(current, operand, operation, line)?;
                 self.registers.set_compat_int(register, value, global);
+            }
+            RegisterKind::CompatDimen(register) => {
+                let current = self.registers.get_compat_dimen(register);
+                let operand = match operation {
+                    ArithmeticOperation::Advance => self.parse_dimension_value()?.unwrap_or(0),
+                    ArithmeticOperation::Multiply | ArithmeticOperation::Divide => {
+                        self.parse_integer_value()?.unwrap_or(0)
+                    }
+                };
+                let value = apply_integer_arithmetic(current, operand, operation, line)?;
+                self.registers.set_compat_dimen(register, value, global);
             }
             RegisterKind::Dimen => {
                 let index = index.expect("indexed register kind");
@@ -3724,6 +3746,16 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 Some("pdftexversion") => {
                     return Ok(Some(RegisterKind::CompatInt(
                         CompatIntRegister::PdfTexVersion,
+                    )));
+                }
+                Some("pdfpagewidth") => {
+                    return Ok(Some(RegisterKind::CompatDimen(
+                        CompatDimenRegister::PdfPageWidth,
+                    )));
+                }
+                Some("pdfpageheight") => {
+                    return Ok(Some(RegisterKind::CompatDimen(
+                        CompatDimenRegister::PdfPageHeight,
                     )));
                 }
                 Some("dimen") => return Ok(Some(RegisterKind::Dimen)),
@@ -3911,6 +3943,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     .registers
                     .get_compat_int(CompatIntRegister::PdfTexVersion),
             )),
+            Some("pdfshellescape") => Ok(Some(sign * self.pdfshellescape_value())),
             Some("pdfstrcmp") => Ok(Some(sign * self.parse_pdfstrcmp_value(token.line)?)),
             Some("pdffilesize") => Ok(Some(sign * self.parse_pdffilesize_value()?)),
             Some("numexpr") => Ok(Some(sign * self.parse_numexpr_value(token.line)?)),
@@ -3948,6 +3981,16 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     sign * self.registers.get_muskip(index),
                 )))
             }
+            Some("pdfpagewidth") => Ok(Some(ParsedDimensionValue::Scaled(
+                sign * self
+                    .registers
+                    .get_compat_dimen(CompatDimenRegister::PdfPageWidth),
+            ))),
+            Some("pdfpageheight") => Ok(Some(ParsedDimensionValue::Scaled(
+                sign * self
+                    .registers
+                    .get_compat_dimen(CompatDimenRegister::PdfPageHeight),
+            ))),
             Some("dimexpr") => Ok(Some(ParsedDimensionValue::Scaled(
                 sign * self.parse_dimexpr_value(token.line)?,
             ))),
@@ -4300,6 +4343,117 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
             _ => false,
         }
+    }
+
+    fn process_unless_primitive(&mut self, line: u32) -> Result<(), ParseError> {
+        let Some(token) = self.next_significant_token() else {
+            return Ok(());
+        };
+        let Some(name) = control_sequence_name(&token) else {
+            self.push_front_token(token);
+            return Ok(());
+        };
+
+        if !self.process_conditional_primitive(&name, line, true)? {
+            self.push_front_token(token);
+        }
+
+        Ok(())
+    }
+
+    fn process_conditional_primitive(
+        &mut self,
+        name: &str,
+        line: u32,
+        negate: bool,
+    ) -> Result<bool, ParseError> {
+        let Some(mut condition) = self.parse_conditional_primitive_value(name, line)? else {
+            return Ok(false);
+        };
+        if negate {
+            condition = !condition;
+        }
+
+        self.conditionals.process_if_at(condition, line);
+        if self.conditionals.is_skipping() {
+            self.skip_current_false_branch();
+        }
+        Ok(true)
+    }
+
+    fn parse_conditional_primitive_value(
+        &mut self,
+        name: &str,
+        line: u32,
+    ) -> Result<Option<bool>, ParseError> {
+        let condition = match name {
+            "iftrue" => true,
+            "iffalse" => false,
+            "ifnum" => {
+                let left = self.parse_integer_value()?.unwrap_or(0);
+                let relation = self.parse_relation_token().unwrap_or('=');
+                let right = self.parse_integer_value()?.unwrap_or(0);
+                evaluate_ifnum(left, relation, right)
+            }
+            "if" => {
+                let left = self.next_significant_token();
+                let right = self.next_significant_token();
+                match (left.as_ref(), right.as_ref()) {
+                    (Some(left), Some(right)) => {
+                        matches!(
+                            (char_code_of(left), char_code_of(right)),
+                            (Some(left_code), Some(right_code)) if left_code == right_code
+                        )
+                    }
+                    _ => false,
+                }
+            }
+            "ifcat" => {
+                let left = self.next_significant_token();
+                let right = self.next_significant_token();
+                match (left.as_ref(), right.as_ref()) {
+                    (Some(left), Some(right)) => {
+                        matches!(
+                            (cat_code_of(left), cat_code_of(right)),
+                            (Some(left_cat), Some(right_cat)) if left_cat == right_cat
+                        )
+                    }
+                    _ => false,
+                }
+            }
+            "ifdim" => {
+                let left = self.parse_dimension_value()?.unwrap_or(0);
+                let relation = self.parse_relation_token().unwrap_or('=');
+                let right = self.parse_dimension_value()?.unwrap_or(0);
+                evaluate_ifnum(left, relation, right)
+            }
+            "ifx" => {
+                let left = self.next_significant_token();
+                let right = self.next_significant_token();
+                match (left.as_ref(), right.as_ref()) {
+                    (Some(left), Some(right)) => self.tokens_match_for_ifx(left, right),
+                    _ => false,
+                }
+            }
+            "ifdefined" => self
+                .next_significant_token()
+                .and_then(|name_token| control_sequence_name(&name_token))
+                .map(|name| self.macro_engine.lookup(&name).is_some())
+                .unwrap_or(false),
+            "ifcsname" => {
+                let name = self.read_csname_name(line)?;
+                !name.is_empty() && self.macro_engine.lookup(&name).is_some()
+            }
+            "ifodd" => self.parse_integer_value()?.unwrap_or(0) % 2 != 0,
+            "ifvoid" | "ifhbox" | "ifvbox" | "ifeof" => {
+                let _ = self.parse_integer_value()?;
+                false
+            }
+            "ifhmode" | "ifvmode" | "ifmmode" | "ifinner" => false,
+            _ => return Ok(None),
+        };
+
+        Ok(Some(condition))
     }
 
     fn take_global_prefix(&mut self) -> bool {
@@ -4687,6 +4841,31 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         Ok(())
     }
 
+    fn parse_compat_dimen_primitive(
+        &mut self,
+        register: CompatDimenRegister,
+        line: u32,
+    ) -> Result<(), ParseError> {
+        if self.consume_optional_equals() {
+            let value = self.parse_dimension_value()?.unwrap_or(0);
+            let global = self.take_global_prefix();
+            self.registers.set_compat_dimen(register, value, global);
+        } else {
+            let _ = self.take_global_prefix();
+            let value = self.registers.get_compat_dimen(register);
+            self.push_front_tokens(tokens_from_text(&format_dimen(value), line));
+        }
+        Ok(())
+    }
+
+    fn pdfshellescape_value(&self) -> i32 {
+        if self.shell_escape_handler.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
     fn parse_pdfstrcmp_value(&mut self, _line: u32) -> Result<i32, ParseError> {
         let left = self
             .read_required_braced_tokens()?
@@ -4704,9 +4883,49 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         })
     }
 
+    fn parse_pdfmdfivesum_value(&mut self) -> Result<String, ParseError> {
+        let text = self
+            .read_required_braced_tokens()?
+            .map(|tokens| tokens_to_text(&tokens))
+            .unwrap_or_default();
+        Ok(format!("{:x}", md5::compute(text.as_bytes())))
+    }
+
     fn parse_pdffilesize_value(&mut self) -> Result<i32, ParseError> {
         let _ = self.read_required_braced_tokens()?;
         Ok(0)
+    }
+
+    fn parse_pdfescapestring_value(&mut self) -> Result<String, ParseError> {
+        let text = self
+            .read_required_braced_tokens()?
+            .map(|tokens| tokens_to_text(&tokens))
+            .unwrap_or_default();
+        Ok(pdf_escape_string(&text))
+    }
+
+    fn parse_pdfescapename_value(&mut self) -> Result<String, ParseError> {
+        let text = self
+            .read_required_braced_tokens()?
+            .map(|tokens| tokens_to_text(&tokens))
+            .unwrap_or_default();
+        Ok(pdf_escape_name(&text))
+    }
+
+    fn parse_pdfescapehex_value(&mut self) -> Result<String, ParseError> {
+        let text = self
+            .read_required_braced_tokens()?
+            .map(|tokens| tokens_to_text(&tokens))
+            .unwrap_or_default();
+        Ok(pdf_escape_hex(&text))
+    }
+
+    fn parse_pdfunescapehex_value(&mut self) -> Result<Vec<u8>, ParseError> {
+        let text = self
+            .read_required_braced_tokens()?
+            .map(|tokens| tokens_to_text(&tokens))
+            .unwrap_or_default();
+        Ok(pdf_unescape_hex(&text))
     }
 
     fn consume_optional_equals(&mut self) -> bool {
@@ -5025,6 +5244,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     let value = self.parse_pdfstrcmp_value(token.line)?;
                     body.extend(tokens_from_text(&value.to_string(), token.line));
                 }
+                TokenKind::ControlWord(ref name) if name == "pdfmdfivesum" => {
+                    let value = self.parse_pdfmdfivesum_value()?;
+                    body.extend(tokens_from_text(&value, token.line));
+                }
                 TokenKind::ControlWord(ref name) if name == "pdfoutput" => {
                     let value = self.registers.get_compat_int(CompatIntRegister::PdfOutput);
                     body.extend(tokens_from_text(&value.to_string(), token.line));
@@ -5035,12 +5258,47 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         .get_compat_int(CompatIntRegister::PdfTexVersion);
                     body.extend(tokens_from_text(&value.to_string(), token.line));
                 }
+                TokenKind::ControlWord(ref name) if name == "pdfshellescape" => {
+                    let value = self.pdfshellescape_value();
+                    body.extend(tokens_from_text(&value.to_string(), token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfpagewidth" => {
+                    let value = self
+                        .registers
+                        .get_compat_dimen(CompatDimenRegister::PdfPageWidth);
+                    body.extend(tokens_from_text(&format_dimen(value), token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfpageheight" => {
+                    let value = self
+                        .registers
+                        .get_compat_dimen(CompatDimenRegister::PdfPageHeight);
+                    body.extend(tokens_from_text(&format_dimen(value), token.line));
+                }
                 TokenKind::ControlWord(ref name) if name == "pdffilesize" => {
                     let value = self.parse_pdffilesize_value()?;
                     body.extend(tokens_from_text(&value.to_string(), token.line));
                 }
                 TokenKind::ControlWord(ref name) if name == "pdftexbanner" => {
                     body.extend(tokens_from_text("This is ferritex", token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfcreationdate" => {
+                    body.extend(tokens_from_text(PDF_CREATION_DATE_PLACEHOLDER, token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfescapestring" => {
+                    let value = self.parse_pdfescapestring_value()?;
+                    body.extend(tokens_from_text(&value, token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfescapename" => {
+                    let value = self.parse_pdfescapename_value()?;
+                    body.extend(tokens_from_text(&value, token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfescapehex" => {
+                    let value = self.parse_pdfescapehex_value()?;
+                    body.extend(tokens_from_text(&value, token.line));
+                }
+                TokenKind::ControlWord(ref name) if name == "pdfunescapehex" => {
+                    let value = self.parse_pdfunescapehex_value()?;
+                    body.extend(tokens_from_bytes(&value, token.line));
                 }
                 TokenKind::ControlWord(ref name) if name == "numexpr" => {
                     let value = self.parse_numexpr_value(token.line)?;
@@ -5574,6 +5832,37 @@ fn tokens_from_text(text: &str, line: u32) -> Vec<Token> {
         .collect()
 }
 
+fn tokens_from_bytes(bytes: &[u8], line: u32) -> Vec<Token> {
+    let mut tokens = bytes
+        .iter()
+        .enumerate()
+        .map(|(offset, byte)| {
+            let char = char::from(*byte);
+            Token {
+                kind: TokenKind::CharToken {
+                    char,
+                    cat: catcode_for_expanded_char(char),
+                },
+                line,
+                column: (offset + 1) as u32,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if bytes.last() == Some(&b' ') {
+        tokens.push(Token {
+            kind: TokenKind::CharToken {
+                char: BODY_TRAILING_SPACE_SENTINEL,
+                cat: CatCode::Other,
+            },
+            line,
+            column: (bytes.len() + 1) as u32,
+        });
+    }
+
+    tokens
+}
+
 fn detokenized_tokens(tokens: &[Token], line: u32) -> Vec<Token> {
     tokens_to_text(tokens)
         .chars()
@@ -5587,6 +5876,69 @@ fn detokenized_tokens(tokens: &[Token], line: u32) -> Vec<Token> {
             column: (offset + 1) as u32,
         })
         .collect()
+}
+
+fn pdf_escape_string(text: &str) -> String {
+    let mut escaped = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'\\' => escaped.push_str(r"\\"),
+            b'(' => escaped.push_str(r"\("),
+            b')' => escaped.push_str(r"\)"),
+            0x20..=0x7E => escaped.push(char::from(byte)),
+            _ => escaped.push_str(&format!(r"\{:03o}", byte)),
+        }
+    }
+    escaped
+}
+
+fn pdf_escape_name(text: &str) -> String {
+    let mut escaped = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'!'..=b'"' | b'$'..=b'~' => escaped.push(char::from(byte)),
+            _ => escaped.push_str(&format!("#{byte:02X}")),
+        }
+    }
+    escaped
+}
+
+fn pdf_escape_hex(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() * 2);
+    for byte in text.bytes() {
+        escaped.push_str(&format!("{byte:02X}"));
+    }
+    escaped
+}
+
+fn pdf_unescape_hex(text: &str) -> Vec<u8> {
+    let hex_digits = text
+        .bytes()
+        .filter(|byte| byte.is_ascii_hexdigit())
+        .collect::<Vec<_>>();
+
+    let mut decoded = Vec::with_capacity(hex_digits.len() / 2);
+    for chunk in hex_digits.chunks(2) {
+        if chunk.len() < 2 {
+            let high = hex_value(chunk[0]).expect("filtered ASCII hex digit");
+            decoded.push(high << 4);
+            break;
+        }
+
+        let high = hex_value(chunk[0]).expect("filtered ASCII hex digit");
+        let low = hex_value(chunk[1]).expect("filtered ASCII hex digit");
+        decoded.push((high << 4) | low);
+    }
+    decoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn end_environment_tokens(name: &str, line: u32) -> Vec<Token> {
@@ -10782,6 +11134,104 @@ mod tests {
         );
 
         assert_eq!(document.body, "20/Y/3.0pt/\\foobar/X");
+    }
+
+    #[test]
+    fn unless_negates_conditionals_and_nested_skips() {
+        let document = parse_document(
+            "\\unless\\iftrue A\\else B\\fi/\\unless\\iffalse C\\else D\\fi/\\unless\\ifnum2<1E\\else F\\fi/\\iffalse X\\unless\\iftrue Y\\else Z\\fi\\else N\\fi",
+        );
+
+        assert_eq!(document.body, "B/C/E/N");
+    }
+
+    #[test]
+    fn pdfmdfivesum_expands_known_vector_in_body_and_edef() {
+        let document =
+            parse_document("\\pdfmdfivesum{abc}/\\edef\\digest{\\pdfmdfivesum{abc}}\\digest");
+
+        assert_eq!(
+            document.body,
+            "900150983cd24fb0d6963f7d28e17f72/900150983cd24fb0d6963f7d28e17f72"
+        );
+    }
+
+    #[test]
+    fn pdfmdfivesum_empty_string_known_vector() {
+        let document = parse_document("\\pdfmdfivesum{}");
+
+        assert_eq!(document.body, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn pdfshellescape_defaults_to_zero_without_handler() {
+        let document = parse_document(
+            "\\pdfshellescape/\\the\\pdfshellescape/\\numexpr\\pdfshellescape+1\\relax",
+        );
+
+        assert_eq!(document.body, "0/0/1");
+    }
+
+    #[test]
+    fn pdfshellescape_reports_one_when_handler_present() {
+        let handler = MockShellEscapeHandler {
+            result: ShellEscapeResult::Success { exit_code: 0 },
+        };
+        let output = parse_recovering_with_handlers(
+            "\\pdfshellescape/\\the\\pdfshellescape/\\numexpr\\pdfshellescape+1\\relax",
+            Some(&handler),
+            None,
+        );
+        let document = output.document.expect("parsed document");
+
+        assert_eq!(document.body, "1/1/2");
+    }
+
+    #[test]
+    fn pdfescapestring_expands_in_body_and_edef() {
+        let document = parse_document(
+            r"\pdfescapestring{A (B)}/\edef\escaped{\pdfescapestring{A (B)}}\escaped",
+        );
+
+        assert_eq!(document.body, r"A \(B\)/A \(B\)");
+    }
+
+    #[test]
+    fn pdfescapename_expands_in_body_and_edef() {
+        let document = parse_document(
+            r"\pdfescapename{Name# A}/\edef\escaped{\pdfescapename{Name# A}}\escaped",
+        );
+
+        assert_eq!(document.body, "Name#23#20A/Name#23#20A");
+    }
+
+    #[test]
+    fn pdfescapehex_expands_in_body_and_edef() {
+        let document =
+            parse_document(r"\pdfescapehex{Az}/\edef\escaped{\pdfescapehex{Az}}\escaped");
+
+        assert_eq!(document.body, "417A/417A");
+    }
+
+    #[test]
+    fn pdfunescapehex_decodes_pairs_and_zero_pads_odd_trailing_nibble() {
+        let document = parse_document(
+            r"\pdfunescapehex{48656C6C6F2}/\edef\decoded{\pdfunescapehex{48656C6C6F2}}\decoded",
+        );
+
+        assert_eq!(document.body, "Hello /Hello ");
+    }
+
+    #[test]
+    fn pdfcreationdate_and_page_dimensions_expand_and_assign() {
+        let document = parse_document(
+            r"\edef\creation{\pdfcreationdate}\creation/\pdfpagewidth/\the\pdfpageheight/\pdfpagewidth=300pt\pdfpageheight=400pt\advance\pdfpageheight by 1pt\pdfpagewidth/\the\pdfpageheight",
+        );
+
+        assert_eq!(
+            document.body,
+            "D:20700101000000+00'00'/614.29375pt/795.00662pt/300.0pt/401.0pt"
+        );
     }
 
     #[test]

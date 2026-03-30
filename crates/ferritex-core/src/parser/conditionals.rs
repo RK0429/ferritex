@@ -1,4 +1,4 @@
-use super::{Token, TokenKind};
+use super::{CatCode, Token, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipOutcome {
@@ -159,6 +159,13 @@ impl ConditionalState {
                 return SkipOutcome::EndOfInput;
             };
 
+            if control_sequence_name(&token) == Some("unless") {
+                if consume_unless_conditional_start(&mut token_source) {
+                    nested_depth += 1;
+                }
+                continue;
+            }
+
             if is_conditional_start(&token) {
                 nested_depth += 1;
                 continue;
@@ -211,7 +218,8 @@ fn is_conditional_start(token: &Token) -> bool {
     control_sequence_name(token).is_some_and(|name| {
         matches!(
             name,
-            "iftrue"
+            "unless"
+                | "iftrue"
                 | "iffalse"
                 | "ifnum"
                 | "ifx"
@@ -232,6 +240,26 @@ fn is_conditional_start(token: &Token) -> bool {
                 | "ifcsname"
         )
     })
+}
+
+fn consume_unless_conditional_start<F>(token_source: &mut F) -> bool
+where
+    F: FnMut() -> Option<Token>,
+{
+    loop {
+        let Some(token) = token_source() else {
+            return false;
+        };
+
+        match token.kind {
+            TokenKind::CharToken {
+                cat: CatCode::Space,
+                ..
+            } => continue,
+            TokenKind::ControlWord(ref name) if name == "par" => continue,
+            _ => return is_conditional_start(&token),
+        }
+    }
 }
 
 fn control_sequence_name(token: &Token) -> Option<&str> {
@@ -304,6 +332,7 @@ mod tests {
     #[test]
     fn conditional_start_uses_primitive_whitelist() {
         assert!(is_conditional_start(&control_word("iftrue")));
+        assert!(is_conditional_start(&control_word("unless")));
         assert!(is_conditional_start(&control_word("ifdefined")));
         assert!(is_conditional_start(&control_word("ifcsname")));
         assert!(!is_conditional_start(&control_word("ifmycondition")));
@@ -340,6 +369,28 @@ mod tests {
         assert_eq!(outcome, SkipOutcome::Resumed);
         assert!(!state.is_skipping());
         assert_eq!(tokens.pop_front(), Some(char_token('c')));
+    }
+
+    #[test]
+    fn skip_false_branch_counts_unless_prefixed_conditionals_once() {
+        let mut state = ConditionalState::default();
+        state.process_if(false);
+
+        let mut tokens = VecDeque::from(vec![
+            control_word("unless"),
+            control_word("iftrue"),
+            char_token('a'),
+            control_word("fi"),
+            control_word("else"),
+            char_token('b'),
+            control_word("fi"),
+        ]);
+
+        let outcome = state.skip_false_branch(|| tokens.pop_front());
+
+        assert_eq!(outcome, SkipOutcome::Resumed);
+        assert!(!state.is_skipping());
+        assert_eq!(tokens.pop_front(), Some(char_token('b')));
     }
 
     fn control_word(name: &str) -> Token {
