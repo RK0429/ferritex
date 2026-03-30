@@ -363,9 +363,8 @@ fn corpus_embedded_assets_compiles_and_verifies_content() {
     for asset in &["pixel.png", "diagram.pdf"] {
         let src = corpus_dir.join(asset);
         let dst = temp_dir.path().join(asset);
-        std::fs::copy(&src, &dst).unwrap_or_else(|e| {
-            panic!("copy asset {} to tempdir: {e}", src.display())
-        });
+        std::fs::copy(&src, &dst)
+            .unwrap_or_else(|e| panic!("copy asset {} to tempdir: {e}", src.display()));
     }
 
     let mut cases = Vec::with_capacity(base_cases.len());

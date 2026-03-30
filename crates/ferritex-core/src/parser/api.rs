@@ -1563,10 +1563,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             main_font_name: self.main_font_name.clone(),
             sans_font_name: self.sans_font_name.clone(),
             mono_font_name: self.mono_font_name.clone(),
-            body: self
-                .body
-                .trim()
-                .replace(BODY_TRAILING_SPACE_SENTINEL, ""),
+            body: self.body.trim().replace(BODY_TRAILING_SPACE_SENTINEL, ""),
             labels: DocumentLabels::with_metadata(
                 self.state.labels.clone(),
                 self.state.citations.clone(),
@@ -4773,9 +4770,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         let is_loaded = match extension.as_str() {
             "cls" => {
                 let class_name = target_name.trim_end_matches(".cls");
-                self.class_registry.active_class().is_some_and(|active_class| {
-                    !class_name.is_empty() && active_class.name == class_name
-                })
+                self.class_registry
+                    .active_class()
+                    .is_some_and(|active_class| {
+                        !class_name.is_empty() && active_class.name == class_name
+                    })
             }
             "sty" => {
                 let package_name = target_name.trim_end_matches(".sty");
@@ -4905,9 +4904,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return Ok(());
         }
 
-        if let Some(expansion) = self.expand_defined_control_sequence_token(&control_word_token(
-            &name, line,
-        ))? {
+        if let Some(expansion) =
+            self.expand_defined_control_sequence_token(&control_word_token(&name, line))?
+        {
             self.push_front_tokens(expansion);
         }
         Ok(())
@@ -8881,8 +8880,8 @@ mod tests {
         parse_bbl_input, render_math_nodes_for_anchor, render_math_nodes_for_encoding,
         CaptionEntry, DocumentLabels, DocumentNode, FloatType, FontFamilyRole,
         IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine, MathNode, MinimalLatexParser,
-        OverUnderKind, PackageInfo, ParseError, ParsedDocument, Parser, ParserDriver,
-        SectionEntry, MAX_KERNEL_LOOP_ITERATIONS,
+        OverUnderKind, PackageInfo, ParseError, ParsedDocument, Parser, ParserDriver, SectionEntry,
+        MAX_KERNEL_LOOP_ITERATIONS,
     };
     use crate::bibliography::api::BibliographyState;
     use crate::compilation::IndexEntry;
@@ -11759,7 +11758,8 @@ mod tests {
 
     #[test]
     fn gobble_commands_discard_braced_arguments() {
-        let document = parse_document("\\makeatletter\\@gobble{drop}A/\\@gobbletwo{one}{two}B\\makeatother");
+        let document =
+            parse_document("\\makeatletter\\@gobble{drop}A/\\@gobbletwo{one}{two}B\\makeatother");
 
         assert_eq!(document.body, "A/B");
     }

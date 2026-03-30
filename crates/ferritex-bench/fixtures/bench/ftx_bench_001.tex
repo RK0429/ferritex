@@ -1,0 +1,63 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\makeatletter
+\title{Ferritex Full Benchmark FTX-BENCH-001}
+\author{Ferritex Bench Suite}
+\hypersetup{
+  pdftitle={Ferritex Full Benchmark FTX-BENCH-001},
+  pdfauthor={Ferritex Bench Suite}
+}
+\def\benchmarkparagraph{This synthetic benchmark paragraph repeats scholarly prose about calibration, validation, numerical stability, reproducibility, systems measurement, cross-reference density, and figure reuse so that each iteration occupies substantial space while remaining deterministic under sequential and parallel jobs. }
+\newcount\loopcount
+\begin{document}
+\tableofcontents
+\section{Benchmark Overview}\label{sec:overview}
+This document stresses inline math such as $a_n = a_{n-1} + 1$, display math, numbered equations, aligned equations, repeated figures, internal references to Section \ref{sec:method}, Equation \ref{eq:foundation}, and Figure \ref{fig:reference-pixel}, plus an external archive URL at \url{https://example.com/ftx-bench-001}. See \hyperref[sec:method]{the method section} for the repeated benchmark workload.
+\[
+\sum_{k=1}^{n} k = \frac{n(n+1)}{2}
+\]
+\begin{equation}
+E = mc^2
+\label{eq:foundation}
+\end{equation}
+\begin{figure}[h]
+\includegraphics[width=96pt]{pixel.png}
+\caption{Reference pixel used throughout the benchmark}
+\label{fig:reference-pixel}
+\end{figure}
+\clearpage
+\section{Method}\label{sec:method}
+Each benchmark cycle includes inline math such as $x_n = x_{n-1} + n$, a numbered equation, a display equation, an align environment, a figure that embeds the same PNG asset, and prose that repeatedly links back to the overview resources.
+\clearpage
+\loopcount=0
+% Intended plain-TeX shape: \loop ... \ifnum ... \repeat
+% Ferritex currently expands kernel \@for reliably, so this fixture uses it to
+% generate the 100-page body without requiring runtime changes.
+\@for\benchitem:=01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100\do{%
+\advance\loopcount by 1
+\section{Benchmark Cycle}
+Cycle \the\loopcount\ revisits Section \ref{sec:overview}, Equation \ref{eq:foundation}, Figure \ref{fig:reference-pixel}, and the external record at \url{https://example.com/ftx-bench-001}. The inline recurrence $x_n = x_{n-1} + n$ summarizes the local state transition for this cycle.
+\begin{equation}
+s_n = n^2 + n
+\end{equation}
+\[
+\frac{s_n}{n + 1} = n
+\]
+\begin{align}
+a_n &= s_n + 1 \\
+b_n &= a_n + n
+\end{align}
+\begin{figure}[h]
+\includegraphics[width=80pt]{pixel.png}
+\caption{Observation tile recorded during a benchmark cycle}
+\end{figure}
+\benchmarkparagraph
+\benchmarkparagraph
+\benchmarkparagraph
+\benchmarkparagraph
+\clearpage
+}%
+\makeatother
+\end{document}

@@ -352,8 +352,15 @@ pub fn load_package(
         Ok(())
     } else if let Some(resolve_sty) = sty_resolver {
         if let Some(source) = resolve_sty(name) {
-            StyInterpreter::new(&source, options, registry, engine, active_class, sty_resolver)
-                .interpret()
+            StyInterpreter::new(
+                &source,
+                options,
+                registry,
+                engine,
+                active_class,
+                sty_resolver,
+            )
+            .interpret()
         } else {
             Ok(())
         }
@@ -572,10 +579,15 @@ mod tests {
             Some(&resolver),
         )
         .expect("load mypkg"));
-        assert!(
-            !load_package("mypkg", &[], &mut registry, &mut engine, None, Some(&resolver))
-                .expect("duplicate mypkg load")
-        );
+        assert!(!load_package(
+            "mypkg",
+            &[],
+            &mut registry,
+            &mut engine,
+            None,
+            Some(&resolver)
+        )
+        .expect("duplicate mypkg load"));
 
         assert!(registry.is_loaded("mypkg"));
         assert!(registry.is_loaded("amsmath"));

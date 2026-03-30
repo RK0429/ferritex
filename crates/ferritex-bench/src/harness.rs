@@ -48,6 +48,20 @@ pub fn bench_fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+pub fn full_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let input = fixture_base.join("bench/ftx_bench_001.tex");
+    [1, 4]
+        .into_iter()
+        .map(|jobs| BenchCase {
+            name: format!("ftx-bench-001-jobs{jobs}"),
+            profile: BenchProfile::FullBench,
+            input_fixture: input.clone(),
+            asset_bundle: None,
+            jobs,
+        })
+        .collect()
+}
+
 pub fn bundle_bootstrap_cases(fixture_base: &Path) -> Vec<BenchCase> {
     let bundle_dir = fixture_base.join("bundle");
 
@@ -641,9 +655,9 @@ mod tests {
         bundle_bootstrap_cases, bundle_package_loading_cases, corpus_bibliography_cases,
         corpus_compat_cases, corpus_embedded_assets_cases, corpus_navigation_cases,
         corpus_partition_article_cases, corpus_partition_book_cases,
-        corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, BenchCase, BenchComparison,
-        BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming,
-        CompileBackend, CompileOutput,
+        corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, full_bench_cases, BenchCase,
+        BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig,
+        BenchTiming, CompileBackend, CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -1032,6 +1046,22 @@ mod tests {
             .all(|c| c.profile == BenchProfile::PartitionBench));
         assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
         assert!(cases[0].input_fixture.ends_with("multi_section.tex"));
+        assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
+    }
+
+    #[test]
+    fn test_full_bench_cases_generate_paired_jobs() {
+        let fixture_base = fixtures_root();
+        let cases = full_bench_cases(&fixture_base);
+
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].name, "ftx-bench-001-jobs1");
+        assert_eq!(cases[1].name, "ftx-bench-001-jobs4");
+        assert_eq!(cases[0].jobs, 1);
+        assert_eq!(cases[1].jobs, 4);
+        assert!(cases.iter().all(|c| c.profile == BenchProfile::FullBench));
+        assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
+        assert!(cases[0].input_fixture.ends_with("bench/ftx_bench_001.tex"));
         assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
     }
 
