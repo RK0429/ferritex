@@ -11,9 +11,10 @@ use ferritex_core::bibliography::api::{
     BibliographyToolchain,
 };
 use ferritex_core::compilation::{
-    CompilationJob, CompilationSnapshot, DestinationAnchor, DocumentPartitionPlan, DocumentState,
-    DocumentWorkUnit, IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
-    SectionOutlineEntry, SymbolLocation,
+    commit_layout_fragment, CommitBarrier, CommitEntry, CompilationJob, CompilationSnapshot,
+    DestinationAnchor, DocumentPartitionPlan, DocumentState, DocumentWorkUnit, IndexEntry,
+    LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft, SectionOutlineEntry,
+    StageCommitPayload, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
@@ -66,6 +67,11 @@ const CMR10_TFM_CANDIDATES: [&str; 4] = [
     "texmf/cmr10.tfm",
     "cmr10.tfm",
 ];
+
+#[cfg(test)]
+static FORCE_PARALLEL_FULL_TYPESET_COLLISION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileResult {
     pub diagnostics: Vec<Diagnostic>,
@@ -993,12 +999,55 @@ impl<'a> CompileJobService<'a> {
                     .expect("font selection initialized");
 
                 let full_typeset = || {
-                    self.typeset_document_with_selection(
+                    let sequential_typeset = || {
+                        self.typeset_document_with_selection(
+                            document,
+                            Some(&source_tree.source_lines),
+                            selection,
+                            &graphics_resolver,
+                        )
+                    };
+
+                    if options.parallelism <= 1 {
+                        return sequential_typeset();
+                    }
+
+                    let partition_plan =
+                        partition_plan_for_document(&options.input_file, document, &source_tree);
+                    if partition_plan.work_units.len() < 2 {
+                        return sequential_typeset();
+                    }
+
+                    match try_parallel_full_typeset(
+                        self,
                         document,
-                        Some(&source_tree.source_lines),
+                        &source_tree.source_lines,
                         selection,
                         &graphics_resolver,
-                    )
+                        options.parallelism,
+                        &partition_plan,
+                        graphics_resolver.file_access_gate,
+                        graphics_resolver.input_dir,
+                        graphics_resolver.project_root,
+                        graphics_resolver.overlay_roots,
+                        graphics_resolver.asset_bundle_path,
+                        &options.input_file,
+                        &options.jobname,
+                        &execution_policy,
+                        typeset_callback_count as u32,
+                        &source_tree.document_state,
+                    ) {
+                        Ok(document) => document,
+                        Err(reason) => {
+                            tracing::info!(
+                                jobname = %options.jobname,
+                                input = %options.input_file.display(),
+                                "{}",
+                                format!("full typeset fallback to sequential ({reason})")
+                            );
+                            sequential_typeset()
+                        }
+                    }
                 };
 
                 let partial_typeset_available = cached_recompilation_scope
@@ -2210,10 +2259,123 @@ fn try_partial_typeset_document(
     Ok(merged)
 }
 
+fn try_parallel_full_typeset(
+    service: &CompileJobService<'_>,
+    document: &ParsedDocument,
+    source_lines: &[SourceLineTrace],
+    selection: &CompileFontSelection,
+    graphics_resolver: &CompileGraphicAssetResolver<'_>,
+    parallelism: usize,
+    partition_plan: &DocumentPartitionPlan,
+    file_access_gate: &dyn FileAccessGate,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+    primary_input: &Path,
+    jobname: &str,
+    execution_policy: &ExecutionPolicy,
+    pass_number: u32,
+    document_state: &DocumentState,
+) -> Result<TypesetDocument, &'static str> {
+    if parallelism <= 1 || partition_plan.work_units.len() < 2 {
+        return Err("parallel full typeset requires at least two partitions");
+    }
+
+    let snapshot_job = compilation_job(
+        primary_input.to_path_buf(),
+        jobname.to_string(),
+        execution_policy.clone(),
+    );
+    let snapshot_session = snapshot_job.begin_pass(pass_number);
+    let snapshot = CompilationSnapshot::derive_snapshot(
+        &snapshot_session,
+        &RegisterStore::default(),
+        document_state,
+    );
+    let body_ranges =
+        partition_body_ranges(document, partition_plan).ok_or("partition body slicing failed")?;
+    let section_ranges = partition_section_ranges(document, partition_plan)
+        .ok_or("partition section slicing failed")?;
+    let work_items = collect_full_typeset_work_items(
+        document,
+        partition_plan,
+        &body_ranges,
+        &section_ranges,
+        &snapshot,
+    )?;
+
+    tracing::info!(
+        partitions = work_items.len(),
+        parallelism,
+        pass_number = snapshot.pass_number,
+        "full typeset executing in parallel"
+    );
+
+    let parallel_results = run_parallel_full_typeset(
+        service,
+        source_lines,
+        selection,
+        parallelism,
+        work_items,
+        file_access_gate,
+        input_dir,
+        project_root,
+        overlay_roots,
+        asset_bundle_path,
+    )?;
+    let mut barrier = CommitBarrier::new(snapshot.pass_number);
+    for (partition_id, fragment, _) in &parallel_results {
+        commit_layout_fragment(&mut barrier, partition_id, fragment);
+    }
+    if should_force_parallel_full_typeset_collision() {
+        tracing::warn!(
+            pass_number = snapshot.pass_number,
+            "parallel full typeset authority key collision; falling back to sequential"
+        );
+        return Err("authority key collision in parallel full typeset");
+    }
+    let ordered_entries = match barrier.into_ordered_or_collisions() {
+        Ok(entries) => entries,
+        Err((_ordered_entries, collisions)) => {
+            tracing::warn!(
+                pass_number = snapshot.pass_number,
+                collisions = ?collisions,
+                "parallel full typeset authority key collision; falling back to sequential"
+            );
+            return Err("authority key collision in parallel full typeset");
+        }
+    };
+
+    for (_, _, diagnostics) in parallel_results {
+        for diagnostic in diagnostics {
+            graphics_resolver.push_diagnostic(diagnostic);
+        }
+    }
+
+    let fragments = layout_fragments_from_commit_entries(ordered_entries)?;
+    if fragments.len() < partition_plan.work_units.len() {
+        return Err("parallel full typeset produced incomplete layout fragments");
+    }
+
+    Ok(PaginationMergeCoordinator.merge(
+        partition_plan,
+        &fragments,
+        &navigation_state_for_document(document),
+    ))
+}
+
 #[derive(Debug)]
 struct PartialTypesetWorkItem {
     work_unit: DocumentWorkUnit,
     partition_document: ParsedDocument,
+}
+
+#[derive(Debug)]
+struct FullTypesetWorkItem {
+    work_unit: DocumentWorkUnit,
+    partition_document: ParsedDocument,
+    snapshot: CompilationSnapshot,
 }
 
 fn collect_partial_typeset_work_items(
@@ -2304,6 +2466,134 @@ fn run_parallel_partial_typeset(
     }
 
     Ok(results)
+}
+
+fn collect_full_typeset_work_items(
+    document: &ParsedDocument,
+    partition_plan: &DocumentPartitionPlan,
+    body_ranges: &BTreeMap<String, (usize, usize)>,
+    section_ranges: &BTreeMap<String, (usize, usize)>,
+    snapshot: &CompilationSnapshot,
+) -> Result<Vec<FullTypesetWorkItem>, &'static str> {
+    partition_plan
+        .work_units
+        .iter()
+        .map(|work_unit| {
+            let partition_document = partition_document_for_work_unit(
+                document,
+                work_unit,
+                body_ranges
+                    .get(&work_unit.partition_id)
+                    .copied()
+                    .ok_or("missing body range for partition")?,
+                section_ranges
+                    .get(&work_unit.partition_id)
+                    .copied()
+                    .ok_or("missing section range for partition")?,
+            )
+            .ok_or("failed to build partition-scoped parsed document")?;
+            Ok(FullTypesetWorkItem {
+                work_unit: work_unit.clone(),
+                partition_document,
+                snapshot: snapshot.clone(),
+            })
+        })
+        .collect()
+}
+
+fn run_parallel_full_typeset(
+    service: &CompileJobService<'_>,
+    source_lines: &[SourceLineTrace],
+    selection: &CompileFontSelection,
+    parallelism: usize,
+    mut work_items: Vec<FullTypesetWorkItem>,
+    file_access_gate: &dyn FileAccessGate,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+) -> Result<Vec<(String, DocumentLayoutFragment, Vec<Diagnostic>)>, &'static str> {
+    let mut results = Vec::with_capacity(work_items.len());
+    let concurrency = parallelism.max(1);
+
+    while !work_items.is_empty() {
+        let batch = work_items
+            .drain(..concurrency.min(work_items.len()))
+            .collect::<Vec<_>>();
+        let batch_results = thread::scope(|scope| {
+            let handles = batch
+                .into_iter()
+                .map(|work_item| {
+                    scope.spawn(move || {
+                        let _pass_number = work_item.snapshot.pass_number;
+                        let thread_resolver = CompileGraphicAssetResolver {
+                            file_access_gate,
+                            input_dir,
+                            project_root,
+                            overlay_roots,
+                            asset_bundle_path,
+                            diagnostics: RefCell::new(Vec::new()),
+                        };
+                        let partition_typeset = service.typeset_document_with_selection(
+                            &work_item.partition_document,
+                            Some(source_lines),
+                            selection,
+                            &thread_resolver,
+                        );
+                        let fragment =
+                            extract_rebuilt_fragment(partition_typeset, &work_item.work_unit)?;
+                        Ok((
+                            work_item.work_unit.partition_id,
+                            fragment,
+                            thread_resolver.take_diagnostics(),
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("full typeset thread panicked"))
+                .collect::<Result<Vec<_>, &'static str>>()
+        })?;
+        results.extend(batch_results);
+    }
+
+    Ok(results)
+}
+
+fn layout_fragments_from_commit_entries(
+    entries: Vec<CommitEntry>,
+) -> Result<BTreeMap<String, DocumentLayoutFragment>, &'static str> {
+    let mut fragments = BTreeMap::new();
+
+    for entry in entries {
+        let StageCommitPayload::LayoutMerge(payload) = entry.payload else {
+            return Err("unexpected non-layout commit entry");
+        };
+        if payload.fragments.is_empty() {
+            return Err("layout merge entry missing fragment");
+        }
+        for fragment in payload.fragments {
+            fragments.insert(fragment.partition_id.clone(), fragment);
+        }
+    }
+
+    Ok(fragments)
+}
+
+fn should_force_parallel_full_typeset_collision() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_PARALLEL_FULL_TYPESET_COLLISION.load(
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn extract_rebuilt_fragment(
@@ -5588,6 +5878,19 @@ mod tests {
         (result, trace_messages)
     }
 
+    struct ParallelFullTypesetCollisionGuard;
+
+    impl Drop for ParallelFullTypesetCollisionGuard {
+        fn drop(&mut self) {
+            super::FORCE_PARALLEL_FULL_TYPESET_COLLISION.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn force_parallel_full_typeset_collision() -> ParallelFullTypesetCollisionGuard {
+        super::FORCE_PARALLEL_FULL_TYPESET_COLLISION.store(true, Ordering::SeqCst);
+        ParallelFullTypesetCollisionGuard
+    }
+
     fn test_typeset_document(lines: Vec<TextLine>) -> TypesetDocument {
         TypesetDocument {
             pages: vec![TypesetPage {
@@ -6724,6 +7027,162 @@ mod tests {
         assert!(parallel_trace_messages
             .iter()
             .any(|message| message.contains("partial typeset rebuild executing in parallel")));
+        let parallel_pdf =
+            fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
+
+        assert_eq!(sequential_pdf, parallel_pdf);
+    }
+
+    #[test]
+    fn parallel_full_typeset_produces_same_output_as_sequential() {
+        let loader = MockAssetBundleLoader::valid();
+
+        let sequential_dir = tempdir().expect("create sequential tempdir");
+        let sequential_input = write_partitioned_report_project(
+            sequential_dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nOriginal chapter one body.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nOriginal chapter two body.\n",
+                ),
+                (
+                    "chapter-three.tex",
+                    "\\chapter{Three}\\label{chap:three}\nStable chapter three body.\n",
+                ),
+            ],
+        );
+        let mut sequential_options =
+            runtime_options(sequential_input, sequential_dir.path().join("out"));
+        sequential_options.no_cache = true;
+        sequential_options.parallelism = 1;
+
+        let sequential = service(&FsTestFileAccessGate, &loader).compile(&sequential_options);
+        assert_eq!(sequential.exit_code, 0);
+        let sequential_pdf =
+            fs::read(sequential_options.output_dir.join("main.pdf")).expect("read sequential pdf");
+
+        let parallel_dir = tempdir().expect("create parallel tempdir");
+        let parallel_input = write_partitioned_report_project(
+            parallel_dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nOriginal chapter one body.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nOriginal chapter two body.\n",
+                ),
+                (
+                    "chapter-three.tex",
+                    "\\chapter{Three}\\label{chap:three}\nStable chapter three body.\n",
+                ),
+            ],
+        );
+        let mut parallel_options = runtime_options(parallel_input, parallel_dir.path().join("out"));
+        parallel_options.no_cache = true;
+        parallel_options.parallelism = 4;
+
+        let (parallel, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &parallel_options);
+        assert_eq!(parallel.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("full typeset executing in parallel")));
+        let parallel_pdf =
+            fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
+
+        assert_eq!(sequential_pdf, parallel_pdf);
+    }
+
+    #[test]
+    fn parallel_full_typeset_falls_back_on_single_partition() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            report_document("\\chapter{Only}\\label{chap:only}\nSingle partition body.\n"),
+        )
+        .expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = true;
+        options.parallelism = 4;
+        let loader = MockAssetBundleLoader::valid();
+
+        let (result, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .all(|message| !message.contains("full typeset executing in parallel")));
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("Single partition body."));
+    }
+
+    #[test]
+    fn parallel_full_typeset_collision_fallback_produces_sequential_result() {
+        let loader = MockAssetBundleLoader::valid();
+
+        let sequential_dir = tempdir().expect("create sequential tempdir");
+        let sequential_input = write_partitioned_report_project(
+            sequential_dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nFirst chapter body.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nSecond chapter body.\n",
+                ),
+            ],
+        );
+        let mut sequential_options =
+            runtime_options(sequential_input, sequential_dir.path().join("out"));
+        sequential_options.no_cache = true;
+        sequential_options.parallelism = 1;
+
+        let sequential = service(&FsTestFileAccessGate, &loader).compile(&sequential_options);
+        assert_eq!(sequential.exit_code, 0);
+        let sequential_pdf =
+            fs::read(sequential_options.output_dir.join("main.pdf")).expect("read sequential pdf");
+
+        let parallel_dir = tempdir().expect("create parallel tempdir");
+        let parallel_input = write_partitioned_report_project(
+            parallel_dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nFirst chapter body.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nSecond chapter body.\n",
+                ),
+            ],
+        );
+        let mut parallel_options = runtime_options(parallel_input, parallel_dir.path().join("out"));
+        parallel_options.no_cache = true;
+        parallel_options.parallelism = 4;
+
+        let _collision_guard = force_parallel_full_typeset_collision();
+        let (parallel, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &parallel_options);
+        assert_eq!(parallel.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("full typeset executing in parallel")), "{trace_messages:?}");
+        assert!(trace_messages.iter().any(|message| {
+            message.contains(
+                "parallel full typeset authority key collision; falling back to sequential",
+            )
+        }), "{trace_messages:?}");
         let parallel_pdf =
             fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
 

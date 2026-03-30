@@ -151,13 +151,19 @@ impl CommitBarrier {
     }
 
     pub fn into_ordered(mut self) -> Vec<CommitEntry> {
-        self.pending.sort_by(|left, right| {
-            left.payload
-                .stage_order()
-                .cmp(&right.payload.stage_order())
-                .then_with(|| left.partition_id.cmp(&right.partition_id))
-        });
+        self.sort_pending();
         self.pending
+    }
+
+    pub fn into_ordered_or_collisions(
+        mut self,
+    ) -> Result<Vec<CommitEntry>, (Vec<CommitEntry>, Vec<AuthorityKeyCollision>)> {
+        self.sort_pending();
+        if self.collisions.is_empty() {
+            Ok(self.pending)
+        } else {
+            Err((self.pending, self.collisions))
+        }
     }
 
     fn record_collision(
@@ -187,6 +193,30 @@ impl CommitBarrier {
             partition_ids,
         });
     }
+
+    fn sort_pending(&mut self) {
+        self.pending.sort_by(|left, right| {
+            left.payload
+                .stage_order()
+                .cmp(&right.payload.stage_order())
+                .then_with(|| left.partition_id.cmp(&right.partition_id))
+        });
+    }
+}
+
+pub fn commit_layout_fragment(
+    barrier: &mut CommitBarrier,
+    partition_id: &str,
+    fragment: &DocumentLayoutFragment,
+) {
+    let mut fragment = fragment.clone();
+    fragment.partition_id = partition_id.to_string();
+    barrier.commit(CommitEntry {
+        partition_id: partition_id.to_string(),
+        payload: StageCommitPayload::LayoutMerge(LayoutMergePayload {
+            fragments: vec![fragment],
+        }),
+    });
 }
 
 fn authority_keys(payload: &StageCommitPayload) -> HashSet<AuthorityKey> {
@@ -222,7 +252,22 @@ fn authority_keys(payload: &StageCommitPayload) -> HashSet<AuthorityKey> {
         StageCommitPayload::LayoutMerge(payload) => payload
             .fragments
             .iter()
-            .map(|fragment| AuthorityKey::TocNavigation(fragment.partition_id.clone()))
+            .flat_map(|fragment| {
+                std::iter::once(AuthorityKey::TocNavigation(format!(
+                    "partition:{}",
+                    fragment.partition_id
+                )))
+                .chain(
+                    fragment
+                        .local_label_pages
+                        .keys()
+                        .cloned()
+                        .map(AuthorityKey::Label),
+                )
+                .chain(fragment.named_destinations.iter().map(|destination| {
+                    AuthorityKey::TocNavigation(format!("destination:{}", destination.name))
+                }))
+            })
             .collect(),
         StageCommitPayload::ArtifactCache(payload) => payload
             .artifact_records
@@ -252,8 +297,9 @@ fn register_update_prefix(kind: RegisterUpdateKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorityKey, CommitBarrier, CommitEntry, DocumentReferencePayload, LayoutMergePayload,
-        MacroSessionPayload, RegisterUpdate, RegisterUpdateKind, StageCommitPayload, StageOrder,
+        commit_layout_fragment, AuthorityKey, CommitBarrier, CommitEntry, DocumentReferencePayload,
+        LayoutMergePayload, MacroSessionPayload, RegisterUpdate, RegisterUpdateKind,
+        StageCommitPayload, StageOrder,
     };
     use crate::typesetting::DocumentLayoutFragment;
 
@@ -371,6 +417,56 @@ mod tests {
         let barrier = CommitBarrier::new(3);
 
         assert_eq!(barrier.pass_number(), 3);
+    }
+
+    #[test]
+    fn commit_barrier_into_ordered_or_collisions_returns_ok_without_collisions() {
+        let mut barrier = CommitBarrier::new(7);
+        commit_layout_fragment(&mut barrier, "section:a", &fragment("section:a"));
+        commit_layout_fragment(&mut barrier, "section:b", &fragment("section:b"));
+
+        let ordered = barrier
+            .into_ordered_or_collisions()
+            .expect("collision-free ordered entries")
+            .into_iter()
+            .map(|entry| entry.partition_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered,
+            vec!["section:a".to_string(), "section:b".to_string()]
+        );
+    }
+
+    #[test]
+    fn commit_barrier_into_ordered_or_collisions_returns_err_with_collision_details() {
+        let mut barrier = CommitBarrier::new(8);
+        let mut left = fragment("section:a");
+        left.local_label_pages = [("shared".to_string(), 0)].into_iter().collect();
+        let mut right = fragment("section:b");
+        right.local_label_pages = [("shared".to_string(), 0)].into_iter().collect();
+        commit_layout_fragment(&mut barrier, "section:a", &left);
+        commit_layout_fragment(&mut barrier, "section:b", &right);
+
+        let (ordered, collisions) = barrier
+            .into_ordered_or_collisions()
+            .expect_err("collisions should be returned");
+
+        assert_eq!(
+            ordered
+                .into_iter()
+                .map(|entry| entry.partition_id)
+                .collect::<Vec<_>>(),
+            vec!["section:a".to_string(), "section:b".to_string()]
+        );
+        assert_eq!(
+            collisions,
+            vec![super::AuthorityKeyCollision {
+                key: AuthorityKey::Label("shared".to_string()),
+                stage: StageOrder::LayoutPageNumberMerge,
+                partition_ids: vec!["section:a".to_string(), "section:b".to_string()],
+            }]
+        );
     }
 
     fn fragment(partition_id: &str) -> DocumentLayoutFragment {
