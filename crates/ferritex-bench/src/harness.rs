@@ -692,12 +692,15 @@ mod tests {
     use ferritex_application::{
         compile_job_service::CompileJobService,
         ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput},
+        runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode},
     };
     use ferritex_core::{
         diagnostics::Severity,
         policy::{FileAccessError, FileAccessGate, PathAccessDecision},
     };
     use tempfile::tempdir;
+
+    use crate::parity::{compute_parity_score, format_parity_summary, ParityResult};
 
     use super::{
         bundle_bootstrap_cases, bundle_package_loading_cases, corpus_bibliography_cases,
@@ -828,6 +831,79 @@ mod tests {
     }
 
     static NOOP_SHELL_COMMAND_GATEWAY: NoopShellCommandGateway = NoopShellCommandGateway;
+
+    #[derive(Clone, Default)]
+    struct ServiceCompileBackend;
+
+    impl CompileBackend for ServiceCompileBackend {
+        fn compile(
+            &self,
+            input: &Path,
+            asset_bundle: Option<&Path>,
+            jobs: u32,
+        ) -> Result<CompileOutput, String> {
+            let gate = FsTestFileAccessGate;
+            let loader = NoopAssetBundleLoader;
+            let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
+            let start = std::time::Instant::now();
+            let options = RuntimeOptions {
+                input_file: input.to_path_buf(),
+                output_dir: input
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from(".")),
+                jobname: input
+                    .file_stem()
+                    .or_else(|| input.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "texput".to_string()),
+                parallelism: jobs as usize,
+                overlay_roots: Vec::new(),
+                no_cache: true,
+                asset_bundle: asset_bundle.map(Path::to_path_buf),
+                host_font_fallback: false,
+                host_font_roots: Vec::new(),
+                interaction_mode: InteractionMode::Nonstopmode,
+                synctex: false,
+                trace_font_tasks: false,
+                shell_escape: ShellEscapeMode::Disabled,
+            };
+            let result = service.compile(&options);
+            if result.exit_code != 0 {
+                let diagnostics = result
+                    .diagnostics
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                return Err(format!(
+                    "compile failed for {} with exit code {}: {}",
+                    input.display(),
+                    result.exit_code,
+                    diagnostics
+                ));
+            }
+
+            let output_pdf = result.output_pdf.ok_or_else(|| {
+                format!(
+                    "compile succeeded without output PDF for {}",
+                    input.display()
+                )
+            })?;
+            let output_bytes = fs::read(&output_pdf).map_err(|error| {
+                format!(
+                    "failed to read output PDF {}: {error}",
+                    output_pdf.display()
+                )
+            })?;
+
+            Ok(CompileOutput {
+                duration: start.elapsed(),
+                output_bytes,
+            })
+        }
+    }
 
     #[test]
     fn test_single_case_timing() {
@@ -1214,6 +1290,118 @@ mod tests {
         assert!(names.contains(&"corpus-layout-core-sectioning_book".to_string()));
         assert!(names.contains(&"corpus-layout-core-letter_basic".to_string()));
         assert!(names.contains(&"corpus-layout-core-compat_primitives".to_string()));
+    }
+
+    #[test]
+    fn parity_layout_core_measurement() {
+        let fixture_base = fixtures_root();
+        let base_cases = corpus_compat_cases(&fixture_base);
+        let reference_dir = fixture_base.join("corpus/layout-core/reference");
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
+
+        assert!(reference_dir.exists(), "reference directory should exist");
+
+        let harness = BenchHarness::new(
+            cases.clone(),
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(ServiceCompileBackend);
+
+        let report = harness.run();
+        assert!(
+            report.failures.is_empty(),
+            "layout-core parity compilation failed: {:?}",
+            report.failures
+        );
+        assert_eq!(report.results.len(), cases.len());
+
+        let mut results = Vec::with_capacity(cases.len());
+        for case in &cases {
+            let document_name = case
+                .input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem should be utf-8")
+                .to_string();
+            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
+            let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
+
+            if !reference_pdf_path.exists() {
+                results.push(ParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(format!(
+                        "missing reference PDF {}",
+                        reference_pdf_path.display()
+                    )),
+                });
+                continue;
+            }
+
+            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read ferritex PDF {}: {error}",
+                    ferritex_pdf_path.display()
+                )
+            });
+            let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read reference PDF {}: {error}",
+                    reference_pdf_path.display()
+                )
+            });
+
+            match compute_parity_score(&ferritex_pdf, &reference_pdf) {
+                Ok(score) => results.push(ParityResult {
+                    document_name,
+                    score: Some(score),
+                    error: None,
+                }),
+                Err(error) => results.push(ParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(error),
+                }),
+            }
+        }
+
+        let summary = format_parity_summary(&results);
+        println!("{summary}");
+
+        let measured = results
+            .iter()
+            .filter(|result| result.score.is_some())
+            .count();
+        let errors = results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count();
+
+        assert_eq!(results.len(), base_cases.len());
+        assert!(summary.contains("REQ-NF-007 Parity Summary (layout-core)"));
+        assert!(summary.contains("Document"));
+        assert!(
+            measured >= 1,
+            "expected at least one measured parity result"
+        );
+        assert_eq!(
+            errors, 0,
+            "all layout-core fixtures must have reference PDFs and produce parity scores"
+        );
+        assert_eq!(measured + errors, results.len());
+        assert!(results
+            .iter()
+            .filter_map(|result| result.score.as_ref())
+            .all(|score| score.document_diff_rate.is_finite()
+                && score
+                    .per_page_diff_rates
+                    .iter()
+                    .all(|rate| rate.is_finite())));
     }
 
     #[test]
@@ -1787,6 +1975,29 @@ mod tests {
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    }
+
+    fn stage_cases_in_tempdir(base_cases: &[BenchCase], temp_dir: &Path) -> Vec<BenchCase> {
+        let mut cases = Vec::with_capacity(base_cases.len());
+        for case in base_cases {
+            let fixture_name = case
+                .input_fixture
+                .file_name()
+                .expect("fixture should have filename");
+            let temp_input = temp_dir.join(fixture_name);
+            if !temp_input.exists() {
+                fs::copy(&case.input_fixture, &temp_input)
+                    .expect("fixture should copy into temp dir");
+            }
+            cases.push(BenchCase {
+                name: case.name.clone(),
+                profile: case.profile.clone(),
+                input_fixture: temp_input,
+                asset_bundle: case.asset_bundle.clone(),
+                jobs: case.jobs,
+            });
+        }
+        cases
     }
 
     fn fixture_path(name: &str) -> PathBuf {

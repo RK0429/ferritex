@@ -1,4 +1,5 @@
 pub mod harness;
+pub mod parity;
 
 pub use harness::{
     bench_fixtures_root, bundle_bootstrap_cases, bundle_package_loading_cases,
@@ -8,4 +9,8 @@ pub use harness::{
     partition_bench_cases, BenchCase, BenchComparison, BenchFailure, BenchHarness, BenchProfile,
     BenchReport, BenchResult, BenchRunConfig, BenchTiming, CliCompileBackend, CompileBackend,
     CompileOutput,
+};
+pub use parity::{
+    compute_parity_score, extract_line_y_positions, extract_pdf_page_count, format_parity_summary,
+    ParityResult, ParityScore,
 };
