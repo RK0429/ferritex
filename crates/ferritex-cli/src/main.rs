@@ -1,11 +1,17 @@
-use std::{path::PathBuf, process, sync::Arc, thread};
+use std::{
+    path::PathBuf,
+    process,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferritex_application::compile_job_service::CompileJobService;
 use ferritex_application::execution_policy_factory::ExecutionPolicyFactory;
-use ferritex_application::ports::PreviewTransportPort;
+use ferritex_application::ports::{PreviewTransportPort, TransportRevisionEvent};
 use ferritex_application::preview_session_service::{
-    PreviewSessionService, PreviewTarget, PublishDecision, SessionErrorResponse,
+    PreviewSessionService, PreviewTarget, PreviewViewState, PublishDecision, SessionErrorResponse,
+    SessionId,
 };
 use ferritex_application::runtime_options::{CompileArgs, CompileInteraction, RuntimeOptions};
 use ferritex_core::diagnostics::{Diagnostic, Severity};
@@ -141,6 +147,7 @@ fn handle_preview(command: &CompileCommand) -> i32 {
     match execute_preview(command) {
         Ok(preview) => {
             println!("{}", preview.document_url);
+            println!("{}", preview.events_url);
             eprintln!(
                 "preview server listening on http://127.0.0.1:{}",
                 preview.server_port
@@ -180,6 +187,7 @@ fn emit_diagnostic(diagnostic: &Diagnostic) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewExecution {
     document_url: String,
+    events_url: String,
     server_port: u16,
 }
 
@@ -232,12 +240,22 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
     })?;
 
     let preview_transport: Arc<dyn PreviewTransportPort> = transport.clone();
-    let mut session_service = PreviewSessionService::new(Arc::clone(&preview_transport));
+    let session_service = Arc::new(Mutex::new(PreviewSessionService::new(Arc::clone(
+        &preview_transport,
+    ))));
+
     let bootstrap = session_service
+        .lock()
+        .expect("preview session service poisoned")
         .create_session(&target, &policy)
         .map_err(|error| vec![diagnostic_for_session_error(&error)])?;
 
-    match session_service.check_publish(&bootstrap.session_id, &target, &policy) {
+    let publish_decision = session_service
+        .lock()
+        .expect("preview session service poisoned")
+        .check_publish(&bootstrap.session_id, &target, &policy);
+
+    match publish_decision {
         PublishDecision::Allowed => {
             let pdf_bytes = std::fs::read(&output_pdf).map_err(|error| {
                 vec![Diagnostic::new(
@@ -247,6 +265,12 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
                 .with_file(output_pdf.to_string_lossy().into_owned())
                 .with_suggestion("rerun the preview command after verifying the output directory")]
             })?;
+
+            let page_count = estimate_pdf_page_count(&pdf_bytes);
+            session_service
+                .lock()
+                .expect("preview session service poisoned")
+                .apply_page_fallback(&bootstrap.session_id, page_count);
 
             preview_transport
                 .publish_pdf(bootstrap.session_id.as_str(), &pdf_bytes)
@@ -259,20 +283,81 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
                     .with_suggestion("retry after resetting the preview session")]
                 })?;
 
+            let revision = session_service
+                .lock()
+                .expect("preview session service poisoned")
+                .advance_revision(&bootstrap.session_id, page_count)
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        Severity::Error,
+                        "failed to advance preview revision for an existing session",
+                    )
+                    .with_context(format!("session id: {}", bootstrap.session_id))
+                    .with_suggestion(
+                        "bootstrap a new preview session and retry the preview command",
+                    )]
+                })?;
+            preview_transport
+                .publish_revision_event(&TransportRevisionEvent {
+                    session_id: bootstrap.session_id.to_string(),
+                    target_input: revision.target.input_file.to_string_lossy().into_owned(),
+                    target_jobname: revision.target.jobname,
+                    revision: revision.revision,
+                    page_count: revision.page_count,
+                })
+                .map_err(|error| {
+                    vec![Diagnostic::new(
+                        Severity::Error,
+                        format!("failed to publish preview revision event: {error}"),
+                    )
+                    .with_context(format!("session id: {}", bootstrap.session_id))
+                    .with_suggestion("retry after resetting the preview session")]
+                })?;
+            {
+                let svc = Arc::clone(&session_service);
+                transport.set_view_state_handler(Arc::new(move |session_id, update| {
+                    let view_state = PreviewViewState {
+                        page_number: update.page_number,
+                        zoom: update.zoom,
+                        viewport_offset_y: update.viewport_offset_y,
+                    };
+                    svc.lock()
+                        .expect("preview session service poisoned")
+                        .update_view_state(&SessionId::new(session_id), view_state);
+                }));
+            }
+
             tracing::info!(
                 session_id = %bootstrap.session_id,
                 input = %target.input_file.display(),
                 jobname = %target.jobname,
+                revision = revision.revision,
+                page_count = revision.page_count,
                 document_url = %bootstrap.document_url,
-                "preview command published compiled PDF"
+                events_url = %bootstrap.events_url,
+                "preview command published compiled PDF and revision event"
             );
 
             Ok(PreviewExecution {
                 document_url: bootstrap.document_url,
+                events_url: bootstrap.events_url,
                 server_port: transport.port(),
             })
         }
         PublishDecision::Denied(error) => Err(vec![diagnostic_for_session_error(&error)]),
+    }
+}
+
+fn estimate_pdf_page_count(pdf_bytes: &[u8]) -> usize {
+    let content = String::from_utf8_lossy(pdf_bytes);
+    let count = content.matches("/Type /Page").count();
+    // /Type /Pages also matches, subtract those
+    let pages_obj = content.matches("/Type /Pages").count();
+    let page_count = count.saturating_sub(pages_obj);
+    if page_count == 0 {
+        1
+    } else {
+        page_count
     }
 }
 
@@ -282,7 +367,7 @@ fn diagnostic_for_session_error(error: &SessionErrorResponse) -> Diagnostic {
         format!("preview session error: {}", error.error_kind),
     )
     .with_context(format!("session id: {}", error.session_id))
-    .with_suggestion(error.recovery_instruction.clone())
+    .with_suggestion(&error.recovery_instruction)
 }
 
 fn diagnostics_exit_code(diagnostics: &[Diagnostic]) -> i32 {
@@ -465,6 +550,10 @@ mod tests {
         assert!(preview
             .document_url
             .contains("/preview/preview-session-1/document"));
+        assert!(preview.events_url.contains("ws://127.0.0.1:"));
+        assert!(preview
+            .events_url
+            .contains("/preview/preview-session-1/events"));
         assert!(preview.server_port > 0);
         assert!(dir.path().join("hello.pdf").exists());
     }
