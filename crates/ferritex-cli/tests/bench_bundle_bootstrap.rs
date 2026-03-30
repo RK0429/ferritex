@@ -195,7 +195,9 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
             .file_name()
             .expect("fixture should have filename");
         let temp_input = temp_dir.path().join(fixture_name);
-        std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        if !temp_input.exists() {
+            std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        }
         cases.push(BenchCase {
             name: case.name.clone(),
             profile: case.profile.clone(),
@@ -223,7 +225,7 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
         "partition bench compilation failed: {:?}",
         report.failures
     );
-    assert_eq!(report.results.len(), 2);
+    assert_eq!(report.results.len(), 12);
     assert!(report
         .results
         .iter()
@@ -232,27 +234,110 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
         .results
         .iter()
         .all(|result| result.case.asset_bundle.is_none()));
-    assert!(report
-        .results
-        .iter()
-        .all(|result| result.case.input_fixture.ends_with("multi_section.tex")));
+    for pair in report.results.chunks(2) {
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0].case.jobs, 1);
+        assert_eq!(pair[1].case.jobs, 4);
+        assert_eq!(
+            pair[0].timings[0].output_hash,
+            pair[1].timings[0].output_hash,
+            "partition bench output should be identical across jobs=1 and jobs=4 for {}",
+            pair[0].case.input_fixture.display()
+        );
+    }
+}
 
-    let sequential = report
-        .results
-        .iter()
-        .find(|result| result.case.jobs == 1)
-        .expect("jobs=1 result should exist");
-    let parallel = report
-        .results
-        .iter()
-        .find(|result| result.case.jobs == 4)
-        .expect("jobs=4 result should exist");
+#[test]
+fn partition_bench_docs_protocol_median_and_timing_proof() {
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = partition_bench_cases(&bench_fixtures);
 
-    assert_eq!(sequential.timings.len(), 1);
-    assert_eq!(parallel.timings.len(), 1);
-    assert_eq!(
-        sequential.timings[0].output_hash, parallel.timings[0].output_hash,
-        "partition bench output should stay identical across jobs=1 and jobs=4"
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let mut cases = Vec::with_capacity(base_cases.len());
+    for case in &base_cases {
+        let fixture_name = case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename");
+        let temp_input = temp_dir.path().join(fixture_name);
+        if !temp_input.exists() {
+            std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        }
+        cases.push(BenchCase {
+            name: case.name.clone(),
+            profile: case.profile.clone(),
+            input_fixture: temp_input,
+            asset_bundle: case.asset_bundle.clone(),
+            jobs: case.jobs,
+        });
+    }
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases,
+        BenchRunConfig {
+            warmup_runs: 1,
+            measured_runs: 5,
+            compare_output_identity: true,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "partition bench docs protocol failed: {:?}",
+        report.failures
+    );
+    assert_eq!(report.results.len(), 12);
+
+    assert!(report.results.iter().all(|r| r.timings.len() == 5));
+
+    for pair in report.results.chunks(2) {
+        assert_eq!(pair[0].case.jobs, 1);
+        assert_eq!(pair[1].case.jobs, 4);
+        assert_eq!(
+            pair[0].timings[0].output_hash,
+            pair[1].timings[0].output_hash,
+            "output identity should hold for {}",
+            pair[0].case.input_fixture.display()
+        );
+    }
+
+    for result in &report.results {
+        let median = result.median_duration().expect("median should exist");
+        assert!(
+            !median.is_zero(),
+            "median should be positive for {}",
+            result.case.name
+        );
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_str(&report.to_json()).expect("JSON should parse");
+    let json_results = json["results"].as_array().expect("results array");
+    for result in json_results {
+        assert!(
+            result.get("median_duration_ms").is_some(),
+            "JSON result should include median_duration_ms"
+        );
+    }
+
+    let threshold_secs = 1.0;
+    for result in &report.results {
+        let median = result.median_duration().unwrap();
+        if median.as_secs_f64() > threshold_secs {
+            eprintln!(
+                "[FTX-PARTITION-BENCH-001 TIMING] {} median {:.3}s exceeds {threshold_secs}s",
+                result.case.name,
+                median.as_secs_f64()
+            );
+        }
+    }
+    eprintln!(
+        "[FTX-PARTITION-BENCH-001 TIMING] protocol proof complete for {} cases",
+        report.results.len()
     );
 }
 

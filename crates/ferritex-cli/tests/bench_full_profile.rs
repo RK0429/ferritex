@@ -200,6 +200,11 @@ fn full_bench_report_captures_timing_in_json() {
             .expect("timings should be an array");
         assert!(!timings.is_empty(), "timings should not be empty");
         assert_eq!(result["case"]["profile"].as_str(), Some("full-bench"));
+        let median_ms = result.get("median_duration_ms");
+        assert!(
+            median_ms.is_some(),
+            "result should include median_duration_ms"
+        );
 
         for timing in timings {
             let duration = timing["duration"]
@@ -213,5 +218,92 @@ fn full_bench_report_captures_timing_in_json() {
             assert!(duration > 0.0, "duration should be positive");
             assert!(!output_hash.is_empty(), "output_hash should not be empty");
         }
+    }
+}
+
+#[test]
+fn full_bench_docs_protocol_median_and_timing_proof() {
+    let (_temp_dir, cases) = stage_full_bench_cases();
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases,
+        BenchRunConfig {
+            warmup_runs: 1,
+            measured_runs: 5,
+            compare_output_identity: true,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "full bench docs protocol failed: {:?}",
+        report.failures
+    );
+    assert_eq!(report.results.len(), 2);
+
+    let seq = report
+        .results
+        .iter()
+        .find(|r| r.case.jobs == 1)
+        .expect("jobs=1 result");
+    let par = report
+        .results
+        .iter()
+        .find(|r| r.case.jobs == 4)
+        .expect("jobs=4 result");
+    assert_eq!(seq.timings.len(), 5);
+    assert_eq!(par.timings.len(), 5);
+    assert_eq!(
+        seq.timings[0].output_hash, par.timings[0].output_hash,
+        "output should be identical across jobs=1 and jobs=4"
+    );
+
+    let seq_median = report
+        .median_duration_for(&seq.case.name)
+        .expect("jobs=1 median should exist");
+    let par_median = report
+        .median_duration_for(&par.case.name)
+        .expect("jobs=4 median should exist");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&report.to_json()).expect("JSON should parse");
+    let results = json["results"].as_array().expect("results array");
+    for result in results {
+        assert!(
+            result.get("median_duration_ms").is_some(),
+            "each result should have median_duration_ms in JSON"
+        );
+        let median_ms = result["median_duration_ms"]
+            .as_f64()
+            .expect("median_duration_ms should be numeric");
+        assert!(median_ms > 0.0, "median should be positive");
+    }
+
+    let threshold_secs = 1.0;
+    if seq_median.as_secs_f64() > threshold_secs {
+        eprintln!(
+            "[FTX-BENCH-001 TIMING] jobs=1 median {:.3}s exceeds {threshold_secs}s threshold",
+            seq_median.as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "[FTX-BENCH-001 TIMING] jobs=1 median {:.3}s within {threshold_secs}s threshold",
+            seq_median.as_secs_f64()
+        );
+    }
+    if par_median.as_secs_f64() > threshold_secs {
+        eprintln!(
+            "[FTX-BENCH-001 TIMING] jobs=4 median {:.3}s exceeds {threshold_secs}s threshold",
+            par_median.as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "[FTX-BENCH-001 TIMING] jobs=4 median {:.3}s within {threshold_secs}s threshold",
+            par_median.as_secs_f64()
+        );
     }
 }

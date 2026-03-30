@@ -123,17 +123,49 @@ pub fn bundle_package_loading_cases(fixture_base: &Path) -> Vec<BenchCase> {
 }
 
 pub fn partition_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
-    let input = fixture_base.join("multi_section.tex");
-    [1, 4]
-        .into_iter()
-        .map(|jobs| BenchCase {
-            name: format!("partition-multi-section-jobs{jobs}"),
-            profile: BenchProfile::PartitionBench,
-            input_fixture: input.clone(),
-            asset_bundle: None,
-            jobs,
-        })
-        .collect()
+    let mut cases = Vec::new();
+    for subset in &["partition-book", "partition-article"] {
+        let corpus_dir = fixture_base.join(format!("corpus/{subset}"));
+        let mut fixtures = fs::read_dir(&corpus_dir)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to read corpus partition fixtures from {}: {error}",
+                    corpus_dir.display()
+                )
+            })
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| {
+                        panic!("failed to enumerate partition fixture entry: {error}")
+                    })
+                    .path()
+            })
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("tex"))
+            .collect::<Vec<_>>();
+        fixtures.sort();
+
+        for fixture in fixtures {
+            let stem = fixture
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "invalid UTF-8 partition fixture name: {}",
+                        fixture.display()
+                    )
+                });
+            for &jobs in &[1, 4] {
+                cases.push(BenchCase {
+                    name: format!("partition-{subset}-{stem}-jobs{jobs}"),
+                    profile: BenchProfile::PartitionBench,
+                    input_fixture: fixture.clone(),
+                    asset_bundle: None,
+                    jobs,
+                });
+            }
+        }
+    }
+    cases
 }
 
 pub fn corpus_compat_cases(fixture_base: &Path) -> Vec<BenchCase> {
@@ -219,9 +251,8 @@ pub struct BenchCase {
 }
 
 impl BenchCase {
-    fn comparison_key(&self) -> (String, String, String, String) {
+    fn comparison_key(&self) -> (String, String, String) {
         (
-            self.name.clone(),
             self.profile.stable_id().to_string(),
             self.input_fixture.display().to_string(),
             self.asset_bundle
@@ -368,7 +399,17 @@ pub struct BenchReport {
 
 impl BenchReport {
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("bench report serialization should succeed")
+        let mut value =
+            serde_json::to_value(self).expect("bench report serialization should succeed");
+        if let Some(results) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
+            for (i, result) in self.results.iter().enumerate() {
+                if let Some(median) = result.median_duration() {
+                    results[i]["median_duration_ms"] =
+                        serde_json::json!(median.as_secs_f64() * 1000.0);
+                }
+            }
+        }
+        serde_json::to_string_pretty(&value).expect("bench report re-serialization should succeed")
     }
 
     pub fn summary(&self) -> String {
@@ -381,6 +422,13 @@ impl BenchReport {
 
         lines.extend(self.failures.iter().map(|failure| failure.to_string()));
         lines.join("\n")
+    }
+
+    pub fn median_duration_for(&self, case_name: &str) -> Option<Duration> {
+        self.results
+            .iter()
+            .find(|result| result.case.name == case_name)
+            .and_then(|result| result.median_duration())
     }
 }
 
@@ -490,7 +538,7 @@ impl BenchHarness {
     }
 
     fn build_comparisons(&self, results: &[BenchResult]) -> Vec<BenchComparison> {
-        let mut groups = BTreeMap::<(String, String, String, String), Vec<BenchResult>>::new();
+        let mut groups = BTreeMap::<(String, String, String), Vec<BenchResult>>::new();
         for result in results {
             groups
                 .entry(result.case.comparison_key())
@@ -1036,17 +1084,24 @@ mod tests {
         let fixture_base = fixtures_root();
         let cases = super::partition_bench_cases(&fixture_base);
 
-        assert_eq!(cases.len(), 2);
-        assert_eq!(cases[0].name, "partition-multi-section-jobs1");
-        assert_eq!(cases[1].name, "partition-multi-section-jobs4");
-        assert_eq!(cases[0].jobs, 1);
-        assert_eq!(cases[1].jobs, 4);
+        assert_eq!(cases.len(), 12);
         assert!(cases
             .iter()
             .all(|c| c.profile == BenchProfile::PartitionBench));
         assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
-        assert!(cases[0].input_fixture.ends_with("multi_section.tex"));
-        assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
+        assert!(cases.iter().all(|c| c.input_fixture.exists()));
+
+        let job_values: Vec<u32> = cases.iter().map(|c| c.jobs).collect();
+        for chunk in job_values.chunks(2) {
+            assert_eq!(chunk, &[1, 4]);
+        }
+
+        assert!(cases
+            .iter()
+            .any(|c| c.name.starts_with("partition-partition-book-")));
+        assert!(cases
+            .iter()
+            .any(|c| c.name.starts_with("partition-partition-article-")));
     }
 
     #[test]
