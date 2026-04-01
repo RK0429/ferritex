@@ -6,7 +6,11 @@ use crate::graphics::api::{
 };
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
-    FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage,
+    FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage, FOOTNOTE_MARKER_END,
+    FOOTNOTE_MARKER_START,
+};
+use crate::typesetting::math_layout::{
+    SUBSCRIPT_END_MARKER, SUBSCRIPT_START_MARKER, SUPERSCRIPT_END_MARKER, SUPERSCRIPT_START_MARKER,
 };
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -14,6 +18,9 @@ const LEFT_MARGIN_PT: i64 = 72;
 const LINK_CHAR_WIDTH_PT: i64 = 6;
 const LINK_HEIGHT_PT: i64 = 12;
 const LINK_DESCENT_PT: i64 = 2;
+const SUPERSCRIPT_RISE_PT: i64 = 4;
+const FOOTNOTE_SUPERSCRIPT_RISE_PT: i64 = 3;
+const SUBSCRIPT_DROP_PT: i64 = 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PdfDocument {
@@ -891,8 +898,13 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
         return String::new();
     };
 
-    let mut stream = format!("BT\n/F{} 12 Tf\n", first_line.font_index + 1);
+    let mut stream = format!(
+        "BT\n/F{} {} Tf\n",
+        first_line.font_index + 1,
+        points_to_pdf_number(first_line.font_size)
+    );
     let mut current_font = first_line.font_index;
+    let mut current_font_size = first_line.font_size;
     stream.push_str(&format!(
         "{} {} Td\n",
         LEFT_MARGIN_PT,
@@ -906,9 +918,14 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
             "0 {} Td\n",
             points_to_pdf_number(line.y - previous_y)
         ));
-        if line.font_index != current_font {
-            stream.push_str(&format!("/F{} 12 Tf\n", line.font_index + 1));
+        if line.font_index != current_font || line.font_size != current_font_size {
+            stream.push_str(&format!(
+                "/F{} {} Tf\n",
+                line.font_index + 1,
+                points_to_pdf_number(line.font_size)
+            ));
             current_font = line.font_index;
+            current_font_size = line.font_size;
         }
         render_text_line(&mut stream, line, link_style);
         previous_y = line.y;
@@ -918,8 +935,16 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
 }
 
 fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle) {
+    if contains_math_script_markers(&line.text) && line.links.is_empty() {
+        render_text_line_with_scripts(stream, line);
+        return;
+    }
+
     let Some(link_color) = active_link_color(link_style) else {
-        stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
+        stream.push_str(&format!(
+            "({}) Tj\n",
+            escape_pdf_text(&strip_math_script_markers(&line.text))
+        ));
         return;
     };
 
@@ -929,12 +954,16 @@ fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle
         .filter(|link| !link.url.is_empty() && link.start_char < link.end_char)
         .collect::<Vec<_>>();
     if links.is_empty() {
-        stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&line.text)));
+        stream.push_str(&format!(
+            "({}) Tj\n",
+            escape_pdf_text(&strip_math_script_markers(&line.text))
+        ));
         return;
     }
 
     links.sort_by_key(|link| (link.start_char, link.end_char));
-    let boundaries = char_boundaries(&line.text);
+    let rendered_text = strip_math_script_markers(&line.text);
+    let boundaries = char_boundaries(&rendered_text);
     let char_count = boundaries.len().saturating_sub(1);
     let mut cursor = 0usize;
     for link in links {
@@ -946,13 +975,13 @@ fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle
         if cursor < start {
             stream.push_str(&format!(
                 "({}) Tj\n",
-                escape_pdf_text(char_slice(&line.text, &boundaries, cursor, start))
+                escape_pdf_text(char_slice(&rendered_text, &boundaries, cursor, start))
             ));
         }
         stream.push_str(&pdf_rgb_operator(link_color));
         stream.push_str(&format!(
             "({}) Tj\n",
-            escape_pdf_text(char_slice(&line.text, &boundaries, start, end))
+            escape_pdf_text(char_slice(&rendered_text, &boundaries, start, end))
         ));
         stream.push_str("0 0 0 rg\n");
         cursor = end;
@@ -961,9 +990,148 @@ fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle
     if cursor < char_count {
         stream.push_str(&format!(
             "({}) Tj\n",
-            escape_pdf_text(char_slice(&line.text, &boundaries, cursor, char_count))
+            escape_pdf_text(char_slice(&rendered_text, &boundaries, cursor, char_count))
         ));
     }
+}
+
+fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
+    let base_font = line.font_index + 1;
+    let base_font_size = line.font_size;
+    let script_font_size = scaled_font_size(base_font_size, 7, 10);
+
+    for segment in parse_math_script_segments(&line.text) {
+        if segment.text.is_empty() {
+            continue;
+        }
+
+        match segment.kind {
+            ScriptSegmentKind::Base => {
+                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+            }
+            ScriptSegmentKind::Superscript => {
+                stream.push_str(&format!("0 {SUPERSCRIPT_RISE_PT} Td\n"));
+                stream.push_str(&format!(
+                    "/F{base_font} {} Tf\n",
+                    points_to_pdf_number(script_font_size)
+                ));
+                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+                stream.push_str(&format!(
+                    "/F{base_font} {} Tf\n",
+                    points_to_pdf_number(base_font_size)
+                ));
+                stream.push_str(&format!("0 {} Td\n", -SUPERSCRIPT_RISE_PT));
+            }
+            ScriptSegmentKind::FootnoteSuperscript => {
+                stream.push_str(&format!("0 {FOOTNOTE_SUPERSCRIPT_RISE_PT} Td\n"));
+                stream.push_str(&format!(
+                    "/F{base_font} {} Tf\n",
+                    points_to_pdf_number(script_font_size)
+                ));
+                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+                stream.push_str(&format!(
+                    "/F{base_font} {} Tf\n",
+                    points_to_pdf_number(base_font_size)
+                ));
+                stream.push_str(&format!("0 {} Td\n", -FOOTNOTE_SUPERSCRIPT_RISE_PT));
+            }
+            ScriptSegmentKind::Subscript => {
+                stream.push_str(&format!("0 {} Td\n", -SUBSCRIPT_DROP_PT));
+                stream.push_str(&format!(
+                    "/F{base_font} {} Tf\n",
+                    points_to_pdf_number(script_font_size)
+                ));
+                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+                stream.push_str(&format!(
+                    "/F{base_font} {} Tf\n",
+                    points_to_pdf_number(base_font_size)
+                ));
+                stream.push_str(&format!("0 {SUBSCRIPT_DROP_PT} Td\n"));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptSegmentKind {
+    Base,
+    Superscript,
+    FootnoteSuperscript,
+    Subscript,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptSegment {
+    kind: ScriptSegmentKind,
+    text: String,
+}
+
+fn parse_math_script_segments(text: &str) -> Vec<ScriptSegment> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut current_kind = ScriptSegmentKind::Base;
+
+    for ch in text.chars() {
+        let next_kind = match ch {
+            SUPERSCRIPT_START_MARKER => Some(ScriptSegmentKind::Superscript),
+            FOOTNOTE_MARKER_START => Some(ScriptSegmentKind::FootnoteSuperscript),
+            SUPERSCRIPT_END_MARKER | SUBSCRIPT_END_MARKER => Some(ScriptSegmentKind::Base),
+            FOOTNOTE_MARKER_END => Some(ScriptSegmentKind::Base),
+            SUBSCRIPT_START_MARKER => Some(ScriptSegmentKind::Subscript),
+            _ => None,
+        };
+
+        if let Some(kind) = next_kind {
+            if !current.is_empty() {
+                segments.push(ScriptSegment {
+                    kind: current_kind,
+                    text: std::mem::take(&mut current),
+                });
+            }
+            current_kind = kind;
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        segments.push(ScriptSegment {
+            kind: current_kind,
+            text: current,
+        });
+    }
+
+    segments
+}
+
+fn contains_math_script_markers(text: &str) -> bool {
+    text.contains(SUPERSCRIPT_START_MARKER)
+        || text.contains(SUPERSCRIPT_END_MARKER)
+        || text.contains(FOOTNOTE_MARKER_START)
+        || text.contains(FOOTNOTE_MARKER_END)
+        || text.contains(SUBSCRIPT_START_MARKER)
+        || text.contains(SUBSCRIPT_END_MARKER)
+}
+
+fn strip_math_script_markers(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            !matches!(
+                *ch,
+                SUPERSCRIPT_START_MARKER
+                    | SUPERSCRIPT_END_MARKER
+                    | FOOTNOTE_MARKER_START
+                    | FOOTNOTE_MARKER_END
+                    | SUBSCRIPT_START_MARKER
+                    | SUBSCRIPT_END_MARKER
+            )
+        })
+        .collect()
+}
+
+fn scaled_font_size(size: DimensionValue, numerator: i64, denominator: i64) -> DimensionValue {
+    DimensionValue((size.0 * numerator + denominator / 2) / denominator)
 }
 
 fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
@@ -976,6 +1144,7 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
             y: placement.y_position - line.y,
             links: line.links.clone(),
             font_index: line.font_index,
+            font_size: line.font_size,
             source_span: line.source_span,
         })
         .collect()
@@ -1655,6 +1824,7 @@ mod tests {
                     y: points(720 - (index as i64 * 18)),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(10),
                     source_span: None,
                 })
                 .collect(),
@@ -1819,6 +1989,7 @@ mod tests {
                 end_char,
             }],
             font_index: 0,
+            font_size: points(10),
             source_span: None,
         }
     }
@@ -1850,6 +2021,7 @@ mod tests {
                     y: points(0),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(10),
                     source_span: None,
                 }],
                 images: Vec::new(),
@@ -2379,6 +2551,7 @@ mod tests {
                 },
             ],
             font_index: 0,
+            font_size: points(10),
             source_span: None,
         }];
         document.navigation.default_link_style = LinkStyle {
@@ -2445,6 +2618,7 @@ mod tests {
                 y: points(720),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(10),
                 source_span: None,
             },
             TextLine {
@@ -2452,6 +2626,7 @@ mod tests {
                 y: points(702),
                 links: Vec::new(),
                 font_index: 1,
+                font_size: points(10),
                 source_span: None,
             },
             TextLine {
@@ -2459,6 +2634,7 @@ mod tests {
                 y: points(684),
                 links: Vec::new(),
                 font_index: 2,
+                font_size: points(10),
                 source_span: None,
             },
         ];
@@ -2477,9 +2653,9 @@ mod tests {
         let pdf = renderer.render(&document);
         let content = String::from_utf8_lossy(&pdf.bytes);
 
-        assert!(content.contains("BT\n/F1 12 Tf\n72 720 Td\n(Main) Tj"));
-        assert!(content.contains("0 -18 Td\n/F2 12 Tf\n(Sans) Tj"));
-        assert!(content.contains("0 -18 Td\n/F3 12 Tf\n(Mono) Tj"));
+        assert!(content.contains("BT\n/F1 10 Tf\n72 720 Td\n(Main) Tj"));
+        assert!(content.contains("0 -18 Td\n/F2 10 Tf\n(Sans) Tj"));
+        assert!(content.contains("0 -18 Td\n/F3 10 Tf\n(Mono) Tj"));
     }
 
     #[test]

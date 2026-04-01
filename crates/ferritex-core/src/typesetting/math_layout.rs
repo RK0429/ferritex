@@ -4,6 +4,11 @@ use super::api::{
 use crate::kernel::api::DimensionValue;
 use crate::parser::api::{MathLine, MathNode, OverUnderKind};
 
+pub const SUPERSCRIPT_START_MARKER: char = '\u{e200}';
+pub const SUPERSCRIPT_END_MARKER: char = '\u{e201}';
+pub const SUBSCRIPT_START_MARKER: char = '\u{e202}';
+pub const SUBSCRIPT_END_MARKER: char = '\u{e203}';
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MathAtomKind {
     Ord,
@@ -324,14 +329,32 @@ fn extend_math_nodes(
                 }
                 *prev_kind = Some(kind);
             }
-            MathNode::Superscript(node) | MathNode::Subscript(node) => {
+            MathNode::Superscript(node) => {
                 let script_items = math_nodes_to_hlist(
                     std::slice::from_ref(node.as_ref()),
                     provider,
                     style.script_style(),
                 );
                 if !script_items.is_empty() {
-                    items.push(inline_box_from_items(script_items));
+                    items.push(inline_box_from_script_items(
+                        script_items,
+                        SUPERSCRIPT_START_MARKER,
+                        SUPERSCRIPT_END_MARKER,
+                    ));
+                }
+            }
+            MathNode::Subscript(node) => {
+                let script_items = math_nodes_to_hlist(
+                    std::slice::from_ref(node.as_ref()),
+                    provider,
+                    style.script_style(),
+                );
+                if !script_items.is_empty() {
+                    items.push(inline_box_from_script_items(
+                        script_items,
+                        SUBSCRIPT_START_MARKER,
+                        SUBSCRIPT_END_MARKER,
+                    ));
                 }
             }
             MathNode::Frac { numer, denom } => {
@@ -477,6 +500,21 @@ fn inline_box_from_items(items: Vec<HListItem>) -> HListItem {
     }
 }
 
+fn inline_box_from_script_items(
+    items: Vec<HListItem>,
+    start_marker: char,
+    end_marker: char,
+) -> HListItem {
+    let content = format!("{start_marker}{}{end_marker}", hlist_to_string(&items));
+
+    HListItem::InlineBox {
+        width: hlist_total_width(&items),
+        height: DimensionValue::zero(),
+        depth: DimensionValue::zero(),
+        content,
+    }
+}
+
 fn text_to_hlist(text: &str, provider: &dyn CharWidthProvider) -> Vec<HListItem> {
     let mut items = Vec::new();
     for ch in text.chars() {
@@ -548,7 +586,8 @@ fn scaled_dimension(width: DimensionValue, factor: f64) -> DimensionValue {
 mod tests {
     use super::{
         classify_char, classify_symbol, hlist_to_string, hlist_total_width, inter_atom_space,
-        math_nodes_to_hlist, mu_to_sp, MathAtomKind, MathStyle,
+        math_nodes_to_hlist, mu_to_sp, MathAtomKind, MathStyle, SUPERSCRIPT_END_MARKER,
+        SUPERSCRIPT_START_MARKER,
     };
     use crate::kernel::api::DimensionValue;
     use crate::parser::api::MathNode;
@@ -719,7 +758,8 @@ mod tests {
         assert!(matches!(
             &items[1],
             HListItem::InlineBox { width, content, .. }
-                if *width == DimensionValue(7) && content == "2"
+                if *width == DimensionValue(7)
+                    && content == &format!("{SUPERSCRIPT_START_MARKER}2{SUPERSCRIPT_END_MARKER}")
         ));
     }
 

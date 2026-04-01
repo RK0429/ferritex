@@ -11,6 +11,8 @@ pub use harness::{
     CompileOutput,
 };
 pub use parity::{
-    compute_parity_score, extract_line_y_positions, extract_pdf_page_count, format_parity_summary,
-    ParityResult, ParityScore,
+    compute_parity_score, compute_tikz_parity_score, extract_graphics_ops,
+    extract_line_y_positions, extract_pdf_page_count, format_parity_summary,
+    format_tikz_parity_summary, GraphicsOp, ParityResult, ParityScore, TikzParityResult,
+    TikzParityScore,
 };

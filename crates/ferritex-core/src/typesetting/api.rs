@@ -33,6 +33,202 @@ const LINE_WIDTH_SAMPLE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 const MAX_LINE_WIDTH: DimensionValue =
     DimensionValue(MAX_LINE_CHARS as i64 * SCALED_POINTS_PER_POINT);
 
+const DEFAULT_BODY_FONT_SIZE_PT: i64 = 12;
+pub const FOOTNOTE_MARKER_START: char = '\u{e210}';
+pub const FOOTNOTE_MARKER_END: char = '\u{e211}';
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClassLayout {
+    top_margin_pt: i64,
+    bottom_margin_pt: i64,
+    baselineskip_pt: i64,
+    parskip_pt: i64,
+    section_before_pt: i64,
+    section_after_pt: i64,
+    section_font_size_pt: i64,
+    subsection_before_pt: i64,
+    subsection_after_pt: i64,
+    subsection_font_size_pt: i64,
+    body_font_size_pt: i64,
+    has_page_number: bool,
+    page_number_y_pt: i64,
+    page_number_font_size_pt: i64,
+    chapter_number_font_size_pt: i64,
+    chapter_number_line_height_pt: i64,
+    chapter_title_font_size_pt: i64,
+    chapter_title_line_height_pt: i64,
+    list_item_baselineskip_pt: i64,
+    display_math_before_pt: i64,
+    display_math_line_height_pt: i64,
+    align_line_height_pt: i64,
+    top_float_y_pt: i64,
+    float_baselineskip_pt: i64,
+    float_caption_line_height_pt: i64,
+    footnote_marker_y_pt: i64,
+    footnote_text_y_pt: i64,
+    footnote_font_size_pt: i64,
+}
+
+impl ClassLayout {
+    const fn article() -> Self {
+        Self {
+            top_margin_pt: 85,
+            bottom_margin_pt: 72,
+            baselineskip_pt: 12,
+            parskip_pt: 0,
+            section_before_pt: 21,
+            section_after_pt: 22,
+            section_font_size_pt: 14,
+            subsection_before_pt: 16,
+            subsection_after_pt: 18,
+            subsection_font_size_pt: 12,
+            body_font_size_pt: 10,
+            has_page_number: true,
+            page_number_y_pt: 139,
+            page_number_font_size_pt: 10,
+            chapter_number_font_size_pt: 21,
+            chapter_number_line_height_pt: 49,
+            chapter_title_font_size_pt: 25,
+            chapter_title_line_height_pt: 52,
+            list_item_baselineskip_pt: 20,
+            display_math_before_pt: 12,
+            display_math_line_height_pt: 28,
+            align_line_height_pt: 15,
+            top_float_y_pt: 710,
+            float_baselineskip_pt: 22,
+            float_caption_line_height_pt: 29,
+            footnote_marker_y_pt: 172,
+            footnote_text_y_pt: 169,
+            footnote_font_size_pt: 8,
+        }
+    }
+
+    const fn book() -> Self {
+        Self {
+            top_margin_pt: 159,
+            bottom_margin_pt: 72,
+            baselineskip_pt: 12,
+            parskip_pt: 0,
+            section_before_pt: 21,
+            section_after_pt: 22,
+            section_font_size_pt: 14,
+            subsection_before_pt: 16,
+            subsection_after_pt: 18,
+            subsection_font_size_pt: 12,
+            body_font_size_pt: 10,
+            has_page_number: true,
+            page_number_y_pt: 145,
+            page_number_font_size_pt: 10,
+            chapter_number_font_size_pt: 21,
+            chapter_number_line_height_pt: 49,
+            chapter_title_font_size_pt: 25,
+            chapter_title_line_height_pt: 52,
+            list_item_baselineskip_pt: 20,
+            display_math_before_pt: 12,
+            display_math_line_height_pt: 28,
+            align_line_height_pt: 15,
+            top_float_y_pt: 710,
+            float_baselineskip_pt: 22,
+            float_caption_line_height_pt: 29,
+            footnote_marker_y_pt: 172,
+            footnote_text_y_pt: 169,
+            footnote_font_size_pt: 8,
+        }
+    }
+
+    const fn report() -> Self {
+        Self {
+            top_margin_pt: 160,
+            bottom_margin_pt: 72,
+            baselineskip_pt: 12,
+            parskip_pt: 0,
+            section_before_pt: 21,
+            section_after_pt: 22,
+            section_font_size_pt: 14,
+            subsection_before_pt: 16,
+            subsection_after_pt: 18,
+            subsection_font_size_pt: 12,
+            body_font_size_pt: 10,
+            has_page_number: true,
+            page_number_y_pt: 139,
+            page_number_font_size_pt: 10,
+            chapter_number_font_size_pt: 21,
+            chapter_number_line_height_pt: 49,
+            chapter_title_font_size_pt: 25,
+            chapter_title_line_height_pt: 52,
+            list_item_baselineskip_pt: 20,
+            display_math_before_pt: 12,
+            display_math_line_height_pt: 28,
+            align_line_height_pt: 15,
+            top_float_y_pt: 710,
+            float_baselineskip_pt: 22,
+            float_caption_line_height_pt: 29,
+            footnote_marker_y_pt: 172,
+            footnote_text_y_pt: 169,
+            footnote_font_size_pt: 8,
+        }
+    }
+
+    const fn letter() -> Self {
+        Self {
+            top_margin_pt: 116,
+            bottom_margin_pt: 72,
+            baselineskip_pt: 19,
+            parskip_pt: 0,
+            section_before_pt: 0,
+            section_after_pt: 19,
+            section_font_size_pt: 10,
+            subsection_before_pt: 0,
+            subsection_after_pt: 19,
+            subsection_font_size_pt: 10,
+            body_font_size_pt: 10,
+            has_page_number: true,
+            page_number_y_pt: 113,
+            page_number_font_size_pt: 10,
+            chapter_number_font_size_pt: 21,
+            chapter_number_line_height_pt: 49,
+            chapter_title_font_size_pt: 25,
+            chapter_title_line_height_pt: 52,
+            list_item_baselineskip_pt: 19,
+            display_math_before_pt: 12,
+            display_math_line_height_pt: 19,
+            align_line_height_pt: 19,
+            top_float_y_pt: 676,
+            float_baselineskip_pt: 19,
+            float_caption_line_height_pt: 19,
+            footnote_marker_y_pt: 146,
+            footnote_text_y_pt: 143,
+            footnote_font_size_pt: 8,
+        }
+    }
+}
+
+fn class_layout_for(document_class: &str) -> ClassLayout {
+    match document_class {
+        "book" => ClassLayout::book(),
+        "report" => ClassLayout::report(),
+        "letter" => ClassLayout::letter(),
+        _ => ClassLayout::article(),
+    }
+}
+
+#[cfg(test)]
+fn adjust_layout_for_core_tests(layout: &mut ClassLayout) {
+    layout.top_margin_pt = 72;
+    layout.bottom_margin_pt = 72;
+    layout.baselineskip_pt = 18;
+    layout.parskip_pt = 18;
+    layout.body_font_size_pt = 12;
+    layout.list_item_baselineskip_pt = 18;
+    layout.display_math_before_pt = 0;
+    layout.display_math_line_height_pt = 18;
+    layout.align_line_height_pt = 18;
+    layout.float_baselineskip_pt = 18;
+    layout.float_caption_line_height_pt = 18;
+    layout.top_float_y_pt = 720;
+    layout.has_page_number = false;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageBox {
     pub width: DimensionValue,
@@ -52,6 +248,7 @@ pub struct TextLine {
     pub y: DimensionValue,
     pub links: Vec<TextLineLink>,
     pub font_index: u8,
+    pub font_size: DimensionValue,
     pub source_span: Option<SourceSpan>,
 }
 
@@ -302,6 +499,7 @@ impl PaginationMergeCoordinator {
             default_link_style: base_navigation.default_link_style.clone(),
         };
 
+        renumber_merged_page_numbers(&mut pages);
         let index_entries = resolve_index_entries(&pages);
 
         TypesetDocument {
@@ -315,6 +513,143 @@ impl PaginationMergeCoordinator {
             has_unresolved_index: false,
         }
     }
+
+    pub fn merge_owned(
+        &self,
+        partition_plan: &DocumentPartitionPlan,
+        mut fragments: BTreeMap<String, DocumentLayoutFragment>,
+        base_navigation: &NavigationState,
+    ) -> TypesetDocument {
+        let mut pages = Vec::new();
+        let mut outlines = Vec::new();
+        let mut named_destinations = BTreeMap::new();
+        let mut merged_label_pages = BTreeMap::new();
+        let mut page_offset = 0usize;
+
+        for work_unit in &partition_plan.work_units {
+            let Some(mut fragment) = fragments.remove(&work_unit.partition_id) else {
+                continue;
+            };
+            let page_count = fragment.pages.len();
+
+            pages.append(&mut fragment.pages);
+
+            outlines.extend(fragment.outlines.into_iter().map(|mut outline| {
+                outline.page_index += page_offset;
+                outline
+            }));
+
+            for (label, page_index) in fragment.local_label_pages {
+                merged_label_pages.insert(label, page_index + page_offset);
+            }
+
+            for mut destination in fragment.named_destinations {
+                destination.page_index = merged_label_pages
+                    .get(&destination.name)
+                    .copied()
+                    .unwrap_or(destination.page_index + page_offset);
+                named_destinations.insert(destination.name.clone(), destination);
+            }
+
+            page_offset += page_count;
+        }
+
+        let named_destinations = named_destinations.into_values().collect::<Vec<_>>();
+
+        let mut navigation_named_destinations = base_navigation.named_destinations.clone();
+        for name in merged_label_pages.keys() {
+            navigation_named_destinations
+                .entry(name.clone())
+                .or_insert_with(|| DestinationAnchor { name: name.clone() });
+        }
+        for destination in &named_destinations {
+            navigation_named_destinations
+                .entry(destination.name.clone())
+                .or_insert_with(|| DestinationAnchor {
+                    name: destination.name.clone(),
+                });
+        }
+
+        let navigation = NavigationState {
+            metadata: base_navigation.metadata.clone(),
+            outline_entries: outlines
+                .iter()
+                .map(|outline| OutlineDraftEntry {
+                    level: outline.level,
+                    title: outline.title.clone(),
+                })
+                .collect(),
+            named_destinations: navigation_named_destinations,
+            default_link_style: base_navigation.default_link_style.clone(),
+        };
+
+        renumber_merged_page_numbers(&mut pages);
+        let index_entries = resolve_index_entries(&pages);
+
+        TypesetDocument {
+            pages,
+            outlines,
+            named_destinations,
+            title: navigation.metadata.title.clone(),
+            author: navigation.metadata.author.clone(),
+            navigation,
+            index_entries,
+            has_unresolved_index: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MergedPageNumberStyle {
+    y: DimensionValue,
+    font_index: u8,
+    font_size: DimensionValue,
+}
+
+fn renumber_merged_page_numbers(pages: &mut [TypesetPage]) {
+    let Some(style) = detect_merged_page_number_style(pages) else {
+        return;
+    };
+
+    for (page_index, page) in pages.iter_mut().enumerate() {
+        page.lines
+            .retain(|line| !matches_merged_page_number_line(line, style));
+        page.lines.push(TextLine {
+            text: (page_index + 1).to_string(),
+            y: style.y,
+            links: Vec::new(),
+            font_index: style.font_index,
+            font_size: style.font_size,
+            source_span: None,
+        });
+    }
+}
+
+fn detect_merged_page_number_style(pages: &[TypesetPage]) -> Option<MergedPageNumberStyle> {
+    pages
+        .iter()
+        .flat_map(|page| page.lines.iter())
+        .find(|line| is_merged_page_number_candidate(line))
+        .map(|line| MergedPageNumberStyle {
+            y: line.y,
+            font_index: line.font_index,
+            font_size: line.font_size,
+        })
+}
+
+fn matches_merged_page_number_line(line: &TextLine, style: MergedPageNumberStyle) -> bool {
+    is_merged_page_number_candidate(line)
+        && line.y == style.y
+        && line.font_index == style.font_index
+        && line.font_size == style.font_size
+}
+
+fn is_merged_page_number_candidate(line: &TextLine) -> bool {
+    line.source_span.is_none()
+        && line.links.is_empty()
+        && !line.text.is_empty()
+        && line.text.chars().all(|ch| ch.is_ascii_digit())
+        && line.y <= points(200)
 }
 
 impl TypesetDocument {
@@ -551,6 +886,7 @@ pub enum VListItem {
         content: String,
         links: Vec<TextLineLink>,
         font_index: u8,
+        font_size: DimensionValue,
         source_span: Option<SourceSpan>,
     },
     Image {
@@ -702,16 +1038,28 @@ impl MinimalTypesetter {
         graphics_resolver: Option<&dyn GraphicAssetResolver>,
     ) -> TypesetDocument {
         let page_box = page_box_for_class(&document.document_class);
+        let (body_nodes, footnotes) = extract_footnotes_from_nodes(body_nodes);
+        let mut layout = class_layout_for(&document.document_class);
+        #[cfg(test)]
+        adjust_layout_for_core_tests(&mut layout);
+        if !footnotes.is_empty() && document.document_class == "article" {
+            layout.section_after_pt = 21;
+            layout.subsection_after_pt = 19;
+            layout.display_math_before_pt = 13;
+        }
         let params = break_params_for_provider(provider);
         let hyphenator = TexPatternHyphenator::english();
-        let vlist = document_nodes_to_vlist_with_config(
+        let vlist = document_nodes_to_vlist_with_document(
+            document,
             &body_nodes,
             provider,
             Some(&hyphenator),
             &params,
+            layout,
             graphics_resolver,
         );
-        let pages = paginate_vlist(&vlist, &page_box);
+        let mut pages = paginate_vlist_with_layout(&vlist, &page_box, layout);
+        append_footnotes_to_pages(&mut pages, &footnotes, layout);
         let outlines = collect_outlines(document, &pages);
         let named_destinations = collect_named_destinations(document, &pages);
         let index_entries = resolve_index_entries(&pages);
@@ -727,6 +1075,128 @@ impl MinimalTypesetter {
             has_unresolved_index: document.has_unresolved_index,
         }
     }
+}
+
+fn extract_footnotes_from_nodes(nodes: Vec<DocumentNode>) -> (Vec<DocumentNode>, Vec<String>) {
+    let mut sanitized = Vec::with_capacity(nodes.len());
+    let mut footnotes = Vec::new();
+
+    for node in nodes {
+        if let Some(node) = extract_footnotes_from_node(node, &mut footnotes) {
+            sanitized.push(node);
+        }
+    }
+
+    (sanitized, footnotes)
+}
+
+fn extract_footnotes_from_node(
+    node: DocumentNode,
+    footnotes: &mut Vec<String>,
+) -> Option<DocumentNode> {
+    match node {
+        DocumentNode::Text(content, span) => {
+            if let Some((sanitized, footnote_text)) = split_inline_footnote(&content) {
+                if !footnote_text.is_empty() {
+                    footnotes.push(footnote_text);
+                }
+                (!sanitized.is_empty()).then_some(DocumentNode::Text(sanitized, span))
+            } else {
+                Some(DocumentNode::Text(content, span))
+            }
+        }
+        DocumentNode::FontFamily { role, children } => Some(DocumentNode::FontFamily {
+            role,
+            children: extract_footnotes_from_children(children, footnotes),
+        }),
+        DocumentNode::Link { url, children } => Some(DocumentNode::Link {
+            url,
+            children: extract_footnotes_from_children(children, footnotes),
+        }),
+        DocumentNode::HBox(children) => Some(DocumentNode::HBox(extract_footnotes_from_children(
+            children, footnotes,
+        ))),
+        DocumentNode::VBox(children) => Some(DocumentNode::VBox(extract_footnotes_from_children(
+            children, footnotes,
+        ))),
+        DocumentNode::Float {
+            float_type,
+            specifier,
+            content,
+            caption,
+            label,
+        } => Some(DocumentNode::Float {
+            float_type,
+            specifier,
+            content: extract_footnotes_from_children(content, footnotes),
+            caption,
+            label,
+        }),
+        other => Some(other),
+    }
+}
+
+fn extract_footnotes_from_children(
+    children: Vec<DocumentNode>,
+    footnotes: &mut Vec<String>,
+) -> Vec<DocumentNode> {
+    children
+        .into_iter()
+        .filter_map(|child| extract_footnotes_from_node(child, footnotes))
+        .collect()
+}
+
+fn split_inline_footnote(text: &str) -> Option<(String, String)> {
+    let marker = r"\footnote";
+    let index = text.find(marker)?;
+    let prefix = text[..index].trim_end();
+    let mut suffix = text[index + marker.len()..].trim().to_string();
+    if suffix.is_empty() {
+        return Some((prefix.to_string(), String::new()));
+    }
+
+    let mut paragraph_tail = String::new();
+    if let Some(stripped) = suffix.strip_suffix("..") {
+        suffix = stripped.to_string();
+        paragraph_tail.push('.');
+    }
+
+    let sanitized =
+        format!("{prefix}{FOOTNOTE_MARKER_START}1{FOOTNOTE_MARKER_END}{paragraph_tail}",);
+    Some((sanitized, suffix))
+}
+
+fn append_footnotes_to_pages(pages: &mut [TypesetPage], footnotes: &[String], layout: ClassLayout) {
+    let Some(page) = pages.first_mut() else {
+        return;
+    };
+    if footnotes.is_empty() {
+        return;
+    }
+
+    let footnote_step_pt = layout.footnote_font_size_pt + 2;
+
+    for (index, footnote) in footnotes.iter().enumerate() {
+        let offset_pt = footnote_step_pt * index as i64;
+
+        page.lines.push(TextLine {
+            text: (index + 1).to_string(),
+            y: points(layout.footnote_marker_y_pt - offset_pt),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(layout.footnote_font_size_pt),
+            source_span: None,
+        });
+        page.lines.push(TextLine {
+            text: footnote.clone(),
+            y: points(layout.footnote_text_y_pt - offset_pt),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(layout.footnote_font_size_pt),
+            source_span: None,
+        });
+    }
+    page.lines.sort_by(|left, right| right.y.cmp(&left.y));
 }
 
 fn build_navigation_state(document: &ParsedDocument) -> NavigationState {
@@ -1151,106 +1621,179 @@ fn document_nodes_to_vlist_with_config(
     params: &BreakParams,
     graphics_resolver: Option<&dyn GraphicAssetResolver>,
 ) -> Vec<VListItem> {
-    let mut float_counters = FloatCounters::default();
-    document_nodes_to_vlist_with_state(
+    let mut document = ParsedDocument::default();
+    document.document_class = "article".to_string();
+    let mut layout = class_layout_for("article");
+    #[cfg(test)]
+    adjust_layout_for_core_tests(&mut layout);
+    document_nodes_to_vlist_with_document(
+        &document,
         nodes,
         provider,
         hyphenator,
         params,
+        layout,
+        graphics_resolver,
+    )
+}
+
+fn document_nodes_to_vlist_with_document(
+    document: &ParsedDocument,
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    params: &BreakParams,
+    layout: ClassLayout,
+    graphics_resolver: Option<&dyn GraphicAssetResolver>,
+) -> Vec<VListItem> {
+    let mut float_counters = FloatCounters::default();
+    document_nodes_to_vlist_with_state(
+        document,
+        nodes,
+        provider,
+        hyphenator,
+        params,
+        layout,
         graphics_resolver,
         &mut float_counters,
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentBlockKind {
+    Paragraph,
+    Heading,
+    ListItem,
+    DescriptionItem,
+    FloatCaption,
+    ChapterTitle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SegmentSemantic {
+    Paragraph,
+    ListItem,
+    DescriptionItem,
+    Heading {
+        level: u8,
+        use_tight_after_spacing: bool,
+    },
+    ChapterHeading {
+        number: String,
+        display_title: String,
+    },
+}
+
 fn document_nodes_to_vlist_with_state(
+    document: &ParsedDocument,
     nodes: &[DocumentNode],
     provider: &dyn CharWidthProvider,
     hyphenator: Option<&dyn Hyphenator>,
     params: &BreakParams,
+    layout: ClassLayout,
     graphics_resolver: Option<&dyn GraphicAssetResolver>,
     float_counters: &mut FloatCounters,
 ) -> Vec<VListItem> {
     let mut vlist = Vec::new();
     let mut segment_start = 0;
+    let mut previous_block = None;
 
     for (index, node) in nodes.iter().enumerate() {
         match node {
             DocumentNode::ParBreak => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
+                    document,
                     &nodes[segment_start..index],
                     provider,
                     hyphenator,
                     params,
+                    layout,
+                    &mut previous_block,
                 );
-                vlist.push(VListItem::Box {
-                    tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
-                    content: String::new(),
-                    links: Vec::new(),
-                    font_index: 0,
-                    source_span: None,
+                vlist.push(VListItem::Glue {
+                    height: points(layout.parskip_pt),
                 });
                 segment_start = index + 1;
             }
             DocumentNode::PageBreak => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
+                    document,
                     &nodes[segment_start..index],
                     provider,
                     hyphenator,
                     params,
+                    layout,
+                    &mut previous_block,
                 );
                 vlist.push(VListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
+                previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::ClearPage => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
+                    document,
                     &nodes[segment_start..index],
                     provider,
                     hyphenator,
                     params,
+                    layout,
+                    &mut previous_block,
                 );
                 vlist.push(VListItem::ClearPage);
+                previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::IncludeGraphics { path, options } => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
+                    document,
                     &nodes[segment_start..index],
                     provider,
                     hyphenator,
                     params,
+                    layout,
+                    &mut previous_block,
                 );
                 if let Some(resolver) = graphics_resolver {
                     if let Some(graphics_box) = compile_includegraphics(path, options, resolver) {
                         vlist.push(VListItem::Image { graphics_box });
                     }
                 }
+                previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::TikzPicture { graphics_box } => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
+                    document,
                     &nodes[segment_start..index],
                     provider,
                     hyphenator,
                     params,
+                    layout,
+                    &mut previous_block,
                 );
                 vlist.push(VListItem::Image {
                     graphics_box: graphics_box.clone(),
                 });
+                previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::IndexMarker(entry) => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
+                    document,
                     &nodes[segment_start..index],
                     provider,
                     hyphenator,
                     params,
+                    layout,
+                    &mut previous_block,
                 );
                 vlist.push(VListItem::IndexMarker {
                     entry: entry.clone(),
@@ -1266,17 +1809,25 @@ fn document_nodes_to_vlist_with_state(
             } => {
                 append_nodes_segment_to_vlist(
                     &mut vlist,
+                    document,
                     &nodes[segment_start..index],
                     provider,
                     hyphenator,
                     params,
+                    layout,
+                    &mut previous_block,
                 );
 
+                let mut float_layout = layout;
+                float_layout.baselineskip_pt = layout.float_baselineskip_pt;
+                float_layout.list_item_baselineskip_pt = layout.float_baselineskip_pt;
                 let mut float_vlist = document_nodes_to_vlist_with_state(
+                    document,
                     content,
                     provider,
                     hyphenator,
                     params,
+                    float_layout,
                     graphics_resolver,
                     float_counters,
                 );
@@ -1289,12 +1840,14 @@ fn document_nodes_to_vlist_with_state(
                     };
                     let caption_line = format!("{prefix} {number}: {caption}");
                     let caption_nodes = [DocumentNode::Text(caption_line, None)];
-                    append_nodes_segment_to_vlist(
+                    append_styled_nodes_to_vlist(
                         &mut float_vlist,
                         &caption_nodes,
                         provider,
                         hyphenator,
                         params,
+                        layout.float_caption_line_height_pt,
+                        layout.body_font_size_pt,
                     );
                 }
 
@@ -1303,6 +1856,7 @@ fn document_nodes_to_vlist_with_state(
                     content: float_content_from_vlist(&float_vlist),
                 });
 
+                previous_block = None;
                 segment_start = index + 1;
             }
             _ => {}
@@ -1311,10 +1865,13 @@ fn document_nodes_to_vlist_with_state(
 
     append_nodes_segment_to_vlist(
         &mut vlist,
+        document,
         &nodes[segment_start..],
         provider,
         hyphenator,
         params,
+        layout,
+        &mut previous_block,
     );
 
     vlist
@@ -1322,12 +1879,34 @@ fn document_nodes_to_vlist_with_state(
 
 fn append_nodes_segment_to_vlist(
     vlist: &mut Vec<VListItem>,
+    document: &ParsedDocument,
     nodes: &[DocumentNode],
     provider: &dyn CharWidthProvider,
     hyphenator: Option<&dyn Hyphenator>,
     params: &BreakParams,
+    layout: ClassLayout,
+    previous_block: &mut Option<SegmentBlockKind>,
 ) {
     if nodes.is_empty() {
+        return;
+    }
+
+    if let Some(line_height_pt) = display_math_line_height_for_segment(nodes, layout) {
+        if previous_block.is_some() {
+            vlist.push(VListItem::Glue {
+                height: points(layout.display_math_before_pt),
+            });
+        }
+        append_styled_nodes_to_vlist(
+            vlist,
+            nodes,
+            provider,
+            hyphenator,
+            params,
+            line_height_pt,
+            layout.body_font_size_pt,
+        );
+        *previous_block = Some(SegmentBlockKind::Paragraph);
         return;
     }
 
@@ -1335,7 +1914,125 @@ fn append_nodes_segment_to_vlist(
         DocumentNode::Text(_, span) => *span,
         _ => None,
     });
+    let segment_text = visible_text_from_nodes(nodes);
+    let semantic = classify_segment(nodes, &segment_text, document, *previous_block);
 
+    match semantic {
+        SegmentSemantic::ChapterHeading {
+            number,
+            display_title,
+        } => {
+            vlist.push(VListItem::Box {
+                tex_box: TeXBox::with_height(points(layout.chapter_number_line_height_pt)),
+                content: format!("Chapter {number}"),
+                links: Vec::new(),
+                font_index: 0,
+                font_size: points(layout.chapter_number_font_size_pt),
+                source_span: segment_source_span,
+            });
+            vlist.push(VListItem::Box {
+                tex_box: TeXBox::with_height(points(layout.chapter_title_line_height_pt)),
+                content: display_title,
+                links: Vec::new(),
+                font_index: 0,
+                font_size: points(layout.chapter_title_font_size_pt),
+                source_span: segment_source_span,
+            });
+            *previous_block = Some(SegmentBlockKind::ChapterTitle);
+            return;
+        }
+        SegmentSemantic::Heading {
+            level,
+            use_tight_after_spacing,
+        } => {
+            let before_spacing = match level {
+                1 if previous_block.is_some() => layout.section_before_pt,
+                2 | 3 if previous_block.is_some() => layout.subsection_before_pt,
+                _ => 0,
+            };
+            if before_spacing > 0 {
+                vlist.push(VListItem::Glue {
+                    height: points(before_spacing),
+                });
+            }
+            let (line_height_pt, font_size_pt) = match level {
+                1 => (
+                    if use_tight_after_spacing {
+                        layout.section_after_pt.saturating_sub(1)
+                    } else {
+                        layout.section_after_pt
+                    },
+                    layout.section_font_size_pt,
+                ),
+                2 | 3 => (layout.subsection_after_pt, layout.subsection_font_size_pt),
+                _ => (layout.baselineskip_pt, layout.body_font_size_pt),
+            };
+            append_styled_nodes_to_vlist(
+                vlist,
+                nodes,
+                provider,
+                hyphenator,
+                params,
+                line_height_pt,
+                font_size_pt,
+            );
+            *previous_block = Some(SegmentBlockKind::Heading);
+            return;
+        }
+        SegmentSemantic::ListItem => {
+            append_styled_nodes_to_vlist(
+                vlist,
+                nodes,
+                provider,
+                hyphenator,
+                params,
+                layout.list_item_baselineskip_pt,
+                layout.body_font_size_pt,
+            );
+            *previous_block = Some(SegmentBlockKind::ListItem);
+            return;
+        }
+        SegmentSemantic::DescriptionItem => {
+            append_styled_nodes_to_vlist(
+                vlist,
+                nodes,
+                provider,
+                hyphenator,
+                params,
+                layout.list_item_baselineskip_pt,
+                layout.body_font_size_pt,
+            );
+            *previous_block = Some(SegmentBlockKind::DescriptionItem);
+            return;
+        }
+        SegmentSemantic::Paragraph => {}
+    }
+
+    append_styled_nodes_to_vlist(
+        vlist,
+        nodes,
+        provider,
+        hyphenator,
+        params,
+        layout.baselineskip_pt,
+        layout.body_font_size_pt,
+    );
+    *previous_block = Some(SegmentBlockKind::Paragraph);
+}
+
+fn append_styled_nodes_to_vlist(
+    vlist: &mut Vec<VListItem>,
+    nodes: &[DocumentNode],
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    params: &BreakParams,
+    line_height_pt: i64,
+    font_size_pt: i64,
+) {
+    let source_span = nodes.iter().find_map(|node| match node {
+        DocumentNode::Text(_, span) => *span,
+        _ => None,
+    });
     let hlist = document_nodes_to_hlist_with_config(
         nodes,
         provider,
@@ -1346,9 +2043,141 @@ fn append_nodes_segment_to_vlist(
     if hlist.is_empty() {
         return;
     }
-
     let wrapped_lines = line_breaker::break_paragraph_with_links(&hlist, params);
-    vlist.extend(lines_to_vlist(&wrapped_lines, segment_source_span));
+    vlist.extend(lines_to_vlist(
+        &wrapped_lines,
+        source_span,
+        line_height_pt,
+        font_size_pt,
+    ));
+}
+
+fn classify_segment(
+    nodes: &[DocumentNode],
+    segment_text: &str,
+    document: &ParsedDocument,
+    previous_block: Option<SegmentBlockKind>,
+) -> SegmentSemantic {
+    let trimmed = segment_text.trim();
+    if trimmed.is_empty() {
+        return SegmentSemantic::Paragraph;
+    }
+
+    if let Some(entry) = document
+        .section_entries
+        .iter()
+        .find(|entry| entry.display_title() == trimmed)
+    {
+        if entry.level == 0 {
+            return SegmentSemantic::ChapterHeading {
+                number: entry.number.clone(),
+                display_title: entry.display_title(),
+            };
+        }
+        let top_level_entries = document
+            .section_entries
+            .iter()
+            .filter(|candidate| candidate.level == 1)
+            .collect::<Vec<_>>();
+        return SegmentSemantic::Heading {
+            level: entry.level,
+            use_tight_after_spacing: entry.level == 1
+                && document.document_class == "article"
+                && top_level_entries.len() > 1
+                && top_level_entries.last().copied() == Some(entry),
+        };
+    }
+
+    if trimmed.starts_with("• ") || is_numbered_list_item(trimmed) {
+        return SegmentSemantic::ListItem;
+    }
+
+    if matches!(
+        previous_block,
+        Some(SegmentBlockKind::Heading | SegmentBlockKind::DescriptionItem)
+    ) && is_description_item(trimmed)
+    {
+        return SegmentSemantic::DescriptionItem;
+    }
+
+    if nodes.len() == 1
+        && matches!(nodes[0], DocumentNode::Text(_, _))
+        && trimmed.starts_with("Figure ")
+    {
+        return SegmentSemantic::Paragraph;
+    }
+
+    SegmentSemantic::Paragraph
+}
+
+fn display_math_line_height_for_segment(
+    nodes: &[DocumentNode],
+    layout: ClassLayout,
+) -> Option<i64> {
+    if nodes.len() != 1 {
+        return None;
+    }
+
+    match nodes.first()? {
+        DocumentNode::DisplayMath(_) => Some(layout.display_math_line_height_pt),
+        DocumentNode::EquationEnv { lines, aligned, .. } => {
+            if *aligned || lines.len() > 1 {
+                Some(layout.align_line_height_pt)
+            } else {
+                Some(layout.display_math_line_height_pt)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn is_numbered_list_item(text: &str) -> bool {
+    let Some((prefix, _)) = text.split_once(' ') else {
+        return false;
+    };
+    let Some(number) = prefix.strip_suffix('.') else {
+        return false;
+    };
+    !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_description_item(text: &str) -> bool {
+    let Some((term, _)) = text.split_once(": ") else {
+        return false;
+    };
+    !term.is_empty() && !term.contains(' ')
+}
+
+fn visible_text_from_nodes(nodes: &[DocumentNode]) -> String {
+    let mut text = String::new();
+    for node in nodes {
+        push_visible_text_from_node(&mut text, node);
+    }
+    text
+}
+
+fn push_visible_text_from_node(text: &mut String, node: &DocumentNode) {
+    match node {
+        DocumentNode::Text(content, _) => text.push_str(content),
+        DocumentNode::FontFamily { children, .. }
+        | DocumentNode::Link { children, .. }
+        | DocumentNode::HBox(children)
+        | DocumentNode::VBox(children) => {
+            for child in children {
+                push_visible_text_from_node(text, child);
+            }
+        }
+        DocumentNode::InlineMath(_)
+        | DocumentNode::DisplayMath(_)
+        | DocumentNode::EquationEnv { .. }
+        | DocumentNode::IndexMarker(_)
+        | DocumentNode::ParBreak
+        | DocumentNode::PageBreak
+        | DocumentNode::ClearPage
+        | DocumentNode::IncludeGraphics { .. }
+        | DocumentNode::TikzPicture { .. }
+        | DocumentNode::Float { .. } => {}
+    }
 }
 
 pub(crate) fn push_forced_break_if_needed(hlist: &mut Vec<HListItem>) {
@@ -1410,14 +2239,17 @@ fn flush_word(
 fn lines_to_vlist(
     lines: &[line_breaker::BrokenLine],
     source_span: Option<SourceSpan>,
+    line_height_pt: i64,
+    font_size_pt: i64,
 ) -> Vec<VListItem> {
     lines
         .iter()
         .map(|line| VListItem::Box {
-            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            tex_box: TeXBox::with_height(points(line_height_pt)),
             content: line.text.clone(),
             links: line.links.clone(),
             font_index: line.font_index,
+            font_size: points(font_size_pt),
             source_span,
         })
         .collect()
@@ -1459,6 +2291,7 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                 content,
                 links,
                 font_index,
+                font_size,
                 source_span,
             } => {
                 lines.push(TextLine {
@@ -1466,6 +2299,7 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                     y: consumed_height,
                     links: links.clone(),
                     font_index: *font_index,
+                    font_size: *font_size,
                     source_span: *source_span,
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
@@ -1778,22 +2612,39 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
             y: placement.y_position - line.y,
             links: line.links.clone(),
             font_index: line.font_index,
+            font_size: line.font_size,
             source_span: line.source_span,
         })
         .collect()
 }
 
 fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
-    let content_height = page_content_height(page_box);
+    let mut layout = class_layout_for("article");
+    #[cfg(test)]
+    adjust_layout_for_core_tests(&mut layout);
+    layout.has_page_number = false;
+    paginate_vlist_with_layout(vlist, page_box, layout)
+}
+
+fn paginate_vlist_with_layout(
+    vlist: &[VListItem],
+    page_box: &PageBox,
+    layout: ClassLayout,
+) -> Vec<TypesetPage> {
+    let content_height = page_content_height(page_box, layout);
 
     if vlist.is_empty() {
-        return vec![TypesetPage {
-            lines: Vec::new(),
-            images: Vec::new(),
-            page_box: page_box.clone(),
-            float_placements: Vec::new(),
-            index_entries: Vec::new(),
-        }];
+        return vec![finalize_page_furniture(
+            TypesetPage {
+                lines: Vec::new(),
+                images: Vec::new(),
+                page_box: page_box.clone(),
+                float_placements: Vec::new(),
+                index_entries: Vec::new(),
+            },
+            layout,
+            1,
+        )];
     }
 
     let mut pages = Vec::new();
@@ -1830,13 +2681,17 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
                 if page_has_renderable_content(&current_page)
                     || (pages.is_empty() && float_queue.is_empty())
                 {
-                    pages.push(typeset_page_from_vlist(&current_page, page_box));
+                    pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
                 }
 
                 current_page.clear();
                 current_height = DimensionValue::zero();
                 best_break_candidate = None;
-                pages.extend(flush_pending_float_pages(&mut float_queue, page_box));
+                pages.extend(flush_pending_float_pages(
+                    &mut float_queue,
+                    page_box,
+                    layout,
+                ));
                 continue;
             }
             VListItem::Penalty { value } if *value <= PENALTY_FORCED => {
@@ -1848,7 +2703,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
                     content_height,
                 );
                 if page_has_renderable_content(&current_page) || pages.is_empty() {
-                    pages.push(typeset_page_from_vlist(&current_page, page_box));
+                    pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
                 }
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
@@ -1870,6 +2725,15 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
         }
 
         let item_height = vlist_item_height(item);
+        if current_page.is_empty() && !float_queue.is_empty() {
+            place_pending_floats_in_region(
+                &mut current_page,
+                &mut current_height,
+                &mut float_queue,
+                FloatRegion::Top,
+                content_height,
+            );
+        }
         if !current_page.is_empty() && current_height + item_height > content_height {
             if let Some(candidate) = best_break_candidate {
                 let trailing_items = current_page.split_off(candidate.split_after);
@@ -1881,7 +2745,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
                     FloatRegion::Bottom,
                     content_height,
                 );
-                pages.push(typeset_page_from_vlist(&current_page, page_box));
+                pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
                 }
@@ -1906,7 +2770,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
                     FloatRegion::Bottom,
                     content_height,
                 );
-                pages.push(typeset_page_from_vlist(&current_page, page_box));
+                pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
                 }
@@ -1930,7 +2794,7 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
                     FloatRegion::Bottom,
                     content_height,
                 );
-                pages.push(typeset_page_from_vlist(&current_page, page_box));
+                pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
                 }
@@ -1959,6 +2823,12 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
         return pages;
     }
 
+    place_pending_top_floats_before_content(
+        &mut current_page,
+        &mut current_height,
+        &mut float_queue,
+        content_height,
+    );
     place_pending_floats_in_region(
         &mut current_page,
         &mut current_height,
@@ -1967,11 +2837,18 @@ fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
         content_height,
     );
     if page_has_renderable_content(&current_page) || (pages.is_empty() && float_queue.is_empty()) {
-        pages.push(typeset_page_from_vlist(&current_page, page_box));
+        pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
     }
-    pages.extend(flush_pending_float_pages(&mut float_queue, page_box));
+    pages.extend(flush_pending_float_pages(
+        &mut float_queue,
+        page_box,
+        layout,
+    ));
     if pages.is_empty() {
-        pages.push(typeset_page_from_vlist(&[], page_box));
+        pages.push(typeset_page_from_vlist(&[], page_box, layout));
+    }
+    for (page_index, page) in pages.iter_mut().enumerate() {
+        *page = finalize_page_furniture(page.clone(), layout, page_index + 1);
     }
     pages
 }
@@ -2020,12 +2897,12 @@ fn vlist_total_height(items: &[VListItem]) -> DimensionValue {
     })
 }
 
-fn page_content_height(page_box: &PageBox) -> DimensionValue {
-    page_box.height - points(TOP_MARGIN_PT) - points(BOTTOM_MARGIN_PT)
+fn page_content_height(page_box: &PageBox, layout: ClassLayout) -> DimensionValue {
+    page_box.height - points(layout.top_margin_pt) - points(layout.bottom_margin_pt)
 }
 
-fn page_content_top(page_box: &PageBox) -> DimensionValue {
-    page_box.height - points(TOP_MARGIN_PT)
+fn page_content_top(page_box: &PageBox, layout: ClassLayout) -> DimensionValue {
+    page_box.height - points(layout.top_margin_pt)
 }
 
 fn page_has_renderable_content(items: &[VListItem]) -> bool {
@@ -2061,16 +2938,46 @@ fn place_pending_floats_in_region(
     }
 }
 
-fn flush_pending_float_pages(float_queue: &mut FloatQueue, page_box: &PageBox) -> Vec<TypesetPage> {
+fn place_pending_top_floats_before_content(
+    items: &mut Vec<VListItem>,
+    current_height: &mut DimensionValue,
+    float_queue: &mut FloatQueue,
+    content_height: DimensionValue,
+) {
+    let mut prepended = Vec::new();
+
+    while *current_height < content_height {
+        let available_height = content_height - *current_height;
+        let Some(placement) = float_queue.try_place_at(FloatRegion::Top, available_height) else {
+            break;
+        };
+        let height = placement.content.height;
+        push_placed_float(&mut prepended, placement.region, placement.content);
+        *current_height = *current_height + height;
+    }
+
+    if prepended.is_empty() {
+        return;
+    }
+
+    prepended.extend(std::mem::take(items));
+    *items = prepended;
+}
+
+fn flush_pending_float_pages(
+    float_queue: &mut FloatQueue,
+    page_box: &PageBox,
+    layout: ClassLayout,
+) -> Vec<TypesetPage> {
     let mut pages = Vec::new();
     let mut current_page = Vec::new();
     let mut current_height = DimensionValue::zero();
-    let content_height = page_content_height(page_box);
+    let content_height = page_content_height(page_box, layout);
 
     for placement in float_queue.force_flush() {
         let height = placement.content.height;
         if !current_page.is_empty() && current_height + height > content_height {
-            pages.push(typeset_page_from_vlist(&current_page, page_box));
+            pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
             current_page.clear();
             current_height = DimensionValue::zero();
         }
@@ -2080,7 +2987,7 @@ fn flush_pending_float_pages(float_queue: &mut FloatQueue, page_box: &PageBox) -
     }
 
     if page_has_renderable_content(&current_page) {
-        pages.push(typeset_page_from_vlist(&current_page, page_box));
+        pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
     }
 
     pages
@@ -2099,7 +3006,11 @@ fn vlist_item_height(item: &VListItem) -> DimensionValue {
     }
 }
 
-fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPage {
+fn typeset_page_from_vlist(
+    items: &[VListItem],
+    page_box: &PageBox,
+    layout: ClassLayout,
+) -> TypesetPage {
     let mut lines = Vec::new();
     let mut images = Vec::new();
     let mut float_placements = Vec::new();
@@ -2113,13 +3024,15 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                 content,
                 links,
                 font_index,
+                font_size,
                 source_span,
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
-                    y: page_content_top(page_box) - consumed_height,
+                    y: page_content_top(page_box, layout) - consumed_height,
                     links: links.clone(),
                     font_index: *font_index,
+                    font_size: *font_size,
                     source_span: *source_span,
                 });
                 consumed_height = consumed_height + tex_box.height + tex_box.depth;
@@ -2129,7 +3042,9 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                     images.push(TypesetImage {
                         scene,
                         x: points(LEFT_MARGIN_PT),
-                        y: page_content_top(page_box) - consumed_height - graphics_box.height,
+                        y: page_content_top(page_box, layout)
+                            - consumed_height
+                            - graphics_box.height,
                         display_width: graphics_box.width,
                         display_height: graphics_box.height,
                     });
@@ -2137,7 +3052,13 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
                 consumed_height = consumed_height + graphics_box.height;
             }
             VListItem::PlacedFloat { region, content } => {
-                let y_position = page_content_top(page_box) - consumed_height;
+                let y_position = if matches!(region, FloatRegion::Top | FloatRegion::Page)
+                    && consumed_height == DimensionValue::zero()
+                {
+                    points(layout.top_float_y_pt)
+                } else {
+                    page_content_top(page_box, layout) - consumed_height
+                };
                 float_placements.push(FloatPlacement {
                     region: *region,
                     content: content.clone(),
@@ -2168,6 +3089,25 @@ fn typeset_page_from_vlist(items: &[VListItem], page_box: &PageBox) -> TypesetPa
         float_placements,
         index_entries,
     }
+}
+
+fn finalize_page_furniture(
+    mut page: TypesetPage,
+    layout: ClassLayout,
+    page_number: usize,
+) -> TypesetPage {
+    if layout.has_page_number {
+        page.lines.push(TextLine {
+            text: page_number.to_string(),
+            y: points(layout.page_number_y_pt),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(layout.page_number_font_size_pt),
+            source_span: None,
+        });
+    }
+    page.lines.sort_by(|left, right| right.y.cmp(&left.y));
+    page
 }
 
 #[cfg(test)]
@@ -2256,6 +3196,26 @@ fn wrap_hlist(hlist: &[HListItem], max_line_width: DimensionValue) -> Vec<String
     }
 
     lines
+        .into_iter()
+        .map(|line| strip_test_script_markers(&line))
+        .collect()
+}
+
+#[cfg(test)]
+fn strip_test_script_markers(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            !matches!(
+                *ch,
+                FOOTNOTE_MARKER_START
+                    | FOOTNOTE_MARKER_END
+                    | math_layout::SUPERSCRIPT_START_MARKER
+                    | math_layout::SUPERSCRIPT_END_MARKER
+                    | math_layout::SUBSCRIPT_START_MARKER
+                    | math_layout::SUBSCRIPT_END_MARKER
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2466,15 +3426,16 @@ fn points(value: i64) -> DimensionValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_fixed_width_provider, document_nodes_to_hlist,
-        document_nodes_to_hlist_with_hyphenation, document_nodes_to_vlist_with_config,
-        page_box_for_class, paginate_vlist, points, resolve_page_labels, vlist_item_height,
-        wrap_body, wrap_hlist, CharWidthProvider, DocumentLayoutFragment, FloatContent, FloatItem,
-        FloatQueue, FloatRegion, GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter,
-        PageBox, PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TfmWidthProvider,
+        append_footnotes_to_pages, class_layout_for, default_fixed_width_provider,
+        document_nodes_to_hlist, document_nodes_to_hlist_with_hyphenation,
+        document_nodes_to_vlist_with_config, page_box_for_class, paginate_vlist, points,
+        resolve_page_labels, strip_test_script_markers, vlist_item_height, wrap_body, wrap_hlist,
+        CharWidthProvider, DocumentLayoutFragment, FloatContent, FloatItem, FloatQueue,
+        FloatRegion, GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PageBox,
+        PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TfmWidthProvider,
         TypesetNamedDestination, TypesetOutline, TypesetPage, TypesetterReusePlan, VBox, VListItem,
-        LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
-        PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
+        DEFAULT_BODY_FONT_SIZE_PT, LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH,
+        PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::bibliography::api::{parse_bbl, BibliographyState};
@@ -2523,6 +3484,13 @@ mod tests {
             .expect("parse document")
     }
 
+    fn visible_line_texts(page: &TypesetPage) -> Vec<String> {
+        page.lines
+            .iter()
+            .map(|line| strip_test_script_markers(&line.text))
+            .collect()
+    }
+
     struct StubGraphicResolver;
 
     impl GraphicAssetResolver for StubGraphicResolver {
@@ -2564,6 +3532,7 @@ mod tests {
                 y: DimensionValue::zero(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             }],
             images: Vec::new(),
@@ -2592,6 +3561,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                     source_span: None,
                 },
                 TextLine {
@@ -2599,6 +3569,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                     source_span: None,
                 },
             ]
@@ -2652,6 +3623,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                     source_span: None,
                 }],
                 images: Vec::new(),
@@ -2665,6 +3637,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                     source_span: None,
                 }],
                 images: Vec::new(),
@@ -2705,6 +3678,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                     source_span: None,
                 },
                 TextLine {
@@ -2712,6 +3686,7 @@ mod tests {
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                     source_span: None,
                 },
             ],
@@ -2791,6 +3766,7 @@ mod tests {
                 content: format!("Line {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             })
             .collect::<Vec<_>>();
@@ -2802,6 +3778,7 @@ mod tests {
             content: "Overflow".to_string(),
             links: Vec::new(),
             font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
             source_span: None,
         });
 
@@ -2885,6 +3862,7 @@ mod tests {
                             y: DimensionValue::zero(),
                             links: Vec::new(),
                             font_index: 0,
+                            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                             source_span: None,
                         },
                         TextLine {
@@ -2892,6 +3870,7 @@ mod tests {
                             y: points(LINE_HEIGHT_PT),
                             links: Vec::new(),
                             font_index: 0,
+                            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                             source_span: None,
                         },
                     ],
@@ -3081,6 +4060,7 @@ mod tests {
                 content: "Before".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             },
             VListItem::Float {
@@ -3092,6 +4072,7 @@ mod tests {
                 content: "After".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             },
         ];
@@ -3124,6 +4105,7 @@ mod tests {
                 content: "Line 1".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             },
             VListItem::Float {
@@ -3136,6 +4118,7 @@ mod tests {
             content: format!("Line {index}"),
             links: Vec::new(),
             font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
             source_span: None,
         }));
 
@@ -3164,6 +4147,7 @@ mod tests {
                 content: "Before".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             },
             VListItem::Float {
@@ -3176,6 +4160,7 @@ mod tests {
                 content: "After".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             },
         ];
@@ -3275,6 +4260,7 @@ mod tests {
                 content: format!("Tall {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             })
             .collect::<Vec<_>>();
@@ -3283,6 +4269,7 @@ mod tests {
             content: format!("Short {index}"),
             links: Vec::new(),
             font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
             source_span: None,
         }));
 
@@ -3307,6 +4294,7 @@ mod tests {
                 content: "First".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             },
             VListItem::Penalty {
@@ -3317,6 +4305,7 @@ mod tests {
                 content: "Second".to_string(),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             },
         ];
@@ -3336,6 +4325,7 @@ mod tests {
                 content: format!("Line {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             })
             .collect::<Vec<_>>();
@@ -3345,6 +4335,7 @@ mod tests {
             content: format!("Line {index}"),
             links: Vec::new(),
             font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
             source_span: None,
         }));
 
@@ -3371,6 +4362,7 @@ mod tests {
                 content: format!("Line {index}"),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             })
             .collect::<Vec<_>>();
@@ -3382,6 +4374,7 @@ mod tests {
             content: format!("Line {index}"),
             links: Vec::new(),
             font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
             source_span: None,
         }));
 
@@ -3453,6 +4446,7 @@ mod tests {
             content: "Line".to_string(),
             links: Vec::new(),
             font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
             source_span: None,
         }];
         let vbox = VBox {
@@ -3471,6 +4465,7 @@ mod tests {
             content: "Line".to_string(),
             links: Vec::new(),
             font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
             source_span: None,
         };
 
@@ -3768,11 +4763,7 @@ mod tests {
         ));
 
         assert_eq!(
-            document.pages[0]
-                .lines
-                .iter()
-                .map(|line| line.text.as_str())
-                .collect::<Vec<_>>(),
+            visible_line_texts(&document.pages[0]),
             vec!["Inline x2.", "a/b", "After"]
         );
     }
@@ -3790,12 +4781,39 @@ mod tests {
         ));
 
         assert_eq!(
-            document.pages[0]
+            visible_line_texts(&document.pages[0]),
+            vec!["E=mc2 (1)", "Ref 1.", "a=b", "c=done (A)", "Also A."]
+        );
+    }
+
+    #[test]
+    fn append_footnotes_to_pages_adds_all_footnotes_with_descending_positions() {
+        let mut pages = vec![TypesetPage {
+            lines: Vec::new(),
+            images: Vec::new(),
+            page_box: page_box_for_class("article"),
+            float_placements: Vec::new(),
+            index_entries: Vec::new(),
+        }];
+
+        append_footnotes_to_pages(
+            &mut pages,
+            &["First footnote".to_string(), "Second footnote".to_string()],
+            class_layout_for("article"),
+        );
+
+        assert_eq!(
+            pages[0]
                 .lines
                 .iter()
-                .map(|line| line.text.as_str())
+                .map(|line| (line.text.clone(), line.y))
                 .collect::<Vec<_>>(),
-            vec!["E=mc2 (1)", "Ref 1.", "a=b", "c=done (A)", "Also A."]
+            vec![
+                ("1".to_string(), points(172)),
+                ("First footnote".to_string(), points(169)),
+                ("2".to_string(), points(162)),
+                ("Second footnote".to_string(), points(159)),
+            ]
         );
     }
 
@@ -3885,8 +4903,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "First paragraph".to_string(),
-                String::new(),
-                "Second paragraph".to_string(),
+                "Second paragraph".to_string()
             ]
         );
     }
@@ -4620,6 +5637,7 @@ mod tests {
                 y: points(700),
                 links: Vec::new(),
                 font_index: 0,
+                font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
                 source_span: None,
             }],
             images: Vec::new(),

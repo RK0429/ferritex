@@ -422,7 +422,7 @@ fn contains_pdf_position(fragment: &SyncTraceFragment, position: PdfPosition) ->
     fragment.page == position.page
         && fragment.x_start <= position.x
         && position.x <= fragment.x_end
-        && fragment.y_bottom <= position.y
+        && fragment.y_bottom < position.y
         && position.y <= fragment.y_top
 }
 

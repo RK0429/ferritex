@@ -1039,6 +1039,7 @@ mod tests {
                     y: DimensionValue(0),
                     links: Vec::new(),
                     font_index: 0,
+                    font_size: DimensionValue(10 * 65_536),
                     source_span: None,
                 }],
                 images: Vec::new(),

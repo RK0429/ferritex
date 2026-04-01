@@ -700,7 +700,10 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use crate::parity::{compute_parity_score, format_parity_summary, ParityResult};
+    use crate::parity::{
+        compute_parity_score, compute_tikz_parity_score, format_parity_summary,
+        format_tikz_parity_summary, ParityResult, TikzParityResult,
+    };
 
     use super::{
         bundle_bootstrap_cases, bundle_package_loading_cases, corpus_bibliography_cases,
@@ -1394,14 +1397,168 @@ mod tests {
             "all layout-core fixtures must have reference PDFs and produce parity scores"
         );
         assert_eq!(measured + errors, results.len());
-        assert!(results
+        let failing = results
             .iter()
-            .filter_map(|result| result.score.as_ref())
-            .all(|score| score.document_diff_rate.is_finite()
-                && score
-                    .per_page_diff_rates
-                    .iter()
-                    .all(|rate| rate.is_finite())));
+            .filter_map(|result| {
+                result
+                    .score
+                    .as_ref()
+                    .filter(|score| !score.passes_req_nf_007())
+                    .map(|score| (&result.document_name, score))
+            })
+            .collect::<Vec<_>>();
+        let failure_details = failing
+            .iter()
+            .map(|(document_name, score)| {
+                format!(
+                    "- {}: diff_rate={:.3}, pages={}/{}, reasons={}",
+                    document_name,
+                    score.document_diff_rate,
+                    score.ferritex_pages,
+                    score.reference_pages,
+                    score.failure_reasons().join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            failing.is_empty(),
+            "REQ-NF-007 gate failed for {} documents:\n{}\n\n{}",
+            failing.len(),
+            failure_details,
+            summary
+        );
+    }
+
+    fn assert_tikz_parity_measurement(base_cases: &[BenchCase], reference_dir: &Path) {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cases = stage_cases_in_tempdir(base_cases, temp_dir.path());
+
+        assert!(reference_dir.exists(), "reference directory should exist");
+
+        let harness = BenchHarness::new(
+            cases.clone(),
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(ServiceCompileBackend);
+
+        let report = harness.run();
+        assert!(
+            report.failures.is_empty(),
+            "TikZ parity compilation failed: {:?}",
+            report.failures
+        );
+        assert_eq!(report.results.len(), cases.len());
+
+        let mut results = Vec::with_capacity(cases.len());
+        for case in &cases {
+            let document_name = case
+                .input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem should be utf-8")
+                .to_string();
+            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
+            let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
+
+            if !reference_pdf_path.exists() {
+                results.push(TikzParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(format!(
+                        "missing reference PDF {}",
+                        reference_pdf_path.display()
+                    )),
+                });
+                continue;
+            }
+
+            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read ferritex PDF {}: {error}",
+                    ferritex_pdf_path.display()
+                )
+            });
+            let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read reference PDF {}: {error}",
+                    reference_pdf_path.display()
+                )
+            });
+
+            match compute_tikz_parity_score(&ferritex_pdf, &reference_pdf) {
+                Ok(score) => results.push(TikzParityResult {
+                    document_name,
+                    score: Some(score),
+                    error: None,
+                }),
+                Err(error) => results.push(TikzParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(error),
+                }),
+            }
+        }
+
+        let summary = format_tikz_parity_summary(&results);
+        println!("{summary}");
+
+        let measured = results
+            .iter()
+            .filter(|result| result.score.is_some())
+            .count();
+        let errors = results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count();
+
+        assert_eq!(results.len(), base_cases.len());
+        assert!(summary.contains("TikZ Geometric Parity Summary"));
+        assert!(summary.contains("Document"));
+        assert!(
+            measured >= 1,
+            "expected at least one measured TikZ parity result"
+        );
+        assert_eq!(
+            errors, 0,
+            "all TikZ fixtures must have reference PDFs and produce parity scores"
+        );
+        let failing = results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .score
+                    .as_ref()
+                    .filter(|score| !score.pass)
+                    .map(|score| (&result.document_name, score))
+            })
+            .collect::<Vec<_>>();
+        let failure_details = failing
+            .iter()
+            .map(|(document_name, score)| {
+                format!(
+                    "- {}: match_ratio={:.3}, matched={}, mismatched={}, extra_ferritex={}, extra_reference={}",
+                    document_name,
+                    score.match_ratio,
+                    score.matched_ops,
+                    score.mismatched_ops,
+                    score.extra_ferritex_ops,
+                    score.extra_reference_ops
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            failing.is_empty(),
+            "TikZ parity gate failed for {} documents:\n{}\n\n{}",
+            failing.len(),
+            failure_details,
+            summary
+        );
     }
 
     #[test]
@@ -1718,6 +1875,15 @@ mod tests {
     }
 
     #[test]
+    fn parity_tikz_basic_shapes_measurement() {
+        let fixture_base = fixtures_root();
+        let base_cases = corpus_tikz_basic_shapes_cases(&fixture_base);
+        let reference_dir = fixture_base.join("corpus/tikz/basic-shapes/reference");
+
+        assert_tikz_parity_measurement(&base_cases, &reference_dir);
+    }
+
+    #[test]
     fn test_corpus_tikz_nested_cases_enumerate_fixtures() {
         let fixture_base = fixtures_root();
         let cases = corpus_tikz_nested_cases(&fixture_base);
@@ -1782,6 +1948,16 @@ mod tests {
                 state.page_count
             );
         }
+    }
+
+    #[test]
+    fn parity_tikz_nested_measurement() {
+        let fixture_base = fixtures_root();
+        let base_cases = corpus_tikz_nested_cases(&fixture_base);
+        let reference_dir =
+            fixture_base.join("corpus/tikz/nested-style-transform-clip-arrow/reference");
+
+        assert_tikz_parity_measurement(&base_cases, &reference_dir);
     }
 
     #[test]
