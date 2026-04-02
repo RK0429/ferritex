@@ -11,8 +11,14 @@ pub use harness::{
     CompileOutput,
 };
 pub use parity::{
-    compute_parity_score, compute_tikz_parity_score, extract_graphics_ops,
-    extract_line_y_positions, extract_pdf_page_count, format_parity_summary,
-    format_tikz_parity_summary, GraphicsOp, ParityResult, ParityScore, TikzParityResult,
-    TikzParityScore,
+    compute_bibliography_parity_score, compute_embedded_assets_parity_score,
+    compute_navigation_parity_score, compute_parity_score, compute_tikz_parity_score,
+    extract_bibliography_manifest, extract_embedded_assets_manifest, extract_graphics_ops,
+    extract_line_y_positions, extract_navigation_manifest, extract_pdf_page_count,
+    format_bibliography_parity_summary, format_embedded_assets_parity_summary,
+    format_navigation_parity_summary, format_parity_summary, format_tikz_parity_summary,
+    BibliographyManifest, BibliographyParityResult, BibliographyParityScore,
+    EmbeddedAssetsManifest, EmbeddedAssetsParityResult, EmbeddedAssetsParityScore, GraphicsOp,
+    NavigationManifest, NavigationParityResult, NavigationParityScore, ParityResult, ParityScore,
+    TikzParityResult, TikzParityScore,
 };

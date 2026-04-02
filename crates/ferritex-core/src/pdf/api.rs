@@ -33,6 +33,34 @@ pub struct PdfDocument {
 pub enum FontResource {
     /// A bare Type1 reference (e.g., Helvetica) - no embedding
     BuiltinType1 { base_font: String },
+    /// An embedded Type1 font backed by a PFB program
+    EmbeddedType1 {
+        base_font: String,
+        ascii_length: usize,
+        binary_length: usize,
+        trailer_length: usize,
+        font_program: Vec<u8>,
+        /// First char code in the encoding
+        first_char: u8,
+        /// Last char code in the encoding
+        last_char: u8,
+        /// Glyph widths for first_char..=last_char, in PDF text space (1/1000 of text size)
+        widths: Vec<u16>,
+        /// Font bounding box [llx, lly, urx, ury] in font units
+        bbox: [i16; 4],
+        /// Ascent in font units
+        ascent: i16,
+        /// Descent in font units (negative)
+        descent: i16,
+        /// Italic angle in degrees (0 for upright)
+        italic_angle: i16,
+        /// Dominant stem width (required by PDF spec)
+        stem_v: u16,
+        /// Capital letter height in font units
+        cap_height: i16,
+        /// PDF font descriptor flags
+        flags: u32,
+    },
     /// An embedded TrueType font with raw font data
     EmbeddedTrueType {
         base_font: String,
@@ -138,6 +166,12 @@ struct OutlineObject {
     body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct OutlineBuildResult {
+    objects: Vec<OutlineObject>,
+    root_child_object_ids: Vec<usize>,
+}
+
 impl PdfRenderer {
     pub fn new() -> Self {
         Self {
@@ -238,15 +272,16 @@ impl PdfRenderer {
         let outline_item_object_start = next_object_after_annotations
             + usize::from(named_destination_object_id.is_some())
             + usize::from(outline_root_object_id.is_some());
-        let outline_objects = outline_root_object_id.map_or_else(Vec::new, |root_object_id| {
-            build_outline_objects(
-                &document.outlines,
-                page_object_start,
-                root_object_id,
-                outline_item_object_start,
-            )
-        });
-        let font_object_start = outline_item_object_start + outline_objects.len();
+        let outline_build =
+            outline_root_object_id.map_or_else(OutlineBuildResult::default, |root_object_id| {
+                build_outline_objects(
+                    &document.outlines,
+                    page_object_start,
+                    root_object_id,
+                    outline_item_object_start,
+                )
+            });
+        let font_object_start = outline_item_object_start + outline_build.objects.len();
         let font_objects = build_font_objects(&self.fonts, font_object_start);
         let font_object_count = font_objects
             .iter()
@@ -385,8 +420,8 @@ impl PdfRenderer {
         }
 
         if let Some(root_object_id) = outline_root_object_id {
-            let first_object_id = outline_objects.first().map(|item| item.object_id);
-            let last_object_id = outline_objects.last().map(|item| item.object_id);
+            let first_object_id = outline_build.root_child_object_ids.first().copied();
+            let last_object_id = outline_build.root_child_object_ids.last().copied();
             append_object(
                 &mut pdf,
                 &mut offsets,
@@ -398,11 +433,11 @@ impl PdfRenderer {
                     last_object_id
                         .map(|object_id| format!(" /Last {object_id} 0 R"))
                         .unwrap_or_default(),
-                    outline_objects.len(),
+                    outline_build.objects.len(),
                 ),
             );
 
-            for outline_object in &outline_objects {
+            for outline_object in &outline_build.objects {
                 append_object(
                     &mut pdf,
                     &mut offsets,
@@ -511,6 +546,71 @@ fn build_font_objects(fonts: &[FontResource], start_object_id: usize) -> Vec<Fon
                             base_font
                         )
                         .into_bytes(),
+                    ],
+                });
+            }
+            FontResource::EmbeddedType1 {
+                base_font,
+                ascii_length,
+                binary_length,
+                trailer_length,
+                font_program,
+                first_char,
+                last_char,
+                widths,
+                bbox,
+                ascent,
+                descent,
+                italic_angle,
+                stem_v,
+                cap_height,
+                flags,
+            } => {
+                let dictionary_object_id = next_object_id;
+                let descriptor_object_id = next_object_id + 1;
+                let font_file_object_id = next_object_id + 2;
+                next_object_id += 3;
+
+                let mut font_file_object = format!(
+                    "{font_file_object_id} 0 obj\n<< /Length {} /Length1 {} /Length2 {} /Length3 {} >>\nstream\n",
+                    font_program.len(),
+                    ascii_length,
+                    binary_length,
+                    trailer_length
+                )
+                .into_bytes();
+                font_file_object.extend_from_slice(font_program);
+                font_file_object.extend_from_slice(b"\nendstream\nendobj\n");
+
+                font_objects.push(FontObjectSet {
+                    dictionary_object_id,
+                    objects: vec![
+                        format!(
+                            "{dictionary_object_id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{} /FirstChar {} /LastChar {} /Widths [{}] /FontDescriptor {} 0 R >>\nendobj\n",
+                            base_font,
+                            first_char,
+                            last_char,
+                            render_widths(widths),
+                            descriptor_object_id
+                        )
+                        .into_bytes(),
+                        format!(
+                            "{descriptor_object_id} 0 obj\n<< /Type /FontDescriptor /FontName /{} /Flags {} /FontBBox [{} {} {} {}] /Ascent {} /Descent {} /ItalicAngle {} /StemV {} /CapHeight {} /FontFile {} 0 R >>\nendobj\n",
+                            base_font,
+                            flags,
+                            bbox[0],
+                            bbox[1],
+                            bbox[2],
+                            bbox[3],
+                            ascent,
+                            descent,
+                            italic_angle,
+                            stem_v,
+                            cap_height,
+                            font_file_object_id
+                        )
+                        .into_bytes(),
+                        font_file_object,
                     ],
                 });
             }
@@ -1664,32 +1764,103 @@ fn build_outline_objects(
     page_object_start: usize,
     root_object_id: usize,
     first_object_id: usize,
-) -> Vec<OutlineObject> {
-    outlines
+) -> OutlineBuildResult {
+    if outlines.is_empty() {
+        return OutlineBuildResult::default();
+    }
+
+    let mut parents = vec![None; outlines.len()];
+    for index in 0..outlines.len() {
+        parents[index] = (0..index)
+            .rev()
+            .find(|&candidate| outlines[candidate].level < outlines[index].level);
+    }
+
+    let mut root_children = Vec::new();
+    let mut children = vec![Vec::new(); outlines.len()];
+    for (index, parent) in parents.iter().enumerate() {
+        if let Some(parent_index) = parent {
+            children[*parent_index].push(index);
+        } else {
+            root_children.push(index);
+        }
+    }
+
+    let mut descendant_counts = vec![0usize; outlines.len()];
+    for index in (0..outlines.len()).rev() {
+        descendant_counts[index] = children[index]
+            .iter()
+            .map(|&child_index| descendant_counts[child_index] + 1)
+            .sum();
+    }
+
+    let objects = outlines
         .iter()
         .enumerate()
         .map(|(index, outline)| {
             let object_id = first_object_id + index;
-            let prev = (index > 0).then_some(object_id - 1);
-            let next = (index + 1 < outlines.len()).then_some(object_id + 1);
+            let parent_object_id = parents[index]
+                .map(|parent_index| first_object_id + parent_index)
+                .unwrap_or(root_object_id);
+            let siblings = parents[index]
+                .map(|parent_index| children[parent_index].as_slice())
+                .unwrap_or(root_children.as_slice());
+            let sibling_position = siblings
+                .iter()
+                .position(|&candidate| candidate == index)
+                .expect("outline should be present among its siblings");
+            let prev =
+                (sibling_position > 0).then(|| first_object_id + siblings[sibling_position - 1]);
+            let next = (sibling_position + 1 < siblings.len())
+                .then(|| first_object_id + siblings[sibling_position + 1]);
+            let first_child = children[index]
+                .first()
+                .copied()
+                .map(|child_index| first_object_id + child_index);
+            let last_child = children[index]
+                .last()
+                .copied()
+                .map(|child_index| first_object_id + child_index);
             let page_object_id = page_object_start + outline.page_index;
-            OutlineObject {
-                object_id,
-                body: format!(
-                    "<< /Title ({}) /Parent {} 0 R{}{} /Dest [{} 0 R /XYZ {} {} 0] >>",
-                    escape_pdf_text(&outline.title),
-                    root_object_id,
-                    prev.map(|id| format!(" /Prev {id} 0 R"))
-                        .unwrap_or_default(),
-                    next.map(|id| format!(" /Next {id} 0 R"))
-                        .unwrap_or_default(),
-                    page_object_id,
-                    LEFT_MARGIN_PT,
-                    points_to_pdf_number(outline.y),
-                ),
+
+            let mut body = format!(
+                "<< /Title ({}) /Parent {} 0 R",
+                escape_pdf_text(&outline.title),
+                parent_object_id,
+            );
+            if let Some(prev_id) = prev {
+                body.push_str(&format!(" /Prev {prev_id} 0 R"));
             }
+            if let Some(next_id) = next {
+                body.push_str(&format!(" /Next {next_id} 0 R"));
+            }
+            if let Some(first_child_id) = first_child {
+                body.push_str(&format!(" /First {first_child_id} 0 R"));
+            }
+            if let Some(last_child_id) = last_child {
+                body.push_str(&format!(" /Last {last_child_id} 0 R"));
+            }
+            if descendant_counts[index] > 0 {
+                body.push_str(&format!(" /Count {}", descendant_counts[index]));
+            }
+            body.push_str(&format!(
+                " /Dest [{} 0 R /XYZ {} {} 0] >>",
+                page_object_id,
+                LEFT_MARGIN_PT,
+                points_to_pdf_number(outline.y),
+            ));
+
+            OutlineObject { object_id, body }
         })
-        .collect()
+        .collect();
+
+    OutlineBuildResult {
+        objects,
+        root_child_object_ids: root_children
+            .into_iter()
+            .map(|index| first_object_id + index)
+            .collect(),
+    }
 }
 
 fn build_named_destination_object(
@@ -2382,6 +2553,56 @@ mod tests {
     }
 
     #[test]
+    fn render_outlines_uses_hierarchical_links() {
+        let mut document = single_page(&["Outline body"]);
+        document.outlines = vec![
+            TypesetOutline {
+                level: 0,
+                title: "Alpha".to_string(),
+                page_index: 0,
+                y: points(720),
+            },
+            TypesetOutline {
+                level: 1,
+                title: "Alpha Sub".to_string(),
+                page_index: 0,
+                y: points(702),
+            },
+            TypesetOutline {
+                level: 0,
+                title: "Beta".to_string(),
+                page_index: 0,
+                y: points(684),
+            },
+            TypesetOutline {
+                level: 1,
+                title: "Beta Sub".to_string(),
+                page_index: 0,
+                y: points(666),
+            },
+        ];
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains(
+            "5 0 obj\n<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 4 >>\nendobj\n"
+        ));
+        assert!(content.contains(
+            "6 0 obj\n<< /Title (Alpha) /Parent 5 0 R /Next 8 0 R /First 7 0 R /Last 7 0 R /Count 1 /Dest [3 0 R /XYZ 72 720 0] >>\nendobj\n"
+        ));
+        assert!(content.contains(
+            "7 0 obj\n<< /Title (Alpha Sub) /Parent 6 0 R /Dest [3 0 R /XYZ 72 702 0] >>\nendobj\n"
+        ));
+        assert!(content.contains(
+            "8 0 obj\n<< /Title (Beta) /Parent 5 0 R /Prev 6 0 R /First 9 0 R /Last 9 0 R /Count 1 /Dest [3 0 R /XYZ 72 684 0] >>\nendobj\n"
+        ));
+        assert!(content.contains(
+            "9 0 obj\n<< /Title (Beta Sub) /Parent 8 0 R /Dest [3 0 R /XYZ 72 666 0] >>\nendobj\n"
+        ));
+    }
+
+    #[test]
     fn escapes_pdf_special_characters() {
         let pdf = PdfRenderer::default().render(&single_page(&[r#"A (test) \ sample"#]));
         let content = String::from_utf8_lossy(&pdf.bytes);
@@ -2580,6 +2801,20 @@ mod tests {
     }
 
     #[test]
+    fn renders_embedded_type1_font_objects() {
+        let renderer = PdfRenderer::with_fonts(vec![embedded_type1_font_resource()]);
+        let pdf = renderer.render(&single_page(&["Hello, Ferritex!"]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/Subtype /Type1 /BaseFont /FERRTX+CMR10"));
+        assert!(content.contains("/FontDescriptor 6 0 R"));
+        assert!(content.contains("/FontFile 7 0 R"));
+        assert!(content.contains("/Length1 3"));
+        assert!(content.contains("/Length2 4"));
+        assert!(content.contains("/Length3 2"));
+    }
+
+    #[test]
     fn renders_font_descriptor_with_correct_metrics() {
         let renderer = PdfRenderer::with_fonts(vec![embedded_font_resource()]);
         let pdf = renderer.render(&single_page(&["Hello, Ferritex!"]));
@@ -2591,6 +2826,20 @@ mod tests {
         assert!(content.contains("/ItalicAngle 0"));
         assert!(content.contains("/StemV 80"));
         assert!(content.contains("/CapHeight 700"));
+    }
+
+    #[test]
+    fn renders_type1_font_descriptor_with_configured_flags() {
+        let renderer = PdfRenderer::with_fonts(vec![embedded_type1_font_resource()]);
+        let pdf = renderer.render(&single_page(&["Hello, Ferritex!"]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/Flags 6"));
+        assert!(content.contains("/FontBBox [-251 -250 1009 750]"));
+        assert!(content.contains("/Ascent 683"));
+        assert!(content.contains("/Descent -217"));
+        assert!(content.contains("/StemV 69"));
+        assert!(content.contains("/CapHeight 683"));
     }
 
     #[test]
@@ -2692,6 +2941,26 @@ mod tests {
 
     fn embedded_font_resource() -> FontResource {
         embedded_font_resource_with_data(vec![1, 2, 3, 4, 5])
+    }
+
+    fn embedded_type1_font_resource() -> FontResource {
+        FontResource::EmbeddedType1 {
+            base_font: "FERRTX+CMR10".to_string(),
+            ascii_length: 3,
+            binary_length: 4,
+            trailer_length: 2,
+            font_program: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            first_char: 32,
+            last_char: 34,
+            widths: vec![250, 300, 325],
+            bbox: [-251, -250, 1009, 750],
+            ascent: 683,
+            descent: -217,
+            italic_angle: 0,
+            stem_v: 69,
+            cap_height: 683,
+            flags: 6,
+        }
     }
 
     fn embedded_font_resource_with_data(font_data: Vec<u8>) -> FontResource {

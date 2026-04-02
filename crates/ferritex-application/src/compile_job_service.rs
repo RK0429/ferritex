@@ -18,7 +18,8 @@ use ferritex_core::compilation::{
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
 use ferritex_core::font::{
-    resolve_named_font, OpenTypeFont, ResolvedFont, TfmMetrics, OPENTYPE_FONT_SEARCH_ROOTS,
+    resolve_named_font, OpenTypeFont, ResolvedFont, TfmMetrics, Type1Font,
+    OPENTYPE_FONT_SEARCH_ROOTS,
 };
 use ferritex_core::graphics::api::{
     extract_png_image_data, is_pdf_signature, parse_image_metadata, parse_pdf_metadata,
@@ -66,6 +67,19 @@ const CMR10_TFM_CANDIDATES: [&str; 4] = [
     "texmf/cmr10.tfm",
     "cmr10.tfm",
 ];
+const CMBX12_TFM_CANDIDATES: [&str; 4] = [
+    "texmf/fonts/tfm/public/cm/cmbx12.tfm",
+    "fonts/tfm/public/cm/cmbx12.tfm",
+    "texmf/cmbx12.tfm",
+    "cmbx12.tfm",
+];
+const CM_PFB_CANDIDATE_TEMPLATES: [&str; 4] = [
+    "texmf/fonts/type1/public/amsfonts/cm/{name}.pfb",
+    "fonts/type1/public/amsfonts/cm/{name}.pfb",
+    "texmf/fonts/type1/public/cm/{name}.pfb",
+    "texmf/{name}.pfb",
+];
+const PDF_TYPE1_DEFAULT_FLAGS: u32 = 6;
 
 #[cfg(test)]
 static FORCE_PARALLEL_FULL_TYPESET_COLLISION: std::sync::atomic::AtomicBool =
@@ -158,6 +172,13 @@ struct LoadedOpenTypeFont {
     font: OpenTypeFont,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TfmFontBundle {
+    font_name: String,
+    metrics: TfmMetrics,
+    type1: Option<Type1Font>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FontFamilySelection {
     main: Option<LoadedOpenTypeFont>,
@@ -178,7 +199,10 @@ impl FontFamilySelection {
 
 enum CompileFontSelection {
     OpenType(LoadedOpenTypeFont),
-    Tfm(TfmMetrics),
+    Tfm {
+        main: TfmFontBundle,
+        bold: Option<TfmFontBundle>,
+    },
     Basic,
 }
 
@@ -1132,10 +1156,30 @@ impl<'a> CompileJobService<'a> {
             },
         );
         let pdf_renderer = match (
+            compile_font_selection.as_ref(),
             font_family_selection.as_ref(),
             parse_pass_result.typeset_document.as_ref(),
         ) {
-            (Some(families), Some(typeset_document)) => {
+            (
+                Some(CompileFontSelection::Tfm { main, bold }),
+                Some(families),
+                Some(typeset_document),
+            ) if main.type1.is_some() => {
+                let font_resources = build_type1_font_resources(
+                    families,
+                    main,
+                    bold.as_ref(),
+                    typeset_document,
+                    options.parallelism,
+                    options.trace_font_tasks,
+                );
+                if font_resources.is_empty() {
+                    self.pdf_renderer.clone()
+                } else {
+                    PdfRenderer::with_fonts(font_resources)
+                }
+            }
+            (_, Some(families), Some(typeset_document)) => {
                 let font_resources = build_multi_font_pdf_resources(
                     families,
                     typeset_document,
@@ -1638,8 +1682,33 @@ impl<'a> CompileJobService<'a> {
                 )
             },
         ) {
+            let main = TfmFontBundle {
+                font_name: "cmr10".to_string(),
+                type1: resolve_type1_font(
+                    self.file_access_gate,
+                    self.asset_bundle_loader,
+                    asset_bundle_path,
+                    "cmr10",
+                ),
+                metrics,
+            };
+            let bold = load_cmbx12_metrics(
+                self.file_access_gate,
+                self.asset_bundle_loader,
+                asset_bundle_path,
+            )
+            .map(|metrics| TfmFontBundle {
+                font_name: "cmbx12".to_string(),
+                type1: resolve_type1_font(
+                    self.file_access_gate,
+                    self.asset_bundle_loader,
+                    asset_bundle_path,
+                    "cmbx12",
+                ),
+                metrics,
+            });
             return (
-                CompileFontSelection::Tfm(metrics),
+                CompileFontSelection::Tfm { main, bold },
                 families,
                 diagnostics,
                 false,
@@ -1707,9 +1776,9 @@ impl<'a> CompileJobService<'a> {
                     Some(graphics_resolver),
                 )
             }
-            (CompileFontSelection::Tfm(metrics), Some(body_nodes)) => {
+            (CompileFontSelection::Tfm { main, .. }, Some(body_nodes)) => {
                 let provider = TfmWidthProvider {
-                    metrics,
+                    metrics: &main.metrics,
                     fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
                 };
                 self.typesetter.typeset_with_body_nodes(
@@ -1719,9 +1788,9 @@ impl<'a> CompileJobService<'a> {
                     Some(graphics_resolver),
                 )
             }
-            (CompileFontSelection::Tfm(metrics), None) => {
+            (CompileFontSelection::Tfm { main, .. }, None) => {
                 let provider = TfmWidthProvider {
-                    metrics,
+                    metrics: &main.metrics,
                     fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
                 };
                 self.typesetter.typeset_with_provider_and_graphics_resolver(
@@ -4314,17 +4383,47 @@ fn load_cmr10_metrics(
     asset_bundle_loader: &dyn AssetBundleLoaderPort,
     asset_bundle_path: Option<&Path>,
 ) -> Option<TfmMetrics> {
+    load_named_tfm_metrics(
+        file_access_gate,
+        asset_bundle_loader,
+        asset_bundle_path,
+        "cmr10",
+        &CMR10_TFM_CANDIDATES,
+    )
+}
+
+fn load_cmbx12_metrics(
+    file_access_gate: &dyn FileAccessGate,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    asset_bundle_path: Option<&Path>,
+) -> Option<TfmMetrics> {
+    load_named_tfm_metrics(
+        file_access_gate,
+        asset_bundle_loader,
+        asset_bundle_path,
+        "cmbx12",
+        &CMBX12_TFM_CANDIDATES,
+    )
+}
+
+fn load_named_tfm_metrics(
+    file_access_gate: &dyn FileAccessGate,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    asset_bundle_path: Option<&Path>,
+    font_name: &str,
+    candidate_paths: &[&str],
+) -> Option<TfmMetrics> {
     let bundle_path = asset_bundle_path?;
 
-    if let Some(candidate) = asset_bundle_loader.resolve_tfm_font(bundle_path, "cmr10") {
-        if let Some(metrics) = load_tfm_metrics_from_path(file_access_gate, &candidate) {
+    if let Some(candidate) = asset_bundle_loader.resolve_tfm_font(bundle_path, font_name) {
+        if let Some(metrics) = load_tfm_metrics_from_path(file_access_gate, font_name, &candidate) {
             return Some(metrics);
         }
     }
 
-    for relative_path in CMR10_TFM_CANDIDATES {
-        let candidate = bundle_path.join(relative_path);
-        if let Some(metrics) = load_tfm_metrics_from_path(file_access_gate, &candidate) {
+    for relative_path in candidate_paths {
+        let candidate = bundle_path.join(*relative_path);
+        if let Some(metrics) = load_tfm_metrics_from_path(file_access_gate, font_name, &candidate) {
             return Some(metrics);
         }
     }
@@ -4334,6 +4433,7 @@ fn load_cmr10_metrics(
 
 fn load_tfm_metrics_from_path(
     file_access_gate: &dyn FileAccessGate,
+    font_name: &str,
     candidate: &Path,
 ) -> Option<TfmMetrics> {
     if !candidate.is_file() {
@@ -4343,7 +4443,8 @@ fn load_tfm_metrics_from_path(
     if file_access_gate.check_read(candidate) == PathAccessDecision::Denied {
         tracing::warn!(
             path = %candidate.display(),
-            "cmr10.tfm access denied; falling back to fixed-width typesetting"
+            font = font_name,
+            "TFM access denied; falling back to fixed-width typesetting"
         );
         return None;
     }
@@ -4353,8 +4454,9 @@ fn load_tfm_metrics_from_path(
         Err(error) => {
             tracing::warn!(
                 path = %candidate.display(),
+                font = font_name,
                 %error,
-                "failed to read cmr10.tfm; falling back to fixed-width typesetting"
+                "failed to read TFM metrics; falling back to fixed-width typesetting"
             );
             return None;
         }
@@ -4365,8 +4467,114 @@ fn load_tfm_metrics_from_path(
         Err(error) => {
             tracing::warn!(
                 path = %candidate.display(),
+                font = font_name,
                 %error,
-                "failed to parse cmr10.tfm; falling back to fixed-width typesetting"
+                "failed to parse TFM metrics; falling back to fixed-width typesetting"
+            );
+            None
+        }
+    }
+}
+
+fn resolve_type1_font(
+    file_access_gate: &dyn FileAccessGate,
+    asset_bundle_loader: &dyn AssetBundleLoaderPort,
+    asset_bundle_path: Option<&Path>,
+    font_name: &str,
+) -> Option<Type1Font> {
+    let bundle_path = asset_bundle_path?;
+    let mut candidates = Vec::new();
+    let mut visited = BTreeSet::new();
+
+    if let Some(tfm_path) = asset_bundle_loader.resolve_tfm_font(bundle_path, font_name) {
+        candidates.extend(derived_type1_candidates(bundle_path, &tfm_path));
+    }
+    candidates.extend(
+        CM_PFB_CANDIDATE_TEMPLATES
+            .iter()
+            .map(|template| bundle_path.join(template.replace("{name}", font_name))),
+    );
+
+    for candidate in candidates {
+        let normalized = normalize_existing_path(&candidate);
+        if !visited.insert(normalized.clone()) {
+            continue;
+        }
+        if let Some(font) = load_type1_font_from_path(file_access_gate, font_name, &normalized) {
+            return Some(font);
+        }
+    }
+
+    None
+}
+
+fn derived_type1_candidates(bundle_path: &Path, tfm_path: &Path) -> Vec<PathBuf> {
+    let Ok(relative_path) = tfm_path.strip_prefix(bundle_path) else {
+        return Vec::new();
+    };
+    let relative = relative_path.to_string_lossy().replace('\\', "/");
+    let mut candidates = vec![bundle_path.join(relative_path).with_extension("pfb")];
+
+    if relative.contains("/fonts/tfm/") {
+        let type1_relative = relative.replace("/fonts/tfm/", "/fonts/type1/");
+        candidates.push(
+            bundle_path
+                .join(Path::new(&type1_relative))
+                .with_extension("pfb"),
+        );
+
+        if type1_relative.contains("/public/cm/") {
+            let amsfonts_relative = type1_relative.replace("/public/cm/", "/public/amsfonts/cm/");
+            candidates.push(
+                bundle_path
+                    .join(Path::new(&amsfonts_relative))
+                    .with_extension("pfb"),
+            );
+        }
+    }
+
+    candidates
+}
+
+fn load_type1_font_from_path(
+    file_access_gate: &dyn FileAccessGate,
+    font_name: &str,
+    candidate: &Path,
+) -> Option<Type1Font> {
+    if !candidate.is_file() {
+        return None;
+    }
+
+    if file_access_gate.check_read(candidate) == PathAccessDecision::Denied {
+        tracing::warn!(
+            path = %candidate.display(),
+            font = font_name,
+            "Type1 font access denied; continuing without embedded Type1 font"
+        );
+        return None;
+    }
+
+    let bytes = match file_access_gate.read_file(candidate) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                font = font_name,
+                %error,
+                "failed to read Type1 font; continuing without embedded Type1 font"
+            );
+            return None;
+        }
+    };
+
+    match Type1Font::parse(&bytes) {
+        Ok(font) => Some(font),
+        Err(error) => {
+            tracing::warn!(
+                path = %candidate.display(),
+                font = font_name,
+                %error,
+                "failed to parse Type1 font; continuing without embedded Type1 font"
             );
             None
         }
@@ -4556,6 +4764,89 @@ fn is_ttf_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Type1DescriptorMetrics {
+    bbox: [i16; 4],
+    ascent: i16,
+    descent: i16,
+    italic_angle: i16,
+    stem_v: u16,
+    cap_height: i16,
+    flags: u32,
+}
+
+fn build_type1_font_resources(
+    selection: &FontFamilySelection,
+    main: &TfmFontBundle,
+    bold: Option<&TfmFontBundle>,
+    document: &TypesetDocument,
+    parallelism: usize,
+    trace_font_tasks: bool,
+) -> Vec<FontResource> {
+    let mut used_characters = vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
+    let mut used_roles = [false; 3];
+
+    for page in &document.pages {
+        collect_used_characters_for_lines(&page.lines, &mut used_characters, &mut used_roles);
+        for placement in &page.float_placements {
+            collect_used_characters_for_lines(
+                &placement.content.lines,
+                &mut used_characters,
+                &mut used_roles,
+            );
+        }
+    }
+
+    let Some(highest_used_role) = used_roles.iter().rposition(|used| *used) else {
+        return Vec::new();
+    };
+
+    let mut resources = vec![None; highest_used_role + 1];
+    resources[0] = Some(build_type1_font_resource_with_fallback(
+        main,
+        &used_characters[0],
+        0,
+    ));
+
+    let mut tasks: Vec<Box<dyn FnOnce() -> (usize, Option<FontResource>) + Send>> = Vec::new();
+    for role in 1..=highest_used_role {
+        let Some(font) = selection.font_for_role(role as u8) else {
+            resources[role] = Some(builtin_font_resource_for_role(role as u8));
+            continue;
+        };
+        let font = font.clone();
+        let role_characters = used_characters[role].clone();
+        tasks.push(Box::new(move || {
+            (
+                role,
+                trace_font_task(
+                    trace_font_tasks,
+                    subset_task_id_for_role(role as u8),
+                    &font.base_font,
+                    role,
+                    || build_opentype_font_resource(&font, &role_characters),
+                ),
+            )
+        }));
+    }
+
+    for (role, resource) in run_font_tasks(parallelism, tasks) {
+        resources[role] =
+            Some(resource.unwrap_or_else(|| builtin_font_resource_for_role(role as u8)));
+    }
+
+    let mut resources = resources.into_iter().flatten().collect::<Vec<_>>();
+    if !document.outlines.is_empty() {
+        if let Some(font) =
+            bold.and_then(|bundle| build_type1_font_resource(bundle, &BTreeMap::new()))
+        {
+            resources.push(font);
+        }
+    }
+
+    resources
+}
+
 fn build_multi_font_pdf_resources(
     selection: &FontFamilySelection,
     document: &TypesetDocument,
@@ -4738,6 +5029,176 @@ fn build_opentype_font_resource(
         units_per_em: loaded_font.font.units_per_em(),
         to_unicode_map: Some(to_unicode_map),
     })
+}
+
+fn build_type1_font_resource_with_fallback(
+    bundle: &TfmFontBundle,
+    role_characters: &BTreeMap<u8, char>,
+    role: u8,
+) -> FontResource {
+    build_type1_font_resource(bundle, role_characters)
+        .unwrap_or_else(|| builtin_font_resource_for_role(role))
+}
+
+fn build_type1_font_resource(
+    bundle: &TfmFontBundle,
+    role_characters: &BTreeMap<u8, char>,
+) -> Option<FontResource> {
+    let type1 = bundle.type1.as_ref()?;
+    let (first_char, last_char) = type1_char_range(role_characters, &bundle.metrics)?;
+    let descriptor = type1_descriptor_metrics(bundle);
+    let mut font_program = type1.header_segment.clone();
+    font_program.extend_from_slice(&type1.binary_segment);
+    font_program.extend_from_slice(&type1.trailer_segment);
+
+    Some(FontResource::EmbeddedType1 {
+        base_font: format!(
+            "FERRTX+{}",
+            sanitize_pdf_font_name(&bundle.font_name.to_ascii_uppercase())
+        ),
+        ascii_length: type1.header_segment.len(),
+        binary_length: type1.binary_segment.len(),
+        trailer_length: type1.trailer_segment.len(),
+        font_program,
+        first_char,
+        last_char,
+        widths: (first_char..=last_char)
+            .map(|code| tfm_width_to_pdf_units(&bundle.metrics, code))
+            .collect(),
+        bbox: descriptor.bbox,
+        ascent: descriptor.ascent,
+        descent: descriptor.descent,
+        italic_angle: descriptor.italic_angle,
+        stem_v: descriptor.stem_v,
+        cap_height: descriptor.cap_height,
+        flags: descriptor.flags,
+    })
+}
+
+fn type1_char_range(
+    role_characters: &BTreeMap<u8, char>,
+    metrics: &TfmMetrics,
+) -> Option<(u8, u8)> {
+    match (
+        role_characters.keys().next().copied(),
+        role_characters.keys().next_back().copied(),
+    ) {
+        (Some(first_char), Some(last_char)) => Some((first_char, last_char)),
+        _ => {
+            let bc = u8::try_from(metrics.bc).ok()?;
+            let ec = u8::try_from(metrics.ec).ok()?;
+            let printable_start = bc.max(32);
+            let printable_end = ec.min(126);
+            if printable_start <= printable_end {
+                Some((printable_start, printable_end))
+            } else if bc <= ec {
+                Some((bc, ec))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn tfm_width_to_pdf_units(metrics: &TfmMetrics, code: u8) -> u16 {
+    let width = metrics
+        .width(u16::from(code))
+        .unwrap_or_else(|_| DimensionValue::zero());
+    let units = tfm_dimension_to_pdf_units(metrics, width).max(0);
+    u16::try_from(units.min(i64::from(u16::MAX))).expect("PDF width must fit in u16")
+}
+
+fn tfm_dimension_to_pdf_units(metrics: &TfmMetrics, value: DimensionValue) -> i64 {
+    if metrics.design_size.0 == 0 {
+        return 0;
+    }
+    value.0 * 1000 / metrics.design_size.0
+}
+
+fn type1_descriptor_metrics(bundle: &TfmFontBundle) -> Type1DescriptorMetrics {
+    match bundle.font_name.to_ascii_lowercase().as_str() {
+        "cmr10" => Type1DescriptorMetrics {
+            bbox: [-251, -250, 1009, 750],
+            ascent: 683,
+            descent: -217,
+            italic_angle: 0,
+            stem_v: 69,
+            cap_height: 683,
+            flags: PDF_TYPE1_DEFAULT_FLAGS,
+        },
+        "cmbx12" => Type1DescriptorMetrics {
+            bbox: [-342, -251, 1087, 750],
+            ascent: 694,
+            descent: -194,
+            italic_angle: 0,
+            stem_v: 109,
+            cap_height: 694,
+            flags: PDF_TYPE1_DEFAULT_FLAGS,
+        },
+        _ => generic_type1_descriptor_metrics(&bundle.metrics),
+    }
+}
+
+fn generic_type1_descriptor_metrics(metrics: &TfmMetrics) -> Type1DescriptorMetrics {
+    let Some((first_char, last_char)) = type1_char_range(&BTreeMap::new(), metrics) else {
+        return Type1DescriptorMetrics {
+            bbox: [0, 0, 0, 0],
+            ascent: 0,
+            descent: 0,
+            italic_angle: 0,
+            stem_v: 80,
+            cap_height: 0,
+            flags: PDF_TYPE1_DEFAULT_FLAGS,
+        };
+    };
+
+    let mut max_width = 0i64;
+    let mut max_height = 0i64;
+    let mut max_depth = 0i64;
+    let mut cap_height = 0i64;
+
+    for code in first_char..=last_char {
+        let code = u16::from(code);
+        let width = metrics
+            .width(code)
+            .unwrap_or_else(|_| DimensionValue::zero());
+        let height = metrics
+            .height(code)
+            .unwrap_or_else(|_| DimensionValue::zero());
+        let depth = metrics
+            .depth(code)
+            .unwrap_or_else(|_| DimensionValue::zero());
+
+        max_width = max_width.max(tfm_dimension_to_pdf_units(metrics, width));
+        max_height = max_height.max(tfm_dimension_to_pdf_units(metrics, height));
+        max_depth = max_depth.max(tfm_dimension_to_pdf_units(metrics, depth));
+    }
+
+    for code in b'A'..=b'Z' {
+        let height = metrics
+            .height(u16::from(code))
+            .unwrap_or_else(|_| DimensionValue::zero());
+        cap_height = cap_height.max(tfm_dimension_to_pdf_units(metrics, height));
+    }
+
+    Type1DescriptorMetrics {
+        bbox: [
+            0,
+            clamp_i64_to_i16(-max_depth),
+            clamp_i64_to_i16(max_width),
+            clamp_i64_to_i16(max_height),
+        ],
+        ascent: clamp_i64_to_i16(max_height),
+        descent: clamp_i64_to_i16(-max_depth),
+        italic_angle: 0,
+        stem_v: 80,
+        cap_height: clamp_i64_to_i16(cap_height.max(max_height)),
+        flags: PDF_TYPE1_DEFAULT_FLAGS,
+    }
+}
+
+fn clamp_i64_to_i16(value: i64) -> i16 {
+    value.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
 }
 
 fn builtin_font_resource_for_role(role: u8) -> FontResource {
@@ -6084,6 +6545,24 @@ mod tests {
         data.extend_from_slice(&0i32.to_be_bytes());
 
         data
+    }
+
+    fn build_test_pfb(font_name: &str) -> Vec<u8> {
+        fn segment(segment_type: u8, payload: &[u8]) -> Vec<u8> {
+            let mut bytes = vec![0x80, segment_type];
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+
+        let ascii = format!("%!FontType1-1.0: {font_name} 001.000\n/FontName /{font_name} def\n");
+        let binary = [0xde, 0xad, 0xbe, 0xef];
+        let trailer = b"cleartomark\n";
+        let mut bytes = segment(0x01, ascii.as_bytes());
+        bytes.extend_from_slice(&segment(0x02, &binary));
+        bytes.extend_from_slice(&segment(0x01, trailer));
+        bytes.extend_from_slice(&[0x80, 0x03]);
+        bytes
     }
 
     fn build_test_ttf() -> Vec<u8> {
@@ -8591,6 +9070,74 @@ mod tests {
         assert!(pdf.contains("/BaseFont /Courier"));
         assert!(pdf.contains("/F2 10 Tf"));
         assert!(pdf.contains("/F3 10 Tf"));
+    }
+
+    #[test]
+    fn embeds_type1_font_when_bundle_contains_matching_pfb() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let tfm_path = bundle_path.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
+        let pfb_path = bundle_path.join("texmf/fonts/type1/public/amsfonts/cm/cmr10.pfb");
+        fs::create_dir_all(tfm_path.parent().expect("cmr10 parent")).expect("create tfm dir");
+        fs::create_dir_all(pfb_path.parent().expect("cmr10 pfb parent")).expect("create pfb dir");
+        fs::write(&tfm_path, build_test_tfm()).expect("write tfm");
+        fs::write(&pfb_path, build_test_pfb("CMR10")).expect("write pfb");
+        write_asset_bundle_fixture(&bundle_path);
+        fs::write(&input_file, document("Hello")).expect("write input");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("/Subtype /Type1 /BaseFont /FERRTX+CMR10"));
+        assert!(pdf.contains("/FontFile "));
+        assert!(pdf.contains("/Length2 4"));
+        assert!(pdf.contains("/Length3 12"));
+        assert!(pdf.contains("/Flags 6"));
+        assert!(!pdf.contains("/BaseFont /Helvetica"));
+    }
+
+    #[test]
+    fn embeds_cmbx12_type1_font_when_document_produces_outlines() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        let bundle_path = dir.path().join("bundle");
+        let cmr10_tfm = bundle_path.join("texmf/fonts/tfm/public/cm/cmr10.tfm");
+        let cmbx12_tfm = bundle_path.join("texmf/fonts/tfm/public/cm/cmbx12.tfm");
+        let cmr10_pfb = bundle_path.join("texmf/fonts/type1/public/amsfonts/cm/cmr10.pfb");
+        let cmbx12_pfb = bundle_path.join("texmf/fonts/type1/public/amsfonts/cm/cmbx12.pfb");
+        for path in [&cmr10_tfm, &cmbx12_tfm] {
+            fs::create_dir_all(path.parent().expect("tfm parent")).expect("create tfm dir");
+            fs::write(path, build_test_tfm()).expect("write tfm");
+        }
+        for (path, font_name) in [(&cmr10_pfb, "CMR10"), (&cmbx12_pfb, "CMBX12")] {
+            fs::create_dir_all(path.parent().expect("pfb parent")).expect("create pfb dir");
+            fs::write(path, build_test_pfb(font_name)).expect("write pfb");
+        }
+        write_asset_bundle_fixture(&bundle_path);
+        fs::write(
+            &input_file,
+            "\\documentclass{article}\n\\begin{document}\n\\section{Intro}\nHello\n\\end{document}\n",
+        )
+        .expect("write input");
+
+        let mut options = runtime_options(input_file, output_dir.clone());
+        options.asset_bundle = Some(bundle_path);
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        let pdf = read_pdf(&output_dir.join("main.pdf"));
+        assert!(pdf.contains("/BaseFont /FERRTX+CMR10"));
+        assert!(pdf.contains("/BaseFont /FERRTX+CMBX12"));
     }
 
     #[test]

@@ -898,6 +898,7 @@ pub enum VListItem {
     Penalty {
         value: i32,
     },
+    OpenRightBreak,
     IndexMarker {
         entry: IndexRawEntry,
     },
@@ -1922,6 +1923,14 @@ fn append_nodes_segment_to_vlist(
             number,
             display_title,
         } => {
+            if previous_block.is_some() {
+                vlist.push(VListItem::Penalty {
+                    value: PENALTY_FORCED,
+                });
+                if document.document_class == "book" {
+                    vlist.push(VListItem::OpenRightBreak);
+                }
+            }
             vlist.push(VListItem::Box {
                 tex_box: TeXBox::with_height(points(layout.chapter_number_line_height_pt)),
                 content: format!("Chapter {number}"),
@@ -2320,6 +2329,7 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
                 consumed_height = consumed_height + *height;
             }
             VListItem::Penalty { .. }
+            | VListItem::OpenRightBreak
             | VListItem::IndexMarker { .. }
             | VListItem::Float { .. }
             | VListItem::PlacedFloat { .. }
@@ -2721,6 +2731,12 @@ fn paginate_vlist_with_layout(
                 );
                 continue;
             }
+            VListItem::OpenRightBreak => {
+                if pages.len() % 2 == 1 {
+                    pages.push(typeset_page_from_vlist(&[], page_box, layout));
+                }
+                continue;
+            }
             _ => {}
         }
 
@@ -2999,6 +3015,7 @@ fn vlist_item_height(item: &VListItem) -> DimensionValue {
         VListItem::Image { graphics_box } => graphics_box.height,
         VListItem::Glue { height } => *height,
         VListItem::Penalty { .. }
+        | VListItem::OpenRightBreak
         | VListItem::IndexMarker { .. }
         | VListItem::Float { .. }
         | VListItem::PlacedFloat { .. }
@@ -3078,7 +3095,10 @@ fn typeset_page_from_vlist(
             VListItem::Glue { height } => {
                 consumed_height = consumed_height + *height;
             }
-            VListItem::Penalty { .. } | VListItem::Float { .. } | VListItem::ClearPage => {}
+            VListItem::Penalty { .. }
+            | VListItem::OpenRightBreak
+            | VListItem::Float { .. }
+            | VListItem::ClearPage => {}
         }
     }
 
@@ -3480,6 +3500,22 @@ mod tests {
         MinimalLatexParser
             .parse(&format!(
                 "\\documentclass{{article}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
+            ))
+            .expect("parse document")
+    }
+
+    fn parsed_latex_book_document(body: &str) -> ParsedDocument {
+        MinimalLatexParser
+            .parse(&format!(
+                "\\documentclass{{book}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
+            ))
+            .expect("parse document")
+    }
+
+    fn parsed_latex_report_document(body: &str) -> ParsedDocument {
+        MinimalLatexParser
+            .parse(&format!(
+                "\\documentclass{{report}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"
             ))
             .expect("parse document")
     }
@@ -5214,6 +5250,38 @@ mod tests {
         assert_eq!(document.pages.len(), 2);
         assert_eq!(document.pages[0].lines[0].text, "First");
         assert_eq!(document.pages[1].lines[0].text, "Second");
+    }
+
+    #[test]
+    fn chapter_heading_forces_page_break_after_prior_content() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_report_document(
+            "First\n\\chapter{Next}\nSecond",
+        ));
+
+        assert_eq!(document.pages.len(), 2);
+        assert_eq!(document.pages[0].lines[0].text, "First");
+        let chapter_page_lines = visible_line_texts(&document.pages[1]);
+        assert_eq!(&chapter_page_lines[..3], ["Chapter 1", "1 Next", "Second"]);
+    }
+
+    #[test]
+    fn book_chapter_starts_on_next_odd_page() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_book_document(
+            "\\chapter{First}\nBody\n\\chapter{Second}\nMore",
+        ));
+
+        assert_eq!(document.pages.len(), 3);
+        let first_chapter_page_lines = visible_line_texts(&document.pages[0]);
+        assert_eq!(
+            &first_chapter_page_lines[..3],
+            ["Chapter 1", "1 First", "Body"]
+        );
+        assert!(visible_line_texts(&document.pages[1]).is_empty());
+        let second_chapter_page_lines = visible_line_texts(&document.pages[2]);
+        assert_eq!(
+            &second_chapter_page_lines[..3],
+            ["Chapter 2", "2 Second", "More"]
+        );
     }
 
     #[test]

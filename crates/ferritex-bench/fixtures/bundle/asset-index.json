@@ -8,6 +8,7 @@
   },
   "opentype_fonts": {},
   "tfm_fonts": {
+    "cmbx12": "texmf/fonts/tfm/public/cm/cmbx12.tfm",
     "cmr10": "texmf/fonts/tfm/public/cm/cmr10.tfm"
   },
   "default_opentype_fonts": []

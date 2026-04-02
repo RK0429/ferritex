@@ -1,0 +1,36 @@
+# bibliography reference PDFs
+
+- Generated with: `/Library/TeX/texbin/pdflatex`
+- pdfLaTeX version:
+  - `pdfTeX 3.141592653-2.6-1.40.28 (TeX Live 2025)`
+  - `kpathsea version 6.4.1`
+- Date generated: `2026-04-02 07:49 JST`
+- Working directory: `ferritex/crates/ferritex-bench/fixtures/corpus/bibliography/reference/`
+- Exact generation commands used:
+  - `cp ../single_cite.bbl ./single_cite.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../single_cite.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../single_cite.tex}'`
+  - `cp ../multi_cite.bbl ./multi_cite.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../multi_cite.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../multi_cite.tex}'`
+  - `cp ../custom_labels.bbl ./custom_labels.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../custom_labels.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../custom_labels.tex}'`
+  - `cp ../bib_with_sections.bbl ./bib_with_sections.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_with_sections.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_with_sections.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../inline_thebibliography.tex}'`
+
+## Produced references
+
+- `single_cite.tex` -> `single_cite.pdf`
+- `multi_cite.tex` -> `multi_cite.pdf`
+- `custom_labels.tex` -> `custom_labels.pdf`
+- `bib_with_sections.tex` -> `bib_with_sections.pdf`
+- `inline_thebibliography.tex` -> `inline_thebibliography.pdf`
+
+## Notes
+
+- `\pdfcompresslevel=0` disables content stream compression so the parity harness can inspect bibliography text without decompression.
+- `\pdfobjcompresslevel=0` disables object stream compression so page content streams remain directly readable by the PDF comparators.
+- For `.bbl`-backed fixtures, the sibling `.bbl` was copied into `reference/` before compilation and removed after PDF generation; each fixture was compiled twice to resolve citations and bibliography output.

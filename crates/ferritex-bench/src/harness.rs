@@ -177,7 +177,14 @@ pub fn corpus_navigation_cases(fixture_base: &Path) -> Vec<BenchCase> {
 }
 
 pub fn corpus_embedded_assets_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let bundle_dir = fixture_base.join("bundle");
     corpus_subset_cases(fixture_base, "embedded-assets")
+        .into_iter()
+        .map(|mut case| {
+            case.asset_bundle = Some(bundle_dir.clone());
+            case
+        })
+        .collect()
 }
 
 pub fn corpus_bibliography_cases(fixture_base: &Path) -> Vec<BenchCase> {
@@ -701,8 +708,12 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::parity::{
-        compute_parity_score, compute_tikz_parity_score, format_parity_summary,
-        format_tikz_parity_summary, ParityResult, TikzParityResult,
+        compute_bibliography_parity_score, compute_embedded_assets_parity_score,
+        compute_navigation_parity_score, compute_parity_score, compute_tikz_parity_score,
+        format_bibliography_parity_summary, format_embedded_assets_parity_summary,
+        format_navigation_parity_summary, format_parity_summary, format_tikz_parity_summary,
+        BibliographyParityResult, EmbeddedAssetsParityResult, NavigationParityResult, ParityResult,
+        TikzParityResult,
     };
 
     use super::{
@@ -1075,6 +1086,9 @@ mod tests {
             bundle_dir.join("asset-index.json"),
             bundle_dir.join("texmf/tex/latex/benchstub.sty"),
             bundle_dir.join("texmf/fonts/tfm/public/cm/cmr10.tfm"),
+            bundle_dir.join("texmf/fonts/tfm/public/cm/cmbx12.tfm"),
+            bundle_dir.join("texmf/fonts/type1/public/amsfonts/cm/cmr10.pfb"),
+            bundle_dir.join("texmf/fonts/type1/public/amsfonts/cm/cmbx12.pfb"),
         ];
         let layout_paths = [
             fixture_base.join("layout-core/article.tex"),
@@ -1102,6 +1116,10 @@ mod tests {
         assert_eq!(
             asset_index["tfm_fonts"]["cmr10"],
             "texmf/fonts/tfm/public/cm/cmr10.tfm"
+        );
+        assert_eq!(
+            asset_index["tfm_fonts"]["cmbx12"],
+            "texmf/fonts/tfm/public/cm/cmbx12.tfm"
         );
 
         let tfm_bytes = fs::read(bundle_dir.join("texmf/fonts/tfm/public/cm/cmr10.tfm"))
@@ -1430,6 +1448,415 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parity_navigation_measurement() {
+        let fixture_base = fixtures_root();
+        let base_cases = corpus_navigation_cases(&fixture_base);
+        let reference_dir = fixture_base.join("corpus/navigation-features/reference");
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
+
+        assert!(reference_dir.exists(), "reference directory should exist");
+
+        let harness = BenchHarness::new(
+            cases.clone(),
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(ServiceCompileBackend);
+
+        let report = harness.run();
+        assert!(
+            report.failures.is_empty(),
+            "navigation parity compilation failed: {:?}",
+            report.failures
+        );
+        assert_eq!(report.results.len(), cases.len());
+
+        let mut results = Vec::with_capacity(cases.len());
+        for case in &cases {
+            let document_name = case
+                .input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem should be utf-8")
+                .to_string();
+            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
+            let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
+
+            if !reference_pdf_path.exists() {
+                results.push(NavigationParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(format!(
+                        "missing reference PDF {}",
+                        reference_pdf_path.display()
+                    )),
+                });
+                continue;
+            }
+
+            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read ferritex PDF {}: {error}",
+                    ferritex_pdf_path.display()
+                )
+            });
+            let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read reference PDF {}: {error}",
+                    reference_pdf_path.display()
+                )
+            });
+
+            match compute_navigation_parity_score(&ferritex_pdf, &reference_pdf) {
+                Ok(score) => results.push(NavigationParityResult {
+                    document_name,
+                    score: Some(score),
+                    error: None,
+                }),
+                Err(error) => results.push(NavigationParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(error),
+                }),
+            }
+        }
+
+        let summary = format_navigation_parity_summary(&results);
+        println!("{summary}");
+
+        let measured = results
+            .iter()
+            .filter(|result| result.score.is_some())
+            .count();
+        let errors = results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count();
+
+        assert_eq!(results.len(), base_cases.len());
+        assert!(summary.contains("REQ-NF-007 Navigation Parity Summary"));
+        assert!(summary.contains("Document"));
+        assert!(
+            measured >= 1,
+            "expected at least one measured navigation parity result"
+        );
+        assert_eq!(
+            errors, 0,
+            "all navigation fixtures must have reference PDFs and produce parity scores"
+        );
+        assert_eq!(measured + errors, results.len());
+        let failing = results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .score
+                    .as_ref()
+                    .filter(|score| !score.passes_req_nf_007())
+                    .map(|score| (&result.document_name, score))
+            })
+            .collect::<Vec<_>>();
+        let failure_details = failing
+            .iter()
+            .map(|(document_name, score)| {
+                format!(
+                    "- {}: annots={:?}, dests={}, outlines={}/{}, meta={:?}/{:?}, reasons={}",
+                    document_name,
+                    score.ferritex_manifest.annotations_per_page,
+                    score.ferritex_manifest.named_destination_count,
+                    score.ferritex_manifest.outline_entry_count,
+                    score.ferritex_manifest.outline_max_depth,
+                    score.ferritex_manifest.metadata_title,
+                    score.ferritex_manifest.metadata_author,
+                    score.failure_reasons().join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            failing.is_empty(),
+            "REQ-NF-007 navigation gate failed for {} documents:\n{}\n\n{}",
+            failing.len(),
+            failure_details,
+            summary
+        );
+    }
+
+    #[test]
+    fn parity_bibliography_measurement() {
+        let fixture_base = fixtures_root();
+        let base_cases = corpus_bibliography_cases(&fixture_base);
+        let reference_dir = fixture_base.join("corpus/bibliography/reference");
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
+
+        assert_eq!(base_cases.len(), 5);
+        assert!(reference_dir.exists(), "reference directory should exist");
+
+        let harness = BenchHarness::new(
+            cases.clone(),
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(ServiceCompileBackend);
+
+        let report = harness.run();
+        assert!(
+            report.failures.is_empty(),
+            "bibliography parity compilation failed: {:?}",
+            report.failures
+        );
+        assert_eq!(report.results.len(), cases.len());
+
+        let mut results = Vec::with_capacity(cases.len());
+        for case in &cases {
+            let document_name = case
+                .input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem should be utf-8")
+                .to_string();
+            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
+            let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
+
+            if !reference_pdf_path.exists() {
+                results.push(BibliographyParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(format!(
+                        "missing reference PDF {}",
+                        reference_pdf_path.display()
+                    )),
+                });
+                continue;
+            }
+
+            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read ferritex PDF {}: {error}",
+                    ferritex_pdf_path.display()
+                )
+            });
+            let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read reference PDF {}: {error}",
+                    reference_pdf_path.display()
+                )
+            });
+
+            match compute_bibliography_parity_score(&ferritex_pdf, &reference_pdf) {
+                Ok(score) => results.push(BibliographyParityResult {
+                    document_name,
+                    score: Some(score),
+                    error: None,
+                }),
+                Err(error) => results.push(BibliographyParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(error),
+                }),
+            }
+        }
+
+        let summary = format_bibliography_parity_summary(&results);
+        println!("{summary}");
+
+        let measured = results
+            .iter()
+            .filter(|result| result.score.is_some())
+            .count();
+        let errors = results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count();
+
+        assert_eq!(results.len(), base_cases.len());
+        assert!(summary.contains("REQ-NF-007 Bibliography Parity Summary"));
+        assert!(summary.contains("Document"));
+        assert!(
+            measured >= 1,
+            "expected at least one measured bibliography parity result"
+        );
+        assert_eq!(
+            errors, 0,
+            "all bibliography fixtures must have reference PDFs and produce parity scores"
+        );
+        let failing = results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .score
+                    .as_ref()
+                    .filter(|score| !score.passes_req_nf_007())
+                    .map(|score| (&result.document_name, score))
+            })
+            .collect::<Vec<_>>();
+        let failure_details = failing
+            .iter()
+            .map(|(document_name, score)| {
+                format!(
+                    "- {}: entries={}, labels={:?}, reasons={}",
+                    document_name,
+                    score.ferritex_manifest.entry_count,
+                    score.ferritex_manifest.citation_labels,
+                    score.failure_reasons().join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            failing.is_empty(),
+            "REQ-NF-007 bibliography gate failed for {} documents:\n{}\n\n{}",
+            failing.len(),
+            failure_details,
+            summary
+        );
+    }
+
+    #[test]
+    fn parity_embedded_assets_measurement() {
+        let fixture_base = fixtures_root();
+        let base_cases = corpus_embedded_assets_cases(&fixture_base);
+        let reference_dir = fixture_base.join("corpus/embedded-assets/reference");
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
+
+        assert_eq!(base_cases.len(), 5);
+        assert!(reference_dir.exists(), "reference directory should exist");
+
+        let harness = BenchHarness::new(
+            cases.clone(),
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(ServiceCompileBackend);
+
+        let report = harness.run();
+        assert!(
+            report.failures.is_empty(),
+            "embedded-assets parity compilation failed: {:?}",
+            report.failures
+        );
+        assert_eq!(report.results.len(), cases.len());
+
+        let mut results = Vec::with_capacity(cases.len());
+        for case in &cases {
+            let document_name = case
+                .input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem should be utf-8")
+                .to_string();
+            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
+            let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
+
+            if !reference_pdf_path.exists() {
+                results.push(EmbeddedAssetsParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(format!(
+                        "missing reference PDF {}",
+                        reference_pdf_path.display()
+                    )),
+                });
+                continue;
+            }
+
+            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read ferritex PDF {}: {error}",
+                    ferritex_pdf_path.display()
+                )
+            });
+            let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read reference PDF {}: {error}",
+                    reference_pdf_path.display()
+                )
+            });
+
+            match compute_embedded_assets_parity_score(&ferritex_pdf, &reference_pdf) {
+                Ok(score) => results.push(EmbeddedAssetsParityResult {
+                    document_name,
+                    score: Some(score),
+                    error: None,
+                }),
+                Err(error) => results.push(EmbeddedAssetsParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(error),
+                }),
+            }
+        }
+
+        let summary = format_embedded_assets_parity_summary(&results);
+        println!("{summary}");
+
+        let measured = results
+            .iter()
+            .filter(|result| result.score.is_some())
+            .count();
+        let errors = results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count();
+
+        assert_eq!(results.len(), base_cases.len());
+        assert!(summary.contains("REQ-NF-007 Embedded Assets Parity Summary"));
+        assert!(summary.contains("Document"));
+        assert!(
+            measured >= 1,
+            "expected at least one measured embedded-assets parity result"
+        );
+        assert_eq!(
+            errors, 0,
+            "all embedded-assets fixtures must have reference PDFs and produce parity scores"
+        );
+        assert_eq!(measured + errors, results.len());
+        let failing = results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .score
+                    .as_ref()
+                    .filter(|score| !score.passes_req_nf_007())
+                    .map(|score| (&result.document_name, score))
+            })
+            .collect::<Vec<_>>();
+        let failure_details = failing
+            .iter()
+            .map(|(document_name, score)| {
+                format!(
+                    "- {}: fonts={:?}, images={}, forms={}, pages={}, reasons={}",
+                    document_name,
+                    score.ferritex_manifest.font_names,
+                    score.ferritex_manifest.image_xobject_count,
+                    score.ferritex_manifest.form_xobject_count,
+                    score.ferritex_manifest.page_count,
+                    score.failure_reasons().join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            failing.is_empty(),
+            "REQ-NF-007 embedded-assets gate failed for {} documents:\n{}\n\n{}",
+            failing.len(),
+            failure_details,
+            summary
+        );
+    }
+
     fn assert_tikz_parity_measurement(base_cases: &[BenchCase], reference_dir: &Path) {
         let temp_dir = tempdir().expect("tempdir should be created");
         let cases = stage_cases_in_tempdir(base_cases, temp_dir.path());
@@ -1680,12 +2107,15 @@ mod tests {
     fn test_corpus_embedded_assets_cases_enumerate_fixtures() {
         let fixture_base = fixtures_root();
         let cases = corpus_embedded_assets_cases(&fixture_base);
+        let bundle_dir = fixture_base.join("bundle");
 
         assert!(cases.len() >= 2);
         assert!(cases
             .iter()
             .all(|case| case.profile == BenchProfile::CorpusCompat));
-        assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases
+            .iter()
+            .all(|case| case.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
         assert!(cases.iter().all(|case| case.jobs == 1));
         assert!(cases
             .iter()
@@ -1697,47 +2127,20 @@ mod tests {
     fn corpus_embedded_assets_documents_compile_successfully() {
         let fixture_base = fixtures_root();
         let cases = corpus_embedded_assets_cases(&fixture_base);
-        let gate = FsTestFileAccessGate;
-        let loader = NoopAssetBundleLoader;
-        let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
+        let backend = ServiceCompileBackend;
 
         assert!(cases.len() >= 2);
 
         for case in cases {
-            let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {
-                panic!("failed to read {}: {error}", case.input_fixture.display())
-            });
-            let input_path = case.input_fixture.canonicalize().unwrap_or_else(|error| {
-                panic!(
-                    "failed to canonicalize {}: {error}",
-                    case.input_fixture.display()
-                )
-            });
-            let uri = format!("file://{}", input_path.display());
-            let state = service.compile_from_source(&source, &uri);
-            let error_diagnostics = state
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.severity == Severity::Error)
-                .map(|diagnostic| diagnostic.to_string())
-                .collect::<Vec<_>>();
-
+            let output = backend
+                .compile(&case.input_fixture, case.asset_bundle.as_deref(), case.jobs)
+                .unwrap_or_else(|error| {
+                    panic!("{} should compile successfully: {error}", case.name)
+                });
             assert!(
-                state.success,
-                "{} should compile successfully, diagnostics: {:?}",
-                case.name, state.diagnostics
-            );
-            assert!(
-                error_diagnostics.is_empty(),
-                "{} emitted error diagnostics: {:?}",
-                case.name,
-                error_diagnostics
-            );
-            assert!(
-                state.page_count >= 1,
-                "{} should produce at least one page, got {}",
-                case.name,
-                state.page_count
+                !output.output_bytes.is_empty(),
+                "{} should produce a non-empty PDF",
+                case.name
             );
         }
     }
@@ -2164,6 +2567,31 @@ mod tests {
             if !temp_input.exists() {
                 fs::copy(&case.input_fixture, &temp_input)
                     .expect("fixture should copy into temp dir");
+            }
+            let source_bbl = case.input_fixture.with_extension("bbl");
+            let temp_bbl = temp_input.with_extension("bbl");
+            if source_bbl.exists() && !temp_bbl.exists() {
+                fs::copy(&source_bbl, &temp_bbl).expect("sibling .bbl should copy into temp dir");
+            }
+            let source_dir = case
+                .input_fixture
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            for ext in &["png", "jpg", "jpeg", "pdf"] {
+                if let Ok(entries) = fs::read_dir(source_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) == Some(ext) {
+                            let dest = temp_dir.join(
+                                path.file_name()
+                                    .expect("sibling asset should have filename"),
+                            );
+                            if !dest.exists() {
+                                let _ = fs::copy(&path, &dest);
+                            }
+                        }
+                    }
+                }
             }
             cases.push(BenchCase {
                 name: case.name.clone(),
