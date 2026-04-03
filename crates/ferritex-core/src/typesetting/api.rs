@@ -24,8 +24,11 @@ const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
 const PAGE_HEIGHT_PT: i64 = 792;
 const LEFT_MARGIN_PT: i64 = 72;
+#[allow(dead_code)]
 const TOP_MARGIN_PT: i64 = 72;
+#[allow(dead_code)]
 const BOTTOM_MARGIN_PT: i64 = 72;
+#[allow(dead_code)]
 const LINE_HEIGHT_PT: i64 = 18;
 const MAX_LINE_CHARS: usize = 70;
 const LINE_WIDTH_SAMPLE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -33,6 +36,7 @@ const LINE_WIDTH_SAMPLE: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 const MAX_LINE_WIDTH: DimensionValue =
     DimensionValue(MAX_LINE_CHARS as i64 * SCALED_POINTS_PER_POINT);
 
+#[allow(dead_code)]
 const DEFAULT_BODY_FONT_SIZE_PT: i64 = 12;
 pub const FOOTNOTE_MARKER_START: char = '\u{e210}';
 pub const FOOTNOTE_MARKER_END: char = '\u{e211}';
@@ -1683,6 +1687,7 @@ fn document_nodes_to_hlist_with_font_config(
     hlist
 }
 
+#[allow(dead_code)]
 fn document_nodes_to_vlist_with_config(
     nodes: &[DocumentNode],
     provider: &dyn CharWidthProvider,
@@ -1690,8 +1695,10 @@ fn document_nodes_to_vlist_with_config(
     params: &BreakParams,
     graphics_resolver: Option<&dyn GraphicAssetResolver>,
 ) -> Vec<VListItem> {
-    let mut document = ParsedDocument::default();
-    document.document_class = "article".to_string();
+    let document = ParsedDocument {
+        document_class: "article".to_string(),
+        ..Default::default()
+    };
     #[cfg(test)]
     let mut layout = class_layout_for("article");
     #[cfg(not(test))]
@@ -1738,6 +1745,7 @@ enum SegmentBlockKind {
     Heading,
     ListItem,
     DescriptionItem,
+    #[allow(dead_code)]
     FloatCaption,
     ChapterTitle,
 }
@@ -1762,6 +1770,7 @@ enum SegmentSemantic {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn document_nodes_to_vlist_with_state(
     document: &ParsedDocument,
     nodes: &[DocumentNode],
@@ -1975,6 +1984,7 @@ fn document_nodes_to_vlist_with_state(
     vlist
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_nodes_segment_to_vlist(
     vlist: &mut Vec<VListItem>,
     document: &ParsedDocument,
@@ -2180,6 +2190,7 @@ fn append_nodes_segment_to_vlist(
     *previous_block = Some(SegmentBlockKind::Paragraph);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_styled_nodes_to_vlist(
     vlist: &mut Vec<VListItem>,
     nodes: &[DocumentNode],
@@ -2878,6 +2889,7 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn paginate_vlist(vlist: &[VListItem], page_box: &PageBox) -> Vec<TypesetPage> {
     let mut layout = class_layout_for("article");
     #[cfg(test)]
@@ -3703,11 +3715,10 @@ mod tests {
         strip_test_script_markers, vlist_item_height, wrap_body, wrap_hlist, CharWidthProvider,
         DocumentLayoutFragment, FloatContent, FloatItem, FloatQueue, FloatRegion, FootnoteEntry,
         GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PageBox,
-        PaginationMergeCoordinator,
-        PlacementSpec, TeXBox, TextLine, TfmWidthProvider, TypesetNamedDestination, TypesetOutline,
-        TypesetPage, TypesetterReusePlan, VBox, VListItem, DEFAULT_BODY_FONT_SIZE_PT,
-        LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
-        PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
+        PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TfmWidthProvider,
+        TypesetNamedDestination, TypesetOutline, TypesetPage, TypesetterReusePlan, VBox, VListItem,
+        DEFAULT_BODY_FONT_SIZE_PT, LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH,
+        PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::bibliography::api::{parse_bbl, BibliographyState};
@@ -5060,10 +5071,13 @@ mod tests {
         let hlist = document_nodes_to_hlist(
             &[
                 DocumentNode::Text("Before".to_string(), None),
-                DocumentNode::DisplayMath(vec![
-                    MathNode::Ordinary('a'),
-                    MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
-                ], None),
+                DocumentNode::DisplayMath(
+                    vec![
+                        MathNode::Ordinary('a'),
+                        MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
+                    ],
+                    None,
+                ),
                 DocumentNode::Text("After".to_string(), None),
             ],
             &default_fixed_width_provider(),
@@ -5080,11 +5094,14 @@ mod tests {
         let hlist = document_nodes_to_hlist(
             &[
                 DocumentNode::Text("Before".to_string(), None),
-                DocumentNode::DisplayMath(vec![
-                    MathNode::Ordinary('x'),
-                    MathNode::Ordinary('+'),
-                    MathNode::Ordinary('y'),
-                ], None),
+                DocumentNode::DisplayMath(
+                    vec![
+                        MathNode::Ordinary('x'),
+                        MathNode::Ordinary('+'),
+                        MathNode::Ordinary('y'),
+                    ],
+                    None,
+                ),
                 DocumentNode::Text("After".to_string(), None),
             ],
             &default_fixed_width_provider(),
@@ -5256,7 +5273,10 @@ mod tests {
             visible_line_texts(&document.pages[0]),
             vec!["Ferritex", "Ada Lovelace", "April 2026", "Body"]
         );
-        assert!(document.pages[0].lines.iter().all(|line| line.font_size > points(0)));
+        assert!(document.pages[0]
+            .lines
+            .iter()
+            .all(|line| line.font_size > points(0)));
         assert_eq!(document.pages[0].lines[0].font_size, points(12));
     }
 

@@ -45,6 +45,7 @@ fn stage_full_bench_cases() -> (tempfile::TempDir, Vec<BenchCase>) {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 

@@ -1471,7 +1471,9 @@ fn render_arrowheads(primitive: &crate::graphics::api::VectorPrimitive) -> Strin
     stream
 }
 
-fn path_arrow_anchors(path: &[PathSegment]) -> (Option<(Point, Point)>, Option<(Point, Point)>) {
+type ArrowAnchor = (Point, Point);
+
+fn path_arrow_anchors(path: &[PathSegment]) -> (Option<ArrowAnchor>, Option<ArrowAnchor>) {
     let mut current = None;
     let mut subpath_start = None;
     let mut first_anchor = None;

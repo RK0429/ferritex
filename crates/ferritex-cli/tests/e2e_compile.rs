@@ -282,7 +282,9 @@ fn compile_with_synctex_writes_searchable_sidecar_with_float_caption_fragment() 
     });
     assert_eq!(caption_positions.len(), 1);
     assert_eq!(
-        synctex.inverse_search(caption_positions[0]).map(|span| span.start.line),
+        synctex
+            .inverse_search(caption_positions[0])
+            .map(|span| span.start.line),
         Some(6)
     );
     assert!(synctex

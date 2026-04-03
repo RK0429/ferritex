@@ -7091,7 +7091,9 @@ fn render_math_node_for_source_match(node: &MathNode) -> String {
     match node {
         MathNode::Ordinary(ch) => ch.to_string(),
         MathNode::Symbol(symbol) => symbol.clone(),
-        MathNode::Superscript(node) => format!("^{}", render_math_attachment_for_source_match(node)),
+        MathNode::Superscript(node) => {
+            format!("^{}", render_math_attachment_for_source_match(node))
+        }
         MathNode::Subscript(node) => format!("_{}", render_math_attachment_for_source_match(node)),
         MathNode::Frac { numer, denom } => format!(
             "{}{}",
@@ -7114,9 +7116,7 @@ fn render_math_node_for_source_match(node: &MathNode) -> String {
             right
         ),
         MathNode::OverUnder {
-            base,
-            annotation,
-            ..
+            base, annotation, ..
         } => format!(
             "{}{}",
             render_math_nodes_for_source_match(annotation),
@@ -7269,9 +7269,8 @@ impl BodySourceSpanAnnotator {
                 DocumentNode::Text(text, span)
             }
             DocumentNode::DisplayMath(nodes, span) => {
-                let span = span.or_else(|| {
-                    self.match_text(&render_math_nodes_for_source_match(&nodes))
-                });
+                let span =
+                    span.or_else(|| self.match_text(&render_math_nodes_for_source_match(&nodes)));
                 DocumentNode::DisplayMath(nodes, span)
             }
             DocumentNode::EquationEnv {
@@ -7308,8 +7307,11 @@ impl BodySourceSpanAnnotator {
                 caption_span,
                 label,
             } => {
-                let resolved_caption_span = caption_span
-                    .or_else(|| caption.as_deref().and_then(|caption| self.match_text(caption)));
+                let resolved_caption_span = caption_span.or_else(|| {
+                    caption
+                        .as_deref()
+                        .and_then(|caption| self.match_text(caption))
+                });
                 DocumentNode::Float {
                     float_type,
                     specifier,
@@ -9642,9 +9644,8 @@ mod tests {
 
     #[test]
     fn annotate_structure_source_spans_tracks_sections_and_captions() {
-        let mut document = parse_document(
-            "\\section{Intro}\n\\begin{figure}\n\\caption{Overview}\n\\end{figure}",
-        );
+        let mut document =
+            parse_document("\\section{Intro}\n\\begin{figure}\n\\caption{Overview}\n\\end{figure}");
         document.annotate_structure_source_spans(&[
             SourceLineTrace {
                 file: "/tmp/main.tex".to_string(),
@@ -10132,10 +10133,13 @@ mod tests {
     fn parses_display_math_to_math_nodes() {
         assert_eq!(
             parse_document(r"\[a_1\]").body_nodes(),
-            vec![DocumentNode::DisplayMath(vec![
-                MathNode::Ordinary('a'),
-                MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
-            ], None)]
+            vec![DocumentNode::DisplayMath(
+                vec![
+                    MathNode::Ordinary('a'),
+                    MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
+                ],
+                None
+            )]
         );
     }
 

@@ -1621,10 +1621,10 @@ fn extract_uncompressed_stream(data: &[u8], reference: PdfIndirectRef) -> Result
     Ok(extract_uncompressed_stream_slice(data, reference)?.to_vec())
 }
 
-fn extract_uncompressed_stream_slice<'a>(
-    data: &'a [u8],
+fn extract_uncompressed_stream_slice(
+    data: &[u8],
     reference: PdfIndirectRef,
-) -> Result<&'a [u8], String> {
+) -> Result<&[u8], String> {
     let object_body = find_object_by_ref(data, reference).ok_or_else(|| {
         format!(
             "failed to find content stream object {} {} R",
@@ -1693,18 +1693,18 @@ fn extract_line_positions_from_stream(stream: &[u8]) -> Vec<i64> {
             ContentToken::Operator(operator) if in_text => {
                 match operator {
                     "Td" => {
-                        if let Some(dy) = operands.iter().rev().nth(0).copied() {
+                        if let Some(dy) = operands.iter().next_back().copied() {
                             current_y = Some(current_y.unwrap_or(0.0) + dy);
                         }
                     }
                     "TD" => {
-                        if let Some(dy) = operands.iter().rev().nth(0).copied() {
+                        if let Some(dy) = operands.iter().next_back().copied() {
                             current_y = Some(current_y.unwrap_or(0.0) + dy);
                             leading = -dy;
                         }
                     }
                     "Tm" => {
-                        if let Some(y) = operands.iter().rev().nth(0).copied() {
+                        if let Some(y) = operands.iter().next_back().copied() {
                             current_y = Some(y);
                         }
                     }
@@ -3381,9 +3381,7 @@ fn next_object_stream_object(
     let mut index = search_from;
 
     while index < data.len() {
-        let Some(marker_offset) = data[index..].iter().position(|byte| *byte == b'%') else {
-            return None;
-        };
+        let marker_offset = data[index..].iter().position(|byte| *byte == b'%')?;
         let marker_start = index + marker_offset;
         if marker_start > 0 && !matches!(data[marker_start - 1], b'\n' | b'\r') {
             index = marker_start + 1;
@@ -3409,9 +3407,7 @@ fn next_object_stream_object(
 fn find_next_object_stream_marker(data: &[u8], search_from: usize) -> Option<usize> {
     let mut index = search_from;
     while index < data.len() {
-        let Some(marker_offset) = data[index..].iter().position(|byte| *byte == b'%') else {
-            return None;
-        };
+        let marker_offset = data[index..].iter().position(|byte| *byte == b'%')?;
         let marker_start = index + marker_offset;
         if marker_start > 0 && !matches!(data[marker_start - 1], b'\n' | b'\r') {
             index = marker_start + 1;

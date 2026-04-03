@@ -296,7 +296,7 @@ fn split_tikz_command(rest: &str) -> Option<(&str, &str)> {
         if remainder
             .chars()
             .next()
-            .map_or(true, |ch| !ch.is_ascii_alphabetic())
+            .is_none_or(|ch| !ch.is_ascii_alphabetic())
         {
             return Some(("node", &rest["node".len()..]));
         }
@@ -309,7 +309,7 @@ fn split_tikz_command(rest: &str) -> Option<(&str, &str)> {
         if remainder
             .chars()
             .next()
-            .map_or(true, |ch| !ch.is_ascii_alphabetic())
+            .is_none_or(|ch| !ch.is_ascii_alphabetic())
         {
             return Some((command, remainder));
         }
@@ -342,9 +342,7 @@ fn parse_path_statement(
         cursor.skip_whitespace();
     }
 
-    let Some(path) = parse_path_segments(&mut cursor, diagnostics) else {
-        return None;
-    };
+    let path = parse_path_segments(&mut cursor, diagnostics)?;
 
     cursor.skip_whitespace();
     if !cursor.is_eof() {

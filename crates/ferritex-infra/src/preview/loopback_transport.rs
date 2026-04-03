@@ -61,13 +61,15 @@ struct LoopbackRequestHeaders {
     sec_websocket_version: Option<String>,
 }
 
+type ViewStateHandler = dyn Fn(&str, &TransportViewStateUpdate) + Send + Sync;
+
 pub struct LoopbackPreviewTransport {
     documents: Mutex<HashMap<String, Vec<u8>>>,
     invalidated_sessions: Mutex<HashSet<String>>,
     pending_events: Mutex<HashMap<String, Vec<TransportRevisionEvent>>>,
     pending_view_updates: Mutex<HashMap<String, Vec<TransportViewStateUpdate>>>,
     event_subscribers: Mutex<HashMap<String, Vec<TcpStream>>>,
-    view_state_handler: Mutex<Option<Arc<dyn Fn(&str, &TransportViewStateUpdate) + Send + Sync>>>,
+    view_state_handler: Mutex<Option<Arc<ViewStateHandler>>>,
     listener: Option<TcpListener>,
     port: Option<u16>,
 }
@@ -193,10 +195,7 @@ impl LoopbackPreviewTransport {
         let _ = ready_rx.recv();
     }
 
-    pub fn set_view_state_handler(
-        &self,
-        handler: Arc<dyn Fn(&str, &TransportViewStateUpdate) + Send + Sync>,
-    ) {
+    pub fn set_view_state_handler(&self, handler: Arc<ViewStateHandler>) {
         let mut registered_handler = self
             .view_state_handler
             .lock()

@@ -1,24 +1,51 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ferritex_bench::{
     bench_fixtures_root, bundle_bootstrap_cases, bundle_package_loading_cases,
-    corpus_bibliography_cases, corpus_embedded_assets_cases, corpus_navigation_cases,
-    partition_bench_cases, BenchCase, BenchHarness, BenchProfile, BenchRunConfig,
-    CliCompileBackend,
+    bundle_reproducible_cases, corpus_bibliography_cases, corpus_embedded_assets_cases,
+    corpus_navigation_cases, partition_bench_cases, BenchCase, BenchFailure, BenchHarness,
+    BenchProfile, BenchRunConfig, CliCompileBackend,
 };
 
 fn ferritex_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ferritex"))
 }
 
-fn extract_pdf_text(pdf: &str) -> String {
-    pdf.lines()
+/// Simplified test-only helper that extracts text from PDF `(…) Tj` operators.
+/// Not a general-purpose PDF text extractor — assumes known fixture content.
+fn extract_pdf_text(pdf_bytes: &[u8]) -> String {
+    String::from_utf8_lossy(pdf_bytes)
+        .lines()
         .filter_map(|line| {
             line.trim()
                 .strip_suffix(") Tj")
                 .and_then(|line| line.strip_prefix('('))
         })
         .collect()
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst)
+        .unwrap_or_else(|error| panic!("failed to create directory {}: {error}", dst.display()));
+    for entry in std::fs::read_dir(src)
+        .unwrap_or_else(|error| panic!("failed to read directory {}: {error}", src.display()))
+    {
+        let entry =
+            entry.unwrap_or_else(|error| panic!("failed to enumerate {}: {error}", src.display()));
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_all(&path, &target);
+        } else {
+            std::fs::copy(&path, &target).unwrap_or_else(|error| {
+                panic!(
+                    "failed to copy fixture {} -> {}: {error}",
+                    path.display(),
+                    target.display()
+                )
+            });
+        }
+    }
 }
 
 fn partition_subset(case_name: &str) -> &'static str {
@@ -51,6 +78,7 @@ fn bundle_bootstrap_compiles_layout_core_classes_with_real_backend() {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 
@@ -129,6 +157,7 @@ fn bundle_package_loading_compiles_and_verifies_content() {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 
@@ -158,9 +187,9 @@ fn bundle_package_loading_compiles_and_verifies_content() {
 
     for case in &cases {
         let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_content = std::fs::read_to_string(&pdf_path)
+        let pdf_bytes = std::fs::read(&pdf_path)
             .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
-        let pdf_text = extract_pdf_text(&pdf_content);
+        let pdf_text = extract_pdf_text(&pdf_bytes);
 
         match case.name.as_str() {
             "bundle-pkg-compat_options" => {
@@ -214,9 +243,11 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 
+    let expected_case_count = cases.len();
     let backend = CliCompileBackend::new(ferritex_bin());
     let harness = BenchHarness::new(
         cases,
@@ -235,7 +266,7 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
         "partition bench compilation failed: {:?}",
         report.failures
     );
-    assert_eq!(report.results.len(), 12);
+    assert_eq!(report.results.len(), expected_case_count);
     assert!(report
         .results
         .iter()
@@ -297,9 +328,11 @@ fn partition_bench_docs_protocol_median_and_timing_proof() {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 
+    let expected_case_count = cases.len();
     let backend = CliCompileBackend::new(ferritex_bin());
     let harness = BenchHarness::new(
         cases,
@@ -318,7 +351,7 @@ fn partition_bench_docs_protocol_median_and_timing_proof() {
         "partition bench docs protocol failed: {:?}",
         report.failures
     );
-    assert_eq!(report.results.len(), 12);
+    assert_eq!(report.results.len(), expected_case_count);
 
     assert!(report.results.iter().all(|r| r.timings.len() == 5));
 
@@ -447,6 +480,7 @@ fn corpus_navigation_compiles_and_verifies_content() {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 
@@ -476,8 +510,9 @@ fn corpus_navigation_compiles_and_verifies_content() {
 
     for case in &cases {
         let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_content = std::fs::read_to_string(&pdf_path)
+        let pdf_bytes = std::fs::read(&pdf_path)
             .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+        let pdf_content = String::from_utf8_lossy(&pdf_bytes);
 
         match case.name.as_str() {
             "corpus-navigation-features-external_links" => {
@@ -552,6 +587,7 @@ fn corpus_embedded_assets_compiles_and_verifies_content() {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 
@@ -633,6 +669,7 @@ fn corpus_bibliography_compiles_and_verifies_content() {
             input_fixture: temp_input,
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
+            reproducible: case.reproducible,
         });
     }
 
@@ -662,9 +699,9 @@ fn corpus_bibliography_compiles_and_verifies_content() {
 
     for case in &cases {
         let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_content = std::fs::read_to_string(&pdf_path)
+        let pdf_bytes = std::fs::read(&pdf_path)
             .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
-        let pdf_text = extract_pdf_text(&pdf_content);
+        let pdf_text = extract_pdf_text(&pdf_bytes);
 
         match case.name.as_str() {
             "corpus-bibliography-single_cite" => {
@@ -694,4 +731,201 @@ fn corpus_bibliography_compiles_and_verifies_content() {
             _ => {}
         }
     }
+}
+
+#[test]
+fn bundle_only_reproducible_corpus_proof() {
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = bundle_reproducible_cases(&bench_fixtures);
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let mut cases = Vec::with_capacity(base_cases.len());
+    for case in &base_cases {
+        let fixture_name = case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename");
+        let temp_input = temp_dir.path().join(fixture_name);
+        std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        cases.push(BenchCase {
+            name: case.name.clone(),
+            profile: case.profile.clone(),
+            input_fixture: temp_input,
+            asset_bundle: case.asset_bundle.clone(),
+            jobs: case.jobs,
+            reproducible: case.reproducible,
+        });
+    }
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases.clone(),
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "bundle-only reproducible corpus proof failed: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        report.results.len(),
+        cases.len(),
+        "expected all layout-core reproducible bundle cases to run"
+    );
+    assert!(report
+        .results
+        .iter()
+        .all(|result| result.case.profile == BenchProfile::BundleBootstrap));
+    assert!(report
+        .results
+        .iter()
+        .all(|result| result.case.asset_bundle.is_some()));
+    assert!(report.results.iter().all(|result| result.case.reproducible));
+
+    for case in &cases {
+        let pdf_path = case.input_fixture.with_extension("pdf");
+        let pdf_bytes = std::fs::read(&pdf_path)
+            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+        assert!(
+            !pdf_bytes.is_empty(),
+            "reproducible bundle proof should produce a non-empty PDF for {}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn bundle_corrupted_manifest_reports_diagnostic() {
+    let bench_fixtures = bench_fixtures_root();
+    let base_case = bundle_reproducible_cases(&bench_fixtures)
+        .into_iter()
+        .find(|case| case.name == "layout-core-article-bundle-reproducible")
+        .expect("article reproducible case should exist");
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let temp_input = temp_dir.path().join(
+        base_case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename"),
+    );
+    std::fs::copy(&base_case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+
+    let bundle_dir = temp_dir.path().join("bundle");
+    copy_dir_all(
+        &base_case
+            .asset_bundle
+            .clone()
+            .expect("bundle reproducible case should set bundle"),
+        &bundle_dir,
+    );
+    std::fs::write(bundle_dir.join("manifest.json"), "{ not valid json")
+        .expect("corrupt bundle manifest");
+
+    let case = BenchCase {
+        input_fixture: temp_input.clone(),
+        asset_bundle: Some(bundle_dir),
+        ..base_case
+    };
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        vec![case.clone()],
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.results.is_empty(),
+        "corrupted bundle should not produce successful results"
+    );
+    assert_eq!(report.failures.len(), 1);
+    assert!(
+        !case.input_fixture.with_extension("pdf").exists(),
+        "corrupted bundle should not leave a PDF output behind"
+    );
+    assert!(matches!(
+        &report.failures[0],
+        BenchFailure::CompileError { message, .. }
+            if message.contains("invalid manifest")
+                && message.contains("help: verify the asset bundle path and version")
+    ));
+}
+
+#[test]
+fn bundle_package_resolution_prefers_project_local_over_bundle() {
+    let bench_fixtures = bench_fixtures_root();
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = temp_dir.path().join("main.tex");
+
+    std::fs::write(
+        temp_dir.path().join("ftxcompat.sty"),
+        "\\NeedsTeXFormat{LaTeX2e}\n\
+         \\ProvidesPackage{ftxcompat}[2026/04/04 Project-local override]\n\
+         \\newcommand{\\ftxcompatinfo}{PROJECT:project-local-priority}\n",
+    )
+    .expect("write project-local ftxcompat.sty");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\
+         \\usepackage{ftxcompat}\n\
+         \\begin{document}\n\
+         \\ftxcompatinfo\n\
+         \\end{document}\n",
+    )
+    .expect("write package priority fixture");
+
+    let case = BenchCase {
+        name: "bundle-priority-project-local-package".to_string(),
+        profile: BenchProfile::BundleBootstrap,
+        input_fixture: tex_file.clone(),
+        asset_bundle: Some(bench_fixtures.join("bundle")),
+        jobs: 1,
+        reproducible: false,
+    };
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        vec![case.clone()],
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "bundle package priority compilation failed: {:?}",
+        report.failures
+    );
+    let pdf_bytes = std::fs::read(case.input_fixture.with_extension("pdf"))
+        .expect("read package priority output PDF");
+    let pdf_text = extract_pdf_text(&pdf_bytes);
+
+    assert!(
+        pdf_text.contains("PROJECT:project-local-priority"),
+        "project-local package should override bundle package content"
+    );
+    assert!(
+        !pdf_text.contains("COMPAT:compat-loaded-ftxutils"),
+        "bundle package content should not appear when project-local package wins"
+    );
 }

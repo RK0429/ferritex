@@ -1,3 +1,11 @@
+#![allow(
+    clippy::large_enum_variant,
+    clippy::needless_range_loop,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
@@ -486,7 +494,8 @@ impl SourceSpanAnnotator {
             if let Some(span) = assignment {
                 match rendered_line.placement_index {
                     Some(placement_index) => {
-                        document.pages[rendered_line.page_index].float_placements[placement_index]
+                        document.pages[rendered_line.page_index].float_placements
+                            [placement_index]
                             .content
                             .lines[rendered_line.line_index]
                             .source_span = Some(span);
@@ -7409,12 +7418,13 @@ mod tests {
             .iter()
             .any(|fragment| fragment.text == "Float caption coverage"));
         assert_eq!(
-            synctex.forward_search(SourceLocation {
-                file_id: 0,
-                line: 5,
-                column: 1,
-            })
-            .len(),
+            synctex
+                .forward_search(SourceLocation {
+                    file_id: 0,
+                    line: 5,
+                    column: 1,
+                })
+                .len(),
             1
         );
     }
@@ -7447,15 +7457,22 @@ mod tests {
 
         let synctex = super::synctex_data_for(&document, &source_lines);
 
-        assert!(synctex.fragments.iter().any(|fragment| fragment.text == "Body"));
-        assert!(!synctex.fragments.iter().any(|fragment| fragment.text == "1"));
+        assert!(synctex
+            .fragments
+            .iter()
+            .any(|fragment| fragment.text == "Body"));
+        assert!(!synctex
+            .fragments
+            .iter()
+            .any(|fragment| fragment.text == "1"));
         assert_eq!(
-            synctex.forward_search(SourceLocation {
-                file_id: 0,
-                line: 3,
-                column: 1,
-            })
-            .len(),
+            synctex
+                .forward_search(SourceLocation {
+                    file_id: 0,
+                    line: 3,
+                    column: 1,
+                })
+                .len(),
             1
         );
     }

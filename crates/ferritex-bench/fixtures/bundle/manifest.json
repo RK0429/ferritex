@@ -3,5 +3,7 @@
   "version": "2026.03.30",
   "min_ferritex_version": "0.1.0",
   "format_version": 1,
-  "asset_index_path": "asset-index.json"
+  "asset_index_path": "asset-index.json",
+  "description": "FTX-ASSET-BUNDLE-001: Minimal asset bundle for layout-core corpus proof",
+  "content_policy": "All asset paths must be relative to bundle root, no parent directory traversal, all referenced files must exist"
 }

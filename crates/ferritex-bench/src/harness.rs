@@ -15,6 +15,7 @@ pub trait CompileBackend: Send + Sync {
         input: &Path,
         asset_bundle: Option<&Path>,
         jobs: u32,
+        reproducible: bool,
     ) -> Result<CompileOutput, String>;
 }
 
@@ -58,6 +59,7 @@ pub fn full_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
             input_fixture: input.clone(),
             asset_bundle: None,
             jobs,
+            reproducible: false,
         })
         .collect()
 }
@@ -73,6 +75,23 @@ pub fn bundle_bootstrap_cases(fixture_base: &Path) -> Vec<BenchCase> {
             input_fixture: fixture_base.join(format!("layout-core/{class}.tex")),
             asset_bundle: Some(bundle_dir.clone()),
             jobs: 1,
+            reproducible: false,
+        })
+        .collect()
+}
+
+pub fn bundle_reproducible_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let bundle_dir = fixture_base.join("bundle");
+
+    ["article", "book", "report", "letter"]
+        .into_iter()
+        .map(|class| BenchCase {
+            name: format!("layout-core-{class}-bundle-reproducible"),
+            profile: BenchProfile::BundleBootstrap,
+            input_fixture: fixture_base.join(format!("layout-core/{class}.tex")),
+            asset_bundle: Some(bundle_dir.clone()),
+            jobs: 1,
+            reproducible: true,
         })
         .collect()
 }
@@ -117,6 +136,7 @@ pub fn bundle_package_loading_cases(fixture_base: &Path) -> Vec<BenchCase> {
                 input_fixture,
                 asset_bundle: Some(bundle_dir.clone()),
                 jobs: 1,
+                reproducible: false,
             }
         })
         .collect()
@@ -161,6 +181,7 @@ pub fn partition_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
                     input_fixture: fixture.clone(),
                     asset_bundle: None,
                     jobs,
+                    reproducible: false,
                 });
             }
         }
@@ -211,15 +232,16 @@ pub fn corpus_partition_book_cases(fixture_base: &Path) -> Vec<BenchCase> {
 pub fn corpus_partition_book_parity_cases(fixture_base: &Path) -> Vec<BenchCase> {
     let corpus_dir = fixture_base.join("corpus/partition-book");
     ["book_chapters_minimal"]
-    .into_iter()
-    .map(|stem| BenchCase {
-        name: format!("corpus-partition-book-{stem}"),
-        profile: BenchProfile::CorpusCompat,
-        input_fixture: corpus_dir.join(format!("{stem}.tex")),
-        asset_bundle: None,
-        jobs: 1,
-    })
-    .collect()
+        .into_iter()
+        .map(|stem| BenchCase {
+            name: format!("corpus-partition-book-{stem}"),
+            profile: BenchProfile::CorpusCompat,
+            input_fixture: corpus_dir.join(format!("{stem}.tex")),
+            asset_bundle: None,
+            jobs: 1,
+            reproducible: false,
+        })
+        .collect()
 }
 
 pub fn corpus_partition_article_cases(fixture_base: &Path) -> Vec<BenchCase> {
@@ -266,6 +288,7 @@ fn corpus_subset_cases(fixture_base: &Path, subset: &str) -> Vec<BenchCase> {
                 input_fixture,
                 asset_bundle: None,
                 jobs: 1,
+                reproducible: false,
             }
         })
         .collect()
@@ -278,10 +301,11 @@ pub struct BenchCase {
     pub input_fixture: PathBuf,
     pub asset_bundle: Option<PathBuf>,
     pub jobs: u32,
+    pub reproducible: bool,
 }
 
 impl BenchCase {
-    fn comparison_key(&self) -> (String, String, String) {
+    fn comparison_key(&self) -> (String, String, String, bool) {
         (
             self.profile.stable_id().to_string(),
             self.input_fixture.display().to_string(),
@@ -289,6 +313,7 @@ impl BenchCase {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            self.reproducible,
         )
     }
 }
@@ -516,6 +541,7 @@ impl BenchHarness {
                     case.input_fixture.as_path(),
                     case.asset_bundle.as_deref(),
                     case.jobs,
+                    case.reproducible,
                 )
                 .map_err(|message| BenchFailure::CompileError {
                     case_name: case.name.clone(),
@@ -531,6 +557,7 @@ impl BenchHarness {
                     case.input_fixture.as_path(),
                     case.asset_bundle.as_deref(),
                     case.jobs,
+                    case.reproducible,
                 )
                 .map_err(|message| BenchFailure::CompileError {
                     case_name: case.name.clone(),
@@ -568,7 +595,7 @@ impl BenchHarness {
     }
 
     fn build_comparisons(&self, results: &[BenchResult]) -> Vec<BenchComparison> {
-        let mut groups = BTreeMap::<(String, String, String), Vec<BenchResult>>::new();
+        let mut groups = BTreeMap::<(String, String, String, bool), Vec<BenchResult>>::new();
         for result in results {
             groups
                 .entry(result.case.comparison_key())
@@ -618,6 +645,7 @@ impl CompileBackend for CliCompileBackend {
         input: &Path,
         asset_bundle: Option<&Path>,
         jobs: u32,
+        reproducible: bool,
     ) -> Result<CompileOutput, String> {
         let start = std::time::Instant::now();
         let mut cmd = std::process::Command::new(&self.binary_path);
@@ -626,6 +654,9 @@ impl CompileBackend for CliCompileBackend {
             cmd.args(["--asset-bundle", &bundle.to_string_lossy()]);
         }
         cmd.args(["--jobs", &jobs.to_string()]);
+        if reproducible {
+            cmd.arg("--reproducible");
+        }
 
         let output = cmd
             .output()
@@ -657,6 +688,7 @@ impl CompileBackend for UnconfiguredBackend {
         _input: &Path,
         _asset_bundle: Option<&Path>,
         _jobs: u32,
+        _reproducible: bool,
     ) -> Result<CompileOutput, String> {
         Err("compile backend is not configured".to_string())
     }
@@ -740,13 +772,13 @@ mod tests {
     };
 
     use super::{
-        bundle_bootstrap_cases, bundle_package_loading_cases, corpus_bibliography_cases,
-        corpus_combined_stress_cases, corpus_compat_cases, corpus_embedded_assets_cases,
-        corpus_navigation_cases, corpus_partition_article_cases, corpus_partition_book_cases,
-        corpus_partition_book_parity_cases, corpus_tikz_basic_shapes_cases,
-        corpus_tikz_nested_cases, full_bench_cases, BenchCase, BenchComparison, BenchFailure,
-        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend,
-        CompileOutput,
+        bundle_bootstrap_cases, bundle_package_loading_cases, bundle_reproducible_cases,
+        corpus_bibliography_cases, corpus_combined_stress_cases, corpus_compat_cases,
+        corpus_embedded_assets_cases, corpus_navigation_cases, corpus_partition_article_cases,
+        corpus_partition_book_cases, corpus_partition_book_parity_cases,
+        corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, full_bench_cases, BenchCase,
+        BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig,
+        BenchTiming, CompileBackend, CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -760,7 +792,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockCompileBackend {
         outputs: Arc<Mutex<VecDeque<Result<CompileOutput, String>>>>,
-        calls: Arc<Mutex<Vec<(PathBuf, Option<PathBuf>, u32)>>>,
+        calls: Arc<Mutex<Vec<(PathBuf, Option<PathBuf>, u32, bool)>>>,
     }
 
     impl MockCompileBackend {
@@ -782,11 +814,13 @@ mod tests {
             input: &Path,
             asset_bundle: Option<&Path>,
             jobs: u32,
+            reproducible: bool,
         ) -> Result<CompileOutput, String> {
             self.calls.lock().expect("calls lock").push((
                 input.to_path_buf(),
                 asset_bundle.map(Path::to_path_buf),
                 jobs,
+                reproducible,
             ));
 
             self.outputs
@@ -879,6 +913,7 @@ mod tests {
             input: &Path,
             asset_bundle: Option<&Path>,
             jobs: u32,
+            _reproducible: bool,
         ) -> Result<CompileOutput, String> {
             let gate = FsTestFileAccessGate;
             let loader = NoopAssetBundleLoader;
@@ -1087,6 +1122,7 @@ mod tests {
             input_fixture: missing_fixture.clone(),
             asset_bundle: None,
             jobs: 1,
+            reproducible: false,
         };
         let harness = BenchHarness::new(vec![case.clone()], BenchRunConfig::default())
             .with_backend(MockCompileBackend::default());
@@ -1170,6 +1206,7 @@ mod tests {
         assert!(cases
             .iter()
             .all(|case| case.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
+        assert!(cases.iter().all(|case| !case.reproducible));
 
         let harness = BenchHarness::new(
             cases,
@@ -1210,6 +1247,7 @@ mod tests {
             .iter()
             .all(|c| c.profile == BenchProfile::PartitionBench));
         assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
+        assert!(cases.iter().all(|c| !c.reproducible));
         assert!(cases.iter().all(|c| c.input_fixture.exists()));
 
         let job_values: Vec<u32> = cases.iter().map(|c| c.jobs).collect();
@@ -1237,6 +1275,46 @@ mod tests {
         assert_eq!(cases[1].jobs, 4);
         assert!(cases.iter().all(|c| c.profile == BenchProfile::FullBench));
         assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
+        assert!(cases.iter().all(|c| !c.reproducible));
+        assert!(cases.iter().all(|c| c.input_fixture.exists()));
+        assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
+    }
+
+    #[test]
+    fn test_bundle_reproducible_cases_enumerate_layout_core_bundle_subset() {
+        let fixture_base = fixtures_root();
+        let bundle_dir = fixture_base.join("bundle");
+        let cases = bundle_reproducible_cases(&fixture_base);
+
+        assert_eq!(cases.len(), 4);
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::BundleBootstrap));
+        assert!(cases
+            .iter()
+            .all(|case| case.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
+        assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases.iter().all(|case| case.reproducible));
+        assert!(cases.iter().all(|case| case.input_fixture.exists()));
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "layout-core-article-bundle-reproducible",
+                "layout-core-book-bundle-reproducible",
+                "layout-core-report-bundle-reproducible",
+                "layout-core-letter-bundle-reproducible",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_full_bench_cases_use_single_input_fixture() {
+        let fixture_base = fixtures_root();
+        let cases = full_bench_cases(&fixture_base);
+
         assert!(cases[0].input_fixture.ends_with("bench/ftx_bench_001.tex"));
         assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
     }
@@ -1279,8 +1357,13 @@ mod tests {
         assert_eq!(report.results.len(), 2);
 
         let calls = backend.calls.lock().expect("calls lock");
-        let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs)| *jobs).collect();
+        let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs, _)| *jobs).collect();
+        let reproducible_values: Vec<bool> = calls
+            .iter()
+            .map(|(_, _, _, reproducible)| *reproducible)
+            .collect();
         assert_eq!(jobs_values, vec![1, 1, 4, 4]);
+        assert_eq!(reproducible_values, vec![false, false, false, false]);
     }
 
     #[test]
@@ -1294,6 +1377,7 @@ mod tests {
             .all(|case| case.profile == BenchProfile::BundleBootstrap));
         assert!(cases.iter().all(|case| case.asset_bundle.is_some()));
         assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases.iter().all(|case| !case.reproducible));
         assert!(cases
             .iter()
             .all(|case| case.name.starts_with("bundle-pkg-")));
@@ -1314,6 +1398,7 @@ mod tests {
             .iter()
             .all(|case| case.profile == BenchProfile::CorpusCompat));
         assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases.iter().all(|case| !case.reproducible));
         assert!(cases.iter().all(|case| case.jobs == 1));
         assert!(cases
             .iter()
@@ -2071,6 +2156,7 @@ mod tests {
             .iter()
             .all(|case| case.profile == BenchProfile::CorpusCompat));
         assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases.iter().all(|case| !case.reproducible));
         assert!(cases.iter().all(|case| case.jobs == 1));
         assert!(cases
             .iter()
@@ -2140,6 +2226,7 @@ mod tests {
         assert!(cases
             .iter()
             .all(|case| case.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
+        assert!(cases.iter().all(|case| !case.reproducible));
         assert!(cases.iter().all(|case| case.jobs == 1));
         assert!(cases
             .iter()
@@ -2157,7 +2244,12 @@ mod tests {
 
         for case in cases {
             let output = backend
-                .compile(&case.input_fixture, case.asset_bundle.as_deref(), case.jobs)
+                .compile(
+                    &case.input_fixture,
+                    case.asset_bundle.as_deref(),
+                    case.jobs,
+                    case.reproducible,
+                )
                 .unwrap_or_else(|error| {
                     panic!("{} should compile successfully: {error}", case.name)
                 });
@@ -2772,6 +2864,7 @@ mod tests {
             input_fixture: fixture_path(fixture_name),
             asset_bundle: None,
             jobs,
+            reproducible: false,
         }
     }
 
@@ -2830,6 +2923,7 @@ mod tests {
                 input_fixture: temp_input,
                 asset_bundle: case.asset_bundle.clone(),
                 jobs: case.jobs,
+                reproducible: case.reproducible,
             });
         }
         cases

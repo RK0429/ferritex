@@ -491,6 +491,7 @@ fn push_spacing(
     }
 }
 
+#[allow(dead_code)]
 fn inline_box_from_items(items: Vec<HListItem>) -> HListItem {
     HListItem::InlineBox {
         width: hlist_total_width(&items),
