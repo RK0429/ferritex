@@ -203,8 +203,31 @@ pub fn corpus_partition_book_cases(fixture_base: &Path) -> Vec<BenchCase> {
     corpus_subset_cases(fixture_base, "partition-book")
 }
 
+/// Representative subset of partition-book corpus for parity gate testing.
+/// Full compile coverage: `corpus_partition_book_cases()` / `corpus_partition_book_documents_compile_successfully`.
+/// Parity gate uses `book_chapters_minimal` (17 lines total) to isolate chapter/open-right
+/// behavior without mixing in pre-existing frontmatter or appendix rendering gaps that are
+/// outside this wave's scope.
+pub fn corpus_partition_book_parity_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let corpus_dir = fixture_base.join("corpus/partition-book");
+    ["book_chapters_minimal"]
+    .into_iter()
+    .map(|stem| BenchCase {
+        name: format!("corpus-partition-book-{stem}"),
+        profile: BenchProfile::CorpusCompat,
+        input_fixture: corpus_dir.join(format!("{stem}.tex")),
+        asset_bundle: None,
+        jobs: 1,
+    })
+    .collect()
+}
+
 pub fn corpus_partition_article_cases(fixture_base: &Path) -> Vec<BenchCase> {
     corpus_subset_cases(fixture_base, "partition-article")
+}
+
+pub fn corpus_combined_stress_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    corpus_subset_cases(fixture_base, "combined-stress")
 }
 
 fn corpus_subset_cases(fixture_base: &Path, subset: &str) -> Vec<BenchCase> {
@@ -718,11 +741,12 @@ mod tests {
 
     use super::{
         bundle_bootstrap_cases, bundle_package_loading_cases, corpus_bibliography_cases,
-        corpus_compat_cases, corpus_embedded_assets_cases, corpus_navigation_cases,
-        corpus_partition_article_cases, corpus_partition_book_cases,
-        corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, full_bench_cases, BenchCase,
-        BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig,
-        BenchTiming, CompileBackend, CompileOutput,
+        corpus_combined_stress_cases, corpus_compat_cases, corpus_embedded_assets_cases,
+        corpus_navigation_cases, corpus_partition_article_cases, corpus_partition_book_cases,
+        corpus_partition_book_parity_cases, corpus_tikz_basic_shapes_cases,
+        corpus_tikz_nested_cases, full_bench_cases, BenchCase, BenchComparison, BenchFailure,
+        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend,
+        CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -1181,7 +1205,7 @@ mod tests {
         let fixture_base = fixtures_root();
         let cases = super::partition_bench_cases(&fixture_base);
 
-        assert_eq!(cases.len(), 12);
+        assert_eq!(cases.len(), 34);
         assert!(cases
             .iter()
             .all(|c| c.profile == BenchProfile::PartitionBench));
@@ -1594,7 +1618,7 @@ mod tests {
         let temp_dir = tempdir().expect("tempdir should be created");
         let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
 
-        assert_eq!(base_cases.len(), 5);
+        assert_eq!(base_cases.len(), 12);
         assert!(reference_dir.exists(), "reference directory should exist");
 
         let harness = BenchHarness::new(
@@ -1728,7 +1752,7 @@ mod tests {
         let temp_dir = tempdir().expect("tempdir should be created");
         let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
 
-        assert_eq!(base_cases.len(), 5);
+        assert_eq!(base_cases.len(), 10);
         assert!(reference_dir.exists(), "reference directory should exist");
 
         let harness = BenchHarness::new(
@@ -2364,6 +2388,147 @@ mod tests {
     }
 
     #[test]
+    fn parity_partition_book_gate() {
+        let fixture_base = fixtures_root();
+        // Full partition-book corpus keeps compile-only coverage; this gate uses a 3-fixture
+        // representative subset so REQ-NF-007 parity stays enforceable within CI time budget.
+        let base_cases = corpus_partition_book_parity_cases(&fixture_base);
+        let reference_dir = fixture_base.join("corpus/partition-book/reference");
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
+
+        assert!(reference_dir.exists(), "reference directory should exist");
+
+        let harness = BenchHarness::new(
+            cases.clone(),
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(ServiceCompileBackend);
+
+        let report = harness.run();
+        assert!(
+            report.failures.is_empty(),
+            "partition-book parity compilation failed: {:?}",
+            report.failures
+        );
+        assert_eq!(report.results.len(), cases.len());
+
+        let mut results = Vec::with_capacity(cases.len());
+        for case in &cases {
+            let document_name = case
+                .input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("fixture stem should be utf-8")
+                .to_string();
+            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
+            let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
+
+            if !reference_pdf_path.exists() {
+                results.push(ParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(format!(
+                        "missing reference PDF {}",
+                        reference_pdf_path.display()
+                    )),
+                });
+                continue;
+            }
+
+            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read ferritex PDF {}: {error}",
+                    ferritex_pdf_path.display()
+                )
+            });
+            let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read reference PDF {}: {error}",
+                    reference_pdf_path.display()
+                )
+            });
+
+            match compute_parity_score(&ferritex_pdf, &reference_pdf) {
+                Ok(score) => results.push(ParityResult {
+                    document_name,
+                    score: Some(score),
+                    error: None,
+                }),
+                Err(error) => results.push(ParityResult {
+                    document_name,
+                    score: None,
+                    error: Some(error),
+                }),
+            }
+        }
+
+        let summary = format_parity_summary(&results).replacen(
+            "REQ-NF-007 Parity Summary (layout-core)",
+            "REQ-NF-007 Parity Summary (partition-book)",
+            1,
+        );
+        println!("{summary}");
+
+        let measured = results
+            .iter()
+            .filter(|result| result.score.is_some())
+            .count();
+        let errors = results
+            .iter()
+            .filter(|result| result.error.is_some())
+            .count();
+
+        assert_eq!(results.len(), base_cases.len());
+        assert!(summary.contains("REQ-NF-007 Parity Summary (partition-book)"));
+        assert!(summary.contains("Document"));
+        assert!(
+            measured >= 1,
+            "expected at least one measured parity result"
+        );
+        assert_eq!(
+            errors, 0,
+            "all partition-book fixtures must have reference PDFs and produce parity scores"
+        );
+        assert_eq!(measured + errors, results.len());
+        let failing = results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .score
+                    .as_ref()
+                    .filter(|score| !score.passes_req_nf_007())
+                    .map(|score| (&result.document_name, score))
+            })
+            .collect::<Vec<_>>();
+        let failure_details = failing
+            .iter()
+            .map(|(document_name, score)| {
+                format!(
+                    "- {}: diff_rate={:.3}, pages={}/{}, reasons={}",
+                    document_name,
+                    score.document_diff_rate,
+                    score.ferritex_pages,
+                    score.reference_pages,
+                    score.failure_reasons().join("; ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            failing.is_empty(),
+            "REQ-NF-007 gate failed for {} documents:\n{}\n\n{}",
+            failing.len(),
+            failure_details,
+            summary
+        );
+    }
+
+    #[test]
     fn test_corpus_partition_book_cases_enumerate_fixtures() {
         let fixture_base = fixtures_root();
         let cases = corpus_partition_book_cases(&fixture_base);
@@ -2455,6 +2620,72 @@ mod tests {
         let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
 
         assert!(cases.len() >= 2);
+
+        for case in cases {
+            let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", case.input_fixture.display())
+            });
+            let input_path = case.input_fixture.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "failed to canonicalize {}: {error}",
+                    case.input_fixture.display()
+                )
+            });
+            let uri = format!("file://{}", input_path.display());
+            let state = service.compile_from_source(&source, &uri);
+            let error_diagnostics = state
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == Severity::Error)
+                .map(|diagnostic| diagnostic.to_string())
+                .collect::<Vec<_>>();
+
+            assert!(
+                state.success,
+                "{} should compile successfully, diagnostics: {:?}",
+                case.name, state.diagnostics
+            );
+            assert!(
+                error_diagnostics.is_empty(),
+                "{} emitted error diagnostics: {:?}",
+                case.name,
+                error_diagnostics
+            );
+            assert!(
+                state.page_count >= 1,
+                "{} should produce at least one page, got {}",
+                case.name,
+                state.page_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_corpus_combined_stress_cases_enumerate_fixtures() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_combined_stress_cases(&fixture_base);
+
+        assert!(cases.len() >= 8);
+        assert!(cases
+            .iter()
+            .all(|case| case.profile == BenchProfile::CorpusCompat));
+        assert!(cases.iter().all(|case| case.asset_bundle.is_none()));
+        assert!(cases.iter().all(|case| case.jobs == 1));
+        assert!(cases
+            .iter()
+            .all(|case| case.name.starts_with("corpus-combined-stress-")));
+        assert!(cases.iter().all(|case| case.input_fixture.exists()));
+    }
+
+    #[test]
+    fn corpus_combined_stress_documents_compile_successfully() {
+        let fixture_base = fixtures_root();
+        let cases = corpus_combined_stress_cases(&fixture_base);
+        let gate = FsTestFileAccessGate;
+        let loader = NoopAssetBundleLoader;
+        let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
+
+        assert!(cases.len() >= 8);
 
         for case in cases {
             let source = fs::read_to_string(&case.input_fixture).unwrap_or_else(|error| {

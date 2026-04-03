@@ -1,0 +1,40 @@
+\documentclass{book}
+\title{Book with Contents, List of Tables, and List of Figures}
+\author{Ferritex Bench Corpus}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\listoftables
+\listoffigures
+
+\chapter{Overview}
+This chapter introduces a short figure and table so the book can populate the
+table of contents together with the list of tables and list of figures.
+
+\begin{figure}[ht]
+\centering
+\rule{0.7\textwidth}{2.2cm}
+\caption{Placeholder figure for the figure list}
+\label{fig:placeholder}
+\end{figure}
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{|l|c|}
+\hline
+Artifact & Count \\
+\hline
+Source files & 8 \\
+Reference PDFs & 8 \\
+\hline
+\end{tabular}
+\caption{Simple inventory table}
+\label{tab:inventory}
+\end{table}
+
+\chapter{Interpretation}
+Readers can verify that \ref{fig:placeholder} and \ref{tab:inventory} appear
+in the generated lists and retain consistent numbering.
+\end{document}

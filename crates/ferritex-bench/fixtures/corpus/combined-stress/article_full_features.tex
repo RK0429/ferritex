@@ -1,0 +1,62 @@
+\documentclass{article}
+\usepackage{graphicx}
+\makeatletter
+\@ifundefined{rule}{\newcommand{\rule}[2]{[rule #1 by #2]}}{}
+\makeatother
+\title{Article Full Features}
+\author{Ferritex Bench}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Overview}\label{sec:overview}
+This article combines sectioning, inline math such as $a^2 + b^2 = c^2$, and a footnote\footnote{Footnotes add another layout feature to the corpus fixture.} in a realistic report-like narrative. The introduction points ahead to Figure \ref{fig:system}, Table \ref{tab:checks}, and Section \ref{sec:analysis}.
+
+\subsection{Checklist}
+\begin{itemize}
+\item Confirm that Figure \ref{fig:system} is numbered and referenced.
+\item Confirm that Equation \ref{eq:balance} is resolved on the second pass.
+\item Confirm that the table in Section \ref{sec:analysis} stays in the reading order.
+\end{itemize}
+
+\begin{enumerate}
+\item Establish the data model for the draft.
+\item Run the compile cycle twice for stable references.
+\item Compare the output with the expected baseline.
+\end{enumerate}
+
+\begin{equation}\label{eq:balance}
+f(x) = x^2 + 3x + 2
+\end{equation}
+
+\begin{figure}[h]
+\begin{center}
+\rule{4.5in}{2in}
+\end{center}
+\caption{Rule-based overview figure}
+\label{fig:system}
+\end{figure}
+
+\section{Analysis}\label{sec:analysis}
+The analysis section revisits Equation \ref{eq:balance} and Figure \ref{fig:system}. It also includes a short descriptive table and a displayed sum:
+\[
+\sum_{k=1}^{5} k = 15
+\]
+
+\begin{table}[h]
+\caption{Validation checks}
+\label{tab:checks}
+\begin{tabular}{|l|c|l|}
+\hline
+Check & Status & Note \\
+\hline
+Cross-reference & pass & Links resolve after rerun \\
+Figure placeholder & pass & Uses only the rule command \\
+Math display & pass & Uses core equation support \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Follow-up}
+Section \ref{sec:overview} introduced the scenario, while Section \ref{sec:analysis} confirms that layout, navigation, tables, figures, and math can coexist inside one compact fixture.
+\end{document}

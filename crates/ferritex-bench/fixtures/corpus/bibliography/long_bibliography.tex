@@ -1,0 +1,164 @@
+\documentclass{article}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=black]{hyperref}
+\begin{document}
+\title{Annotated Reading File for a Distributed Typesetting Project}
+\author{Corpus Fixture Working Group}
+\date{}
+\maketitle
+\tableofcontents
+
+\section{Goals and Scope}
+This reading file was assembled for a project that compares multiple PDF
+production paths while keeping authoring conventions stable. The initial brief
+leans on the practical typography described by Knuth and the
+maintainer-oriented workflow associated with Lamport. A second strand of the
+project concerns implementation hygiene, so the checklist also points readers to
+verification and design sources from Hoare and Brooks.
+
+The purpose of the document is not to argue for one rendering stack. Instead,
+it records what teams read when they need to compare generated output, citation
+behavior, and reproducibility across several subsets of a benchmark corpus.
+Because the reading file acts as a handoff artifact, each section restates the
+question under discussion in ordinary prose before collecting references.
+
+\section{Foundational Texts}
+Foundational texts remain useful because they explain both notation and
+expectation. Documentation on literate programming from Knuth complements
+formal introductions to document preparation associated with Lamport and
+Mittelbach. The
+combination gives editors a vocabulary for talking about source readability,
+macro boundaries, and the kinds of regressions that are visible only in final
+pages.
+
+At the same time, engineering teams still borrow from classic systems writing.
+Scheduling passes and dependency traversal often refer to Tarjan, while
+error containment and disciplined refinement bring in Wirth and Dijkstra. These
+references appear far from the typesetting literature,
+yet they describe the review habits that keep toolchains understandable.
+
+\clearpage
+\section{Corpus Design Notes}
+Corpus design is constrained by realism. Small fixtures are easier to debug, but
+they risk hiding the composition effects that appear in longer reports,
+multi-page figures, or chapter-oriented bibliographies. The team therefore keeps
+short examples for operator-level inspection and longer reports for page-level
+regression measurements. This approach owes something to case-based observation
+from Brooks and to the argument for representative problem sets made by Bentley.
+
+Another design note concerns metadata. When reference PDFs are generated for
+comparison, object compression is disabled so page operators remain readable.
+This makes the files less compact, but it shortens debugging sessions because
+the comparators can inspect text and drawing streams directly. Statistical
+thinking in Tukey's tradition also shapes the evaluation practice: summary
+statistics matter, but teams still inspect individual outliers by hand.
+
+\section{Evaluation Workflow}
+The evaluation workflow has three stable phases. First, authors write fixtures
+that isolate one behavior at a time. Second, the same fixtures are rendered with
+the external engine to produce a reference set. Third, the generated PDFs are
+compared using structural measurements such as page count, embedded resources,
+and selected text extraction. The reading notes for this phase include numerical
+methods texts and matrix-oriented references because numerical stability often
+leaks into tooling decisions.
+
+Reviewers also maintain a narrative log. The log records what changed, which
+reference PDFs were regenerated, and which comparator dimensions were expected
+to move. Transaction and recovery ideas in the Gray and Reuter style are surprisingly
+helpful here: even a local benchmark corpus benefits from careful state
+transitions and reproducible rebuild instructions.
+
+\clearpage
+\section{Implementation Concerns}
+Implementation work tends to alternate between high-level design and low-level
+inspection. A macro parser might look complete on paper, yet generated pages
+still differ because font descriptors or object streams are encoded differently.
+The team therefore reads language and compiler material alongside
+rendering-specific notes. Those works do not solve PDF generation directly, but
+they clarify how intermediate forms should be structured.
+
+The project also includes graphics-oriented fixtures. Simple diagrams and TikZ
+examples are used to check whether path operators and clipping behavior survive
+the conversion pipeline. Older computer graphics texts
+remain useful because they describe the geometry behind drawing primitives
+without assuming a specific modern graphics stack.
+
+\section{Operational Reporting}
+Long-running projects accumulate status reports, release notes, and design
+records. The bibliography in this document intentionally contains several books
+that teams cite while writing those artifacts. Practical editing references such
+as style handbooks and programming practice texts shape the house style for
+reports, while broader discussions of software process help frame tradeoffs
+between speed and rigor.
+
+Operational reporting is also where web references and issue trackers meet
+archival sources. Even when the final corpus fixture uses only inline
+bibliography content, the surrounding process still resembles a literature
+review. Teams read, annotate, compile, compare, and then decide whether the next
+iteration should add new samples or refine the engine itself.
+
+\clearpage
+\section{Reference Regeneration Practice}
+Reference regeneration is deliberately repetitive. Maintainers copy any required
+sidecar files, disable PDF compression for inspectability, run the external
+engine, and then clean the working directory so the fixture tree stays readable.
+The procedure sounds mechanical, but the repeatability matters because the
+corpus is meant to support future debugging sessions as much as the present one.
+
+This practice also changes how authors write documents. They favor concise,
+explicit inputs over clever package combinations, and they document the exact
+command lines that produced each reference artifact. That habit draws equally on
+typesetting manuals and on engineering texts that argue for transparent tools,
+small interfaces, and reproducible staging steps.
+
+\section{Review Cadence}
+The review cadence for the corpus balances speed with deliberate verification.
+Small additions are grouped into waves, and each wave ends with a pass that
+checks counts, reference PDFs, and any acceptance criteria tied to page count or
+resource usage. This mirrors the way experimental work is often staged: collect
+new material, verify the obvious invariants, and then decide whether the next
+iteration should broaden coverage or deepen one difficult corner.
+
+Over time, the cadence produces a useful paper trail. Future editors can see not
+only which files were added, but also why a given subset needed more variety or
+why a particular long-form document was kept in the corpus. In that sense the
+review cadence is part bibliography, part maintenance log, and part training
+material for the next person who inherits the benchmark.
+
+\clearpage
+\section{Maintenance Handoff}
+The handoff story matters because benchmark corpora rarely stay fixed. New
+subsets are added when a comparator grows, old fixtures are retired when they no
+longer differentiate behavior, and long reference PDFs are kept around when they
+surface pagination issues that short notes cannot expose. The reading file
+captures that mindset by preserving both foundational texts and practical books
+about reusable software structures, measurement, and report writing.
+
+For the next maintainer, the value of the bibliography is not only the sources
+themselves but the pattern they imply. Read broadly enough to understand the
+tradeoffs, keep fixture additions small enough to review, and regenerate
+reference outputs in a way that another engineer can repeat without guesswork.
+That combination of literature and procedure is what turns a pile of examples
+into an enduring benchmark corpus.
+
+\clearpage
+\section{Annotated Source Log}
+This section acts as a compact appendix for future maintainers. Each paragraph
+describes why a group of sources is still present in the reading file even when
+the prose names only a subset directly. Algorithmic and language-design sources
+continue to inform discussions about internal representations. Mathematical
+references remain in scope because layout engines eventually need dependable
+models for measurement and recurrence.
+
+The final maintenance note is procedural. A benchmark corpus is valuable only if
+new documents can be added without rewriting the harness every time. That is why
+the bibliography includes texts on reusable software ideas and structured
+experimentation. The references may be old, but the questions they answer still
+appear in day-to-day engineering work.
+
+\nocite{aho86,backus78,bentley86,brooks75,chomsky57,dijkstra68,fisher35}
+\nocite{gamma95,glass02,golub96,gray93,hearn83,hoare69,kernighan99,knuth84}
+\nocite{knuth92,lamport94,mittelbach04,milner78,press92,rudin76,shannon48}
+\nocite{steele90,strunk79,tarjan72,tukey77,wilf94,wirth71}
+
+\bibliography{refs}
+\end{document}

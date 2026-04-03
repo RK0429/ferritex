@@ -4,10 +4,10 @@
 - pdfLaTeX version:
   - `pdfTeX 3.141592653-2.6-1.40.28 (TeX Live 2025)`
   - `kpathsea version 6.4.1`
-- Date generated: `2026-04-02 05:08:39 JST`
+- Date generated: `2026-04-02 11:46 JST`
 - Working directory: `ferritex/crates/ferritex-bench/fixtures/corpus/tikz/basic-shapes/reference/`
 - Exact generation command used:
-  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -jobname=<name> -output-directory=crates/ferritex-bench/fixtures/corpus/tikz/basic-shapes/reference '\RequirePackage{tikz}\pdfcompresslevel=0 \input{crates/ferritex-bench/fixtures/corpus/tikz/basic-shapes/<name>.tex}'`
+- `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -jobname=<name> -output-directory=crates/ferritex-bench/fixtures/corpus/tikz/basic-shapes/reference '\RequirePackage{tikz}\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{crates/ferritex-bench/fixtures/corpus/tikz/basic-shapes/<name>.tex}'`
 
 ## Produced references
 
@@ -16,8 +16,12 @@
 - `mixed_shapes.tex` -> `mixed_shapes.pdf`
 - `rectangle.tex` -> `rectangle.pdf`
 - `text_node.tex` -> `text_node.pdf`
+- `ellipse.tex` -> `ellipse.pdf`
+- `grid_pattern.tex` -> `grid_pattern.pdf`
+- `path_operations.tex` -> `path_operations.pdf`
 
 ## Notes
 
 - `\pdfcompresslevel=0` is required so the page content streams stay uncompressed and the parity harness can inspect graphics operators without decompression.
+- `\pdfobjcompresslevel=0` keeps PDF objects out of `/ObjStm`, matching the other corpus subsets and keeping operator/resource dictionaries directly readable.
 - The fixture sources do not declare `\usepackage{tikz}`, so the command preloads TikZ with `\RequirePackage{tikz}` before `\input{...}` to obtain valid pdfLaTeX references.

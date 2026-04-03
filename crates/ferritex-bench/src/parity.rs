@@ -130,6 +130,18 @@ pub fn extract_pdf_page_count(pdf_bytes: &[u8]) -> Result<usize, String> {
         return Err("input is not a PDF".to_string());
     }
 
+    if let Some(root_body) =
+        find_pages_root(pdf_bytes).and_then(|root_ref| find_object_by_ref(pdf_bytes, root_ref))
+    {
+        if let Some(count) = extract_pages_count(root_body) {
+            return Ok(count);
+        }
+    }
+
+    extract_pdf_page_count_by_sequential_scan(pdf_bytes)
+}
+
+fn extract_pdf_page_count_by_sequential_scan(pdf_bytes: &[u8]) -> Result<usize, String> {
     let mut offset = 0usize;
     let mut counted_pages = 0usize;
     let mut pages_dict_count = None;
@@ -3899,6 +3911,7 @@ mod tests {
     };
 
     const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /ProcSet [/PDF] >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 18 >>\nstream\n0 0 m\n200 100 l\nS\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
+    const NESTED_PAGE_TREE_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 4 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [5 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Pages /Kids [6 0 R 7 0 R] /Count 2 >>\nendobj\n4 0 obj\n<< /Type /Pages /Kids [2 0 R 3 0 R] /Count 3 >>\nendobj\n5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>\nendobj\n6 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 200 100] >>\nendobj\n7 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 200 100] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
     const LINE_POSITIONS_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 102 >>\nstream\nBT\n/F1 12 Tf\n72 720 Td\n(Hello) Tj\n0 -18 Td\n(World) Tj\n1 0 0 1 72 650 Tm\n(Again) Tj\nET\nendstream\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
     const TWO_PAGE_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>\nendobj\n4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>\nendobj\n5 0 obj\n<< /Length 37 >>\nstream\nBT\n/F1 12 Tf\n72 720 Td\n(Page1) Tj\nET\nendstream\nendobj\n6 0 obj\n<< /Length 37 >>\nstream\nBT\n/F1 12 Tf\n72 700 Td\n(Page2) Tj\nET\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
     const NAVIGATION_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R /Dests 11 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [5 0 R 6 0 R] /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 19 >>\nstream\nBT\n(Hello) Tj\nET\nendstream\nendobj\n5 0 obj\n<< /Type /Annot /Subtype /Link /A << /S /GoTo /D /intro >> >>\nendobj\n6 0 obj\n<< /Type /Annot /Subtype /Link /Dest /deep >>\nendobj\n7 0 obj\n<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 2 >>\nendobj\n8 0 obj\n<< /Title (Chapter 1) /Parent 7 0 R /First 9 0 R /Last 9 0 R /Dest /intro >>\nendobj\n9 0 obj\n<< /Title (Section 1) /Parent 8 0 R /Dest /deep >>\nendobj\n11 0 obj\n<< /Doc-Start [3 0 R /Fit] /page.1 [3 0 R /Fit] /section*.1 [3 0 R /Fit] /intro [3 0 R /Fit] /deep [3 0 R /Fit] >>\nendobj\n12 0 obj\n<< /Title (Navigation Test) /Author <416c696365> >>\nendobj\ntrailer\n<< /Root 1 0 R /Info 12 0 R >>\n%%EOF\n";
@@ -4041,6 +4054,11 @@ mod tests {
     #[test]
     fn extract_pdf_page_count_reads_minimal_pdf() {
         assert_eq!(extract_pdf_page_count(MINIMAL_PDF).unwrap(), 1);
+    }
+
+    #[test]
+    fn extract_pdf_page_count_resolves_nested_page_tree() {
+        assert_eq!(extract_pdf_page_count(NESTED_PAGE_TREE_PDF).unwrap(), 3);
     }
 
     #[test]

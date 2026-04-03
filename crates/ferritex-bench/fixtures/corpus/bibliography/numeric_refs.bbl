@@ -1,0 +1,33 @@
+\begin{thebibliography}{99}
+
+\bibitem{aho86}
+Alfred~V. Aho, Ravi Sethi, and Jeffrey~D. Ullman.
+\newblock {\em Compilers: Principles, Techniques, and Tools}.
+\newblock Addison-Wesley, 1986.
+
+\bibitem{dijkstra68}
+Edsger~W. Dijkstra.
+\newblock {\em Go To Statement Considered Harmful}.
+\newblock Communications of the ACM, 11(3), 1968.
+
+\bibitem{knuth84}
+Donald~E. Knuth.
+\newblock {\em Literate Programming}.
+\newblock Computer Journal, 27(2), 1984.
+
+\bibitem{lamport94}
+Leslie Lamport.
+\newblock {\em {\LaTeX}: A Document Preparation System}.
+\newblock Addison-Wesley, second edition, 1994.
+
+\bibitem{shannon48}
+Claude~E. Shannon.
+\newblock {\em A Mathematical Theory of Communication}.
+\newblock Bell System Technical Journal, 27, 1948.
+
+\bibitem{tarjan72}
+Robert~E. Tarjan.
+\newblock {\em Depth-First Search and Linear Graph Algorithms}.
+\newblock SIAM Journal on Computing, 1(2), 1972.
+
+\end{thebibliography}

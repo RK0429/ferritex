@@ -1,0 +1,65 @@
+\documentclass[11pt]{book}
+\title{Multipage Book for Partition Benchmarks}
+\author{Ferritex Bench Corpus}
+\date{April 2026}
+
+\newcommand{\bookparagraph}[2]{%
+  \noindent\textbf{#1.} #2\par\medskip
+}
+\newcommand{\fillchapter}[2]{%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+  \bookparagraph{#1}{#2}%
+}
+
+\begin{document}
+\frontmatter
+\maketitle
+\tableofcontents
+
+\mainmatter
+\chapter{Editorial Origins}
+\fillchapter{Origin note}{
+The first stewards of the benchmark collection treated each document as a
+small public artifact rather than a disposable test case. They wrote clear
+titles, preserved the context for unusual formatting choices, and kept a
+record of how reference PDFs were produced. That discipline made the archive
+more useful because later contributors could understand the purpose of a
+fixture without reverse engineering it from raw source alone.
+}
+
+\chapter{Growth of the Corpus}
+\fillchapter{Growth note}{
+As the corpus expanded, the maintainers learned that structure mattered as
+much as quantity. New subsets were easier to review when each one expressed
+a distinct idea: layout features in one area, navigation behavior in
+another, and partition-oriented documents in a third. Long-form book
+fixtures were especially helpful because they exposed page sequencing,
+chapter starts, and cumulative pagination over a broader range.
+}
+
+\chapter{Publication Discipline}
+\fillchapter{Publication note}{
+Publication week followed a familiar script. One maintainer confirmed the
+inventory, another generated reference PDFs, and a third checked that the
+bookmarks, page counts, and provenance notes still matched the source tree.
+This division of labor reduced mistakes and gave reviewers multiple ways to
+verify the same outcome before the artifacts were archived.
+}
+
+\chapter{Stewardship}
+\fillchapter{Stewardship note}{
+Sustained stewardship depends on small repeated actions: naming files
+carefully, removing stale auxiliary outputs, and recording the exact command
+used to build each reference. None of those steps is glamorous, yet together
+they are what make a benchmark trustworthy over time. A long book fixture is
+an effective place to capture that theme because it unfolds across many
+pages and chapters.
+}
+\end{document}

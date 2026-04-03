@@ -1,0 +1,47 @@
+\documentclass{book}
+\makeatletter
+\@ifundefined{frontmatter}{\newcommand{\frontmatter}{\clearpage}}{}
+\@ifundefined{mainmatter}{\newcommand{\mainmatter}{\clearpage}}{}
+\@ifundefined{backmatter}{\newcommand{\backmatter}{\clearpage}}{}
+\makeatother
+\title{Book Full Fixture}
+\author{Ferritex Bench}
+\begin{document}
+\frontmatter
+\maketitle
+\tableofcontents
+
+\chapter{Preface}
+The front matter provides a short preface that introduces the corpus document. It is intentionally brief but includes inline math $u_n = u_{n-1} + 1$ to mix narrative and notation.
+
+\mainmatter
+\chapter{Foundations}\label{chap:foundations}
+This chapter introduces the main discussion and refers ahead to Chapter \ref{chap:applications}.
+
+\section{Concepts}
+We use the classical identity
+\begin{equation}
+\sum_{k=1}^{n} k = \frac{n(n+1)}{2}
+\end{equation}
+to keep the content recognizable while exercising numbered displays.
+
+\section{Context}
+The prose is intentionally plain: the goal is to combine book structure, chapter navigation, and equation layout in one self-contained source.
+
+\chapter{Applications}\label{chap:applications}
+This chapter points back to Chapter \ref{chap:foundations} and adds a second layer of sectioning.
+
+\section{Case Study}
+Assume that $p(x) = x^3 - x$. Then
+\[
+p(2) = 6
+\]
+and the text around the formula verifies that ordinary paragraphs and displayed math coexist correctly.
+
+\section{Observations}
+The book fixture uses front matter, main matter, back matter, a table of contents, chapters, sections, and math in a single source file.
+
+\backmatter
+\chapter{Closing Notes}
+Back matter closes the document with a concise summary of the integration features covered by the fixture.
+\end{document}

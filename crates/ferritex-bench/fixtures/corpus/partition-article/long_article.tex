@@ -1,0 +1,60 @@
+\documentclass[11pt]{article}
+\title{Long Article on Editorial Maintenance}
+\author{Ferritex Bench Corpus}
+\date{April 2026}
+
+\newcommand{\articleparagraph}[2]{%
+  \noindent\textbf{#1.} #2\par\medskip
+}
+\newcommand{\fillarticle}[2]{%
+  \articleparagraph{#1}{#2}%
+  \articleparagraph{#1}{#2}%
+  \articleparagraph{#1}{#2}%
+  \articleparagraph{#1}{#2}%
+  \articleparagraph{#1}{#2}%
+  \articleparagraph{#1}{#2}%
+  \articleparagraph{#1}{#2}%
+}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Editorial Intent}
+\fillarticle{Intent note}{
+The maintainers wanted a longer article that looked like something a human
+could plausibly write during a release cycle. They avoided filler words where
+possible and instead described how drafts were reviewed, how file inventories
+were reconciled, and how each publication decision was documented for later
+inspection. The result is repetitive enough to produce several pages but
+still readable enough to support manual review.
+}
+
+\section{Operational Routine}
+\fillarticle{Routine note}{
+Operational routine matters because long articles exercise section starts,
+paragraph spacing, and cumulative pagination differently from short notes.
+One contributor checks headings, another watches page counts, and a third
+verifies that the source tree and reference directory still align after the
+latest edits. Those steps recur throughout the release process, which makes
+them suitable subject matter for a long-form fixture.
+}
+
+\section{Archive Perspective}
+\fillarticle{Archive note}{
+Archives remain coherent when contributors explain their choices in plain
+language. A reader should be able to open the article months later and still
+understand why it exists, what feature it isolates, and which parts of the
+text are deliberately repetitive in service of pagination. That kind of
+clarity is not ornamental; it is part of the benchmark's long-term utility.
+}
+
+\section{Conclusion}
+\fillarticle{Closing note}{
+The article ends by emphasizing maintenance rather than novelty. Stable
+benchmarks are the product of repeated careful work: naming, compiling,
+verifying, and documenting. A longer article fixture is a good place to keep
+that message visible because it demonstrates how ordinary prose behaves once
+it extends across multiple sections and pages.
+}
+\end{document}

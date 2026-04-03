@@ -1,0 +1,29 @@
+\documentclass{article}
+\usepackage[pdfusetitle]{hyperref}
+\hypersetup{
+  pdfauthor={Ferritex Bench Corpus},
+  pdfsubject={Navigation metadata exercise},
+  pdfkeywords={benchmark, corpus, metadata, hyperref},
+  pdfproducer={pdfLaTeX},
+  pdfcreator={Ferritex reference generation}
+}
+\title{Custom Metadata for a Navigation Fixture}
+\author{Ferritex Bench Corpus}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\section{Metadata Choices}
+The title is exported through \texttt{pdfusetitle}, while the author,
+subject, keywords, producer, and creator fields are overridden through
+\verb|\hypersetup|.
+
+\section{Document Body}
+The prose is intentionally brief because the important feature lives in the
+PDF catalog metadata rather than in visible navigation links.
+
+\section{Review Note}
+An inspector can open the document properties panel and confirm that the
+custom values match the metadata declared in the source file.
+\end{document}

@@ -1,0 +1,22 @@
+\documentclass{article}
+\usepackage[pdfusetitle]{hyperref}
+\title{Links With Sections}
+\author{Ferritex Corpus}
+\date{April 2, 2026}
+\begin{document}
+\maketitle
+
+\section{Overview}
+\label{sec:overview}
+This section introduces a simple network of internal hyperlinks.
+
+\section{Details}
+\label{sec:details}
+Readers can jump back to \hyperref[sec:overview]{the overview} or continue to
+\hyperref[sec:summary]{the summary section}.
+
+\section{Summary}
+\label{sec:summary}
+The summary links to \hyperref[sec:details]{details} and keeps the navigation
+fixture within article-level sectioning.
+\end{document}

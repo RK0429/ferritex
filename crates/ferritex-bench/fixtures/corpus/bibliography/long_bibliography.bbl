@@ -1,0 +1,207 @@
+\begin{thebibliography}{99}
+
+\bibitem{aho86}
+Alfred~V. Aho, Ravi Sethi, and Jeffrey~D. Ullman.
+\newblock {\em Compilers: Principles, Techniques, and Tools for Building
+Reliable Translators and Intermediate Representations Used in Production
+Systems}.
+\newblock Addison-Wesley, 1986. This volume is cited in implementation
+meetings whenever the project needs a shared vocabulary for parsing passes,
+symbol tables, and phase ordering.
+
+\bibitem{backus78}
+John Backus.
+\newblock {\em Can Programming Be Liberated from the von Neumann Style? A
+Functional Style and Its Algebra of Programs}.
+\newblock Communications of the ACM, 21(8), 1978. The essay remains useful when
+maintainers compare declarative layout descriptions with imperative rendering
+pipelines.
+
+\bibitem{bentley86}
+Jon Bentley.
+\newblock {\em Programming Pearls: Practical Essays on Problem Solving,
+Measurement, and the Discipline of Turning Small Examples into Lasting
+Engineering Habits}.
+\newblock Addison-Wesley, 1986. The short case-study style makes the book a
+frequent reference during corpus design discussions.
+
+\bibitem{brooks75}
+Frederick~P. Brooks.
+\newblock {\em The Mythical Man-Month: Essays on Software Engineering with Long
+Lived Lessons About Communication, Scheduling, and the Cost of Late
+Integration}.
+\newblock Addison-Wesley, 1975. Project retrospectives still cite this book
+when coordination overhead begins to dominate seemingly small changes.
+
+\bibitem{chomsky57}
+Noam Chomsky.
+\newblock {\em Syntactic Structures}.
+\newblock Mouton, 1957. The work is included because grammar discussions appear
+whenever macro syntax or parser recovery rules are revisited.
+
+\bibitem{dijkstra68}
+Edsger~W. Dijkstra.
+\newblock {\em Go To Statement Considered Harmful}.
+\newblock Communications of the ACM, 11(3), 1968. The paper is cited in review
+notes as a concise defense of readable control flow.
+
+\bibitem{fisher35}
+Ronald~A. Fisher.
+\newblock {\em The Design of Experiments}.
+\newblock Oliver and Boyd, 1935. Benchmark maintenance benefits from explicit
+ideas about randomization, replication, and the separation of signal from
+noise.
+
+\bibitem{gamma95}
+Erich Gamma, Richard Helm, Ralph Johnson, and John Vlissides.
+\newblock {\em Design Patterns: Elements of Reusable Object-Oriented Software
+for Systems That Must Evolve Without Breaking Their Existing Interfaces}.
+\newblock Addison-Wesley, 1995. The book appears in the reading file because
+fixture generators and comparator layers often need modest but durable
+abstractions.
+
+\bibitem{glass02}
+Robert~L. Glass.
+\newblock {\em Facts and Fallacies of Software Engineering}.
+\newblock Addison-Wesley, 2002. This source is referenced when teams want short
+counterweights to fashionable but weak engineering claims.
+
+\bibitem{golub96}
+Gene~H. Golub and Charles~F. Van Loan.
+\newblock {\em Matrix Computations with Extensive Guidance on Stable Numerical
+Methods, Conditioning, and the Cost of Seemingly Innocent Transformations}.
+\newblock Johns Hopkins University Press, third edition, 1996. The text is
+valuable when measurement or geometry code starts to depend on floating-point
+operations.
+
+\bibitem{gray93}
+Jim Gray and Andreas Reuter.
+\newblock {\em Transaction Processing: Concepts and Techniques for Reliable
+State Transitions, Recovery Strategies, and the Practicalities of Durable
+Systems}.
+\newblock Morgan Kaufmann, 1993. The project cites this book in discussions
+about staged artifact generation and rollback-friendly workflows.
+
+\bibitem{hearn83}
+Donald Hearn and M. Pauline Baker.
+\newblock {\em Computer Graphics}.
+\newblock Prentice Hall, 1983. Older graphics texts still explain clipping,
+coordinate systems, and curve construction in a form that transfers well to
+PDF-oriented debugging.
+
+\bibitem{hoare69}
+C.~A.~R. Hoare.
+\newblock {\em An Axiomatic Basis for Computer Programming}.
+\newblock Communications of the ACM, 12(10), 1969. Reviewers cite this paper
+when they want to express assumptions and guarantees with precision instead of
+only anecdotal confidence.
+
+\bibitem{kernighan99}
+Brian~W. Kernighan and Rob Pike.
+\newblock {\em The Practice of Programming}.
+\newblock Addison-Wesley, 1999. The engineering notes borrow from its advice on
+tooling, scripts, and the importance of making intermediate artifacts easy to
+inspect.
+
+\bibitem{knuth84}
+Donald~E. Knuth.
+\newblock {\em The {\TeX}book: A Detailed Guide to the Typographic System That
+Still Shapes Modern Document Tooling and Production Workflows}.
+\newblock Addison-Wesley, 1984. No corpus centered on TeX-derived behavior
+would be complete without the reference manual that defines the baseline
+language.
+
+\bibitem{knuth92}
+Donald~E. Knuth.
+\newblock {\em Literate Programming}.
+\newblock Center for the Study of Language and Information, 1992. The book is
+relevant because benchmark fixtures are easier to maintain when explanation and
+source stay close together.
+
+\bibitem{lamport94}
+Leslie Lamport.
+\newblock {\em {\LaTeX}: A Document Preparation System, Second Edition, with
+Practical Guidance for Authors Who Need Repeatable Structure Rather Than Ad Hoc
+Formatting Tricks}.
+\newblock Addison-Wesley, second edition, 1994. This remains the most common
+entry point for maintainers who are new to the corpus.
+
+\bibitem{mittelbach04}
+Frank Mittelbach and Michel Goossens.
+\newblock {\em The {\LaTeX} Companion, Second Edition, Covering Document
+Structure, Bibliographies, Graphics, and the Kinds of Package Interactions That
+Show Up in Real Authoring Projects}.
+\newblock Addison-Wesley, 2004. The companion is routinely cited when fixtures
+need to balance simplicity with realistic authoring patterns.
+
+\bibitem{milner78}
+Robin Milner.
+\newblock {\em A Theory of Type Polymorphism in Programming}.
+\newblock Journal of Computer and System Sciences, 17(3), 1978. The source is
+included because implementation teams repeatedly discuss internal typing and the
+shape of reusable data structures.
+
+\bibitem{press92}
+William~H. Press, Saul~A. Teukolsky, William~T. Vetterling, and Brian~P.
+Flannery.
+\newblock {\em Numerical Recipes in C: The Art of Scientific Computing, with
+Worked Guidance on Approximation, Fitting, and the Practical Limits of Compact
+Implementations}.
+\newblock Cambridge University Press, second edition, 1992. The reading file
+uses this text when comparator thresholds and measurement heuristics need more
+than informal justification.
+
+\bibitem{rudin76}
+Walter Rudin.
+\newblock {\em Principles of Mathematical Analysis}.
+\newblock McGraw-Hill, third edition, 1976. The text appears in the appendix
+because layout and graphics discussions eventually rely on rigorous notions of
+continuity, bounds, and convergence.
+
+\bibitem{shannon48}
+Claude~E. Shannon.
+\newblock {\em A Mathematical Theory of Communication}.
+\newblock Bell System Technical Journal, 27, 1948. The paper remains a common
+reference when teams discuss information loss in conversion pipelines and the
+cost of noisy intermediate formats.
+
+\bibitem{steele90}
+Guy~L. Steele.
+\newblock {\em Common Lisp: The Language}.
+\newblock Digital Press, second edition, 1990. This source is retained because
+macro systems and programmable document languages share several design
+questions, especially around extensibility.
+
+\bibitem{strunk79}
+William Strunk~Jr. and E.~B. White.
+\newblock {\em The Elements of Style}.
+\newblock Macmillan, third edition, 1979. Even technical benchmark reports
+benefit from a small reminder that clear prose reduces review time.
+
+\bibitem{tarjan72}
+Robert~E. Tarjan.
+\newblock {\em Depth-First Search and Linear Graph Algorithms}.
+\newblock SIAM Journal on Computing, 1(2), 1972. Dependency resolution and pass
+ordering discussions cite this paper with predictable regularity.
+
+\bibitem{tukey77}
+John~W. Tukey.
+\newblock {\em Exploratory Data Analysis}.
+\newblock Addison-Wesley, 1977. The project references Tukey whenever summary
+plots and outlier inspection are needed alongside automated thresholds.
+
+\bibitem{wilf94}
+Herbert~S. Wilf.
+\newblock {\em Generatingfunctionology}.
+\newblock Academic Press, second edition, 1994. The appendix keeps this book in
+scope because recurrence-driven reasoning still appears in pagination and
+combinatorial counting tasks.
+
+\bibitem{wirth71}
+Niklaus Wirth.
+\newblock {\em Program Development by Stepwise Refinement}.
+\newblock Communications of the ACM, 14(4), 1971. The essay supports the team's
+preference for small, testable fixture additions rather than broad speculative
+rewrites.
+
+\end{thebibliography}

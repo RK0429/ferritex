@@ -1,0 +1,15 @@
+\documentclass{article}
+\usepackage{graphicx}
+\begin{document}
+\section{Rotated Images}
+The same tiny asset can be reused in multiple orientations to test graphic
+transforms.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=90pt,angle=90]{pixel.png}\hspace{1cm}
+\includegraphics[width=90pt,angle=-25]{pixel.png}
+\caption{Two rotated renderings of the same PNG asset}
+\end{figure}
+
+\end{document}

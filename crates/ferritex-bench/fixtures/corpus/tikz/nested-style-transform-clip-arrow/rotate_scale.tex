@@ -1,0 +1,17 @@
+\documentclass{article}
+\begin{document}
+\begin{tikzpicture}
+\draw (0,0) -- (2,0);
+\begin{scope}[shift={(1,1)}]
+  \draw[blue,rotate=30] (0,0) rectangle (1.5,0.8);
+  \draw[red,scale=1.5] (0,0) -- (1,0);
+  \begin{scope}[rotate=45]
+    \draw[green] (0,0) -- (0.8,0.8);
+  \end{scope}
+\end{scope}
+\begin{scope}[shift={(3.5,1.2)}]
+  \draw[scale=0.8,rotate=15] (0,0) rectangle (1.2,0.9);
+  \draw[->,blue,scale=1.2] (0,0) -- (1,0);
+\end{scope}
+\end{tikzpicture}
+\end{document}

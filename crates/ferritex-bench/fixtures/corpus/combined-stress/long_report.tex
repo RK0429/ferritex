@@ -1,0 +1,57 @@
+\documentclass{report}
+\usepackage{graphicx}
+\makeatletter
+\@ifundefined{rule}{\newcommand{\rule}[2]{[rule #1 by #2]}}{}
+\def\reportparagraph{This report chapter blends ordinary prose with inline math such as $r_n = r_{n-1} + n$ and a short note about structured compilation workload. A second sentence keeps the content realistic by mentioning schedules, validation loops, and consistent page construction. A third sentence repeats the same topic from a slightly different angle so the fixture produces predictable but substantial text. }
+\def\chapterworkload{%
+  \@for\rep:=a,b,c,d,e,f,g,h\do{%
+    \reportparagraph
+    \reportparagraph
+    \begin{equation}
+    s_n = \frac{n(n+3)}{2}
+    \end{equation}
+  }%
+  \begin{table}[h]
+  \caption{Chapter checkpoint table}
+  \begin{tabular}{|l|c|c|}
+  \hline
+  Item & Count & State \\
+  \hline
+  Sections & 2 & ready \\
+  Tables & 1 & ready \\
+  Figures & 1 & ready \\
+  \hline
+  \end{tabular}
+  \end{table}
+  \begin{figure}[h]
+  \begin{center}
+  \rule{4.0in}{1.5in}
+  \end{center}
+  \caption{Chapter placeholder figure}
+  \end{figure}
+}
+\makeatother
+\title{Long Report Fixture}
+\author{Ferritex Bench}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Planning}
+\section{Scope}
+\makeatletter\chapterworkload\makeatother
+\section{Risks}
+\makeatletter\chapterworkload\makeatother
+
+\chapter{Execution}
+\section{Preparation}
+\makeatletter\chapterworkload\makeatother
+\section{Delivery}
+\makeatletter\chapterworkload\makeatother
+
+\chapter{Verification}
+\section{Checks}
+\makeatletter\chapterworkload\makeatother
+\section{Review}
+\makeatletter\chapterworkload\makeatother
+\end{document}

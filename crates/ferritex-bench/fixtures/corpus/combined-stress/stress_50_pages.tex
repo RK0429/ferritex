@@ -1,0 +1,73 @@
+\documentclass{article}
+\usepackage{graphicx}
+\makeatletter
+\@ifundefined{rule}{\newcommand{\rule}[2]{[rule #1 by #2]}}{}
+\@ifundefined{eqnarray}{
+  \newcommand{\stressalignment}[1]{
+    \begin{align}
+    z_{#1} &= y_{#1} + n \\
+    w_{#1} &= 2z_{#1} - 1
+    \end{align}
+  }
+}{
+  \newcommand{\stressalignment}[1]{
+    \begin{eqnarray}
+    z_{#1} &=& y_{#1} + n \\
+    w_{#1} &=& 2z_{#1} - 1
+    \end{eqnarray}
+  }
+}
+\def\stressparagraph#1#2{This stress paragraph for #1 discusses a realistic compilation workflow, mixes inline math such as $x_{#2} = #2^2 + #2$, and keeps the prose deterministic so benchmark output is stable across runs. A second sentence explains that layout, navigation, tables, and numbered equations all appear in the same document to exercise integrated behavior instead of isolated primitives. A third sentence closes the block by referring to repeated validation passes, cross-feature interactions, and predictable page construction for large reference PDFs. }
+\def\stressworkload#1{%
+  \@for\phase:=alpha,beta\do{%
+    \subsection{#1 \phase}
+    \@for\block:=a,b,c,d,e,f,g,h,i,j\do{%
+      \stressparagraph{#1}{\block}
+      \stressparagraph{#1}{\block}
+      \begin{equation}
+      y_{\block} = \frac{n(n+1)}{2} + 3
+      \end{equation}
+      \stressalignment{\block}
+    }%
+  }%
+  \begin{table}[h]
+  \caption{Stress section table for #1}
+  \begin{tabular}{|l|c|c|}
+  \hline
+  Category & Blocks & Result \\
+  \hline
+  Paragraph pairs & 20 & stable \\
+  Equation groups & 20 & stable \\
+  Cross-feature mixes & 1 & complete \\
+  \hline
+  \end{tabular}
+  \end{table}
+  \begin{figure}[h]
+  \begin{center}
+  \rule{4.5in}{1.8in}
+  \end{center}
+  \caption{Stress placeholder figure for #1}
+  \end{figure}
+}
+\makeatother
+\title{Fifty Page Stress Fixture}
+\author{Ferritex Bench}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Acquisition}
+\makeatletter\stressworkload{Acquisition}\makeatother
+
+\section{Normalization}
+\makeatletter\stressworkload{Normalization}\makeatother
+
+\section{Analysis}
+\makeatletter\stressworkload{Analysis}\makeatother
+
+\section{Synthesis}
+\makeatletter\stressworkload{Synthesis}\makeatother
+
+\section{Publication}
+\makeatletter\stressworkload{Publication}\makeatother
+\end{document}

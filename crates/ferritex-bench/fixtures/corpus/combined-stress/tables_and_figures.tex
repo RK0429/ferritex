@@ -1,0 +1,63 @@
+\documentclass{article}
+\usepackage{graphicx}
+\makeatletter
+\@ifundefined{rule}{\newcommand{\rule}[2]{[rule #1 by #2]}}{}
+\makeatother
+\title{Tables And Figures}
+\author{Ferritex Bench}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Summary}
+The first section introduces a schedule table and two rule-based figures that share the same narrative thread.
+
+\begin{table}[h]
+\caption{Delivery schedule}
+\label{tab:schedule}
+\begin{tabular}{|l|c|c|}
+\hline
+Track & Items & Ready \\
+\hline
+Layout & 4 & yes \\
+Navigation & 3 & yes \\
+Math & 5 & no \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+\begin{center}
+\rule{4.0in}{1.6in}
+\end{center}
+\caption{Pipeline sketch}
+\label{fig:pipeline}
+\end{figure}
+
+\section{Comparison}
+Table \ref{tab:schedule} and Figure \ref{fig:pipeline} are referenced together so the fixture mixes float metadata with normal prose.
+
+\begin{figure}[h]
+\begin{center}
+\rule{3.0in}{1.4in}
+\end{center}
+\caption{Secondary placeholder}
+\label{fig:secondary}
+\end{figure}
+
+\begin{table}[h]
+\caption{Observed ratios}
+\label{tab:ratios}
+\begin{tabular}{|l|c|}
+\hline
+Metric & Value \\
+\hline
+Pages per section & 2.0 \\
+Tables per run & 2 \\
+Figures per run & 2 \\
+\hline
+\end{tabular}
+\end{table}
+
+Figure \ref{fig:secondary} complements Table \ref{tab:ratios}. Together they provide a compact float-heavy integration test without any external image files.
+\end{document}

@@ -4,7 +4,7 @@
 - pdfLaTeX version:
   - `pdfTeX 3.141592653-2.6-1.40.28 (TeX Live 2025)`
   - `kpathsea version 6.4.1`
-- Date generated: `2026-04-02 07:49 JST`
+- Date generated: `2026-04-02 10:45 JST`
 - Working directory: `ferritex/crates/ferritex-bench/fixtures/corpus/bibliography/reference/`
 - Exact generation commands used:
   - `cp ../single_cite.bbl ./single_cite.bbl`
@@ -20,6 +20,25 @@
   - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_with_sections.tex}'`
   - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_with_sections.tex}'`
   - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../inline_thebibliography.tex}'`
+  - `cp ../numeric_refs.bbl ./numeric_refs.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../numeric_refs.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../numeric_refs.tex}'`
+  - `cp ../alpha_style.bbl ./alpha_style.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../alpha_style.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../alpha_style.tex}'`
+  - `cp ../many_entries.bbl ./many_entries.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../many_entries.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../many_entries.tex}'`
+  - `cp ../bib_in_chapter.bbl ./bib_in_chapter.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_in_chapter.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_in_chapter.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../cite_variations.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../cite_variations.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_url_entries.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../bib_url_entries.tex}'`
+  - `cp ../long_bibliography.bbl ./long_bibliography.bbl`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../long_bibliography.tex}'`
+  - `/Library/TeX/texbin/pdflatex -interaction=nonstopmode -output-directory=. '\pdfcompresslevel=0 \pdfobjcompresslevel=0 \input{../long_bibliography.tex}'`
 
 ## Produced references
 
@@ -28,6 +47,13 @@
 - `custom_labels.tex` -> `custom_labels.pdf`
 - `bib_with_sections.tex` -> `bib_with_sections.pdf`
 - `inline_thebibliography.tex` -> `inline_thebibliography.pdf`
+- `numeric_refs.tex` -> `numeric_refs.pdf`
+- `alpha_style.tex` -> `alpha_style.pdf`
+- `many_entries.tex` -> `many_entries.pdf`
+- `bib_in_chapter.tex` -> `bib_in_chapter.pdf`
+- `cite_variations.tex` -> `cite_variations.pdf`
+- `bib_url_entries.tex` -> `bib_url_entries.pdf`
+- `long_bibliography.tex` -> `long_bibliography.pdf`
 
 ## Notes
 

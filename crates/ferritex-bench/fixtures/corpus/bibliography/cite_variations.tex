@@ -1,0 +1,45 @@
+\documentclass{article}
+\begin{document}
+\section{Citation Variations}
+Single citations appear in ordinary prose as in \cite{knuth}. Authors also join
+multiple keys in one command, for example \cite{lamport,mittelbach}, and then
+repeat an earlier source \cite{knuth} after additional commentary.
+
+\subsection{Grouped Discussion}
+Review notes sometimes cite three sources together \cite{hoare,dijkstra,brooks}
+to summarize design, process, and implementation constraints in one sentence.
+The final sentence cites a pair again \cite{lamport,mittelbach} to verify that
+repeated multi-citations stay stable across runs.
+
+\begin{thebibliography}{99}
+\bibitem{knuth}
+Donald~E. Knuth.
+\newblock {\em The {\TeX}book}.
+\newblock Addison-Wesley, 1984.
+
+\bibitem{lamport}
+Leslie Lamport.
+\newblock {\em {\LaTeX}: A Document Preparation System}.
+\newblock Addison-Wesley, second edition, 1994.
+
+\bibitem{mittelbach}
+Frank Mittelbach and Michel Goossens.
+\newblock {\em The {\LaTeX} Companion}.
+\newblock Addison-Wesley, second edition, 2004.
+
+\bibitem{hoare}
+C.~A.~R. Hoare.
+\newblock {\em An Axiomatic Basis for Computer Programming}.
+\newblock Communications of the ACM, 12(10), 1969.
+
+\bibitem{dijkstra}
+Edsger~W. Dijkstra.
+\newblock {\em Go To Statement Considered Harmful}.
+\newblock Communications of the ACM, 11(3), 1968.
+
+\bibitem{brooks}
+Frederick~P. Brooks.
+\newblock {\em The Mythical Man-Month}.
+\newblock Addison-Wesley, 1975.
+\end{thebibliography}
+\end{document}

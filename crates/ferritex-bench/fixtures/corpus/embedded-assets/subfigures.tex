@@ -1,0 +1,26 @@
+\documentclass{article}
+\usepackage{graphicx}
+\begin{document}
+\section{Side-by-Side Figures}
+This fixture keeps two embedded assets in one floating figure by placing them in
+adjacent minipages.
+
+\begin{figure}[t]
+\centering
+\begin{minipage}[t]{0.44\textwidth}
+\centering
+\includegraphics[width=0.8\linewidth]{pixel.png}
+
+Raster source
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.44\textwidth}
+\centering
+\includegraphics[width=\linewidth]{diagram.pdf}
+
+PDF source
+\end{minipage}
+\caption{Two assets arranged as subfigures without extra packages}
+\end{figure}
+
+\end{document}

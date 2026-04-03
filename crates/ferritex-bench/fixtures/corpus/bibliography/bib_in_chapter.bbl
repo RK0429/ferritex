@@ -1,0 +1,33 @@
+\begin{thebibliography}{99}
+
+\bibitem{brooks75}
+Frederick~P. Brooks.
+\newblock {\em The Mythical Man-Month}.
+\newblock Addison-Wesley, 1975.
+
+\bibitem{hoare69}
+C.~A.~R. Hoare.
+\newblock {\em An Axiomatic Basis for Computer Programming}.
+\newblock Communications of the ACM, 12(10), 1969.
+
+\bibitem{knuth84}
+Donald~E. Knuth.
+\newblock {\em The {\TeX}book}.
+\newblock Addison-Wesley, 1984.
+
+\bibitem{lamport94}
+Leslie Lamport.
+\newblock {\em {\LaTeX}: A Document Preparation System}.
+\newblock Addison-Wesley, second edition, 1994.
+
+\bibitem{mittelbach04}
+Frank Mittelbach and Michel Goossens.
+\newblock {\em The {\LaTeX} Companion}.
+\newblock Addison-Wesley, second edition, 2004.
+
+\bibitem{tarjan72}
+Robert~E. Tarjan.
+\newblock {\em Depth-First Search and Linear Graph Algorithms}.
+\newblock SIAM Journal on Computing, 1(2), 1972.
+
+\end{thebibliography}

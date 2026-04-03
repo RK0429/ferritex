@@ -1,0 +1,25 @@
+\documentclass{article}
+\usepackage[pdfusetitle]{hyperref}
+\title{Hyperref With Bibliography}
+\author{Ferritex Bench}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Introduction}\label{sec:intro}
+This document combines internal links, a table of contents, and inline bibliography entries. Jump to \hyperref[sec:methods]{Methods} or see Reference \cite{knuth}.
+
+\section{Methods}\label{sec:methods}
+The method section links back to Section \ref{sec:intro} and forwards to \hyperref[sec:discussion]{Discussion}. It also includes an external link to \href{https://example.com}{Example}.
+
+\subsection{Link Behavior}
+The goal is not a complex layout; the goal is a realistic integration case that still compiles with core packages only.
+
+\section{Discussion}\label{sec:discussion}
+Reference \cite{lamport} complements \cite{knuth}. The table of contents and bibliography both require the standard multi-pass compile flow.
+
+\begin{thebibliography}{99}
+\bibitem{knuth} Donald E. Knuth, The TeXbook, Addison-Wesley, 1984.
+\bibitem{lamport} Leslie Lamport, LaTeX: A Document Preparation System, Addison-Wesley, 1994.
+\end{thebibliography}
+\end{document}

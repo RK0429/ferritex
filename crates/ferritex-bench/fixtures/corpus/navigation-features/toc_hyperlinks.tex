@@ -1,0 +1,23 @@
+\documentclass{article}
+\usepackage[pdfusetitle]{hyperref}
+\title{TOC Hyperlinks}
+\author{Ferritex Corpus}
+\date{April 2, 2026}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Introduction}
+\label{sec:introduction}
+This opening section appears in the table of contents and introduces the cross-links.
+
+\section{Middle}
+\label{sec:middle}
+See \hyperref[sec:introduction]{the introduction} for the starting point and
+\hyperref[sec:ending]{the ending section} for the conclusion.
+
+\section{Ending}
+\label{sec:ending}
+The final section links back to \hyperref[sec:middle]{the middle section} and keeps
+the document within simple article-level navigation.
+\end{document}

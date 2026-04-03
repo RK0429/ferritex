@@ -1,0 +1,34 @@
+\documentclass{article}
+\usepackage{graphicx}
+\begin{document}
+\section{Page One}
+The first page starts with a small raster image and a short explanation.
+\begin{center}
+\includegraphics[width=110pt]{pixel.png}
+\end{center}
+
+\clearpage
+\section{Page Two}
+The second page shifts to the PDF diagram so the reference set includes both
+image types in one document.
+\begin{center}
+\includegraphics[width=0.75\textwidth]{diagram.pdf}
+\end{center}
+
+\clearpage
+\section{Page Three}
+The third page repeats the assets at different scales.
+\begin{center}
+\includegraphics[width=80pt]{pixel.png}\hspace{1cm}
+\includegraphics[width=150pt]{diagram.pdf}
+\end{center}
+
+\clearpage
+\section{Page Four}
+The last page closes with another raster image so the document ends with a
+different embedded resource than it began with.
+\begin{center}
+\includegraphics[width=150pt]{pixel.png}
+\end{center}
+
+\end{document}

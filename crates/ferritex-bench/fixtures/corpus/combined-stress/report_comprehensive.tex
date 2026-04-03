@@ -1,0 +1,63 @@
+\documentclass{report}
+\usepackage{graphicx}
+\makeatletter
+\@ifundefined{rule}{\newcommand{\rule}[2]{[rule #1 by #2]}}{}
+\makeatother
+\title{Comprehensive Report Fixture}
+\author{Ferritex Bench}
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Program Summary}\label{chap:summary}
+This report fixture combines chaptered structure with tables, equations, and figures. Chapter \ref{chap:execution} expands the operational plan.
+
+\section{Objectives}
+The first objective is to preserve structural metadata. The second objective is to verify that float numbering and chapter numbering stay coherent across a multi-pass document.
+
+\begin{equation}\label{eq:report-growth}
+g(n) = n^2 + 2n + 1
+\end{equation}
+
+\begin{table}[h]
+\caption{Milestone table}
+\label{tab:milestones}
+\begin{tabular}{|l|c|c|}
+\hline
+Milestone & Owner & Week \\
+\hline
+Draft & Core & 1 \\
+Review & Bench & 2 \\
+Approval & Release & 3 \\
+\hline
+\end{tabular}
+\end{table}
+
+\chapter{Execution Plan}\label{chap:execution}
+Equation \ref{eq:report-growth} from Chapter \ref{chap:summary} defines the workload curve used in this example.
+
+\section{Tracking}
+\begin{figure}[h]
+\begin{center}
+\rule{4.0in}{1.8in}
+\end{center}
+\caption{Execution dashboard placeholder}
+\label{fig:dashboard}
+\end{figure}
+
+Figure \ref{fig:dashboard} stands in for a dashboard snapshot without requiring external assets.
+
+\section{Detailed Notes}
+\begin{enumerate}
+\item Gather sectioning and float metadata.
+\item Emit stable chapter numbering for references.
+\item Re-run compilation until the table of contents settles.
+\end{enumerate}
+
+\chapter{Appendix}
+The appendix closes the report with one more equation:
+\[
+\frac{g(n)}{n + 1} = n + 1
+\]
+The fixture therefore exercises table of contents generation, chapter numbering, sections, tables, equations, and rule-based figures.
+\end{document}

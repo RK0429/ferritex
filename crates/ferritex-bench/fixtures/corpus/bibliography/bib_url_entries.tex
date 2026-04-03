@@ -1,0 +1,34 @@
+\documentclass{article}
+\begin{document}
+\section{Repository and Web References}
+Project notes often cite a mix of books, technical reports, and living web
+artifacts. This fixture keeps the entries inline while still formatting URL-like
+strings as monospaced text, as in \cite{pkgindex,buildlog}.
+
+\section{Archival Notes}
+A second citation to \cite{specdraft} checks that ordinary inline bibliography
+entries can include long path fragments without additional packages.
+
+\begin{thebibliography}{99}
+\bibitem{pkgindex}
+Tooling Working Group.
+\newblock {\em Package Index Snapshot}.
+\newblock Retrieved from \texttt{https://example.org/archive/pkg-index-v4}, 2025.
+
+\bibitem{buildlog}
+Release Engineering Team.
+\newblock {\em Continuous Build Dashboard}.
+\newblock Available at \texttt{https://ci.example.net/projects/ferritex/logs}, 2026.
+
+\bibitem{specdraft}
+Documentation Council.
+\newblock {\em Draft Interchange Specification}.
+\newblock Reference copy at
+\texttt{https://docs.example.com/specs/interchange/working-draft}, 2026.
+
+\bibitem{datahub}
+Corpus Curators.
+\newblock {\em Public Data Hub for Fixture Inputs}.
+\newblock Mirror URL \texttt{https://datasets.example.edu/corpus/fixtures}, 2024.
+\end{thebibliography}
+\end{document}

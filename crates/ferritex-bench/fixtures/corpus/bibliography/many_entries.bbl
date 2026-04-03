@@ -1,0 +1,109 @@
+\begin{thebibliography}{99}
+
+\bibitem{aho86}
+Alfred~V. Aho, Ravi Sethi, and Jeffrey~D. Ullman.
+\newblock {\em Compilers: Principles, Techniques, and Tools}.
+\newblock Addison-Wesley, 1986.
+
+\bibitem{backus78}
+John Backus.
+\newblock {\em Can Programming Be Liberated from the von Neumann Style?}
+\newblock Communications of the ACM, 21(8), 1978.
+
+\bibitem{bentley86}
+Jon Bentley.
+\newblock {\em Programming Pearls}.
+\newblock Addison-Wesley, 1986.
+
+\bibitem{brooks75}
+Frederick~P. Brooks.
+\newblock {\em The Mythical Man-Month}.
+\newblock Addison-Wesley, 1975.
+
+\bibitem{chomsky57}
+Noam Chomsky.
+\newblock {\em Syntactic Structures}.
+\newblock Mouton, 1957.
+
+\bibitem{dijkstra68}
+Edsger~W. Dijkstra.
+\newblock {\em Go To Statement Considered Harmful}.
+\newblock Communications of the ACM, 11(3), 1968.
+
+\bibitem{golub96}
+Gene~H. Golub and Charles~F. Van Loan.
+\newblock {\em Matrix Computations}.
+\newblock Johns Hopkins University Press, third edition, 1996.
+
+\bibitem{gray93}
+Jim Gray and Andreas Reuter.
+\newblock {\em Transaction Processing: Concepts and Techniques}.
+\newblock Morgan Kaufmann, 1993.
+
+\bibitem{hearn83}
+Donald Hearn and M. Pauline Baker.
+\newblock {\em Computer Graphics}.
+\newblock Prentice Hall, 1983.
+
+\bibitem{hoare69}
+C.~A.~R. Hoare.
+\newblock {\em An Axiomatic Basis for Computer Programming}.
+\newblock Communications of the ACM, 12(10), 1969.
+
+\bibitem{knuth84}
+Donald~E. Knuth.
+\newblock {\em The {\TeX}book}.
+\newblock Addison-Wesley, 1984.
+
+\bibitem{knuth98}
+Donald~E. Knuth.
+\newblock {\em The Art of Computer Programming, Volume 3}.
+\newblock Addison-Wesley, second edition, 1998.
+
+\bibitem{lamport94}
+Leslie Lamport.
+\newblock {\em {\LaTeX}: A Document Preparation System}.
+\newblock Addison-Wesley, second edition, 1994.
+
+\bibitem{mittelbach04}
+Frank Mittelbach and Michel Goossens.
+\newblock {\em The {\LaTeX} Companion}.
+\newblock Addison-Wesley, second edition, 2004.
+
+\bibitem{milner78}
+Robin Milner.
+\newblock {\em A Theory of Type Polymorphism in Programming}.
+\newblock Journal of Computer and System Sciences, 17(3), 1978.
+
+\bibitem{press92}
+William~H. Press, Saul~A. Teukolsky, William~T. Vetterling, and Brian~P.
+Flannery.
+\newblock {\em Numerical Recipes in C}.
+\newblock Cambridge University Press, second edition, 1992.
+
+\bibitem{shannon48}
+Claude~E. Shannon.
+\newblock {\em A Mathematical Theory of Communication}.
+\newblock Bell System Technical Journal, 27, 1948.
+
+\bibitem{steele90}
+Guy~L. Steele.
+\newblock {\em Common Lisp: The Language}.
+\newblock Digital Press, second edition, 1990.
+
+\bibitem{tarjan72}
+Robert~E. Tarjan.
+\newblock {\em Depth-First Search and Linear Graph Algorithms}.
+\newblock SIAM Journal on Computing, 1(2), 1972.
+
+\bibitem{tukey77}
+John~W. Tukey.
+\newblock {\em Exploratory Data Analysis}.
+\newblock Addison-Wesley, 1977.
+
+\bibitem{wirth71}
+Niklaus Wirth.
+\newblock {\em Program Development by Stepwise Refinement}.
+\newblock Communications of the ACM, 14(4), 1971.
+
+\end{thebibliography}

@@ -1,0 +1,24 @@
+\documentclass{article}
+\usepackage{graphicx}
+\begin{document}
+\section{Text Beside an Asset}
+\noindent
+\begin{minipage}[t]{0.58\textwidth}
+This article places explanatory text beside a figure so the page resembles a
+lightweight newsletter column. The text describes the asset, mentions that the
+diagram is a stable reference input, and keeps enough narrative around the
+figure to exercise mixed text and image layout on one line of composition.
+
+The second paragraph continues in the same column. It records that maintainers
+often compare image-heavy pages by eye first and then use a structural parity
+measurement to confirm that embedded resources and page counts still match.
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.36\textwidth}
+\centering
+\includegraphics[width=\linewidth]{diagram.pdf}
+
+Figure shown beside the surrounding text
+\end{minipage}
+
+\end{document}

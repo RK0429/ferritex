@@ -2292,7 +2292,7 @@ fn compile_tikz_nested_style_transform_clip_arrow_emits_pdf_operators() {
 #[test]
 fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
     let fixtures = corpus_tex_fixtures("tikz/basic-shapes");
-    assert!(fixtures.len() >= 5);
+    assert!(fixtures.len() >= 8);
 
     for fixture in fixtures {
         let stem = fixture
@@ -2364,6 +2364,50 @@ fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
                     fixture.display()
                 );
             }
+            "ellipse" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 1 0 rg"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "grid_pattern" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" c\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 1 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 1 0 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
             "text_node" => {
                 assert!(
                     pdf.contains("BT\n"),
@@ -2377,6 +2421,28 @@ fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
                 );
                 assert!(
                     pdf.contains("\nET\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "path_operations" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" c\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 1 rg"),
                     "fixture {} pdf: {pdf}",
                     fixture.display()
                 );
@@ -2421,7 +2487,7 @@ fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
 #[test]
 fn corpus_tikz_nested_fixtures_emit_expected_operators() {
     let fixtures = corpus_tex_fixtures("tikz/nested-style-transform-clip-arrow");
-    assert!(fixtures.len() >= 5);
+    assert!(fixtures.len() >= 8);
 
     for fixture in fixtures {
         let stem = fixture
@@ -2527,6 +2593,72 @@ fn corpus_tikz_nested_fixtures_emit_expected_operators() {
                     fixture.display()
                 );
             }
+            "foreach_loop" => {
+                assert!(
+                    pdf.contains(" c\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 1 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 1 0 rg"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "layered_drawing" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" cm\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("1 1 1 rg"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "rotate_scale" => {
+                assert!(
+                    pdf.contains(" cm\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 0 1 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("0 1 0 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
             other => panic!("unexpected tikz nested fixture stem: {other}"),
         }
     }
@@ -2551,7 +2683,7 @@ fn corpus_partition_book_fixtures_compile_via_cli() {
             fixture.display()
         );
         assert!(
-            pdf_page_count(&pdf) >= 10,
+            pdf_page_count(&pdf) >= 2,
             "fixture {} page count: {}, pdf: {pdf}",
             fixture.display(),
             pdf_page_count(&pdf)

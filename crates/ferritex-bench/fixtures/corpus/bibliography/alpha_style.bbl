@@ -1,0 +1,23 @@
+\begin{thebibliography}{Lam94}
+
+\bibitem[Bent86]{bentley86}
+Jon Bentley.
+\newblock {\em Programming Pearls}.
+\newblock Addison-Wesley, 1986.
+
+\bibitem[Hoa69]{hoare69}
+C.~A.~R. Hoare.
+\newblock {\em An Axiomatic Basis for Computer Programming}.
+\newblock Communications of the ACM, 12(10), 1969.
+
+\bibitem[Knu84]{knuth84}
+Donald~E. Knuth.
+\newblock {\em The {\TeX}book}.
+\newblock Addison-Wesley, 1984.
+
+\bibitem[Lam94]{lam94}
+Leslie Lamport.
+\newblock {\em {\LaTeX}: A Document Preparation System}.
+\newblock Addison-Wesley, second edition, 1994.
+
+\end{thebibliography}

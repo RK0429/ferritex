@@ -1,0 +1,31 @@
+\documentclass{book}
+\begin{document}
+\frontmatter
+\title{Notes on Chapter-Level Bibliography Discussion}
+\author{Corpus Fixture Working Group}
+\date{}
+\maketitle
+\tableofcontents
+
+\mainmatter
+\chapter{Background}
+Editorial reports often cite foundational tools at the chapter level before
+moving to more recent implementation notes. In this opening chapter we mention
+\cite{knuth84}, \cite{lamport94}, and \cite{mittelbach04} because they define the
+baseline expectations for layout engines and authoring workflows.
+
+\section{Motivation}
+Project teams also reuse algorithmic sources such as \cite{tarjan72} when they
+describe dependency ordering for compilation passes.
+
+\chapter{Chapter-Focused Commentary}
+The second chapter discusses how a single bibliography can still support
+per-chapter narrative structure. Operational guidance from \cite{brooks75} is
+often paired with design rules from \cite{hoare69} in retrospective summaries.
+
+\section{Observed Pattern}
+The text cites sources from both chapters, which helps exercise the same global
+bibliography across multiple chapter headings.
+
+\bibliography{refs}
+\end{document}
