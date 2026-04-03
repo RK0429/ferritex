@@ -5,6 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ferritex_bench::bench_fixtures_root;
+use ferritex_core::kernel::api::SourceLocation;
+use ferritex_core::synctex::SyncTexData;
 use serde_json::{json, Value};
 
 const PNG_1X1_RGB: &[u8] = &[
@@ -18,6 +20,11 @@ const CORRUPT_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /MediaBox [0 0 20
 fn ferritex_bin() -> Command {
     let bin = env!("CARGO_BIN_EXE_ferritex");
     Command::new(bin)
+}
+
+fn read_synctex(path: &Path) -> SyncTexData {
+    serde_json::from_slice(&std::fs::read(path).expect("read output synctex"))
+        .expect("parse output synctex")
 }
 
 fn build_minimal_cmr10_tfm() -> Vec<u8> {
@@ -239,6 +246,49 @@ fn compile_figure_environment_renders_inline_caption_and_ref() {
     assert!(content.contains("/Subtype /Image"));
     assert!(content.contains("/Im1 Do"));
     assert!(!content.contains("??"));
+}
+
+#[test]
+fn compile_with_synctex_writes_searchable_sidecar_with_float_caption_fragment() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("synctex.tex");
+    let image_file = dir.path().join("pixel.png");
+    std::fs::write(&image_file, PNG_1X1_RGB).expect("write image file");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nPrelude\n\\begin{figure}[h]\n\\includegraphics[width=100pt]{pixel.png}\n\\caption{Embedded pixel}\n\\label{fig:pixel}\n\\end{figure}\n\\newpage\nSecond page text\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--synctex",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let synctex_path = dir.path().join("synctex.synctex");
+    assert!(synctex_path.exists());
+    let synctex = read_synctex(&synctex_path);
+
+    let caption_positions = synctex.forward_search(SourceLocation {
+        file_id: 0,
+        line: 6,
+        column: 10,
+    });
+    assert_eq!(caption_positions.len(), 1);
+    assert_eq!(
+        synctex.inverse_search(caption_positions[0]).map(|span| span.start.line),
+        Some(6)
+    );
+    assert!(synctex
+        .fragments
+        .iter()
+        .any(|fragment| fragment.text == "Figure 1: Embedded pixel"));
 }
 
 #[test]

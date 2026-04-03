@@ -84,6 +84,7 @@ pub struct SectionEntry {
     pub level: u8,
     pub number: String,
     pub title: String,
+    pub span: Option<SourceSpan>,
 }
 
 impl SectionEntry {
@@ -146,6 +147,7 @@ pub struct CaptionEntry {
     pub kind: FloatType,
     pub number: String,
     pub caption: String,
+    pub span: Option<SourceSpan>,
 }
 
 impl CaptionEntry {
@@ -169,6 +171,7 @@ impl Default for CaptionEntry {
             kind: FloatType::Figure,
             number: String::new(),
             caption: String::new(),
+            span: None,
         }
     }
 }
@@ -446,11 +449,12 @@ pub enum DocumentNode {
     HBox(Vec<DocumentNode>),
     VBox(Vec<DocumentNode>),
     InlineMath(Vec<MathNode>),
-    DisplayMath(Vec<MathNode>),
+    DisplayMath(Vec<MathNode>, Option<SourceSpan>),
     EquationEnv {
         lines: Vec<MathLine>,
         numbered: bool,
         aligned: bool,
+        source_span: Option<SourceSpan>,
     },
     IncludeGraphics {
         path: String,
@@ -464,6 +468,7 @@ pub enum DocumentNode {
         specifier: Option<String>,
         content: Vec<DocumentNode>,
         caption: Option<String>,
+        caption_span: Option<SourceSpan>,
         label: Option<String>,
     },
 }
@@ -483,6 +488,33 @@ impl ParsedDocument {
         }
 
         BodySourceSpanAnnotator::new(source_lines).annotate_nodes(nodes)
+    }
+
+    pub fn annotate_structure_source_spans(&mut self, source_lines: &[SourceLineTrace]) {
+        if source_lines.is_empty() {
+            return;
+        }
+
+        let mut section_annotator = BodySourceSpanAnnotator::new(source_lines);
+        for entry in &mut self.section_entries {
+            if entry.span.is_none() {
+                entry.span = section_annotator.match_text(&entry.title);
+            }
+        }
+
+        let mut figure_annotator = BodySourceSpanAnnotator::new(source_lines);
+        for entry in &mut self.figure_entries {
+            if entry.span.is_none() {
+                entry.span = figure_annotator.match_text(&entry.caption);
+            }
+        }
+
+        let mut table_annotator = BodySourceSpanAnnotator::new(source_lines);
+        for entry in &mut self.table_entries {
+            if entry.span.is_none() {
+                entry.span = table_annotator.match_text(&entry.caption);
+            }
+        }
     }
 
     pub fn has_pageref_markers(&self) -> bool {
@@ -3003,6 +3035,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     kind: float_state.float_type,
                     number,
                     caption: float_state.caption.clone().unwrap_or_default(),
+                    span: None,
                 };
                 match float_state.float_type {
                     FloatType::Figure => self.state.figure_entries.push(caption_entry),
@@ -3261,6 +3294,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             level: 0,
             number: number.clone(),
             title: title.clone(),
+            span: None,
         });
         self.emit_paragraph_break_before_block();
         self.body.push_str(&number);
@@ -3286,6 +3320,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             level,
             number: number.clone(),
             title: title.clone(),
+            span: None,
         });
         self.emit_paragraph_break_before_block();
         self.body.push_str(&number);
@@ -7044,6 +7079,78 @@ fn render_math_node_for_anchor(node: &MathNode) -> String {
     }
 }
 
+fn render_math_nodes_for_source_match(nodes: &[MathNode]) -> String {
+    nodes
+        .iter()
+        .map(render_math_node_for_source_match)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_math_node_for_source_match(node: &MathNode) -> String {
+    match node {
+        MathNode::Ordinary(ch) => ch.to_string(),
+        MathNode::Symbol(symbol) => symbol.clone(),
+        MathNode::Superscript(node) => format!("^{}", render_math_attachment_for_source_match(node)),
+        MathNode::Subscript(node) => format!("_{}", render_math_attachment_for_source_match(node)),
+        MathNode::Frac { numer, denom } => format!(
+            "{}{}",
+            render_math_nodes_for_source_match(numer),
+            render_math_nodes_for_source_match(denom)
+        ),
+        MathNode::Sqrt { radicand, index } => {
+            let mut rendered = String::new();
+            if let Some(index) = index {
+                rendered.push_str(&render_math_nodes_for_source_match(index));
+            }
+            rendered.push_str(&render_math_nodes_for_source_match(radicand));
+            rendered
+        }
+        MathNode::MathFont { body, .. } => render_math_nodes_for_source_match(body),
+        MathNode::LeftRight { left, right, body } => format!(
+            "{}{}{}",
+            left,
+            render_math_nodes_for_source_match(body),
+            right
+        ),
+        MathNode::OverUnder {
+            base,
+            annotation,
+            ..
+        } => format!(
+            "{}{}",
+            render_math_nodes_for_source_match(annotation),
+            render_math_nodes_for_source_match(base)
+        ),
+        MathNode::Group(nodes) => render_math_nodes_for_source_match(nodes),
+        MathNode::Text(text) => text.clone(),
+    }
+}
+
+fn render_math_attachment_for_source_match(node: &MathNode) -> String {
+    match node {
+        MathNode::Group(nodes) if nodes.len() > 1 => {
+            format!("({})", render_math_nodes_for_source_match(nodes))
+        }
+        _ => render_math_node_for_source_match(node),
+    }
+}
+
+fn render_equation_lines_for_source_match(lines: &[MathLine], aligned: bool) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            let separator = if aligned { "&" } else { "" };
+            line.segments
+                .iter()
+                .map(|segment| render_math_nodes_for_source_match(segment))
+                .collect::<Vec<_>>()
+                .join(separator)
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn render_math_attachment_for_anchor(node: &MathNode) -> String {
     match node {
         MathNode::Group(nodes) if nodes.len() > 1 => {
@@ -7161,6 +7268,28 @@ impl BodySourceSpanAnnotator {
                 let span = span.or_else(|| self.match_text(&text));
                 DocumentNode::Text(text, span)
             }
+            DocumentNode::DisplayMath(nodes, span) => {
+                let span = span.or_else(|| {
+                    self.match_text(&render_math_nodes_for_source_match(&nodes))
+                });
+                DocumentNode::DisplayMath(nodes, span)
+            }
+            DocumentNode::EquationEnv {
+                lines,
+                numbered,
+                aligned,
+                source_span,
+            } => {
+                let source_span = source_span.or_else(|| {
+                    self.match_text(&render_equation_lines_for_source_match(&lines, aligned))
+                });
+                DocumentNode::EquationEnv {
+                    lines,
+                    numbered,
+                    aligned,
+                    source_span,
+                }
+            }
             DocumentNode::FontFamily { role, children } => DocumentNode::FontFamily {
                 role,
                 children: self.annotate_nodes(children),
@@ -7176,23 +7305,26 @@ impl BodySourceSpanAnnotator {
                 specifier,
                 content,
                 caption,
+                caption_span,
                 label,
-            } => DocumentNode::Float {
-                float_type,
-                specifier,
-                content: self.annotate_nodes(content),
-                caption,
-                label,
-            },
+            } => {
+                let resolved_caption_span = caption_span
+                    .or_else(|| caption.as_deref().and_then(|caption| self.match_text(caption)));
+                DocumentNode::Float {
+                    float_type,
+                    specifier,
+                    content: self.annotate_nodes(content),
+                    caption,
+                    caption_span: resolved_caption_span,
+                    label,
+                }
+            }
             other => other,
         }
     }
 
     fn match_text(&mut self, text: &str) -> Option<SourceSpan> {
-        let visible_chars = text
-            .chars()
-            .filter(|ch| !ch.is_whitespace() && !ch.is_control())
-            .collect::<Vec<_>>();
+        let visible_chars = visible_target_chars(text);
         if visible_chars.is_empty() {
             return None;
         }
@@ -7323,6 +7455,27 @@ fn visible_source_chars(text: &str) -> Vec<VisibleSourceChar> {
             _ => {
                 column += 1;
             }
+        }
+    }
+
+    visible
+}
+
+fn visible_target_chars(text: &str) -> Vec<char> {
+    let mut visible = Vec::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '%' => break,
+            '\\' => {
+                while chars.peek().is_some_and(|next| next.is_alphabetic()) {
+                    chars.next();
+                }
+            }
+            '{' | '}' | '[' | ']' => {}
+            _ if !ch.is_control() && !ch.is_whitespace() => visible.push(ch),
+            _ => {}
         }
     }
 
@@ -7496,7 +7649,7 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 let node = if ch == BODY_INLINE_MATH_START {
                     DocumentNode::InlineMath(math)
                 } else {
-                    DocumentNode::DisplayMath(math)
+                    DocumentNode::DisplayMath(math, None)
                 };
                 placeholders.push(node);
                 text.push(placeholder);
@@ -7812,6 +7965,7 @@ fn deserialize_float_marker(content: &str) -> DocumentNode {
         specifier: marker_optional_raw_string(specifier_field),
         content: body_nodes_from_text(body_content),
         caption: marker_optional_string(caption_field),
+        caption_span: None,
         label: marker_optional_string(label_field),
     }
 }
@@ -8646,6 +8800,7 @@ fn deserialize_equation_env(content: &str) -> DocumentNode {
         lines,
         numbered,
         aligned,
+        source_span: None,
     }
 }
 
@@ -9452,6 +9607,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn body_nodes_with_source_spans_tracks_display_math_span() {
+        let document = parse_document(r"\[a_1\]");
+        let nodes = document.body_nodes_with_source_spans(&[SourceLineTrace {
+            file: "/tmp/main.tex".to_string(),
+            line: 3,
+            text: r"\[a_1\]".to_string(),
+        }]);
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 3,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 6,
+            },
+        };
+
+        assert_eq!(
+            nodes,
+            vec![DocumentNode::DisplayMath(
+                vec![
+                    MathNode::Ordinary('a'),
+                    MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
+                ],
+                Some(span),
+            )]
+        );
+    }
+
+    #[test]
+    fn annotate_structure_source_spans_tracks_sections_and_captions() {
+        let mut document = parse_document(
+            "\\section{Intro}\n\\begin{figure}\n\\caption{Overview}\n\\end{figure}",
+        );
+        document.annotate_structure_source_spans(&[
+            SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 3,
+                text: "\\section{Intro}".to_string(),
+            },
+            SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 4,
+                text: "\\begin{figure}".to_string(),
+            },
+            SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 5,
+                text: "\\caption{Overview}".to_string(),
+            },
+            SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 6,
+                text: "\\end{figure}".to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            document.section_entries[0].span,
+            Some(SourceSpan {
+                start: SourceLocation {
+                    file_id: 0,
+                    line: 3,
+                    column: 10,
+                },
+                end: SourceLocation {
+                    file_id: 0,
+                    line: 3,
+                    column: 15,
+                },
+            })
+        );
+        assert_eq!(
+            document.figure_entries[0].span,
+            Some(SourceSpan {
+                start: SourceLocation {
+                    file_id: 0,
+                    line: 5,
+                    column: 10,
+                },
+                end: SourceLocation {
+                    file_id: 0,
+                    line: 5,
+                    column: 18,
+                },
+            })
+        );
+    }
+
     fn parse_document(source_body: &str) -> ParsedDocument {
         MinimalLatexParser
             .parse(&format!(
@@ -9887,7 +10135,7 @@ mod tests {
             vec![DocumentNode::DisplayMath(vec![
                 MathNode::Ordinary('a'),
                 MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
-            ])]
+            ], None)]
         );
     }
 
@@ -10020,6 +10268,7 @@ mod tests {
                 }],
                 numbered: true,
                 aligned: false,
+                source_span: None,
             })
         );
         assert_eq!(
@@ -10074,6 +10323,7 @@ mod tests {
                 ],
                 numbered: true,
                 aligned: true,
+                source_span: None,
             }]
         );
         assert_eq!(
@@ -10098,6 +10348,7 @@ mod tests {
                 }],
                 numbered: false,
                 aligned: false,
+                source_span: None,
             }]
         );
     }
@@ -10149,6 +10400,7 @@ mod tests {
                     options: IncludeGraphicsOptions::default(),
                 }],
                 caption: Some("A figure".to_string()),
+                caption_span: None,
                 label: Some("fig:test".to_string()),
             }]
         );
@@ -10169,6 +10421,7 @@ mod tests {
                 specifier: None,
                 content: Vec::new(),
                 caption: Some("A table".to_string()),
+                caption_span: None,
                 label: None,
             }]
         );
@@ -10188,6 +10441,7 @@ mod tests {
                     specifier: None,
                     content: Vec::new(),
                     caption: Some("Fig".to_string()),
+                    caption_span: None,
                     label: Some("fig:1".to_string()),
                 },
                 DocumentNode::ParBreak,
@@ -10214,6 +10468,7 @@ mod tests {
                 specifier: Some("htbp!".to_string()),
                 content: vec![DocumentNode::Text("Body".to_string(), None)],
                 caption: None,
+                caption_span: None,
                 label: None,
             }]
         );
@@ -11052,11 +11307,13 @@ mod tests {
                     level: 1,
                     number: "A".to_string(),
                     title: "Supplement".to_string(),
+                    span: None,
                 },
                 SectionEntry {
                     level: 2,
                     number: "A.1".to_string(),
                     title: "Details".to_string(),
+                    span: None,
                 },
             ]
         );
@@ -11075,21 +11332,25 @@ mod tests {
                     level: 1,
                     number: "1".to_string(),
                     title: "Program Context".to_string(),
+                    span: None,
                 },
                 SectionEntry {
                     level: 2,
                     number: "1.1".to_string(),
                     title: "Review Cycle".to_string(),
+                    span: None,
                 },
                 SectionEntry {
                     level: 4,
                     number: "1.1.0.1".to_string(),
                     title: "Meeting Record".to_string(),
+                    span: None,
                 },
                 SectionEntry {
                     level: 5,
                     number: "1.1.0.1.1".to_string(),
                     title: "Room Notes".to_string(),
+                    span: None,
                 },
             ]
         );
@@ -11633,11 +11894,13 @@ mod tests {
                         level: 1,
                         number: "1".to_string(),
                         title: "Intro".to_string(),
+                        span: None,
                     },
                     SectionEntry {
                         level: 2,
                         number: "1.1".to_string(),
                         title: "Scope".to_string(),
+                        span: None,
                     },
                 ],
                 Vec::new(),
@@ -11674,6 +11937,7 @@ mod tests {
                     level: 1,
                     number: "1".to_string(),
                     title: "Intro".to_string(),
+                    span: None,
                 }],
                 Vec::new(),
                 Vec::new(),
@@ -11705,11 +11969,13 @@ mod tests {
                     level: 1,
                     number: "1".to_string(),
                     title: "Intro".to_string(),
+                    span: None,
                 },
                 SectionEntry {
                     level: 2,
                     number: "1.1".to_string(),
                     title: "Scope".to_string(),
+                    span: None,
                 },
             ]
         );
@@ -11727,6 +11993,7 @@ mod tests {
                 kind: FloatType::Figure,
                 number: "1".to_string(),
                 caption: "Overview".to_string(),
+                span: None,
             }]
         );
         assert_eq!(
@@ -11735,6 +12002,7 @@ mod tests {
                 kind: FloatType::Table,
                 number: "1".to_string(),
                 caption: "Metrics".to_string(),
+                span: None,
             }]
         );
     }
@@ -11751,11 +12019,13 @@ mod tests {
                         kind: FloatType::Figure,
                         number: "1".to_string(),
                         caption: "Overview".to_string(),
+                        span: None,
                     },
                     CaptionEntry {
                         kind: FloatType::Figure,
                         number: "2".to_string(),
                         caption: String::new(),
+                        span: None,
                     },
                 ],
                 Vec::new(),
@@ -11780,6 +12050,7 @@ mod tests {
                     kind: FloatType::Table,
                     number: "1".to_string(),
                     caption: "Metrics".to_string(),
+                    span: None,
                 }],
                 BTreeMap::new(),
                 Vec::new(),
@@ -11801,11 +12072,13 @@ mod tests {
                     kind: FloatType::Figure,
                     number: "1".to_string(),
                     caption: "Overview".to_string(),
+                    span: None,
                 }],
                 vec![CaptionEntry {
                     kind: FloatType::Table,
                     number: "1".to_string(),
                     caption: "Metrics".to_string(),
+                    span: None,
                 }],
                 BTreeMap::new(),
                 Vec::new(),
@@ -11974,6 +12247,7 @@ mod tests {
                 kind: FloatType::Figure,
                 number: "1".to_string(),
                 caption: "Overview".to_string(),
+                span: None,
             }]
         );
         assert_eq!(
@@ -11982,6 +12256,7 @@ mod tests {
                 kind: FloatType::Table,
                 number: "1".to_string(),
                 caption: "Metrics".to_string(),
+                span: None,
             }]
         );
     }
@@ -11999,6 +12274,7 @@ mod tests {
                 kind: FloatType::Table,
                 number: "1".to_string(),
                 caption: "Metrics".to_string(),
+                span: None,
             }]
         );
     }

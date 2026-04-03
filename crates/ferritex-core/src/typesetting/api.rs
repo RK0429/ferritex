@@ -373,6 +373,12 @@ impl PlacementSpec {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FootnoteEntry {
+    text: String,
+    source_span: Option<SourceSpan>,
+}
+
 fn push_float_region(regions: &mut Vec<FloatRegion>, region: FloatRegion) {
     if !regions.contains(&region) {
         regions.push(region);
@@ -1116,7 +1122,9 @@ impl MinimalTypesetter {
     }
 }
 
-fn extract_footnotes_from_nodes(nodes: Vec<DocumentNode>) -> (Vec<DocumentNode>, Vec<String>) {
+fn extract_footnotes_from_nodes(
+    nodes: Vec<DocumentNode>,
+) -> (Vec<DocumentNode>, Vec<FootnoteEntry>) {
     let mut sanitized = Vec::with_capacity(nodes.len());
     let mut footnotes = Vec::new();
 
@@ -1131,13 +1139,16 @@ fn extract_footnotes_from_nodes(nodes: Vec<DocumentNode>) -> (Vec<DocumentNode>,
 
 fn extract_footnotes_from_node(
     node: DocumentNode,
-    footnotes: &mut Vec<String>,
+    footnotes: &mut Vec<FootnoteEntry>,
 ) -> Option<DocumentNode> {
     match node {
         DocumentNode::Text(content, span) => {
             if let Some((sanitized, footnote_text)) = split_inline_footnote(&content) {
                 if !footnote_text.is_empty() {
-                    footnotes.push(footnote_text);
+                    footnotes.push(FootnoteEntry {
+                        text: footnote_text,
+                        source_span: span,
+                    });
                 }
                 (!sanitized.is_empty()).then_some(DocumentNode::Text(sanitized, span))
             } else {
@@ -1163,12 +1174,14 @@ fn extract_footnotes_from_node(
             specifier,
             content,
             caption,
+            caption_span,
             label,
         } => Some(DocumentNode::Float {
             float_type,
             specifier,
             content: extract_footnotes_from_children(content, footnotes),
             caption,
+            caption_span,
             label,
         }),
         other => Some(other),
@@ -1177,7 +1190,7 @@ fn extract_footnotes_from_node(
 
 fn extract_footnotes_from_children(
     children: Vec<DocumentNode>,
-    footnotes: &mut Vec<String>,
+    footnotes: &mut Vec<FootnoteEntry>,
 ) -> Vec<DocumentNode> {
     children
         .into_iter()
@@ -1205,7 +1218,11 @@ fn split_inline_footnote(text: &str) -> Option<(String, String)> {
     Some((sanitized, suffix))
 }
 
-fn append_footnotes_to_pages(pages: &mut [TypesetPage], footnotes: &[String], layout: ClassLayout) {
+fn append_footnotes_to_pages(
+    pages: &mut [TypesetPage],
+    footnotes: &[FootnoteEntry],
+    layout: ClassLayout,
+) {
     let Some(page) = pages.first_mut() else {
         return;
     };
@@ -1227,12 +1244,12 @@ fn append_footnotes_to_pages(pages: &mut [TypesetPage], footnotes: &[String], la
             source_span: None,
         });
         page.lines.push(TextLine {
-            text: footnote.clone(),
+            text: footnote.text.clone(),
             y: points(layout.footnote_text_y_pt - offset_pt),
             links: Vec::new(),
             font_index: 0,
             font_size: points(layout.footnote_font_size_pt),
-            source_span: None,
+            source_span: footnote.source_span,
         });
     }
     page.lines.sort_by(|left, right| right.y.cmp(&left.y));
@@ -1522,7 +1539,7 @@ fn document_nodes_to_hlist_with_font_config(
                 set_hlist_font_index(&mut math_hlist, current_font_index);
                 hlist.extend(math_hlist);
             }
-            DocumentNode::DisplayMath(nodes) => {
+            DocumentNode::DisplayMath(nodes, _) => {
                 flush_word(
                     &mut hlist,
                     &mut current_word,
@@ -1675,7 +1692,10 @@ fn document_nodes_to_vlist_with_config(
 ) -> Vec<VListItem> {
     let mut document = ParsedDocument::default();
     document.document_class = "article".to_string();
+    #[cfg(test)]
     let mut layout = class_layout_for("article");
+    #[cfg(not(test))]
+    let layout = class_layout_for("article");
     #[cfg(test)]
     adjust_layout_for_core_tests(&mut layout);
     document_nodes_to_vlist_with_document(
@@ -1881,6 +1901,7 @@ fn document_nodes_to_vlist_with_state(
                 specifier,
                 content,
                 caption,
+                caption_span,
                 ..
             } => {
                 append_nodes_segment_to_vlist(
@@ -1915,7 +1936,7 @@ fn document_nodes_to_vlist_with_state(
                         FloatType::Table => "Table",
                     };
                     let caption_line = format!("{prefix} {number}: {caption}");
-                    let caption_nodes = [DocumentNode::Text(caption_line, None)];
+                    let caption_nodes = [DocumentNode::Text(caption_line, *caption_span)];
                     append_styled_nodes_to_vlist(
                         &mut float_vlist,
                         &caption_nodes,
@@ -1924,6 +1945,7 @@ fn document_nodes_to_vlist_with_state(
                         params,
                         layout.float_caption_line_height_pt,
                         layout.body_font_size_pt,
+                        None,
                     );
                 }
 
@@ -1981,16 +2003,14 @@ fn append_nodes_segment_to_vlist(
             params,
             line_height_pt,
             layout.body_font_size_pt,
+            None,
         );
         *previous_block = Some(SegmentBlockKind::Paragraph);
         return;
     }
 
-    let segment_source_span = nodes.iter().find_map(|node| match node {
-        DocumentNode::Text(_, span) => *span,
-        _ => None,
-    });
     let segment_text = visible_text_from_nodes(nodes);
+    let segment_source_span = segment_source_span_for_nodes(nodes, &segment_text, document);
     let semantic = classify_segment(nodes, &segment_text, document, *previous_block);
 
     match semantic {
@@ -2012,6 +2032,7 @@ fn append_nodes_segment_to_vlist(
                 params,
                 layout.title_line_height_pt,
                 layout.title_font_size_pt,
+                Some(segment_source_span),
             );
             if let Some(author) = author {
                 append_styled_nodes_to_vlist(
@@ -2022,6 +2043,7 @@ fn append_nodes_segment_to_vlist(
                     params,
                     layout.author_line_height_pt,
                     layout.author_font_size_pt,
+                    Some(segment_source_span),
                 );
             }
             if let Some(date) = date {
@@ -2033,6 +2055,7 @@ fn append_nodes_segment_to_vlist(
                     params,
                     layout.author_line_height_pt,
                     layout.date_font_size_pt,
+                    Some(segment_source_span),
                 );
             }
             if layout.title_after_pt > 0 {
@@ -2108,6 +2131,7 @@ fn append_nodes_segment_to_vlist(
                 params,
                 line_height_pt,
                 font_size_pt,
+                Some(segment_source_span),
             );
             *previous_block = Some(SegmentBlockKind::Heading);
             return;
@@ -2121,6 +2145,7 @@ fn append_nodes_segment_to_vlist(
                 params,
                 layout.list_item_baselineskip_pt,
                 layout.body_font_size_pt,
+                Some(segment_source_span),
             );
             *previous_block = Some(SegmentBlockKind::ListItem);
             return;
@@ -2134,6 +2159,7 @@ fn append_nodes_segment_to_vlist(
                 params,
                 layout.list_item_baselineskip_pt,
                 layout.body_font_size_pt,
+                Some(segment_source_span),
             );
             *previous_block = Some(SegmentBlockKind::DescriptionItem);
             return;
@@ -2149,6 +2175,7 @@ fn append_nodes_segment_to_vlist(
         params,
         layout.baselineskip_pt,
         layout.body_font_size_pt,
+        Some(segment_source_span),
     );
     *previous_block = Some(SegmentBlockKind::Paragraph);
 }
@@ -2161,11 +2188,9 @@ fn append_styled_nodes_to_vlist(
     params: &BreakParams,
     line_height_pt: i64,
     font_size_pt: i64,
+    source_span_override: Option<Option<SourceSpan>>,
 ) {
-    let source_span = nodes.iter().find_map(|node| match node {
-        DocumentNode::Text(_, span) => *span,
-        _ => None,
-    });
+    let source_span = source_span_override.unwrap_or_else(|| direct_source_span_from_nodes(nodes));
     let hlist = document_nodes_to_hlist_with_config(
         nodes,
         provider,
@@ -2290,7 +2315,7 @@ fn display_math_line_height_for_segment(
     }
 
     match nodes.first()? {
-        DocumentNode::DisplayMath(_) => Some(layout.display_math_line_height_pt),
+        DocumentNode::DisplayMath(_, _) => Some(layout.display_math_line_height_pt),
         DocumentNode::EquationEnv { lines, aligned, .. } => {
             if *aligned || lines.len() > 1 {
                 Some(layout.align_line_height_pt)
@@ -2339,7 +2364,7 @@ fn push_visible_text_from_node(text: &mut String, node: &DocumentNode) {
             }
         }
         DocumentNode::InlineMath(_)
-        | DocumentNode::DisplayMath(_)
+        | DocumentNode::DisplayMath(_, _)
         | DocumentNode::EquationEnv { .. }
         | DocumentNode::IndexMarker(_)
         | DocumentNode::ParBreak
@@ -2350,6 +2375,68 @@ fn push_visible_text_from_node(text: &mut String, node: &DocumentNode) {
         | DocumentNode::TikzPicture { .. }
         | DocumentNode::Float { .. } => {}
     }
+}
+
+fn direct_source_span_from_nodes(nodes: &[DocumentNode]) -> Option<SourceSpan> {
+    nodes.iter().find_map(node_source_span)
+}
+
+fn node_source_span(node: &DocumentNode) -> Option<SourceSpan> {
+    match node {
+        DocumentNode::Text(_, span) => *span,
+        DocumentNode::DisplayMath(_, span) => *span,
+        DocumentNode::EquationEnv { source_span, .. } => *source_span,
+        DocumentNode::FontFamily { children, .. }
+        | DocumentNode::Link { children, .. }
+        | DocumentNode::HBox(children)
+        | DocumentNode::VBox(children) => direct_source_span_from_nodes(children),
+        DocumentNode::InlineMath(_)
+        | DocumentNode::IndexMarker(_)
+        | DocumentNode::ParBreak
+        | DocumentNode::PageBreak
+        | DocumentNode::ClearPage
+        | DocumentNode::ClearDoublePage
+        | DocumentNode::IncludeGraphics { .. }
+        | DocumentNode::TikzPicture { .. }
+        | DocumentNode::Float { .. } => None,
+    }
+}
+
+fn segment_source_span_for_nodes(
+    nodes: &[DocumentNode],
+    segment_text: &str,
+    document: &ParsedDocument,
+) -> Option<SourceSpan> {
+    direct_source_span_from_nodes(nodes).or_else(|| {
+        let normalized_text = normalize_segment_text(segment_text);
+        if normalized_text.is_empty() {
+            return None;
+        }
+
+        document
+            .section_entries
+            .iter()
+            .find_map(|entry| {
+                (normalize_segment_text(&entry.display_title()) == normalized_text)
+                    .then_some(entry.span)
+                    .flatten()
+            })
+            .or_else(|| {
+                document
+                    .figure_entries
+                    .iter()
+                    .chain(document.table_entries.iter())
+                    .find_map(|entry| {
+                        (normalize_segment_text(&entry.display_title()) == normalized_text)
+                            .then_some(entry.span)
+                            .flatten()
+                    })
+            })
+    })
+}
+
+fn normalize_segment_text(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 pub(crate) fn push_forced_break_if_needed(hlist: &mut Vec<HListItem>) {
@@ -3614,8 +3701,9 @@ mod tests {
         document_nodes_to_vlist_with_config, finalize_page_furniture, page_box_for_class,
         paginate_vlist, points, renumber_merged_page_numbers, resolve_page_labels,
         strip_test_script_markers, vlist_item_height, wrap_body, wrap_hlist, CharWidthProvider,
-        DocumentLayoutFragment, FloatContent, FloatItem, FloatQueue, FloatRegion, GlueComponent,
-        GlueOrder, HBox, HListItem, MinimalTypesetter, PageBox, PaginationMergeCoordinator,
+        DocumentLayoutFragment, FloatContent, FloatItem, FloatQueue, FloatRegion, FootnoteEntry,
+        GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PageBox,
+        PaginationMergeCoordinator,
         PlacementSpec, TeXBox, TextLine, TfmWidthProvider, TypesetNamedDestination, TypesetOutline,
         TypesetPage, TypesetterReusePlan, VBox, VListItem, DEFAULT_BODY_FONT_SIZE_PT,
         LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT,
@@ -3867,6 +3955,7 @@ mod tests {
             level: 1,
             number: "1".to_string(),
             title: "Intro".to_string(),
+            span: None,
         });
         parsed.bibliography_state = BibliographyState::from_snapshot(parse_bbl(
             "\\begin{thebibliography}{99}\\bibitem{knuth} Donald Knuth\\end{thebibliography}",
@@ -4048,6 +4137,7 @@ mod tests {
             specifier: Some("h".to_string()),
             content: vec![DocumentNode::Text("Body".to_string(), None)],
             caption: Some("A caption".to_string()),
+            caption_span: None,
             label: Some("fig:test".to_string()),
         }];
 
@@ -4107,6 +4197,141 @@ mod tests {
         assert_eq!(typeset.pages.len(), 1);
         assert_eq!(typeset.pages[0].lines.len(), 1);
         assert_eq!(typeset.pages[0].lines[0].source_span, Some(span));
+    }
+
+    #[test]
+    fn typeset_with_body_nodes_uses_section_entry_span_for_heading() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 10,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 15,
+            },
+        };
+        let mut document = parsed_document("1 Intro");
+        document.section_entries.push(SectionEntry {
+            level: 1,
+            number: "1".to_string(),
+            title: "Intro".to_string(),
+            span: Some(span),
+        });
+
+        let typeset = MinimalTypesetter.typeset_with_body_nodes(
+            &document,
+            vec![DocumentNode::Text("1 Intro".to_string(), None)],
+            &default_fixed_width_provider(),
+            None,
+        );
+
+        assert_eq!(typeset.pages[0].lines[0].source_span, Some(span));
+    }
+
+    #[test]
+    fn typeset_with_body_nodes_uses_section_entry_span_for_toc_line() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 7,
+                column: 10,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 7,
+                column: 15,
+            },
+        };
+        let mut document = parsed_document("1  Intro");
+        document.section_entries.push(SectionEntry {
+            level: 1,
+            number: "1".to_string(),
+            title: "Intro".to_string(),
+            span: Some(span),
+        });
+
+        let typeset = MinimalTypesetter.typeset_with_body_nodes(
+            &document,
+            vec![DocumentNode::Link {
+                url: "#section:1 Intro".to_string(),
+                children: vec![DocumentNode::Text("1  Intro".to_string(), None)],
+            }],
+            &default_fixed_width_provider(),
+            None,
+        );
+
+        assert_eq!(typeset.pages[0].lines[0].source_span, Some(span));
+    }
+
+    #[test]
+    fn typeset_with_body_nodes_propagates_display_math_source_span() {
+        let document = parsed_document("a_1");
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 4,
+                column: 3,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 4,
+                column: 6,
+            },
+        };
+
+        let typeset = MinimalTypesetter.typeset_with_body_nodes(
+            &document,
+            vec![DocumentNode::DisplayMath(
+                vec![
+                    MathNode::Ordinary('a'),
+                    MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
+                ],
+                Some(span),
+            )],
+            &default_fixed_width_provider(),
+            None,
+        );
+
+        assert_eq!(typeset.pages[0].lines[0].source_span, Some(span));
+    }
+
+    #[test]
+    fn typeset_with_body_nodes_propagates_float_caption_source_span() {
+        let document = parsed_document("Figure 1: Caption");
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 6,
+                column: 10,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 6,
+                column: 17,
+            },
+        };
+
+        let typeset = MinimalTypesetter.typeset_with_body_nodes(
+            &document,
+            vec![DocumentNode::Float {
+                float_type: FloatType::Figure,
+                specifier: Some("h".to_string()),
+                content: vec![DocumentNode::Text("Body".to_string(), None)],
+                caption: Some("Caption".to_string()),
+                caption_span: Some(span),
+                label: None,
+            }],
+            &default_fixed_width_provider(),
+            None,
+        );
+
+        assert_eq!(
+            typeset.pages[0].float_placements[0].content.lines[1].source_span,
+            Some(span)
+        );
     }
 
     #[test]
@@ -4838,7 +5063,7 @@ mod tests {
                 DocumentNode::DisplayMath(vec![
                     MathNode::Ordinary('a'),
                     MathNode::Subscript(Box::new(MathNode::Ordinary('1'))),
-                ]),
+                ], None),
                 DocumentNode::Text("After".to_string(), None),
             ],
             &default_fixed_width_provider(),
@@ -4859,7 +5084,7 @@ mod tests {
                     MathNode::Ordinary('x'),
                     MathNode::Ordinary('+'),
                     MathNode::Ordinary('y'),
-                ]),
+                ], None),
                 DocumentNode::Text("After".to_string(), None),
             ],
             &default_fixed_width_provider(),
@@ -4915,6 +5140,7 @@ mod tests {
                     ],
                     numbered: true,
                     aligned: true,
+                    source_span: None,
                 },
                 DocumentNode::Text("After".to_string(), None),
             ],
@@ -4947,6 +5173,7 @@ mod tests {
                 }],
                 numbered: true,
                 aligned: false,
+                source_span: None,
             }],
             &default_fixed_width_provider(),
         );
@@ -5045,7 +5272,16 @@ mod tests {
 
         append_footnotes_to_pages(
             &mut pages,
-            &["First footnote".to_string(), "Second footnote".to_string()],
+            &[
+                FootnoteEntry {
+                    text: "First footnote".to_string(),
+                    source_span: None,
+                },
+                FootnoteEntry {
+                    text: "Second footnote".to_string(),
+                    source_span: None,
+                },
+            ],
             class_layout_for("article"),
         );
 
