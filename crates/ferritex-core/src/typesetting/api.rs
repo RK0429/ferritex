@@ -668,6 +668,7 @@ fn renumber_merged_page_numbers(pages: &mut [TypesetPage]) {
             links: Vec::new(),
             font_index: style.font_index,
             font_size: style.font_size,
+            // This merged page number is generated during pagination, so it has no source origin.
             source_span: None,
         });
     }
@@ -1245,6 +1246,7 @@ fn append_footnotes_to_pages(
             links: Vec::new(),
             font_index: 0,
             font_size: points(layout.footnote_font_size_pt),
+            // Footnote marker numbers are synthetic numbering, not copied from source text.
             source_span: None,
         });
         page.lines.push(TextLine {
@@ -1946,6 +1948,8 @@ fn document_nodes_to_vlist_with_state(
                     };
                     let caption_line = format!("{prefix} {number}: {caption}");
                     let caption_nodes = [DocumentNode::Text(caption_line, *caption_span)];
+                    // Float captions already carry the parsed caption span on `caption_nodes`,
+                    // so the default direct span extraction is the desired behavior here.
                     append_styled_nodes_to_vlist(
                         &mut float_vlist,
                         &caption_nodes,
@@ -2005,6 +2009,7 @@ fn append_nodes_segment_to_vlist(
                 height: points(layout.display_math_before_pt),
             });
         }
+        let source_span = direct_source_span_from_nodes(nodes);
         append_styled_nodes_to_vlist(
             vlist,
             nodes,
@@ -2013,7 +2018,7 @@ fn append_nodes_segment_to_vlist(
             params,
             line_height_pt,
             layout.body_font_size_pt,
-            None,
+            Some(source_span),
         );
         *previous_block = Some(SegmentBlockKind::Paragraph);
         return;
@@ -2419,6 +2424,10 @@ fn segment_source_span_for_nodes(
     document: &ParsedDocument,
 ) -> Option<SourceSpan> {
     direct_source_span_from_nodes(nodes).or_else(|| {
+        // Generated ToC/LoF/LoT entry lines do not carry spans on their synthetic nodes, so
+        // recover the original section/caption span by matching the rendered entry text back
+        // to parser metadata when possible. Synthetic headings like "Contents" still remain
+        // `None` because they have no direct source origin.
         let normalized_text = normalize_segment_text(segment_text);
         if normalized_text.is_empty() {
             return None;
@@ -3385,6 +3394,7 @@ fn finalize_page_furniture(
             links: Vec::new(),
             font_index: 0,
             font_size: points(layout.page_number_font_size_pt),
+            // Page furniture is synthesized during final page assembly, so it has no source origin.
             source_span: None,
         });
     }
@@ -3734,8 +3744,9 @@ mod tests {
     use crate::kernel::api::StableId;
     use crate::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use crate::parser::api::{
-        DocumentNode, FloatType, IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine,
-        MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser, SectionEntry,
+        CaptionEntry, DocumentNode, FloatType, IncludeGraphicsOptions, IndexRawEntry, LineTag,
+        MathLine, MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser,
+        SectionEntry,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -4270,6 +4281,70 @@ mod tests {
                 url: "#section:1 Intro".to_string(),
                 children: vec![DocumentNode::Text("1  Intro".to_string(), None)],
             }],
+            &default_fixed_width_provider(),
+            None,
+        );
+
+        assert_eq!(typeset.pages[0].lines[0].source_span, Some(span));
+    }
+
+    #[test]
+    fn typeset_with_body_nodes_uses_figure_entry_span_for_lof_line() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 9,
+                column: 5,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 9,
+                column: 12,
+            },
+        };
+        let mut document = parsed_document("Figure 1: Overview");
+        document.figure_entries.push(CaptionEntry {
+            kind: FloatType::Figure,
+            number: "1".to_string(),
+            caption: "Overview".to_string(),
+            span: Some(span),
+        });
+
+        let typeset = MinimalTypesetter.typeset_with_body_nodes(
+            &document,
+            vec![DocumentNode::Text("Figure 1: Overview".to_string(), None)],
+            &default_fixed_width_provider(),
+            None,
+        );
+
+        assert_eq!(typeset.pages[0].lines[0].source_span, Some(span));
+    }
+
+    #[test]
+    fn typeset_with_body_nodes_uses_table_entry_span_for_lot_line() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 11,
+                column: 8,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 11,
+                column: 14,
+            },
+        };
+        let mut document = parsed_document("Table 2: Metrics");
+        document.table_entries.push(CaptionEntry {
+            kind: FloatType::Table,
+            number: "2".to_string(),
+            caption: "Metrics".to_string(),
+            span: Some(span),
+        });
+
+        let typeset = MinimalTypesetter.typeset_with_body_nodes(
+            &document,
+            vec![DocumentNode::Text("Table 2: Metrics".to_string(), None)],
             &default_fixed_width_provider(),
             None,
         );
