@@ -5,8 +5,8 @@
 
 | 項目    | 内容              |
 | ----- | --------------- |
-| バージョン | 0.1.41          |
-| 最終更新日 | 2026-03-18      |
+| バージョン | 0.1.43          |
+| 最終更新日 | 2026-04-04      |
 | ステータス | ドラフト            |
 | 作成者   | Claude Opus 4.6 |
 | レビュー者 | —               |
@@ -733,7 +733,7 @@
 - **優先度**: Should
 - **出典**: ユーザー明示
 - **関連要件**: REQ-FUNC-031
-- **実装メモ（2026-04-04）**: 出力等価性（`--jobs=1` == `--jobs=4`、メタデータ差分除外）は partition-book / partition-article 全ケースで確認済み。per-case parallel overhead は 10% 以内（speedup >= 0.90）、per-subset mean speedup >= 0.95。ただし、受け入れ基準の strict speedup 条件（`--jobs=4` 中央値 < `--jobs=1` 中央値）は sub-1s compile の現行コーパスでは未達。理由: partition document construction / thread synchronization / fragment merge の overhead が typesetting savings と拮抗するため。multi-second compile（章あたり数千行規模）では measurable speedup が期待されるが、該当規模のコーパスケースが未整備。適用済み最適化: balanced coalescing / worker-thread document construction / fragment move semantics / inline group execution / merge_owned。計測条件: 600 iterations per chapter/section
+- **実装メモ（2026-04-04）**: `heavy_chapters_independent.tex` / `heavy_sections_independent.tex` を `FTX-PARTITION-BENCH-001` の multi-second evidence 用 fixture として追加し、既存 independent corpus の `\@for` リストを 2x に増やした additive corpus として運用している。canonical cache-enabled protocol を同一入力の warm compile で確認したところ、book 0.92s / 0.92s、article 0.77s / 0.77s（jobs=1 / jobs=4）で依然 sub-1s かつ overhead domination が残ったため、`partition_bench_multisecond_speedup_evidence` は supplementary no-cache evidence として 1 warmup + 5 measured runs、`--no-cache` + `--reproducible`、`--jobs=1` vs `--jobs=4` を比較する。no-cache 計測結果は book 35.399s → 14.352s（2.467x）、article 27.859s → 10.124s（2.752x）であり、multi-second full compile における speedup 自体は確認できた。一方で同条件では jobs=1/jobs=4 の PDF hash が一致せず、strict acceptance 条件の blocker は speedup 不足ではなく full-compile determinism である。cache-enabled の既存 evidence（`partition_bench_output_identity_across_jobs_1_and_jobs_4`、`partition_bench_docs_protocol_median_and_timing_proof`）は引き続き pass。適用済み最適化: balanced coalescing / worker-thread document construction / fragment move semantics / inline group execution / merge_owned
 
 #### REQ-FUNC-033: フォント処理並列化
 
@@ -1151,6 +1151,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.43 | 2026-04-04 | `REQ-FUNC-032` に multi-second no-cache evidence を追記し、heavy partition fixture / speedup 実測値 / full-compile determinism blocker を記録 | Codex |
 | 0.1.42 | 2026-04-04 | `REQ-FUNC-032` に実装メモを追加。出力等価性確認済み・bounded no-regression evidence 確立済み・strict speedup 条件の sub-1s 構造的限界と適用済み最適化を記録 | Claude Opus 4.6 |
 | 0.1.41 | 2026-03-18 | `REQ-FUNC-046` の baseline 文書群成功条件を `--asset-bundle <展開先>` 明示指定へ統一し、`REQ-NF-009` / architecture の bootstrap 契約と整合させた | Codex |
 | 0.1.40 | 2026-03-18 | `REQ-NF-009` と `REQ-FUNC-046` に公式 Asset Bundle archive を `--asset-bundle <展開先>` で指定する初回導入フローを明記し、未確定事項から初回取得戦略を削除 | Codex |

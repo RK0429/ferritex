@@ -1,0 +1,96 @@
+\documentclass{book}
+\makeatletter
+\def\partbody{This partition paragraph exercises the typesetting pipeline with mixed content including mathematical expressions such as $\alpha_{n} + \beta_{n} = \gamma_{n}$ and the recurrence $a_{n+1} = a_n + n$ to establish meaningful compilation workload for parallel benchmarking. A second sentence revisits deterministic page construction, numbering, and paragraph breaking while mentioning the summation $\sum_{k=1}^{n} k = \frac{n(n+1)}{2}$ and the ratio $\frac{s_n}{n + 1} = n$. A third sentence keeps the content stable across job counts by repeating predictable prose about counters, references, and layout decisions so each partition contributes measurable compilation work. }
+\def\partworkload{%
+  \@for\pitem:=a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a\do{%
+    \partbody
+    \partbody
+    \[
+    \frac{s_n}{n + 1} = n
+    \]
+    \begin{equation}
+    s_n = n^2 + n
+    \end{equation}
+  }%
+  \@for\pitem:=a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a\do{%
+    \partbody
+    \partbody
+    \[
+    \frac{s_n}{n + 1} = n
+    \]
+    \begin{equation}
+    s_n = n^2 + n
+    \end{equation}
+  }%
+}
+\makeatother
+\begin{document}
+\chapter{Chapter One}
+Independent chapter one content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Two}
+Independent chapter two content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Three}
+Independent chapter three content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Four}
+Independent chapter four content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Five}
+Independent chapter five content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Six}
+Independent chapter six content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Seven}
+Independent chapter seven content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Eight}
+Independent chapter eight content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Nine}
+Independent chapter nine content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\newpage
+
+\chapter{Chapter Ten}
+Independent chapter ten content for partition testing.
+\makeatletter
+\partworkload
+\makeatother
+\end{document}

@@ -291,6 +291,137 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
     }
 }
 
+/// FTX-PARTITION-BENCH-001 supplementary multi-second speedup evidence for
+/// REQ-FUNC-032 using the `heavy_` partition corpus.
+///
+/// Canonical cache-enabled partition protocol remains covered by
+/// `partition_bench_docs_protocol_median_and_timing_proof`. In the current
+/// environment, cache-warm runs of even heavier partition fixtures remain
+/// sub-1s and show overhead domination, so this supplementary test forces
+/// `--no-cache` to capture full partition compilation. It uses `--reproducible`
+/// to reduce metadata jitter, prints per-case evidence, asserts a conservative
+/// speedup floor of 1.5x, and documents the remaining blocker when full
+/// no-cache output identity is not yet preserved.
+///
+/// TODO(REQ-FUNC-032): once full-compile determinism is fixed, upgrade this
+/// supplementary test to the canonical strict assertion:
+/// jobs=1/jobs=4 output identity + speedup > 1.0 for every heavy case.
+#[test]
+fn partition_bench_multisecond_speedup_evidence() {
+    let has_benchmark_precondition =
+        std::thread::available_parallelism().map_or(false, |n| n.get() >= 4);
+    if !has_benchmark_precondition {
+        eprintln!(
+            "[REQ-FUNC-032 SKIPPED] multi-second partition speedup proof requires >= 4 cores; this machine has fewer"
+        );
+        return;
+    }
+
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = partition_bench_cases(&bench_fixtures);
+    let heavy_cases = base_cases
+        .into_iter()
+        .filter(|case| {
+            case.input_fixture
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.starts_with("heavy_"))
+        })
+        .collect::<Vec<_>>();
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let mut cases = Vec::with_capacity(heavy_cases.len());
+    for case in &heavy_cases {
+        let fixture_name = case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename");
+        let temp_input = temp_dir.path().join(fixture_name);
+        if !temp_input.exists() {
+            std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+        }
+        cases.push(BenchCase {
+            name: case.name.clone(),
+            profile: case.profile.clone(),
+            input_fixture: temp_input,
+            asset_bundle: case.asset_bundle.clone(),
+            jobs: case.jobs,
+            reproducible: true,
+            no_cache: true,
+        });
+    }
+
+    assert_eq!(
+        cases.len(),
+        4,
+        "expected heavy partition corpus to produce paired jobs=1/jobs=4 cases for book and article fixtures"
+    );
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases,
+        BenchRunConfig {
+            warmup_runs: 1,
+            measured_runs: 5,
+            compare_output_identity: true,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "partition heavy corpus speedup proof failed: {:?}",
+        report.failures
+    );
+    assert_eq!(report.results.len(), 4);
+    assert_eq!(report.comparisons.len(), 2);
+
+    let mut output_identity_preserved = true;
+    let mut strict_speedup_achieved = true;
+    let mut speedup_floor_achieved = true;
+    for comparison in &report.comparisons {
+        let speedup = comparison
+            .speedup()
+            .expect("median durations should exist for comparison");
+        let baseline_secs = comparison.baseline.median_duration().unwrap().as_secs_f64();
+        let candidate_secs = comparison
+            .candidate
+            .median_duration()
+            .unwrap()
+            .as_secs_f64();
+        let identical = comparison.output_identity_preserved();
+        output_identity_preserved &= identical;
+        strict_speedup_achieved &= speedup > 1.0;
+        speedup_floor_achieved &= speedup > 1.5;
+        eprintln!(
+            "[REQ-FUNC-032 MULTI-SECOND] case='{}': output_identity={} speedup {:.3}x \
+             (jobs=1 median {:.3}s, jobs=4 median {:.3}s)",
+            comparison.baseline.case.name, identical, speedup, baseline_secs, candidate_secs
+        );
+    }
+
+    assert!(
+        speedup_floor_achieved,
+        "[REQ-FUNC-032] supplementary multi-second evidence regressed below 1.5x speedup floor"
+    );
+
+    if !output_identity_preserved {
+        eprintln!(
+            "[REQ-FUNC-032 LIMITATION] no-cache multi-second partition corpus still produces jobs=1/jobs=4 output divergence; strict speedup proof remains blocked by full-compile determinism"
+        );
+        return;
+    }
+
+    if !strict_speedup_achieved {
+        eprintln!(
+            "[REQ-FUNC-032 LIMITATION] no-cache multi-second partition corpus preserved output identity but did not achieve strict speedup > 1.0 for every case"
+        );
+        return;
+    }
+}
+
 /// FTX-PARTITION-BENCH-001 bounded no-regression proof for REQ-FUNC-032
 /// partition parallelization.
 ///

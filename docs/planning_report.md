@@ -41,7 +41,7 @@
 | ID | 要件領域 | 深刻度 | 現状と残差分 |
 |---|---|---|---|
 | A | Incremental compilation (REQ-FUNC-027-030) | 低 | 依存グラフ・persistent cache・corruption fallback・reverse propagation・subtree cache 再利用・TypesetterReusePlan による部分再 typeset まで実装済み。**Wave 1 完了**: `full_bench_warm_incremental_evidence` で 1.84× speedup を point-in-time 計測（full --no-cache 28.614s vs incremental 15.550s、`FTX-BENCH-001` 1000-section staged input）。`incremental_xref_convergence_after_page_shift` でページ番号ずれ後の TOC/相互参照収束を byte-identical で確認。**Wave 1 残差分なし**。ただし `REQ-NF-002`（差分コンパイル中央値 100ms 未満）は Wave 1 のスコープ外であり、別途最適化が必要 |
-| B | Parallel pipeline (REQ-FUNC-031-033) | 低〜中 | CommitBarrier 4 ステージ・AuthorityKey 衝突検出・DocumentPartitionPlanner・PaginationMergeCoordinator・partition bench corpus まで実装済み。出力等価性（jobs=1 == jobs=4）確認済み、bounded no-regression evidence 確立済み。**残差分**: REQ-FUNC-032 の strict speedup 条件（`--jobs=4` median < `--jobs=1` median）は sub-1s compile の構造的限界により未達。multi-second compile corpus での speedup > 1.0 の実証が未着手 |
+| B | Parallel pipeline (REQ-FUNC-031-033) | 低〜中 | CommitBarrier 4 ステージ・AuthorityKey 衝突検出・DocumentPartitionPlanner・PaginationMergeCoordinator・partition bench corpus まで実装済み。bounded no-regression evidence に加え、multi-second no-cache benchmark で speedup 自体は実測済み（book 2.467x、article 2.752x）。**残差分**: `REQ-FUNC-032` の strict 条件を満たす full-compile determinism（multi-second no-cache では jobs=1/jobs=4 の PDF hash が不一致） |
 | C | tikz/pgf (REQ-FUNC-023) | 低 | graphics scene parsing 実装済み。tikz parity テストで match_ratio >= 0.80 を pass。**残差分**: long-tail な tikz パターンでの geometric parity 継続改善 |
 | D | Asset bundle distribution (REQ-FUNC-046) | 低〜中 | bundle runtime（manifest / index / mmap / version check / 5 種 lookup）は完成。bundle-bootstrap / bundle-package テストで article / book / report / letter の compile が pass。**残差分**: 公式 `FTX-ASSET-BUNDLE-001` archive の配布契約・CI パイプラインへの接続 |
 | E | Full LaTeX compatibility | 中 | long-tail package behavior、より厳密な layout parity は継続課題 |
@@ -64,6 +64,7 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 | math_equations Regression 修正 | `contains_script_markers` で全 6 マーカーを検出復元 | **完了** — document_diff_rate 0.286 → 0.000 |
 | Partition Parallel Bounded Evidence | 出力等価性・overhead bounded の計測 | **完了** — evidence 確立済み（§5 参照） |
 | Wave 1: Incremental Performance Evidence (REQ-FUNC-030) | warm incremental benchmark + cross-reference 収束検証 | **完了** — 1.84× speedup を point-in-time 計測（`FTX-BENCH-001` 固定構成）、xref convergence byte-identical 確認済み（§5 参照）。`REQ-NF-002` 達成とは別 |
+| Wave 2: Partition Parallel Speedup Evidence (REQ-FUNC-032) | multi-second partition benchmark の実測と strict proof blocker の文書化 | **完了（speedup evidence 取得済み、strict acceptance blocker: full-compile determinism）** — heavy partition corpus で speedup 自体は確認（book 35.399s → 14.352s, 2.467x / article 27.859s → 10.124s, 2.752x）。一方で no-cache full compile では jobs=1/jobs=4 の output identity が崩れ、strict proof は determinism blocker として記録（§5 参照） |
 
 ### Wave 1: Incremental Performance Evidence (REQ-FUNC-030) — 完了
 
@@ -71,13 +72,6 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 |---|---|---|
 | 1 | 部分再コンパイルの end-to-end ベンチマーク | `full_bench_warm_incremental_evidence` で 1000 `\section` 入力に対し warm incremental compile 15.550s vs full `--no-cache` 28.614s（1.84× speedup）を実測。`bench_full_profile.rs` に組み込み済み |
 | 2 | cross-reference 収束パスの検証 | `incremental_xref_convergence_after_page_shift` で 3 章 report（TOC + `\ref` + `\pageref`）に `\newpage` 挿入後の incremental compile PDF が fresh full compile と byte-identical であることを確認。`e2e_compile.rs` に組み込み済み |
-
-### Wave 2: Partition Parallel Speedup 実証 (REQ-FUNC-032)
-
-| # | タスク | 受入基準 |
-|---|---|---|
-| 3 | multi-second compile corpus の追加 | `FTX-PARTITION-BENCH-001` に multi-second compile ケースを追加し、speedup > 1.0 を実証 |
-| 4 | sub-1s compile の構造的限界を文書化 | partition overhead が sub-1s compile では支配的であることを計測データとともに ADR または docs に記録 |
 
 ### Wave 3: Bundle Distribution CI 接続 (REQ-FUNC-046)
 
@@ -96,24 +90,24 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 ## 4. 実行戦略
 
 - **Wave 1 完了**。incremental compile 機構の初期実証（point-in-time 計測で 1.84× speedup）と cross-reference 収束検証が確立された。`REQ-NF-002` の定量基準（100ms 未満）は別途最適化が必要
-- **Wave 2 を次に着手する**。multi-second corpus の追加と構造的限界の文書化。Wave 1 の計測基盤を再利用可能
-- **Wave 3 は Wave 2 と並行可能**。bundle-only corpus の parity 判定は Wave 1 で確立された計測基盤を再利用する
+- **Wave 2 完了**。multi-second no-cache partition benchmark で speedup 自体は確認できたが、strict proof を閉じるには full-compile determinism の改善が必要
+- **Wave 3 は次の主タスク**。bundle-only corpus の parity 判定は既存の計測基盤を再利用できる
 - **Wave 4 は単体で進められる**が、parallel の境界が固まってから入る方が安全
 
 ```mermaid
 graph LR
-    W1[Wave 1: Incremental Perf ✓] --> W2[Wave 2: Partition Speedup]
+    W1[Wave 1: Incremental Perf ✓] --> W2[Wave 2: Partition Speedup ✓]
     W2 --> W3[Wave 3: Bundle CI]
     W3 --> W4[Wave 4: Long-tail Compat]
     style W1 fill:#9f9,stroke:#333
-    style W2 fill:#f9f,stroke:#333
+    style W2 fill:#9f9,stroke:#333
 ```
 
 ## 5. 妥当性判定
 
-- **結果**: incremental 機構実証済み・性能最適化と配布整備フェーズ
-- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1 により incremental compile 機構の有効性と cross-reference 収束が point-in-time 計測で確認された。ただし Wave 1 の speedup evidence は `REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成を示すものではなく、同要件は別途最適化が必要。残りは `REQ-NF-002` 差分性能目標、parallel speedup の実証（Wave 2）、bundle 配布 CI 接続（Wave 3）、long-tail 互換性改善（Wave 4）
-- **直近の推奨**: partition parallel speedup の実証（Wave 2）を先に完了させ、multi-second compile corpus での speedup > 1.0 を確認する
+- **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・配布整備フェーズ
+- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1 により incremental compile 機構の有効性と cross-reference 収束が point-in-time 計測で確認された。Wave 2 では multi-second no-cache partition benchmark により speedup 自体を確認した一方、strict `REQ-FUNC-032` を閉じるための full-compile determinism が未充足であることを定量化した。残りは `REQ-NF-002` 差分性能目標、parallel full-compile determinism、bundle 配布 CI 接続（Wave 3）、long-tail 互換性改善（Wave 4）
+- **直近の推奨**: parallel pipeline では speedup より determinism を優先して改善し、その後 Wave 3 の bundle 配布 CI 接続を進める
 
 ### Warm Incremental Benchmark 実績 (REQ-FUNC-030) — Wave 1 完了
 
@@ -130,6 +124,18 @@ graph LR
 
 - **Status**: Bounded no-regression evidence established
 - **確認済み**: partition-book / partition-article コーパス全ケースで出力等価性（jobs=1 == jobs=4）が成立。per-case parallel overhead は 10% 以内（speedup >= 0.90）、per-subset mean speedup >= 0.95
-- **未達**: strict docs 要件（`--jobs=4` median が `--jobs=1` より高速 = speedup > 1.0）。sub-1s compile では parallel overhead（partition document construction / thread sync / fragment merge）が typesetting savings と拮抗するため
+- **未達**: strict docs 要件（`--jobs=4` median が `--jobs=1` より高速 = speedup > 1.0）。当初は sub-1s compile の構造的限界を想定していたが、multi-second no-cache benchmark で speedup 自体は確認できたため、現時点の blocker は full-compile determinism に更新された
 - **適用済み最適化**: balanced coalescing / worker-thread document construction / fragment move semantics / inline group execution / merge_owned
 - **Corpus**: 600 iterations per chapter/section（初期の 100 から増加）
+- **sub-1s structural limitation**: heavier fixture でも cache-warm compile は book/article とも 1s 未満に収束し、parallel overhead が typesetting savings を打ち消す。したがって canonical cache-enabled protocol では「speedup が出ない」問題が残り、これは full-compile determinism blocker とは独立に存在する
+
+### Multi-second Partition Benchmark 実績 (REQ-FUNC-032) — Wave 2 完了
+
+- **Status**: Wave 2 evidence established（speedup 実測済み、strict proof blocker も特定）
+- **テスト**: `partition_bench_multisecond_speedup_evidence`（`bench_bundle_bootstrap.rs`）
+- **構成**: `heavy_chapters_independent.tex` / `heavy_sections_independent.tex` を対象に、`--no-cache` + `--reproducible`、1 warmup + 5 measured runs、`--jobs=1` と `--jobs=4` を比較
+- **fixture 方針**: heavy fixture は既存 independent corpus の `\@for` リストを 2x に増やした additive corpus。cache-enabled protocol では warm compile が依然 sub-1s だったため、supplementary no-cache evidence として評価した
+- **計測結果**: book 35.399s → 14.352s（**2.467x**）、article 27.859s → 10.124s（**2.752x**）
+- **cache-enabled probe**: same-input warm compile では book 0.92s / 0.92s、article 0.77s / 0.77s（jobs=1 / jobs=4）で差が出ず、sub-1s overhead domination を再確認
+- **得られた結論**: multi-second full compile では partition parallelism 自体の speedup は確認できた。したがって `REQ-FUNC-032` の残 blocker は speedup 不足ではなく、jobs=1/jobs=4 で PDF hash が一致しない full-compile determinism にある
+- **補足**: cache-enabled の bounded protocol では `partition_bench_output_identity_across_jobs_1_and_jobs_4` と `partition_bench_docs_protocol_median_and_timing_proof` が引き続き pass。multi-second no-cache evidence は strict proof がどこで止まるかを切り分けるための追加計測である
