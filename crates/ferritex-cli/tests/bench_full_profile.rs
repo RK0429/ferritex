@@ -56,6 +56,7 @@ fn stage_full_bench_cases() -> (tempfile::TempDir, Vec<BenchCase>) {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -155,6 +156,7 @@ fn stage_cases_in_dir(
                 .or_else(|| case.asset_bundle.clone()),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -446,6 +448,182 @@ fn full_bench_docs_protocol_median_and_timing_proof() {
             par_median.as_secs_f64()
         );
     }
+}
+
+#[test]
+fn full_bench_warm_incremental_evidence() {
+    let (_temp_dir, cases) = stage_full_bench_cases();
+    let staged_case = cases
+        .into_iter()
+        .find(|case| case.jobs == 1)
+        .expect("jobs=1 case should exist");
+
+    let staged_source =
+        std::fs::read_to_string(&staged_case.input_fixture).unwrap_or_else(|error| {
+            panic!(
+                "read staged full bench fixture {}: {error}",
+                staged_case.input_fixture.display()
+            )
+        });
+    let loop_marker = "\\@for\\benchitem:=001,002,003,004,005";
+    let (prefix, _) = staged_source
+        .split_once(loop_marker)
+        .expect("FTX-BENCH-001 loop marker should exist");
+
+    let cycle_dir = staged_case.input_fixture.with_file_name("ftx_bench_cycles");
+    std::fs::create_dir_all(&cycle_dir).unwrap_or_else(|error| {
+        panic!(
+            "create staged cycle directory {}: {error}",
+            cycle_dir.display()
+        )
+    });
+
+    let cycle_body = |cycle: usize| {
+        format!(
+            "\\section{{Benchmark Cycle}}\n\
+Cycle {cycle} revisits Section \\ref{{sec:overview}}, Equation \\ref{{eq:foundation}}, Figure \\ref{{fig:reference-pixel}}, and the external record at \\url{{https://example.com/ftx-bench-001}}. The inline recurrence $x_n = x_{{n-1}} + n$ summarizes the local state transition for this cycle.\n\
+\\begin{{equation}}\n\
+s_n = n^2 + n\n\
+\\end{{equation}}\n\
+\\[\n\
+\\frac{{s_n}}{{n + 1}} = n\n\
+\\]\n\
+\\begin{{align}}\n\
+a_n &= s_n + 1 \\\\\n\
+b_n &= a_n + n\n\
+\\end{{align}}\n\
+\\begin{{figure}}[h]\n\
+\\includegraphics[width=80pt]{{pixel.png}}\n\
+\\caption{{Observation tile recorded during a benchmark cycle}}\n\
+\\end{{figure}}\n\
+\\benchmarkparagraph\n\
+\\benchmarkparagraph\n\
+\\benchmarkparagraph\n\
+\\benchmarkparagraph\n\
+\\clearpage\n"
+        )
+    };
+
+    let mut cycle_inputs = String::new();
+    for cycle in 1..=1000 {
+        let cycle_path = cycle_dir.join(format!("ftx_bench_cycle_{cycle:04}.tex"));
+        std::fs::write(&cycle_path, cycle_body(cycle)).unwrap_or_else(|error| {
+            panic!(
+                "write staged cycle fixture {}: {error}",
+                cycle_path.display()
+            )
+        });
+        cycle_inputs.push_str(&format!(
+            "\\input{{ftx_bench_cycles/ftx_bench_cycle_{cycle:04}}}\n"
+        ));
+    }
+    std::fs::write(
+        &staged_case.input_fixture,
+        format!("{prefix}{cycle_inputs}\\end{{document}}\n"),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "write staged full bench fixture {}: {error}",
+            staged_case.input_fixture.display()
+        )
+    });
+
+    let run_case = |case: &BenchCase| -> std::time::Duration {
+        let harness = BenchHarness::new(
+            vec![case.clone()],
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(CliCompileBackend::new(ferritex_bin()));
+        let report = harness.run();
+
+        assert!(
+            report.failures.is_empty(),
+            "{} compilation failed: {:?}",
+            case.name,
+            report.failures
+        );
+        assert_eq!(
+            report.results.len(),
+            1,
+            "{} should produce one result",
+            case.name
+        );
+
+        report.results[0]
+            .median_duration()
+            .expect("single-run benchmark should have a median duration")
+    };
+
+    let full_case = BenchCase {
+        name: format!("{}-no-cache-baseline", staged_case.name),
+        no_cache: true,
+        ..staged_case.clone()
+    };
+    let full_compile_duration = run_case(&full_case);
+
+    let warm_case = BenchCase {
+        name: format!("{}-warm-cache", staged_case.name),
+        no_cache: false,
+        ..staged_case.clone()
+    };
+    let warm_cache_duration = run_case(&warm_case);
+
+    let edited_cycle = 900usize;
+    let edited_cycle_path = cycle_dir.join(format!("ftx_bench_cycle_{edited_cycle:04}.tex"));
+    let source = std::fs::read_to_string(&edited_cycle_path).unwrap_or_else(|error| {
+        panic!(
+            "read staged cycle fixture {}: {error}",
+            edited_cycle_path.display()
+        )
+    });
+    let target = format!("Cycle {edited_cycle} revisits");
+    let replacement = format!("Cycle {edited_cycle} revisits [warm incremental edit]");
+    let updated = source.replacen(&target, &replacement, 1);
+    assert_ne!(
+        updated,
+        source,
+        "expected to mutate one benchmark paragraph in {}",
+        edited_cycle_path.display()
+    );
+    std::fs::write(&edited_cycle_path, updated).unwrap_or_else(|error| {
+        panic!(
+            "write staged cycle fixture {}: {error}",
+            edited_cycle_path.display()
+        )
+    });
+
+    let incremental_case = BenchCase {
+        name: format!("{}-incremental", staged_case.name),
+        no_cache: false,
+        ..staged_case
+    };
+    let incremental_duration = run_case(&incremental_case);
+
+    let speedup = full_compile_duration.as_secs_f64() / incremental_duration.as_secs_f64();
+    eprintln!(
+        "[REQ-FUNC-030 TIMING] full-no-cache {:.3}s, warm-cache {:.3}s, incremental-after-1-paragraph-edit {:.3}s, speedup {:.2}x",
+        full_compile_duration.as_secs_f64(),
+        warm_cache_duration.as_secs_f64(),
+        incremental_duration.as_secs_f64(),
+        speedup
+    );
+    assert!(
+        incremental_duration < full_compile_duration,
+        "[REQ-FUNC-030] warm incremental compile should beat full compile after a 1-paragraph edit: incremental {:.3}s vs full {:.3}s (warm-cache {:.3}s)",
+        incremental_duration.as_secs_f64(),
+        full_compile_duration.as_secs_f64(),
+        warm_cache_duration.as_secs_f64()
+    );
+    eprintln!(
+        "[REQ-FUNC-030 PROVEN] incremental compile {:.3}s < full compile {:.3}s after a 1-paragraph edit ({:.2}x faster)",
+        incremental_duration.as_secs_f64(),
+        full_compile_duration.as_secs_f64(),
+        speedup
+    );
 }
 
 #[test]

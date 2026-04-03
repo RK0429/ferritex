@@ -79,6 +79,7 @@ fn bundle_bootstrap_compiles_layout_core_classes_with_real_backend() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -158,6 +159,7 @@ fn bundle_package_loading_compiles_and_verifies_content() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -244,6 +246,7 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -329,6 +332,7 @@ fn partition_bench_docs_protocol_median_and_timing_proof() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -481,6 +485,7 @@ fn corpus_navigation_compiles_and_verifies_content() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -588,6 +593,7 @@ fn corpus_embedded_assets_compiles_and_verifies_content() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -670,6 +676,7 @@ fn corpus_bibliography_compiles_and_verifies_content() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -754,6 +761,7 @@ fn bundle_only_reproducible_corpus_proof() {
             asset_bundle: case.asset_bundle.clone(),
             jobs: case.jobs,
             reproducible: case.reproducible,
+            no_cache: case.no_cache,
         });
     }
 
@@ -896,6 +904,7 @@ fn bundle_package_resolution_prefers_project_local_over_bundle() {
         asset_bundle: Some(bench_fixtures.join("bundle")),
         jobs: 1,
         reproducible: false,
+        no_cache: false,
     };
 
     let backend = CliCompileBackend::new(ferritex_bin());

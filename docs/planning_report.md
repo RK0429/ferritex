@@ -40,7 +40,7 @@
 
 | ID | 要件領域 | 深刻度 | 現状と残差分 |
 |---|---|---|---|
-| A | Incremental compilation (REQ-FUNC-027-030) | 中 | 依存グラフ・persistent cache・corruption fallback・reverse propagation・subtree cache 再利用・TypesetterReusePlan による部分再 typeset まで実装済み。**残差分**: 大規模文書での部分再コンパイルの性能適合度（`FTX-BENCH-001` 接続）と、ページ番号ずれを伴う変更での cross-reference 収束パスの end-to-end 検証 |
+| A | Incremental compilation (REQ-FUNC-027-030) | 低 | 依存グラフ・persistent cache・corruption fallback・reverse propagation・subtree cache 再利用・TypesetterReusePlan による部分再 typeset まで実装済み。**Wave 1 完了**: `full_bench_warm_incremental_evidence` で 1.84× speedup を point-in-time 計測（full --no-cache 28.614s vs incremental 15.550s、`FTX-BENCH-001` 1000-section staged input）。`incremental_xref_convergence_after_page_shift` でページ番号ずれ後の TOC/相互参照収束を byte-identical で確認。**Wave 1 残差分なし**。ただし `REQ-NF-002`（差分コンパイル中央値 100ms 未満）は Wave 1 のスコープ外であり、別途最適化が必要 |
 | B | Parallel pipeline (REQ-FUNC-031-033) | 低〜中 | CommitBarrier 4 ステージ・AuthorityKey 衝突検出・DocumentPartitionPlanner・PaginationMergeCoordinator・partition bench corpus まで実装済み。出力等価性（jobs=1 == jobs=4）確認済み、bounded no-regression evidence 確立済み。**残差分**: REQ-FUNC-032 の strict speedup 条件（`--jobs=4` median < `--jobs=1` median）は sub-1s compile の構造的限界により未達。multi-second compile corpus での speedup > 1.0 の実証が未着手 |
 | C | tikz/pgf (REQ-FUNC-023) | 低 | graphics scene parsing 実装済み。tikz parity テストで match_ratio >= 0.80 を pass。**残差分**: long-tail な tikz パターンでの geometric parity 継続改善 |
 | D | Asset bundle distribution (REQ-FUNC-046) | 低〜中 | bundle runtime（manifest / index / mmap / version check / 5 種 lookup）は完成。bundle-bootstrap / bundle-package テストで article / book / report / letter の compile が pass。**残差分**: 公式 `FTX-ASSET-BUNDLE-001` archive の配布契約・CI パイプラインへの接続 |
@@ -50,9 +50,9 @@
 
 Must 要件の大部分は動作しており、高難度領域（incremental / parallel / SyncTeX / asset bundle）もそれぞれ実装の核心部分を通過している。parity evidence 計測インフラ（layout-core / navigation / bibliography / embedded-assets / tikz の 5 カテゴリ）がテストに接続済みで、全カテゴリ pass が確認されている。`math_equations` regression も修正済み（0.286 → 0.000）。
 
-残差分は「新機能の実装」ではなく「性能実証の拡充（incremental / parallel speedup）・配布インフラの整備（bundle archive CI）・long-tail 互換性の改善」に絞られている。
+Wave 1（Incremental Performance Evidence）が完了し、warm incremental compile の機構が動作することを point-in-time 計測で確認した（1.84× speedup、`FTX-BENCH-001` 1000-section staged input）。Cross-reference 収束の byte-identical 検証も確立された。ただし Wave 1 は incremental mechanism の初期実証であり、`REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成を意味するものではない。残差分は「`REQ-NF-002` 差分性能目標への最適化・性能実証の拡充（parallel speedup）・配布インフラの整備（bundle archive CI）・long-tail 互換性の改善」に整理される。
 
-現在の到達点は「parity evidence が接続された working product」であり、REQ-NF-007 の主要な判定基準を満たすことが計測データで確認されている段階にある。
+現在の到達点は「incremental compile 機構の初期実証が完了した working product」であり、REQ-NF-007 の parity 5 カテゴリ全 pass に加え、REQ-FUNC-030 の収束要件が計測データで確認されている段階にある。性能面では Wave 1 の speedup evidence が確立されたが、`REQ-NF-002` の定量基準に到達するにはさらなる最適化が必要である。
 
 ## 3. 残 Frontier と推奨 Wave
 
@@ -63,13 +63,14 @@ Must 要件の大部分は動作しており、高難度領域（incremental / p
 | Parity Evidence 接続 (REQ-NF-007) | `bench_full_profile` から 5 カテゴリ parity 計測をテスト実行可能にした | **完了** — layout-core / navigation / bibliography / embedded-assets / tikz 全 pass |
 | math_equations Regression 修正 | `contains_script_markers` で全 6 マーカーを検出復元 | **完了** — document_diff_rate 0.286 → 0.000 |
 | Partition Parallel Bounded Evidence | 出力等価性・overhead bounded の計測 | **完了** — evidence 確立済み（§5 参照） |
+| Wave 1: Incremental Performance Evidence (REQ-FUNC-030) | warm incremental benchmark + cross-reference 収束検証 | **完了** — 1.84× speedup を point-in-time 計測（`FTX-BENCH-001` 固定構成）、xref convergence byte-identical 確認済み（§5 参照）。`REQ-NF-002` 達成とは別 |
 
-### Wave 1: Incremental Performance Evidence (REQ-FUNC-030)
+### Wave 1: Incremental Performance Evidence (REQ-FUNC-030) — 完了
 
-| # | タスク | 受入基準 |
+| # | タスク | 結果 |
 |---|---|---|
-| 1 | 部分再コンパイルの end-to-end ベンチマーク | `FTX-BENCH-001` に warm incremental compile のケースを追加し、小変更時に full compile より高速であることを計測 |
-| 2 | cross-reference 収束パスの検証 | ページ番号がずれる変更で、部分再コンパイル後に目次・相互参照が正しく更新されることをテストで確認 |
+| 1 | 部分再コンパイルの end-to-end ベンチマーク | `full_bench_warm_incremental_evidence` で 1000 `\section` 入力に対し warm incremental compile 15.550s vs full `--no-cache` 28.614s（1.84× speedup）を実測。`bench_full_profile.rs` に組み込み済み |
+| 2 | cross-reference 収束パスの検証 | `incremental_xref_convergence_after_page_shift` で 3 章 report（TOC + `\ref` + `\pageref`）に `\newpage` 挿入後の incremental compile PDF が fresh full compile と byte-identical であることを確認。`e2e_compile.rs` に組み込み済み |
 
 ### Wave 2: Partition Parallel Speedup 実証 (REQ-FUNC-032)
 
@@ -94,25 +95,36 @@ Must 要件の大部分は動作しており、高難度領域（incremental / p
 
 ## 4. 実行戦略
 
-- **Wave 1 を優先する**。incremental compile の性能実証は watch / LSP / benchmark すべてに波及する基盤であるため
-- **Wave 2 は Wave 1 と並行可能**。multi-second corpus の追加と構造的限界の文書化は独立して進められる
-- **Wave 3 は Wave 1 完了後に着手**。bundle-only corpus の parity 判定に既存の計測基盤を再利用するため
-- **Wave 4 は単体で進められる**が、incremental / parallel の境界が固まってから入る方が安全
+- **Wave 1 完了**。incremental compile 機構の初期実証（point-in-time 計測で 1.84× speedup）と cross-reference 収束検証が確立された。`REQ-NF-002` の定量基準（100ms 未満）は別途最適化が必要
+- **Wave 2 を次に着手する**。multi-second corpus の追加と構造的限界の文書化。Wave 1 の計測基盤を再利用可能
+- **Wave 3 は Wave 2 と並行可能**。bundle-only corpus の parity 判定は Wave 1 で確立された計測基盤を再利用する
+- **Wave 4 は単体で進められる**が、parallel の境界が固まってから入る方が安全
 
 ```mermaid
 graph LR
-    W1[Wave 1: Incremental Perf] --> W3[Wave 3: Bundle CI]
-    W2[Wave 2: Partition Speedup] -.-> W3
+    W1[Wave 1: Incremental Perf ✓] --> W2[Wave 2: Partition Speedup]
+    W2 --> W3[Wave 3: Bundle CI]
     W3 --> W4[Wave 4: Long-tail Compat]
-    style W1 fill:#f9f,stroke:#333
+    style W1 fill:#9f9,stroke:#333
     style W2 fill:#f9f,stroke:#333
 ```
 
 ## 5. 妥当性判定
 
-- **結果**: 性能実証・配布整備フェーズ
-- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。残りは incremental / parallel の性能実証、bundle 配布 CI 接続、long-tail 互換性改善に限定される
-- **直近の推奨**: incremental compile の性能実証（Wave 1）を先に完了させ、watch / LSP / benchmark への波及効果を確認する
+- **結果**: incremental 機構実証済み・性能最適化と配布整備フェーズ
+- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1 により incremental compile 機構の有効性と cross-reference 収束が point-in-time 計測で確認された。ただし Wave 1 の speedup evidence は `REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成を示すものではなく、同要件は別途最適化が必要。残りは `REQ-NF-002` 差分性能目標、parallel speedup の実証（Wave 2）、bundle 配布 CI 接続（Wave 3）、long-tail 互換性改善（Wave 4）
+- **直近の推奨**: partition parallel speedup の実証（Wave 2）を先に完了させ、multi-second compile corpus での speedup > 1.0 を確認する
+
+### Warm Incremental Benchmark 実績 (REQ-FUNC-030) — Wave 1 完了
+
+- **Status**: Wave 1 evidence established（incremental 機構の有効性を実証。`REQ-NF-002` の定量基準は未達）
+- **テスト**: `full_bench_warm_incremental_evidence`（`bench_full_profile.rs`）
+- **構成**: 1000 `\section` 入力を `FTX-BENCH-001` に staged 変換し、cycle 900 で 1 段落変更を incremental compile
+- **計測結果**（point-in-time、計測環境固有の値）: full `--no-cache` 28.614s / warm-cache 29.403s / incremental 15.550s（**1.84× speedup**）
+- **注記**: 上記タイミングは特定マシン・特定入力での単一計測であり、環境によって異なる。speedup 比率が機構の有効性を示す主要指標であり、絶対値は参考値として扱うこと
+- **収束検証**: `incremental_xref_convergence_after_page_shift`（`e2e_compile.rs`）で 3 章 report（TOC + `\ref` + `\pageref`）に `\newpage` 挿入後の incremental compile PDF が fresh full compile と **byte-identical** であることを確認
+- **設計判断**: 単一 monolithic `.tex` 直接編集では speedup が出ず、partition entry file 単位への staged 変換が必要だった
+- **REQ-NF-002 との関係**: Wave 1 は incremental compile 機構が full rebuild に対し有意な speedup を生むことの初期実証である。`REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成には、キャッシュ粒度の細分化・再 typeset スコープの縮小等の追加最適化が必要
 
 ### Partition Parallel Benchmark 実績 (REQ-FUNC-031/032)
 

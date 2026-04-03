@@ -16,6 +16,7 @@ pub trait CompileBackend: Send + Sync {
         asset_bundle: Option<&Path>,
         jobs: u32,
         reproducible: bool,
+        no_cache: bool,
     ) -> Result<CompileOutput, String>;
 }
 
@@ -60,6 +61,7 @@ pub fn full_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
             asset_bundle: None,
             jobs,
             reproducible: false,
+            no_cache: false,
         })
         .collect()
 }
@@ -76,6 +78,7 @@ pub fn bundle_bootstrap_cases(fixture_base: &Path) -> Vec<BenchCase> {
             asset_bundle: Some(bundle_dir.clone()),
             jobs: 1,
             reproducible: false,
+            no_cache: false,
         })
         .collect()
 }
@@ -92,6 +95,7 @@ pub fn bundle_reproducible_cases(fixture_base: &Path) -> Vec<BenchCase> {
             asset_bundle: Some(bundle_dir.clone()),
             jobs: 1,
             reproducible: true,
+            no_cache: false,
         })
         .collect()
 }
@@ -137,6 +141,7 @@ pub fn bundle_package_loading_cases(fixture_base: &Path) -> Vec<BenchCase> {
                 asset_bundle: Some(bundle_dir.clone()),
                 jobs: 1,
                 reproducible: false,
+                no_cache: false,
             }
         })
         .collect()
@@ -182,6 +187,7 @@ pub fn partition_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
                     asset_bundle: None,
                     jobs,
                     reproducible: false,
+                    no_cache: false,
                 });
             }
         }
@@ -240,6 +246,7 @@ pub fn corpus_partition_book_parity_cases(fixture_base: &Path) -> Vec<BenchCase>
             asset_bundle: None,
             jobs: 1,
             reproducible: false,
+            no_cache: false,
         })
         .collect()
 }
@@ -289,6 +296,7 @@ fn corpus_subset_cases(fixture_base: &Path, subset: &str) -> Vec<BenchCase> {
                 asset_bundle: None,
                 jobs: 1,
                 reproducible: false,
+                no_cache: false,
             }
         })
         .collect()
@@ -302,10 +310,11 @@ pub struct BenchCase {
     pub asset_bundle: Option<PathBuf>,
     pub jobs: u32,
     pub reproducible: bool,
+    pub no_cache: bool,
 }
 
 impl BenchCase {
-    fn comparison_key(&self) -> (String, String, String, bool) {
+    fn comparison_key(&self) -> (String, String, String, bool, bool) {
         (
             self.profile.stable_id().to_string(),
             self.input_fixture.display().to_string(),
@@ -314,6 +323,7 @@ impl BenchCase {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             self.reproducible,
+            self.no_cache,
         )
     }
 }
@@ -542,6 +552,7 @@ impl BenchHarness {
                     case.asset_bundle.as_deref(),
                     case.jobs,
                     case.reproducible,
+                    case.no_cache,
                 )
                 .map_err(|message| BenchFailure::CompileError {
                     case_name: case.name.clone(),
@@ -558,6 +569,7 @@ impl BenchHarness {
                     case.asset_bundle.as_deref(),
                     case.jobs,
                     case.reproducible,
+                    case.no_cache,
                 )
                 .map_err(|message| BenchFailure::CompileError {
                     case_name: case.name.clone(),
@@ -595,7 +607,7 @@ impl BenchHarness {
     }
 
     fn build_comparisons(&self, results: &[BenchResult]) -> Vec<BenchComparison> {
-        let mut groups = BTreeMap::<(String, String, String, bool), Vec<BenchResult>>::new();
+        let mut groups = BTreeMap::<(String, String, String, bool, bool), Vec<BenchResult>>::new();
         for result in results {
             groups
                 .entry(result.case.comparison_key())
@@ -646,6 +658,7 @@ impl CompileBackend for CliCompileBackend {
         asset_bundle: Option<&Path>,
         jobs: u32,
         reproducible: bool,
+        no_cache: bool,
     ) -> Result<CompileOutput, String> {
         let start = std::time::Instant::now();
         let mut cmd = std::process::Command::new(&self.binary_path);
@@ -656,6 +669,9 @@ impl CompileBackend for CliCompileBackend {
         cmd.args(["--jobs", &jobs.to_string()]);
         if reproducible {
             cmd.arg("--reproducible");
+        }
+        if no_cache {
+            cmd.arg("--no-cache");
         }
 
         let output = cmd
@@ -689,6 +705,7 @@ impl CompileBackend for UnconfiguredBackend {
         _asset_bundle: Option<&Path>,
         _jobs: u32,
         _reproducible: bool,
+        _no_cache: bool,
     ) -> Result<CompileOutput, String> {
         Err("compile backend is not configured".to_string())
     }
@@ -792,7 +809,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockCompileBackend {
         outputs: Arc<Mutex<VecDeque<Result<CompileOutput, String>>>>,
-        calls: Arc<Mutex<Vec<(PathBuf, Option<PathBuf>, u32, bool)>>>,
+        calls: Arc<Mutex<Vec<(PathBuf, Option<PathBuf>, u32, bool, bool)>>>,
     }
 
     impl MockCompileBackend {
@@ -815,12 +832,14 @@ mod tests {
             asset_bundle: Option<&Path>,
             jobs: u32,
             reproducible: bool,
+            no_cache: bool,
         ) -> Result<CompileOutput, String> {
             self.calls.lock().expect("calls lock").push((
                 input.to_path_buf(),
                 asset_bundle.map(Path::to_path_buf),
                 jobs,
                 reproducible,
+                no_cache,
             ));
 
             self.outputs
@@ -914,6 +933,7 @@ mod tests {
             asset_bundle: Option<&Path>,
             jobs: u32,
             _reproducible: bool,
+            _no_cache: bool,
         ) -> Result<CompileOutput, String> {
             let gate = FsTestFileAccessGate;
             let loader = NoopAssetBundleLoader;
@@ -1123,6 +1143,7 @@ mod tests {
             asset_bundle: None,
             jobs: 1,
             reproducible: false,
+            no_cache: false,
         };
         let harness = BenchHarness::new(vec![case.clone()], BenchRunConfig::default())
             .with_backend(MockCompileBackend::default());
@@ -1248,6 +1269,7 @@ mod tests {
             .all(|c| c.profile == BenchProfile::PartitionBench));
         assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
         assert!(cases.iter().all(|c| !c.reproducible));
+        assert!(cases.iter().all(|c| !c.no_cache));
         assert!(cases.iter().all(|c| c.input_fixture.exists()));
 
         let job_values: Vec<u32> = cases.iter().map(|c| c.jobs).collect();
@@ -1276,6 +1298,7 @@ mod tests {
         assert!(cases.iter().all(|c| c.profile == BenchProfile::FullBench));
         assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
         assert!(cases.iter().all(|c| !c.reproducible));
+        assert!(cases.iter().all(|c| !c.no_cache));
         assert!(cases.iter().all(|c| c.input_fixture.exists()));
         assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
     }
@@ -1295,6 +1318,7 @@ mod tests {
             .all(|case| case.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
         assert!(cases.iter().all(|case| case.jobs == 1));
         assert!(cases.iter().all(|case| case.reproducible));
+        assert!(cases.iter().all(|case| !case.no_cache));
         assert!(cases.iter().all(|case| case.input_fixture.exists()));
         assert_eq!(
             cases
@@ -1357,13 +1381,18 @@ mod tests {
         assert_eq!(report.results.len(), 2);
 
         let calls = backend.calls.lock().expect("calls lock");
-        let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs, _)| *jobs).collect();
+        let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs, _, _)| *jobs).collect();
         let reproducible_values: Vec<bool> = calls
             .iter()
-            .map(|(_, _, _, reproducible)| *reproducible)
+            .map(|(_, _, _, reproducible, _)| *reproducible)
+            .collect();
+        let no_cache_values: Vec<bool> = calls
+            .iter()
+            .map(|(_, _, _, _, no_cache)| *no_cache)
             .collect();
         assert_eq!(jobs_values, vec![1, 1, 4, 4]);
         assert_eq!(reproducible_values, vec![false, false, false, false]);
+        assert_eq!(no_cache_values, vec![false, false, false, false]);
     }
 
     #[test]
@@ -2249,6 +2278,7 @@ mod tests {
                     case.asset_bundle.as_deref(),
                     case.jobs,
                     case.reproducible,
+                    case.no_cache,
                 )
                 .unwrap_or_else(|error| {
                     panic!("{} should compile successfully: {error}", case.name)
@@ -2865,6 +2895,7 @@ mod tests {
             asset_bundle: None,
             jobs,
             reproducible: false,
+            no_cache: false,
         }
     }
 
@@ -2924,6 +2955,7 @@ mod tests {
                 asset_bundle: case.asset_bundle.clone(),
                 jobs: case.jobs,
                 reproducible: case.reproducible,
+                no_cache: case.no_cache,
             });
         }
         cases

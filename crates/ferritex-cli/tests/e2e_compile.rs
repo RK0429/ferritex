@@ -1331,6 +1331,124 @@ fn incremental_recompile_matches_full_compile() {
 }
 
 #[test]
+fn incremental_xref_convergence_after_page_shift() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let incremental_out = dir.path().join("incremental-out");
+    let full_out = dir.path().join("full-out");
+    std::fs::write(
+        dir.path().join("main.tex"),
+        concat!(
+            "\\documentclass{report}\n",
+            "\\begin{document}\n",
+            "\\tableofcontents\n",
+            "\\input{chapter-one}\n",
+            "\\input{chapter-two}\n",
+            "\\input{chapter-three}\n",
+            "\\end{document}\n",
+        ),
+    )
+    .expect("write main");
+    std::fs::write(
+        dir.path().join("chapter-one.tex"),
+        concat!(
+            "\\chapter{One}\\label{chap:one}\n",
+            "Chapter one opens the report and points ahead to Chapter \\ref{chap:three} on page \\pageref{chap:three}.\n",
+            "The initial body stays short so later chapters begin earlier.\n",
+        ),
+    )
+    .expect("write chapter one");
+    std::fs::write(
+        dir.path().join("chapter-two.tex"),
+        concat!(
+            "\\chapter{Two}\\label{chap:two}\n",
+            "Chapter two points back to Chapter \\ref{chap:one} on page \\pageref{chap:one}.\n",
+            "Chapter two also points ahead to Chapter \\ref{chap:three} on page \\pageref{chap:three}.\n",
+        ),
+    )
+    .expect("write chapter two");
+    std::fs::write(
+        dir.path().join("chapter-three.tex"),
+        concat!(
+            "\\chapter{Three}\\label{chap:three}\n",
+            "Chapter three points back to Chapter \\ref{chap:one} on page \\pageref{chap:one}.\n",
+            "Chapter three also points back to Chapter \\ref{chap:two} on page \\pageref{chap:two}.\n",
+        ),
+    )
+    .expect("write chapter three");
+
+    let first = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            incremental_out.to_str().expect("utf-8 output dir"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    std::fs::write(
+        dir.path().join("chapter-one.tex"),
+        concat!(
+            "\\chapter{One}\\label{chap:one}\n",
+            "Chapter one opens the report and points ahead to Chapter \\ref{chap:three} on page \\pageref{chap:three}.\n",
+            "The updated body now forces later chapters onto different pages.\n",
+            "\\newpage\n",
+            "Expanded material keeps chapter one running longer before chapter two starts.\n",
+            "\\newpage\n",
+            "A final block of expanded material ensures the shifted layout persists.\n",
+        ),
+    )
+    .expect("update chapter one");
+
+    let second = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            incremental_out.to_str().expect("utf-8 output dir"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let full = ferritex_bin()
+        .current_dir(dir.path())
+        .args([
+            "compile",
+            "main.tex",
+            "--output-dir",
+            full_out.to_str().expect("utf-8 output dir"),
+            "--no-cache",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        full.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+
+    let incremental_pdf =
+        std::fs::read(incremental_out.join("main.pdf")).expect("read incremental pdf");
+    let full_pdf = std::fs::read(full_out.join("main.pdf")).expect("read full pdf");
+    assert_eq!(incremental_pdf, full_pdf);
+}
+
+#[test]
 fn compile_multi_chapter_with_jobs_4_matches_jobs_1() {
     let write_project = |root: &std::path::Path| {
         std::fs::write(
