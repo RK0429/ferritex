@@ -31,6 +31,7 @@ use super::{
 const MAX_CONSECUTIVE_MACRO_EXPANSIONS: usize = 1_000;
 const BODY_PAGE_BREAK_MARKER: char = '\u{E000}';
 const BODY_CLEAR_PAGE_MARKER: char = '\u{E01B}';
+const BODY_CLEAR_DOUBLE_PAGE_MARKER: char = '\u{E02A}';
 const BODY_HBOX_START: char = '\u{E001}';
 const BODY_HBOX_END: char = '\u{E002}';
 const BODY_VBOX_START: char = '\u{E003}';
@@ -189,6 +190,7 @@ pub struct DocumentLabels {
     pub page_label_anchors: BTreeMap<String, String>,
     pub title: Option<String>,
     pub author: Option<String>,
+    pub date: Option<String>,
     pub pdf_title: Option<String>,
     pub pdf_author: Option<String>,
     pub color_links: Option<bool>,
@@ -213,6 +215,7 @@ impl DocumentLabels {
         page_label_anchors: BTreeMap<String, String>,
         title: Option<String>,
         author: Option<String>,
+        date: Option<String>,
         pdf_title: Option<String>,
         pdf_author: Option<String>,
         color_links: Option<bool>,
@@ -234,6 +237,7 @@ impl DocumentLabels {
             page_label_anchors,
             title,
             author,
+            date,
             pdf_title,
             pdf_author,
             color_links,
@@ -262,6 +266,7 @@ impl DocumentLabels {
             page_label_anchors: self.page_label_anchors.clone(),
             title: self.title.clone(),
             author: self.author.clone(),
+            date: self.date.clone(),
             pdf_title: self.pdf_title.clone(),
             pdf_author: self.pdf_author.clone(),
             color_links: self.color_links,
@@ -323,6 +328,7 @@ pub struct ParsedDocument {
     pub body: String,
     pub labels: DocumentLabels,
     pub bibliography_state: BibliographyState,
+    pub has_maketitle: bool,
     pub has_unresolved_refs: bool,
 }
 
@@ -436,6 +442,7 @@ pub enum DocumentNode {
     ParBreak,
     PageBreak,
     ClearPage,
+    ClearDoublePage,
     HBox(Vec<DocumentNode>),
     VBox(Vec<DocumentNode>),
     InlineMath(Vec<MathNode>),
@@ -975,6 +982,9 @@ struct ParserState {
     section: u32,
     subsection: u32,
     subsubsection: u32,
+    paragraph: u32,
+    subparagraph: u32,
+    in_appendix: bool,
     current_section_number: Option<String>,
     current_label_anchor: Option<String>,
     equation_counter: u32,
@@ -1034,6 +1044,9 @@ impl ParserState {
             section: 0,
             subsection: 0,
             subsubsection: 0,
+            paragraph: 0,
+            subparagraph: 0,
+            in_appendix: false,
             current_section_number: None,
             current_label_anchor: None,
             equation_counter: 0,
@@ -1067,45 +1080,71 @@ impl ParserState {
         self.section = 0;
         self.subsection = 0;
         self.subsubsection = 0;
+        self.paragraph = 0;
+        self.subparagraph = 0;
         let number = self.chapter.to_string();
         self.current_section_number = Some(number.clone());
         number
     }
 
     fn next_section_number(&mut self, level: u8, include_chapter: bool) -> String {
+        let section_prefix = |state: &Self| {
+            if state.in_appendix && state.section > 0 {
+                ((b'A' + (state.section - 1) as u8) as char).to_string()
+            } else if include_chapter {
+                format!("{}.{}", state.chapter, state.section)
+            } else {
+                state.section.to_string()
+            }
+        };
         let number = match level {
             1 => {
                 self.section += 1;
                 self.subsection = 0;
                 self.subsubsection = 0;
-                if include_chapter {
-                    format!("{}.{}", self.chapter, self.section)
-                } else {
-                    self.section.to_string()
-                }
+                self.paragraph = 0;
+                self.subparagraph = 0;
+                section_prefix(self)
             }
             2 => {
                 self.subsection += 1;
                 self.subsubsection = 0;
-                if include_chapter {
-                    format!("{}.{}.{}", self.chapter, self.section, self.subsection)
-                } else {
-                    format!("{}.{}", self.section, self.subsection)
-                }
+                self.paragraph = 0;
+                self.subparagraph = 0;
+                format!("{}.{}", section_prefix(self), self.subsection)
             }
             3 => {
                 self.subsubsection += 1;
-                if include_chapter {
-                    format!(
-                        "{}.{}.{}.{}",
-                        self.chapter, self.section, self.subsection, self.subsubsection
-                    )
-                } else {
-                    format!(
-                        "{}.{}.{}",
-                        self.section, self.subsection, self.subsubsection
-                    )
-                }
+                self.paragraph = 0;
+                self.subparagraph = 0;
+                format!(
+                    "{}.{}.{}",
+                    section_prefix(self),
+                    self.subsection,
+                    self.subsubsection
+                )
+            }
+            4 => {
+                self.paragraph += 1;
+                self.subparagraph = 0;
+                format!(
+                    "{}.{}.{}.{}",
+                    section_prefix(self),
+                    self.subsection,
+                    self.subsubsection,
+                    self.paragraph
+                )
+            }
+            5 => {
+                self.subparagraph += 1;
+                format!(
+                    "{}.{}.{}.{}.{}",
+                    section_prefix(self),
+                    self.subsection,
+                    self.subsubsection,
+                    self.paragraph,
+                    self.subparagraph
+                )
             }
             _ => unreachable!("section levels are constrained by the caller"),
         };
@@ -1200,6 +1239,8 @@ struct ParserDriver<'a, 'resolver> {
     errors: Vec<ParseError>,
     title: Option<String>,
     author: Option<String>,
+    date: Option<String>,
+    has_maketitle: bool,
     pdf_title: Option<String>,
     pdf_author: Option<String>,
     color_links: Option<bool>,
@@ -1302,6 +1343,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             errors: Vec::new(),
             title: None,
             author: None,
+            date: None,
+            has_maketitle: false,
             pdf_title: None,
             pdf_author: None,
             color_links: None,
@@ -1598,6 +1641,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.state.page_label_anchors.clone(),
                 self.title.clone(),
                 self.author.clone(),
+                self.date.clone(),
                 self.pdf_title.clone(),
                 self.pdf_author.clone(),
                 self.color_links,
@@ -1610,6 +1654,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.state.has_unresolved_index,
             ),
             bibliography_state: self.state.bibliography_state.clone(),
+            has_maketitle: self.has_maketitle,
             has_unresolved_refs: self.state.has_unresolved_refs,
         }
     }
@@ -1674,6 +1719,17 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     let text = tokens_to_text(&tokens);
                     text.trim().to_string()
                 });
+            }
+            "date" => {
+                self.date = self.read_required_braced_tokens()?.map(|tokens| {
+                    let text = tokens_to_text(&tokens);
+                    text.trim().to_string()
+                });
+            }
+            "setcounter" => {
+                let _ = self.take_global_prefix();
+                let _ = self.read_required_braced_tokens()?;
+                let _ = self.read_required_braced_tokens()?;
             }
             "hypersetup" => {
                 self.parse_hypersetup_command()?;
@@ -1837,7 +1893,6 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
             TokenKind::ControlWord(_) | TokenKind::ControlSymbol(_) => {
                 let name = control_sequence_name(&token).expect("control sequence token");
-
                 if !preserves_protected_prefix(&name) {
                     let _ = self.take_protected_prefix();
                 }
@@ -1854,6 +1909,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     "clearpage" => {
                         let _ = self.take_global_prefix();
                         self.body.push(BODY_CLEAR_PAGE_MARKER);
+                    }
+                    "cleardoublepage" | "frontmatter" | "mainmatter" | "backmatter" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push(BODY_CLEAR_DOUBLE_PAGE_MARKER);
                     }
                     "cite" => {
                         let _ = self.take_global_prefix();
@@ -1911,6 +1970,49 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         let _ = self.take_global_prefix();
                         self.parse_chapter_command()?;
                     }
+                    "maketitle" => {
+                        let _ = self.take_global_prefix();
+                        if let Some(expansion) =
+                            self.expand_defined_control_sequence_token(&token)?
+                        {
+                            self.push_front_tokens(expansion);
+                            return Ok(false);
+                        }
+                        let Some(title) = self
+                            .title
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|title| !title.is_empty())
+                            .map(str::to_string)
+                        else {
+                            return Ok(false);
+                        };
+                        let author = self
+                            .author
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|author| !author.is_empty())
+                            .map(str::to_string);
+                        let date = self
+                            .date
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|date| !date.is_empty())
+                            .map(str::to_string);
+
+                        self.emit_paragraph_break_before_block();
+                        self.body.push_str(&title);
+                        if let Some(author) = author {
+                            self.body.push('\n');
+                            self.body.push_str(&author);
+                        }
+                        if let Some(date) = date {
+                            self.body.push('\n');
+                            self.body.push_str(&date);
+                        }
+                        self.body.push_str("\n\n");
+                        self.has_maketitle = true;
+                    }
                     "section" => {
                         let _ = self.take_global_prefix();
                         self.parse_section_command(1)?;
@@ -1922,6 +2024,28 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     "subsubsection" => {
                         let _ = self.take_global_prefix();
                         self.parse_section_command(3)?;
+                    }
+                    "paragraph" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_section_command(4)?;
+                    }
+                    "subparagraph" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_section_command(5)?;
+                    }
+                    "appendix" => {
+                        let _ = self.take_global_prefix();
+                        self.state.in_appendix = true;
+                        self.state.section = 0;
+                        self.state.subsection = 0;
+                        self.state.subsubsection = 0;
+                        self.state.paragraph = 0;
+                        self.state.subparagraph = 0;
+                    }
+                    "setcounter" => {
+                        let _ = self.take_global_prefix();
+                        let _ = self.read_required_braced_tokens()?;
+                        let _ = self.read_required_braced_tokens()?;
                     }
                     "label" => {
                         let _ = self.take_global_prefix();
@@ -3010,6 +3134,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return;
         }
 
+        if self.class_supports_chapters() {
+            self.body.push(BODY_CLEAR_DOUBLE_PAGE_MARKER);
+        }
         self.emit_paragraph_break_before_block();
         for entry in entries {
             let mut line = entry.number.clone();
@@ -3040,6 +3167,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return;
         }
 
+        if self.class_supports_chapters() {
+            self.body.push(BODY_CLEAR_DOUBLE_PAGE_MARKER);
+        }
         self.emit_paragraph_break_before_block();
         for entry in entries {
             self.body.push_str(&entry.display_title());
@@ -3060,6 +3190,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return;
         }
 
+        if self.class_supports_chapters() {
+            self.body.push(BODY_CLEAR_DOUBLE_PAGE_MARKER);
+        }
         self.emit_paragraph_break_before_block();
         for entry in entries {
             self.body.push_str(&entry.display_title());
@@ -3597,6 +3730,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             || self.body.ends_with("\n\n")
             || self.body.ends_with(BODY_PAGE_BREAK_MARKER)
             || self.body.ends_with(BODY_CLEAR_PAGE_MARKER)
+            || self.body.ends_with(BODY_CLEAR_DOUBLE_PAGE_MARKER)
         {
             return;
         }
@@ -3623,7 +3757,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         ) && (self.body.is_empty()
             || self.body.ends_with("\n\n")
             || self.body.ends_with(BODY_PAGE_BREAK_MARKER)
-            || self.body.ends_with(BODY_CLEAR_PAGE_MARKER))
+            || self.body.ends_with(BODY_CLEAR_PAGE_MARKER)
+            || self.body.ends_with(BODY_CLEAR_DOUBLE_PAGE_MARKER))
     }
 
     fn parse_inline_math(&mut self) -> Result<(), ParseError> {
@@ -6929,18 +7064,20 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
     let mut nodes = Vec::new();
     let mut segment_start = 0;
 
-    for (index, marker) in body_with_placeholders
-        .char_indices()
-        .filter(|(_, ch)| *ch == BODY_PAGE_BREAK_MARKER || *ch == BODY_CLEAR_PAGE_MARKER)
-    {
+    for (index, marker) in body_with_placeholders.char_indices().filter(|(_, ch)| {
+        *ch == BODY_PAGE_BREAK_MARKER
+            || *ch == BODY_CLEAR_PAGE_MARKER
+            || *ch == BODY_CLEAR_DOUBLE_PAGE_MARKER
+    }) {
         nodes.extend(body_text_nodes(
             &body_with_placeholders[segment_start..index],
             &placeholders,
         ));
-        nodes.push(if marker == BODY_PAGE_BREAK_MARKER {
-            DocumentNode::PageBreak
-        } else {
-            DocumentNode::ClearPage
+        nodes.push(match marker {
+            BODY_PAGE_BREAK_MARKER => DocumentNode::PageBreak,
+            BODY_CLEAR_PAGE_MARKER => DocumentNode::ClearPage,
+            BODY_CLEAR_DOUBLE_PAGE_MARKER => DocumentNode::ClearDoublePage,
+            _ => unreachable!("filtered markers should only include page break markers"),
         });
         segment_start = index + marker.len_utf8();
     }
@@ -8096,6 +8233,10 @@ fn encode_body_markers_in_text(text: &str) -> String {
                 encoded.push(BODY_CLEAR_PAGE_MARKER);
                 index = command_end;
             }
+            "cleardoublepage" | "frontmatter" | "mainmatter" | "backmatter" => {
+                encoded.push(BODY_CLEAR_DOUBLE_PAGE_MARKER);
+                index = command_end;
+            }
             "href" => {
                 let url_start = skip_optional_command_whitespace(text, command_end);
                 if let Some((url, after_url)) = extract_braced_text(text, url_start) {
@@ -8954,6 +9095,7 @@ mod tests {
             body: body.to_string(),
             labels: DocumentLabels::default(),
             bibliography_state: BibliographyState::default(),
+            has_maketitle: false,
             has_unresolved_refs: false,
         }
     }
@@ -9000,6 +9142,7 @@ mod tests {
                 body: "Hello".to_string(),
                 labels: DocumentLabels::default(),
                 bibliography_state: BibliographyState::default(),
+                has_maketitle: false,
                 has_unresolved_refs: false,
             }
         );
@@ -9054,6 +9197,7 @@ mod tests {
                 body: "AB".to_string(),
                 labels: DocumentLabels::default(),
                 bibliography_state: BibliographyState::default(),
+                has_maketitle: false,
                 has_unresolved_refs: false,
             })
         );
@@ -9316,6 +9460,18 @@ mod tests {
             .expect("parse document")
     }
 
+    fn parse_source(source: &str) -> ParsedDocument {
+        MinimalLatexParser.parse(source).expect("parse document")
+    }
+
+    fn parse_book_document(source_body: &str) -> ParsedDocument {
+        MinimalLatexParser
+            .parse(&format!(
+                "\\documentclass{{book}}\n\\begin{{document}}\n{source_body}\n\\end{{document}}\n"
+            ))
+            .expect("parse document")
+    }
+
     fn parse_document_with_package_resolver(
         source: &str,
         sty_resolver: Option<&crate::parser::package_loading::StyPackageResolver<'_>>,
@@ -9373,6 +9529,44 @@ mod tests {
                 DocumentNode::Text("First".to_string(), None),
                 DocumentNode::ClearPage,
                 DocumentNode::Text("Second".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn cleardoublepage_parsed_to_clear_double_page_node() {
+        assert_eq!(
+            parse_document("First\n\\cleardoublepage\nSecond").body_nodes(),
+            vec![
+                DocumentNode::Text("First".to_string(), None),
+                DocumentNode::ClearDoublePage,
+                DocumentNode::Text("Second".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn frontmatter_parsed_to_clear_double_page_node() {
+        assert_eq!(
+            parse_book_document("First\n\\frontmatter\nSecond").body_nodes(),
+            vec![
+                DocumentNode::Text("First".to_string(), None),
+                DocumentNode::ClearDoublePage,
+                DocumentNode::Text("Second".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn mainmatter_and_backmatter_parsed_to_clear_double_page_nodes() {
+        assert_eq!(
+            parse_book_document("First\n\\mainmatter\nSecond\n\\backmatter\nThird").body_nodes(),
+            vec![
+                DocumentNode::Text("First".to_string(), None),
+                DocumentNode::ClearDoublePage,
+                DocumentNode::Text("Second".to_string(), None),
+                DocumentNode::ClearDoublePage,
+                DocumentNode::Text("Third".to_string(), None),
             ]
         );
     }
@@ -10832,6 +11026,112 @@ mod tests {
     }
 
     #[test]
+    fn appendix_switches_section_numbering_to_alphabetic() {
+        let document = parse_document(
+            "\\section{Main One}\n\\section{Main Two}\n\\appendix\n\\section{Appendix One}\n\\section{Appendix Two}",
+        );
+
+        assert_eq!(
+            document
+                .section_entries
+                .iter()
+                .map(|entry| entry.number.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "A", "B"]
+        );
+    }
+
+    #[test]
+    fn appendix_subsection_numbering() {
+        let document = parse_document("\\appendix\n\\section{Supplement}\n\\subsection{Details}");
+
+        assert_eq!(
+            document.section_entries,
+            vec![
+                SectionEntry {
+                    level: 1,
+                    number: "A".to_string(),
+                    title: "Supplement".to_string(),
+                },
+                SectionEntry {
+                    level: 2,
+                    number: "A.1".to_string(),
+                    title: "Details".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn paragraph_and_subparagraph_parsed_as_sections() {
+        let document = parse_document(
+            "\\section{Program Context}\n\\subsection{Review Cycle}\n\\paragraph{Meeting Record}\n\\subparagraph{Room Notes}",
+        );
+
+        assert_eq!(
+            document.section_entries,
+            vec![
+                SectionEntry {
+                    level: 1,
+                    number: "1".to_string(),
+                    title: "Program Context".to_string(),
+                },
+                SectionEntry {
+                    level: 2,
+                    number: "1.1".to_string(),
+                    title: "Review Cycle".to_string(),
+                },
+                SectionEntry {
+                    level: 4,
+                    number: "1.1.0.1".to_string(),
+                    title: "Meeting Record".to_string(),
+                },
+                SectionEntry {
+                    level: 5,
+                    number: "1.1.0.1.1".to_string(),
+                    title: "Room Notes".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deeper_section_counters_reset_for_new_parent_sections() {
+        let document = parse_document(
+            "\\section{One}\n\\subsection{Alpha}\n\\subsubsection{Inner}\n\\paragraph{Detail}\n\\subparagraph{Leaf}\n\\subsection{Beta}\n\\paragraph{Next Detail}",
+        );
+
+        assert_eq!(
+            document
+                .section_entries
+                .iter()
+                .map(|entry| entry.number.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "1",
+                "1.1",
+                "1.1.1",
+                "1.1.1.1",
+                "1.1.1.1.1",
+                "1.2",
+                "1.2.0.1"
+            ]
+        );
+    }
+
+    #[test]
+    fn setcounter_consumed_without_body_leak() {
+        let document = parse_source(
+            "\\documentclass{article}\n\\setcounter{secnumdepth}{5}\n\\begin{document}\n\\setcounter{tocdepth}{5}\nVisible text\n\\end{document}\n",
+        );
+
+        assert_eq!(document.body, "Visible text");
+        assert!(!document.body.contains("secnumdepth"));
+        assert!(!document.body.contains("tocdepth"));
+        assert!(!document.body.contains('5'));
+    }
+
+    #[test]
     fn label_and_ref_resolve_within_same_file() {
         let document = parse_document("\\section{Intro}\\label{sec:intro}\nSee \\ref{sec:intro}.");
 
@@ -11217,6 +11517,47 @@ mod tests {
     }
 
     #[test]
+    fn preamble_date_is_stored_in_document_labels() {
+        let document = parse_source(
+            "\\documentclass{article}\n\\title{Ferritex}\n\\author{Ada Lovelace}\n\\date{April 2026}\n\\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert_eq!(document.title.as_deref(), Some("Ferritex"));
+        assert_eq!(document.author.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(document.date.as_deref(), Some("April 2026"));
+    }
+
+    #[test]
+    fn maketitle_emits_title_author_and_date_into_body() {
+        let document = parse_source(
+            "\\documentclass{article}\n\\title{Ferritex}\n\\author{Ada Lovelace}\n\\date{April 2026}\n\\begin{document}\n\\maketitle\nBody\n\\end{document}\n",
+        );
+
+        assert!(document.has_maketitle);
+        assert_eq!(document.body, "Ferritex\nAda Lovelace\nApril 2026\n\nBody");
+    }
+
+    #[test]
+    fn maketitle_without_title_produces_no_body_output() {
+        let document = parse_source(
+            "\\documentclass{article}\n\\author{Ada Lovelace}\n\\date{April 2026}\n\\begin{document}\n\\maketitle\nBody\n\\end{document}\n",
+        );
+
+        assert!(!document.has_maketitle);
+        assert_eq!(document.body, "Body");
+    }
+
+    #[test]
+    fn redefined_maketitle_macro_overrides_builtin_handler() {
+        let document = parse_source(
+            "\\documentclass{article}\n\\def\\maketitle{}\n\\title{Suppressed}\n\\author{Ferritex Corpus}\n\\date{April 2, 2026}\n\\begin{document}\n\\maketitle\n\\section{Overview}\nBody\n\\end{document}\n",
+        );
+
+        assert!(!document.has_maketitle);
+        assert_eq!(document.body, "1 Overview\n\nBody");
+    }
+
+    #[test]
     fn hypersetup_sets_colorlinks_flag() {
         let document = parse_document(r"\hypersetup{colorlinks=true}");
 
@@ -11324,6 +11665,36 @@ mod tests {
     }
 
     #[test]
+    fn book_tableofcontents_emits_clear_double_page_before_entries() {
+        let document = MinimalLatexParser
+            .parse_with_state(
+                "\\documentclass{book}\n\\begin{document}\n\\tableofcontents\n\\end{document}\n",
+                BTreeMap::new(),
+                vec![SectionEntry {
+                    level: 1,
+                    number: "1".to_string(),
+                    title: "Intro".to_string(),
+                }],
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                Vec::new(),
+            )
+            .expect("parse document");
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![
+                DocumentNode::ClearDoublePage,
+                DocumentNode::Link {
+                    url: "#section:1 Intro".to_string(),
+                    children: vec![DocumentNode::Text("1  Intro".to_string(), None)],
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn sections_are_collected_for_toc_resolution() {
         let document = parse_document("\\section{Intro}\n\\subsection{Scope}");
 
@@ -11417,6 +11788,39 @@ mod tests {
 
         assert_eq!(document.body, "Table 1: Metrics");
         assert!(!document.has_unresolved_lot);
+    }
+
+    #[test]
+    fn book_lists_emit_clear_double_page_before_entries() {
+        let document = MinimalLatexParser
+            .parse_with_state(
+                "\\documentclass{book}\n\\begin{document}\n\\listoffigures\n\\listoftables\n\\end{document}\n",
+                BTreeMap::new(),
+                Vec::new(),
+                vec![CaptionEntry {
+                    kind: FloatType::Figure,
+                    number: "1".to_string(),
+                    caption: "Overview".to_string(),
+                }],
+                vec![CaptionEntry {
+                    kind: FloatType::Table,
+                    number: "1".to_string(),
+                    caption: "Metrics".to_string(),
+                }],
+                BTreeMap::new(),
+                Vec::new(),
+            )
+            .expect("parse document");
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![
+                DocumentNode::ClearDoublePage,
+                DocumentNode::Text("Figure 1: Overview".to_string(), None),
+                DocumentNode::ClearDoublePage,
+                DocumentNode::Text("Table 1: Metrics".to_string(), None),
+            ]
+        );
     }
 
     #[test]

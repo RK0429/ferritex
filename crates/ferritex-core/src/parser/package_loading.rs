@@ -271,7 +271,7 @@ pub fn load_document_class(
             register_noop_command(engine, "subsubsection", 1);
             Ok(())
         }
-        "report" | "book" => {
+        "report" => {
             class_registry.set_class(ClassInfo {
                 name: name.to_string(),
                 options: options.to_vec(),
@@ -281,6 +281,21 @@ pub fn load_document_class(
             register_noop_command(engine, "section", 1);
             register_noop_command(engine, "subsection", 1);
             register_noop_command(engine, "subsubsection", 1);
+            Ok(())
+        }
+        "book" => {
+            class_registry.set_class(ClassInfo {
+                name: name.to_string(),
+                options: options.to_vec(),
+            });
+            register_base_latex_commands(engine);
+            register_noop_command(engine, "chapter", 1);
+            register_noop_command(engine, "section", 1);
+            register_noop_command(engine, "subsection", 1);
+            register_noop_command(engine, "subsubsection", 1);
+            register_alias_command(engine, "frontmatter", "cleardoublepage");
+            register_alias_command(engine, "mainmatter", "cleardoublepage");
+            register_alias_command(engine, "backmatter", "cleardoublepage");
             Ok(())
         }
         "letter" => {
@@ -321,7 +336,7 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
     register_noop_command(engine, "author", 1);
     register_noop_command(engine, "@gobble", 1);
     register_noop_command(engine, "@gobbletwo", 2);
-    register_noop_command(engine, "maketitle", 0);
+    register_noop_command(engine, "date", 1);
     register_noop_command(engine, "title", 1);
     register_noop_command(engine, "textsf", 1);
     register_noop_command(engine, "texttt", 1);
@@ -412,6 +427,22 @@ fn register_noop_command(engine: &mut MacroEngine, name: &str, parameter_count: 
             name: name.to_string(),
             parameter_count,
             body: Vec::new(),
+            protected: false,
+        },
+    );
+}
+
+fn register_alias_command(engine: &mut MacroEngine, name: &str, target: &str) {
+    engine.define_global(
+        name.to_string(),
+        MacroDef {
+            name: name.to_string(),
+            parameter_count: 0,
+            body: vec![Token {
+                kind: TokenKind::ControlWord(target.to_string()),
+                line: 0,
+                column: 0,
+            }],
             protected: false,
         },
     );

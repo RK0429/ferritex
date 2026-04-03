@@ -2866,6 +2866,7 @@ fn partition_document_for_work_unit(
         body: document.body.get(body_start..body_end)?.to_string(),
         labels,
         bibliography_state: document.bibliography_state.clone(),
+        has_maketitle: document.has_maketitle,
         has_unresolved_refs: document.has_unresolved_refs,
     })
 }
