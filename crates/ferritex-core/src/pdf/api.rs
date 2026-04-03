@@ -1035,7 +1035,7 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
 }
 
 fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle) {
-    if contains_math_script_markers(&line.text) && line.links.is_empty() {
+    if contains_footnote_markers(&line.text) && line.links.is_empty() {
         render_text_line_with_scripts(stream, line);
         return;
     }
@@ -1205,13 +1205,8 @@ fn parse_math_script_segments(text: &str) -> Vec<ScriptSegment> {
     segments
 }
 
-fn contains_math_script_markers(text: &str) -> bool {
-    text.contains(SUPERSCRIPT_START_MARKER)
-        || text.contains(SUPERSCRIPT_END_MARKER)
-        || text.contains(FOOTNOTE_MARKER_START)
-        || text.contains(FOOTNOTE_MARKER_END)
-        || text.contains(SUBSCRIPT_START_MARKER)
-        || text.contains(SUBSCRIPT_END_MARKER)
+fn contains_footnote_markers(text: &str) -> bool {
+    text.contains(FOOTNOTE_MARKER_START) || text.contains(FOOTNOTE_MARKER_END)
 }
 
 fn strip_math_script_markers(text: &str) -> String {
