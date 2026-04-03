@@ -733,6 +733,7 @@
 - **優先度**: Should
 - **出典**: ユーザー明示
 - **関連要件**: REQ-FUNC-031
+- **実装メモ（2026-04-04）**: 出力等価性（`--jobs=1` == `--jobs=4`、メタデータ差分除外）は partition-book / partition-article 全ケースで確認済み。per-case parallel overhead は 10% 以内（speedup >= 0.90）、per-subset mean speedup >= 0.95。ただし、受け入れ基準の strict speedup 条件（`--jobs=4` 中央値 < `--jobs=1` 中央値）は sub-1s compile の現行コーパスでは未達。理由: partition document construction / thread synchronization / fragment merge の overhead が typesetting savings と拮抗するため。multi-second compile（章あたり数千行規模）では measurable speedup が期待されるが、該当規模のコーパスケースが未整備。適用済み最適化: balanced coalescing / worker-thread document construction / fragment move semantics / inline group execution / merge_owned。計測条件: 600 iterations per chapter/section
 
 #### REQ-FUNC-033: フォント処理並列化
 
@@ -1150,6 +1151,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.42 | 2026-04-04 | `REQ-FUNC-032` に実装メモを追加。出力等価性確認済み・bounded no-regression evidence 確立済み・strict speedup 条件の sub-1s 構造的限界と適用済み最適化を記録 | Claude Opus 4.6 |
 | 0.1.41 | 2026-03-18 | `REQ-FUNC-046` の baseline 文書群成功条件を `--asset-bundle <展開先>` 明示指定へ統一し、`REQ-NF-009` / architecture の bootstrap 契約と整合させた | Codex |
 | 0.1.40 | 2026-03-18 | `REQ-NF-009` と `REQ-FUNC-046` に公式 Asset Bundle archive を `--asset-bundle <展開先>` で指定する初回導入フローを明記し、未確定事項から初回取得戦略を削除 | Codex |
 | 0.1.39 | 2026-03-18 | 用語集に `OverlaySet` / `PageBox` / `FontTaskTrace` を追加し、requirements 単体で語彙を解決できるようにした | Codex |
