@@ -487,10 +487,27 @@ fn parse_path_segments(
     }
 
     let mut path = vec![PathSegment::MoveTo(start)];
+    let mut current_point = start;
     loop {
         cursor.skip_whitespace();
         if cursor.is_eof() {
             return Some(path);
+        }
+        if cursor.consume_keyword("arc") {
+            cursor.skip_whitespace();
+            let Some((start_deg, end_deg, radius)) = cursor.parse_arc_spec() else {
+                emit_parse_error(
+                    diagnostics,
+                    "arc requires `(start angle:end angle:radius)`".to_string(),
+                );
+                return None;
+            };
+            let start_rad = start_deg.to_radians();
+            let center_x = current_point.x - radius * start_rad.cos();
+            let center_y = current_point.y - radius * start_rad.sin();
+            path.extend(arc_segments(center_x, center_y, radius, start_deg, end_deg));
+            current_point = point_on_circle(center_x, center_y, radius, end_deg.to_radians());
+            continue;
         }
         if !cursor.consume_prefix("--") {
             emit_parse_error(
@@ -514,6 +531,7 @@ fn parse_path_segments(
             return None;
         };
         path.push(PathSegment::LineTo(point));
+        current_point = point;
     }
 }
 
@@ -601,6 +619,61 @@ fn circle_path(center: Point, radius: f64) -> Vec<PathSegment> {
     ]
 }
 
+fn arc_segments(
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+    start_deg: f64,
+    end_deg: f64,
+) -> Vec<PathSegment> {
+    let sweep_deg = end_deg - start_deg;
+    if sweep_deg.abs() < 1e-12 {
+        return Vec::new();
+    }
+
+    let segment_count = (sweep_deg.abs() / 90.0).ceil() as usize;
+    let step_deg = sweep_deg / segment_count as f64;
+    let mut segments = Vec::with_capacity(segment_count);
+
+    for index in 0..segment_count {
+        let segment_start_deg = start_deg + step_deg * index as f64;
+        let segment_end_deg = segment_start_deg + step_deg;
+        let start_rad = segment_start_deg.to_radians();
+        let end_rad = segment_end_deg.to_radians();
+        let delta_rad = end_rad - start_rad;
+        let control_scale = if (delta_rad.abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-12 {
+            KAPPA.copysign(delta_rad)
+        } else {
+            (4.0 / 3.0) * (delta_rad / 4.0).tan()
+        };
+
+        let start_point = point_on_circle(center_x, center_y, radius, start_rad);
+        let end_point = point_on_circle(center_x, center_y, radius, end_rad);
+        let control1 = Point {
+            x: start_point.x - radius * control_scale * start_rad.sin(),
+            y: start_point.y + radius * control_scale * start_rad.cos(),
+        };
+        let control2 = Point {
+            x: end_point.x + radius * control_scale * end_rad.sin(),
+            y: end_point.y - radius * control_scale * end_rad.cos(),
+        };
+        segments.push(PathSegment::CurveTo {
+            control1,
+            control2,
+            end: end_point,
+        });
+    }
+
+    segments
+}
+
+fn point_on_circle(center_x: f64, center_y: f64, radius: f64, angle_rad: f64) -> Point {
+    Point {
+        x: center_x + radius * angle_rad.cos(),
+        y: center_y + radius * angle_rad.sin(),
+    }
+}
+
 fn split_options(options: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0usize;
@@ -622,6 +695,19 @@ fn split_options(options: &str) -> Vec<&str> {
     }
     result.push(options[start..].trim());
     result
+}
+
+fn resolve_line_width_preset(name: &str) -> Option<f64> {
+    match name.trim() {
+        "ultra thin" => Some(0.1),
+        "very thin" => Some(0.2),
+        "thin" => Some(0.4),
+        "semithick" => Some(0.6),
+        "thick" => Some(0.8),
+        "very thick" => Some(1.2),
+        "ultra thick" => Some(1.6),
+        _ => None,
+    }
 }
 
 impl PathStyle {
@@ -714,7 +800,9 @@ impl PathStyle {
                     _ => emit_parse_error(diagnostics, format!("invalid rotate `{value}`")),
                 },
                 (color_name, None) => {
-                    if let Some(color) = resolve_named_color(color_name) {
+                    if let Some(line_width) = resolve_line_width_preset(color_name) {
+                        style.line_width = line_width;
+                    } else if let Some(color) = resolve_named_color(color_name) {
                         match (style.stroke.is_some(), style.fill.is_some()) {
                             (true, true) => {
                                 style.stroke = Some(color);
@@ -821,7 +909,9 @@ impl ScopeOptions {
                     _ => emit_parse_error(diagnostics, format!("invalid rotate `{value}`")),
                 },
                 (color_name, None) => {
-                    if let Some(color) = resolve_named_color(color_name) {
+                    if let Some(line_width) = resolve_line_width_preset(color_name) {
+                        parsed.default_line_width = Some(line_width);
+                    } else if let Some(color) = resolve_named_color(color_name) {
                         parsed.default_stroke = Some(color);
                         parsed.default_fill = Some(color);
                     } else {
@@ -965,6 +1055,38 @@ impl<'a> Cursor<'a> {
         Some(radius)
     }
 
+    /// Parses the colon-separated arc spec `(start:end:radius)`.
+    /// The key-value form `[start angle=..., end angle=..., radius=...]` is not yet supported.
+    fn parse_arc_spec(&mut self) -> Option<(f64, f64, f64)> {
+        self.skip_whitespace();
+        if !self.consume_prefix("(") {
+            return None;
+        }
+
+        self.skip_whitespace();
+        let start_angle = self.parse_number_token(&[':'])?;
+        self.skip_whitespace();
+        if !self.consume_prefix(":") {
+            return None;
+        }
+
+        self.skip_whitespace();
+        let end_angle = self.parse_number_token(&[':'])?;
+        self.skip_whitespace();
+        if !self.consume_prefix(":") {
+            return None;
+        }
+
+        self.skip_whitespace();
+        let radius = self.parse_length_token(true)?;
+        self.skip_whitespace();
+        if !self.consume_prefix(")") {
+            return None;
+        }
+
+        Some((start_angle, end_angle, radius))
+    }
+
     fn parse_braced_text(&mut self) -> Option<String> {
         self.skip_whitespace();
         if !self.consume_prefix("{") {
@@ -1006,6 +1128,23 @@ impl<'a> Cursor<'a> {
         let value = parse_length(token, default_cm)?;
         self.index += token_len;
         Some(value)
+    }
+
+    fn parse_number_token(&mut self, delimiters: &[char]) -> Option<f64> {
+        let rest = self.remaining();
+        let token_len = rest
+            .char_indices()
+            .take_while(|(_, ch)| !ch.is_whitespace() && !delimiters.contains(ch))
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if token_len == 0 {
+            return None;
+        }
+        let token = &rest[..token_len];
+        let value = token.parse::<f64>().ok()?;
+        self.index += token_len;
+        value.is_finite().then_some(value)
     }
 
     fn parse_statement_chunk(&mut self) -> Option<&'a str> {
@@ -1194,7 +1333,10 @@ mod tests {
         PathSegment, Point, Transform2D, VectorPrimitive,
     };
 
-    use super::{circle_path, named_color, parse_tikzpicture, TikzDiagnostic, CM_IN_PT, KAPPA};
+    use super::{
+        arc_segments, circle_path, named_color, parse_tikzpicture, resolve_line_width_preset,
+        TikzDiagnostic, CM_IN_PT, KAPPA,
+    };
 
     fn assert_point_close(actual: Point, expected: Point) {
         assert!(
@@ -1338,6 +1480,165 @@ mod tests {
         assert!(matches!(path[3], PathSegment::CurveTo { .. }));
         assert!(matches!(path[4], PathSegment::CurveTo { .. }));
         assert_eq!(path[5], PathSegment::ClosePath);
+    }
+
+    #[test]
+    fn arc_segments_use_cubic_beziers() {
+        let path = arc_segments(0.0, 0.0, CM_IN_PT, 0.0, 90.0);
+
+        assert_eq!(path.len(), 1);
+        let PathSegment::CurveTo {
+            control1,
+            control2,
+            end,
+        } = path[0]
+        else {
+            panic!("expected quarter arc to be cubic bezier");
+        };
+        assert_point_close(
+            control1,
+            Point {
+                x: CM_IN_PT,
+                y: CM_IN_PT * KAPPA,
+            },
+        );
+        assert_point_close(
+            control2,
+            Point {
+                x: CM_IN_PT * KAPPA,
+                y: CM_IN_PT,
+            },
+        );
+        assert_point_close(
+            end,
+            Point {
+                x: 0.0,
+                y: CM_IN_PT,
+            },
+        );
+    }
+
+    #[test]
+    fn arc_segments_zero_sweep_returns_empty() {
+        let path = arc_segments(0.0, 0.0, CM_IN_PT, 45.0, 45.0);
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn arc_segments_negative_sweep_produces_clockwise_arc() {
+        let path = arc_segments(0.0, 0.0, CM_IN_PT, 90.0, 0.0);
+
+        assert_eq!(path.len(), 1);
+        let PathSegment::CurveTo { end, .. } = path[0] else {
+            panic!("expected CurveTo");
+        };
+        assert_point_close(
+            end,
+            Point {
+                x: CM_IN_PT,
+                y: 0.0,
+            },
+        );
+    }
+
+    #[test]
+    fn arc_segments_splits_large_sweep_into_multiple_beziers() {
+        let path = arc_segments(0.0, 0.0, CM_IN_PT, 0.0, 180.0);
+
+        assert_eq!(path.len(), 2);
+        let PathSegment::CurveTo { end: mid, .. } = path[0] else {
+            panic!("expected CurveTo");
+        };
+        assert_point_close(
+            mid,
+            Point {
+                x: 0.0,
+                y: CM_IN_PT,
+            },
+        );
+        let PathSegment::CurveTo { end: final_pt, .. } = path[1] else {
+            panic!("expected CurveTo");
+        };
+        assert_point_close(
+            final_pt,
+            Point {
+                x: -CM_IN_PT,
+                y: 0.0,
+            },
+        );
+    }
+
+    #[test]
+    fn arc_segments_full_circle_produces_four_beziers() {
+        let path = arc_segments(0.0, 0.0, CM_IN_PT, 0.0, 360.0);
+
+        assert_eq!(path.len(), 4);
+        let PathSegment::CurveTo { end, .. } = path[3] else {
+            panic!("expected CurveTo");
+        };
+        assert_point_close(
+            end,
+            Point {
+                x: CM_IN_PT,
+                y: 0.0,
+            },
+        );
+    }
+
+    #[test]
+    fn parses_arc_path_and_continues_with_line_segments() {
+        let result = parse_tikzpicture(r"\draw (1,0) arc (0:90:1) -- (2,0);");
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.line_width, 0.4);
+        assert_eq!(primitive.stroke, Some(named_color("black")));
+        assert_eq!(primitive.path.len(), 3);
+        assert_eq!(
+            primitive.path[0],
+            PathSegment::MoveTo(Point {
+                x: CM_IN_PT,
+                y: 0.0,
+            })
+        );
+        let PathSegment::CurveTo {
+            control1,
+            control2,
+            end,
+        } = primitive.path[1]
+        else {
+            panic!("expected arc to become cubic bezier");
+        };
+        assert_point_close(
+            control1,
+            Point {
+                x: CM_IN_PT,
+                y: CM_IN_PT * KAPPA,
+            },
+        );
+        assert_point_close(
+            control2,
+            Point {
+                x: CM_IN_PT * KAPPA,
+                y: CM_IN_PT,
+            },
+        );
+        assert_point_close(
+            end,
+            Point {
+                x: 0.0,
+                y: CM_IN_PT,
+            },
+        );
+        assert_eq!(
+            primitive.path[2],
+            PathSegment::LineTo(Point {
+                x: 2.0 * CM_IN_PT,
+                y: 0.0,
+            })
+        );
     }
 
     #[test]
@@ -1579,6 +1880,41 @@ mod tests {
         assert_eq!(double_forward.arrows, ArrowSpec::Forward);
         assert_eq!(backward.arrows, ArrowSpec::Backward);
         assert_eq!(both.arrows, ArrowSpec::Both);
+    }
+
+    #[test]
+    fn resolves_standard_line_width_presets() {
+        assert_eq!(resolve_line_width_preset("ultra thin"), Some(0.1));
+        assert_eq!(resolve_line_width_preset("very thin"), Some(0.2));
+        assert_eq!(resolve_line_width_preset("thin"), Some(0.4));
+        assert_eq!(resolve_line_width_preset("semithick"), Some(0.6));
+        assert_eq!(resolve_line_width_preset("thick"), Some(0.8));
+        assert_eq!(resolve_line_width_preset("very thick"), Some(1.2));
+        assert_eq!(resolve_line_width_preset("ultra thick"), Some(1.6));
+        assert_eq!(resolve_line_width_preset("blue"), None);
+    }
+
+    #[test]
+    fn parses_line_width_presets_in_scope_and_path_styles() {
+        let result = parse_tikzpicture(
+            r"\begin{scope}[very thick]
+                \draw (0,0) -- (1,0);
+                \draw[thin] (0,1) -- (1,1);
+            \end{scope}",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Group(scope)] = result.scene.nodes.as_slice() else {
+            panic!("expected scope group");
+        };
+        assert_eq!(scope.default_line_width, Some(1.2));
+        let [GraphicNode::Vector(default_line), GraphicNode::Vector(thin_line)] =
+            scope.children.as_slice()
+        else {
+            panic!("expected two vector nodes");
+        };
+        assert_eq!(default_line.line_width, 1.2);
+        assert_eq!(thin_line.line_width, 0.4);
     }
 
     #[test]

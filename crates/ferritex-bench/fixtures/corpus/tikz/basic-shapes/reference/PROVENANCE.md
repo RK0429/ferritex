@@ -19,6 +19,8 @@
 - `ellipse.tex` -> `ellipse.pdf`
 - `grid_pattern.tex` -> `grid_pattern.pdf`
 - `path_operations.tex` -> `path_operations.pdf`
+- `arc_basic.tex` -> `arc_basic.pdf` (generated `2026-04-04 JST`)
+- `line_width_presets.tex` -> `line_width_presets.pdf` (generated `2026-04-04 JST`)
 
 ## Notes
 
