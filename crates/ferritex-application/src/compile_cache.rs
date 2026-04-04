@@ -161,6 +161,8 @@ struct CacheIndex {
     dependency_graph: DependencyGraph,
     stable_compile_state: StableCompileState,
     partition_keys: Vec<String>,
+    #[serde(default)]
+    partition_hashes: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,14 +381,23 @@ impl<'a> CompileCache<'a> {
             ));
         }
 
+        let previous_hashes: BTreeMap<String, u64> = self
+            .file_access_gate
+            .read_file(&self.metadata_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CacheIndex>(&bytes).ok())
+            .map(|idx| idx.partition_hashes)
+            .unwrap_or_default();
+
         let partition_blobs = partition_blobs_for(
             cached_source_subtrees,
             cached_typeset_fragments,
             cached_page_payloads,
         );
+        let mut new_hashes = BTreeMap::new();
         for (partition_key, blob) in &partition_blobs {
             let path = self.partition_blob_path(partition_key);
-            let bytes = match serde_json::to_vec_pretty(&blob) {
+            let bytes = match serde_json::to_vec(&blob) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     return Some(cache_info_diagnostic(
@@ -395,6 +406,12 @@ impl<'a> CompileCache<'a> {
                     ));
                 }
             };
+            let hash = fingerprint_bytes(&bytes);
+
+            if previous_hashes.get(partition_key) == Some(&hash) && path.exists() {
+                new_hashes.insert(partition_key.clone(), hash);
+                continue;
+            }
 
             if let Err(error) = self.file_access_gate.write_file(&path, &bytes) {
                 return Some(cache_info_diagnostic(
@@ -402,6 +419,8 @@ impl<'a> CompileCache<'a> {
                     &path,
                 ));
             }
+
+            new_hashes.insert(partition_key.clone(), hash);
         }
 
         let index = CacheIndex {
@@ -413,6 +432,7 @@ impl<'a> CompileCache<'a> {
             dependency_graph: dependency_graph.clone(),
             stable_compile_state: stable_compile_state.clone(),
             partition_keys: partition_blobs.keys().cloned().collect(),
+            partition_hashes: new_hashes,
         };
 
         let bytes = match serde_json::to_vec_pretty(&index) {
@@ -1576,6 +1596,7 @@ mod tests {
             dependency_graph: dependency_graph_for(&input, "stable"),
             stable_compile_state: stable_state(&input),
             partition_keys: vec![partition_key.clone()],
+            partition_hashes: BTreeMap::new(),
         };
         fs::write(
             record_dir.join(super::CACHE_INDEX_FILENAME),
@@ -1759,6 +1780,111 @@ mod tests {
                 .filter(|path| path.starts_with(&cache.partitions_dir))
                 .count(),
             cached_source_subtrees.len() + cached_typeset_fragments.len()
+        );
+    }
+
+    #[test]
+    fn delta_write_skips_unchanged_partition_blobs() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let cached_typeset_fragments = BTreeMap::from([
+            (
+                "document:0000:main".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0000:main"),
+                    source_hash: 11,
+                    block_checkpoints: None,
+                },
+            ),
+            (
+                "document:0001:appendix".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0001:appendix"),
+                    source_hash: 22,
+                    block_checkpoints: None,
+                },
+            ),
+        ]);
+
+        let gate = RecordingFsGate::new();
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        let graph = dependency_graph_for(&input, "stable");
+        let state = stable_state(&input);
+
+        cache
+            .store(
+                &graph,
+                &state,
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+            )
+            .expect_none("initial cache stored");
+
+        let initial_writes = gate.writes();
+        let initial_partition_writes = initial_writes
+            .iter()
+            .filter(|path| path.starts_with(&cache.partitions_dir))
+            .count();
+        assert_eq!(initial_partition_writes, cached_typeset_fragments.len());
+
+        cache
+            .store(
+                &graph,
+                &state,
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+            )
+            .expect_none("unchanged cache stored");
+
+        let writes_after_second_store = gate.writes();
+        let second_store_writes = &writes_after_second_store[initial_writes.len()..];
+        assert_eq!(second_store_writes, &[cache.metadata_path.clone()]);
+
+        let updated_fragments = BTreeMap::from([
+            (
+                "document:0000:main".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0000:main"),
+                    source_hash: 99,
+                    block_checkpoints: None,
+                },
+            ),
+            (
+                "document:0001:appendix".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0001:appendix"),
+                    source_hash: 22,
+                    block_checkpoints: None,
+                },
+            ),
+        ]);
+        let changed_partition = cache.partition_blob_path(&super::sanitize_partition_key(
+            "fragment:document:0000:main",
+        ));
+
+        cache
+            .store(
+                &graph,
+                &state,
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &updated_fragments,
+            )
+            .expect_none("updated cache stored");
+
+        let writes_after_third_store = gate.writes();
+        let third_store_writes = &writes_after_third_store[writes_after_second_store.len()..];
+        assert_eq!(
+            third_store_writes,
+            &[changed_partition, cache.metadata_path.clone()]
         );
     }
 
@@ -2297,6 +2423,7 @@ mod tests {
                 dependency_graph: dependency_graph_for(&valid_a_input, "valid-a"),
                 stable_compile_state: stable_state(&valid_a_input),
                 partition_keys: Vec::new(),
+                partition_hashes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -2311,6 +2438,7 @@ mod tests {
                 dependency_graph: dependency_graph_for(&unreadable_input, "unreadable"),
                 stable_compile_state: stable_state(&unreadable_input),
                 partition_keys: Vec::new(),
+                partition_hashes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -2325,6 +2453,7 @@ mod tests {
                 dependency_graph: dependency_graph_for(&valid_b_input, "valid-b"),
                 stable_compile_state: stable_state(&valid_b_input),
                 partition_keys: Vec::new(),
+                partition_hashes: BTreeMap::new(),
             },
             BTreeMap::new(),
         );
@@ -2394,6 +2523,7 @@ mod tests {
                     dependency_graph: dependency_graph_for(&extra_input, &format!("extra-{index}")),
                     stable_compile_state: stable_state(&extra_input),
                     partition_keys: Vec::new(),
+                    partition_hashes: BTreeMap::new(),
                 },
                 BTreeMap::new(),
             );
