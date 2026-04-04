@@ -149,6 +149,7 @@ pub struct StageTiming {
     pub pdf_render: Option<std::time::Duration>,
     pub cache_store: Option<std::time::Duration>,
     pub typeset_partition_details: Option<Vec<PartitionTypesetDetail>>,
+    pub pass_count: Option<u32>,
 }
 
 impl StageTiming {
@@ -1412,6 +1413,7 @@ impl<'a> CompileJobService<'a> {
             typeset_document,
             pass_count,
         } = parse_pass_result;
+        stage_timing.pass_count = Some(pass_count);
         let mut parse_diagnostics: Vec<Diagnostic> = errors
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
@@ -9172,6 +9174,7 @@ mod tests {
             pdf_render: None,
             cache_store: Some(Duration::from_micros(50)),
             typeset_partition_details: None,
+            pass_count: None,
         };
 
         assert_eq!(timing.total(), Duration::from_micros(1050));
@@ -9189,6 +9192,7 @@ mod tests {
         assert!(timing.pdf_render.is_none());
         assert!(timing.cache_store.is_none());
         assert!(timing.typeset_partition_details.is_none());
+        assert!(timing.pass_count.is_none());
     }
 
     #[test]
@@ -10958,6 +10962,17 @@ mod tests {
                 .join(", ")
         }
 
+        fn run_list_pass_counts(values: &[Option<u32>]) -> String {
+            values
+                .iter()
+                .map(|pass_count| match pass_count {
+                    Some(count) => format!("{count}"),
+                    None => "N/A".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
         let mut body = String::new();
@@ -10988,6 +11003,7 @@ mod tests {
         let mut pdf_render_runs = Vec::with_capacity(5);
         let mut cache_store_runs = Vec::with_capacity(5);
         let mut total_runs = Vec::with_capacity(5);
+        let mut pass_count_runs = Vec::with_capacity(5);
 
         for i in 1..=5 {
             fs::write(
@@ -11009,6 +11025,7 @@ mod tests {
             pdf_render_runs.push(timing.pdf_render.unwrap_or(Duration::ZERO));
             cache_store_runs.push(timing.cache_store.unwrap_or(Duration::ZERO));
             total_runs.push(timing.total());
+            pass_count_runs.push(timing.pass_count);
         }
 
         let cache_load_median = median_duration(&cache_load_runs);
@@ -11071,6 +11088,169 @@ mod tests {
             "total:            median {}ms  (runs: {})",
             total_median.as_millis(),
             run_list_ms(&total_runs)
+        );
+        println!(
+            "pass_count:       (runs: {})",
+            run_list_pass_counts(&pass_count_runs)
+        );
+        println!(
+            "dominant_stage:   {} ({:.1}%)",
+            dominant_stage.0, dominant_percentage
+        );
+    }
+
+    #[test]
+    #[ignore = "REQ-NF-002 convergence analysis: 5-run with cross-references (~6 min)"]
+    fn incremental_stage_timing_with_refs_5run() {
+        fn median_duration(values: &[Duration]) -> Duration {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[2]
+        }
+
+        fn run_list_ms(values: &[Duration]) -> String {
+            values
+                .iter()
+                .map(|value| format!("{}ms", value.as_millis()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+
+        fn run_list_pass_counts(values: &[Option<u32>]) -> String {
+            values
+                .iter()
+                .map(|pass_count| match pass_count {
+                    Some(count) => format!("{count}"),
+                    None => "N/A".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let mut body = String::from("\\tableofcontents\n");
+        for index in 1..=1000 {
+            let stem = format!("section-{index:04}");
+            body.push_str(&format!("\\input{{{stem}}}\n"));
+            fs::write(
+                dir.path().join(format!("{stem}.tex")),
+                format!(
+                    "\\section{{Section {index:04}}}\\label{{sec:{index:04}}}\n{}Alpha paragraph {index:04}.\n\nBeta paragraph {index:04}.\n\nGamma paragraph {index:04}.\n",
+                    if index > 1 {
+                        format!("See Section~\\ref{{sec:{:04}}}.\n\n", index - 1)
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
+            .expect("write section input");
+        }
+        fs::write(&input_file, document(&body)).expect("write main input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0, "{:?}", warmup.diagnostics);
+
+        let mut cache_load_runs = Vec::with_capacity(5);
+        let mut source_tree_load_runs = Vec::with_capacity(5);
+        let mut parse_runs = Vec::with_capacity(5);
+        let mut typeset_runs = Vec::with_capacity(5);
+        let mut pdf_render_runs = Vec::with_capacity(5);
+        let mut cache_store_runs = Vec::with_capacity(5);
+        let mut total_runs = Vec::with_capacity(5);
+        let mut pass_count_runs = Vec::with_capacity(5);
+
+        for i in 1..=5 {
+            fs::write(
+                dir.path().join("section-0900.tex"),
+                format!(
+                    "\\section{{Section 0900}}\\label{{sec:0900}}\nSee Section~\\ref{{sec:0899}}.\n\nAlpha paragraph 0900.\n\nBeta paragraph 0900 after benchmark run {i} edit.\n\nGamma paragraph 0900.\n"
+                ),
+            )
+            .expect("update staged section");
+
+            let incremental = service(&FsTestFileAccessGate, &loader).compile(&options);
+            assert_eq!(incremental.exit_code, 0, "{:?}", incremental.diagnostics);
+
+            let timing = incremental.stage_timing;
+            cache_load_runs.push(timing.cache_load.unwrap_or(Duration::ZERO));
+            source_tree_load_runs.push(timing.source_tree_load.unwrap_or(Duration::ZERO));
+            parse_runs.push(timing.parse.unwrap_or(Duration::ZERO));
+            typeset_runs.push(timing.typeset.unwrap_or(Duration::ZERO));
+            pdf_render_runs.push(timing.pdf_render.unwrap_or(Duration::ZERO));
+            cache_store_runs.push(timing.cache_store.unwrap_or(Duration::ZERO));
+            total_runs.push(timing.total());
+            pass_count_runs.push(timing.pass_count);
+        }
+
+        let cache_load_median = median_duration(&cache_load_runs);
+        let source_tree_load_median = median_duration(&source_tree_load_runs);
+        let parse_median = median_duration(&parse_runs);
+        let typeset_median = median_duration(&typeset_runs);
+        let pdf_render_median = median_duration(&pdf_render_runs);
+        let cache_store_median = median_duration(&cache_store_runs);
+        let total_median = median_duration(&total_runs);
+
+        let dominant_stage = [
+            ("cache_load", cache_load_median),
+            ("source_tree_load", source_tree_load_median),
+            ("parse", parse_median),
+            ("typeset", typeset_median),
+            ("pdf_render", pdf_render_median),
+            ("cache_store", cache_store_median),
+        ]
+        .into_iter()
+        .max_by_key(|(_, duration)| *duration)
+        .expect("stage medians should not be empty");
+        let dominant_percentage = if total_median.is_zero() {
+            0.0
+        } else {
+            dominant_stage.1.as_secs_f64() / total_median.as_secs_f64() * 100.0
+        };
+
+        println!("[REQ-NF-002 STAGE BREAKDOWN WITH REFS]");
+        println!(
+            "cache_load:       median {}ms  (runs: {})",
+            cache_load_median.as_millis(),
+            run_list_ms(&cache_load_runs)
+        );
+        println!(
+            "source_tree_load: median {}ms  (runs: {})",
+            source_tree_load_median.as_millis(),
+            run_list_ms(&source_tree_load_runs)
+        );
+        println!(
+            "parse:            median {}ms  (runs: {})",
+            parse_median.as_millis(),
+            run_list_ms(&parse_runs)
+        );
+        println!(
+            "typeset:          median {}ms  (runs: {})",
+            typeset_median.as_millis(),
+            run_list_ms(&typeset_runs)
+        );
+        println!(
+            "pdf_render:       median {}ms  (runs: {})",
+            pdf_render_median.as_millis(),
+            run_list_ms(&pdf_render_runs)
+        );
+        println!(
+            "cache_store:      median {}ms  (runs: {})",
+            cache_store_median.as_millis(),
+            run_list_ms(&cache_store_runs)
+        );
+        println!(
+            "total:            median {}ms  (runs: {})",
+            total_median.as_millis(),
+            run_list_ms(&total_runs)
+        );
+        println!(
+            "pass_count:       (runs: {})",
+            run_list_pass_counts(&pass_count_runs)
         );
         println!(
             "dominant_stage:   {} ({:.1}%)",
