@@ -35,7 +35,7 @@ Wave 1（Incremental Performance Evidence）では `FTX-BENCH-001` 1000-section 
 | **PDF 出力** | Step 3 で per-page payload reuse は実装済み。ただし再利用対象は `Cached` / `BlockReuse` partition のページに限られ、fallback partition を含む文書や XObject-backed page は safety-first で再 render する | `compile_job_service.rs:1561`, `compile_job_service.rs:4710`, `pdf/api.rs:990` |
 | **Cache 保存** | split cache（現在の format は v7）で monolithic JSON は解消したが、`index.json` と変更 partition blob の serialize/deserialize は依然として発生する | `compile_cache.rs:272` |
 
-**構造的制約**: typeset と render は sub-document 粒度まで縮小できているが、parse と一部 fixed-cost stage は依然として全文・全 partition 相当の処理を含む。`StageTiming.pass_count` 計装と 1000-section staged input の 5-run benchmark により、incremental compile の baseline は no-ref 520ms / with-ref 588ms、pass_count はいずれも 1 と確認された。Round 1（delta write）で with-ref median は 505ms、Round 2（dirty-tracking store + warm-cache lookup）で 369ms まで低下した。旧来の 66.8s 計測値は `--no-cache` 初期 compile を同一 run に含む debug 条件のため hot incremental path の比較基準としては不適切である点は変わらない。現在の frontier は cache I/O 252ms（68.3%）の削減であり、dominant stage は cache_load 151ms（40.9%）である。
+**構造的制約**: typeset と render は sub-document 粒度まで縮小できているが、parse と一部 fixed-cost stage は依然として全文・全 partition 相当の処理を含む。`StageTiming.pass_count` 計装と 1000-section staged input の 5-run benchmark により、incremental compile の baseline は no-ref 520ms / with-ref 588ms、pass_count はいずれも 1 と確認された。Round 1（delta write）で with-ref median は 505ms、Round 2（dirty-tracking store + warm-cache lookup）で 369ms、Round 3（zero-clone warm-cache）で 348ms まで低下した。旧来の 66.8s 計測値は `--no-cache` 初期 compile を同一 run に含む debug 条件のため hot incremental path の比較基準としては不適切である点は変わらない。現在の frontier は cache I/O 231ms（66.4%）の削減であり、dominant stage は cache_load 139ms（40.0%）である。
 
 ### 1.4 収束ループ分析（2026-04-05）
 
@@ -57,7 +57,7 @@ Wave 1（Incremental Performance Evidence）では `FTX-BENCH-001` 1000-section 
 
 注: 上表は delta write 最適化前の baseline 計測を保持する。更新値は §7「Cache I/O delta write optimization (2026-04-05)」を参照。
 
-**結論**: baseline では cache I/O（cache_store + cache_load = 460ms、78%）が最優先ターゲットだった。Round 1（delta write）で with-ref 5-run median は 505ms、cache I/O は 389ms（77.0%）まで低下した。Round 2（dirty-tracking store + warm-cache lookup）で cache_store は 245ms → 101ms（-58.8%）に劇的改善し、total は 369ms、cache I/O は 252ms（68.3%）まで低下した。dominant stage は cache_store から cache_load 151ms（40.9%）にシフトした。cache I/O が引き続き最優先 frontier であり、cache_load の根本的改善（lazy partition load、binary serialization format）が次の候補である。Step 4（incremental parse）は parse が 22ms（6.0%）に留まるため、cache I/O 改善後の次の候補となる。
+**結論**: baseline では cache I/O（cache_store + cache_load = 460ms、78%）が最優先ターゲットだった。Round 1（delta write）で with-ref 5-run median は 505ms、cache I/O は 389ms（77.0%）まで低下した。Round 2（dirty-tracking store + warm-cache lookup）で cache_store は 245ms → 101ms（-58.8%）に劇的改善し、total は 369ms、cache I/O は 252ms（68.3%）まで低下した。Round 3（zero-clone warm-cache）で cache_load は 151ms → 139ms（-7.9%）、cache_store は 101ms → 92ms（-8.9%）に改善し、total は 348ms、cache I/O は 231ms（66.4%）まで低下した。dominant stage は引き続き cache_load 139ms（40.0%）である。cache I/O が引き続き最優先 frontier であり、binary serialization format（bincode 等）と lazy partition load が次の候補である。ただし computation 単独でも 113ms と 100ms 目標を超過しており、cache I/O 削減だけでは不十分。Step 4（incremental parse）は parse が 22ms（6.3%）に留まるが、source_tree_load 23ms（6.6%）と合わせた fixed-cost 45ms の削減も検討対象となる。
 
 ## 2. 設計オプション比較
 
@@ -116,18 +116,18 @@ unchanged partition の parsed body も cache し、全文 parse を省略する
 
 ## 3. 推奨方針
 
-**A → B → C は実装済みで、cache I/O Round 1（delta write）+ Round 2（dirty-tracking store + warm-cache lookup）が完了した。** suffix rebuild 改善と収束ループ分析に加え、Round 1 では compact JSON serialization・`partition_hashes` 追跡・未変更 blob write skip を導入し、Round 2 では clean partition の serialization スキップ（dirty-tracking）と前回 lookup の blob 再利用（warm-cache lookup）を導入した。with-ref 5-run median は 588ms → 505ms → 369ms、cache I/O は 460ms（78%）→ 389ms（77.0%）→ 252ms（68.3%）と段階的に低下した。cache_store は 289ms → 101ms（-65.1%）に劇的改善したが、cache_load は 171ms → 151ms（-11.7%）に留まり dominant stage にシフトした。次の主計画は cache_load 151ms（40.9%）を中心とした lazy partition load と binary serialization format の導入である。D（incremental parse）は parse が 22ms（6.0%）に留まるため、cache I/O 改善後の候補とする。
+**A → B → C は実装済みで、cache I/O Round 1（delta write）+ Round 2（dirty-tracking store + warm-cache lookup）+ Round 3（zero-clone warm-cache）が完了した。** suffix rebuild 改善と収束ループ分析に加え、Round 1 では compact JSON serialization・`partition_hashes` 追跡・未変更 blob write skip を導入し、Round 2 では clean partition の serialization スキップ（dirty-tracking）と前回 lookup の blob 再利用（warm-cache lookup）を導入し、Round 3 では `WarmPartitionCache` を flat map + move ベースへ再設計して partition blob の clone 経路を除去した。with-ref 5-run median は 588ms → 505ms → 369ms → 348ms、cache I/O は 460ms（78%）→ 389ms（77.0%）→ 252ms（68.3%）→ 231ms（66.4%）と段階的に低下した。cache_store は 289ms → 92ms（-68.2%）、cache_load は 171ms → 139ms（-18.7%）に改善したが、cache I/O 231ms は依然支配的で computation 113ms と合わせ 348ms。100ms 目標に対しては、JSON serialization format 自体がボトルネックであり、binary format（bincode/rkyv）+ lazy partition load が次の構造的改善候補。D（incremental parse）は parse が 22ms（6.3%）に留まるが、computation 113ms 超過を解消するには source_tree_load 23ms の削減も視野に入る。
 
 ### 根拠
 
 1. **既存 API の活用**: Option B は `segment_source_span`、`build_vlist_for_partition_continuing()`、`paginate_vlist_continuing_detailed()` など既存の continuation API を直接活用できる。全面的な parser rewrite を先送りしつつ、typeset の支配的コストを大幅に削減できる
-2. **段階的な効果検証**: Step 0 + 収束ループ分析で `pass_count=1` / cache I/O 78% を確認し、Round 1（delta write）で 505ms / 389ms、Round 2（dirty-tracking + warm-cache）で 369ms / 252ms まで低下した。cache_store は 101ms まで改善し dominant stage が cache_load 151ms にシフトした。次段階は cache_load を中心に lazy partition load / binary format で cache I/O を先に削り、その後に parse 最適化の必要性を再判定できる
+2. **段階的な効果検証**: Step 0 + 収束ループ分析で `pass_count=1` / cache I/O 78% を確認し、Round 1（delta write）で 505ms / 389ms、Round 2（dirty-tracking + warm-cache）で 369ms / 252ms、Round 3（zero-clone warm-cache）で 348ms / 231ms まで低下した。cache_store は 92ms、cache_load は 139ms まで改善したが、JSON serialization overhead が残存しており clone 除去だけでは限界に近い。次段階は binary format + lazy load による serialization 自体の置換が必要
 3. **リスクの局所化**: A は低リスク、B と C は中リスクだが影響範囲が異なる module に閉じる。D の高リスクを後回しにすることで、早期に効果を得られる
 4. **`CachedTypesetFragment` の進化方向**: 次の粒度は「paragraph 単体 cache」より「block checkpoint + page suffix」が現実的。footnote/float/page-shift の継続状態を保持できるため
 
 ### 前提条件
 
-- **計装の先行実装（Step 0 + 収束ループ分析完了済み）**: `StageTiming` と `pass_count` により stage 別 timing と収束回数の取得基盤が整った。baseline では with-ref benchmark の total 588ms・cache I/O 78% を確認し、Round 1（delta write）後は total 505ms・cache I/O 389ms（77.0%）、Round 2（dirty-tracking + warm-cache）後は total 369ms・cache I/O 252ms（68.3%）・`pass_count=1` を確認済み
+- **計装の先行実装（Step 0 + 収束ループ分析完了済み）**: `StageTiming` と `pass_count` により stage 別 timing と収束回数の取得基盤が整った。baseline では with-ref benchmark の total 588ms・cache I/O 78% を確認し、Round 1（delta write）後は total 505ms・cache I/O 389ms（77.0%）、Round 2（dirty-tracking + warm-cache）後は total 369ms・cache I/O 252ms（68.3%）、Round 3（zero-clone warm-cache）後は total 348ms・cache I/O 231ms（66.4%）・`pass_count=1` を確認済み
 - **`FTX-BENCH-001` の固定構成**: ベンチマークは 1000-section staged input を使用する。monolithic single-file ではなく partition entry file 単位への staged 変換が前提（Wave 1 の設計判断を踏襲）
 - **preamble 変更は full fallback を許容**: preamble 変更での 100ms 達成は scope 外。本文 1 段落変更が対象
 
@@ -345,3 +345,45 @@ Round 1（delta write）に続き、(1) dirty-tracking store（clean partition b
 - **computation は 114ms（30.9%）** に留まり、cache I/O 252ms（68.3%）との間に 2.2 倍の差がある。100ms 目標に対しては computation 単独でも超過（114ms）しているが、source_tree_load 24ms は cache I/O 改善後に副次的に対処可能な範囲
 
 **次 frontier**: cache I/O 252ms（68.3%）が引き続き支配的。cache_load 151ms（40.9%）が最大の単一 stage であり、(1) lazy partition load（必要な partition blob のみ read + deserialize）、(2) binary serialization format（bincode 等による encode/decode 高速化）、(3) index 分離（partition_hashes のみ先行 read し、blob 本体は遅延 load）が候補。cache_store 101ms（27.4%）は dirty-tracking で大幅改善済みだが、async / background write で残りをさらに削れる可能性がある。Step 4（incremental parse）は parse 22ms（6.0%）のため、cache I/O 改善後に再評価する。
+
+### Cache I/O Round 3: Zero-clone warm-cache (2026-04-05)
+
+Round 2 では warm-cache lookup が clone overhead により逆効果だった（cache_load 144ms → 151ms、+4.9%）。Round 3 では `WarmPartitionCache` を flat map + move ベースへ再設計し、lookup/load/store/compile_job_service の clone 経路を除去した。`store_with_page_payloads` は新しい `partition_hashes` を返し、post-compile data から warm cache を再構築する。
+
+| Stage | Median | % |
+|---|---:|---:|
+| `cache_load` | 139ms | 40.0% |
+| `source_tree_load` | 23ms | 6.6% |
+| `parse` | 22ms | 6.3% |
+| `typeset` | 56ms | 16.1% |
+| `pdf_render` | 12ms | 3.4% |
+| `cache_store` | 92ms | 26.4% |
+| `total` | 348ms | 100.0% |
+| `cache I/O` | 231ms | 66.4% |
+| `computation` | 113ms | 32.5% |
+
+5-run 詳細:
+- cache_load: 144ms, 138ms, 139ms, 139ms, 141ms
+- cache_store: 92ms, 92ms, 92ms, 93ms, 93ms
+- total: 352ms, 346ms, 347ms, 348ms, 350ms
+- pass_count: 1, 1, 1, 1, 1
+
+| Stage | Baseline | Round 1 | Round 2 | Round 3 | R2→R3 Delta | R2→R3 % | Baseline→R3 Delta | Baseline→R3 % |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `cache_store` | 289ms | 245ms | 101ms | 92ms | -9ms | -8.9% | -197ms | -68.2% |
+| `cache_load` | 171ms | 144ms | 151ms | 139ms | -12ms | -7.9% | -32ms | -18.7% |
+| `cache I/O total` | 460ms | 389ms | 252ms | 231ms | -21ms | -8.3% | -229ms | -49.8% |
+| `total` | 588ms | 505ms | 369ms | 348ms | -21ms | -5.7% | -240ms | -40.8% |
+
+**分析**:
+
+- **cache_load が改善**（151ms → 139ms、-7.9%）。zero-clone 化により ~2000 partition blob の `Clone` が除去され、warm-cache hit 時の overhead が低下した。ただし改善幅は 12ms に留まり、clone overhead は全体の一部に過ぎなかった。read-side のコストの大部分は JSON deserialize + disk I/O（index.json + blob files）であり、clone 除去だけでは根本解決に至らない
+- **cache_store も改善**（101ms → 92ms、-8.9%）。warm cache 再構築時の clone 除去と、post-compile data からの直接移動による効率化が寄与
+- **computation は 113ms（32.5%）** で 100ms 目標を単独で超過。cache I/O を仮にゼロにしても 113ms であり、computation 側の最適化も不可避。ただし source_tree_load 23ms は watch mode での差分取得最適化で削減可能な領域
+- **3 ラウンドの累積効果**: cache I/O は 460ms → 231ms（-49.8%）と半減に近い。しかし total は 588ms → 348ms（-40.8%）で、100ms 目標との gap は 248ms。JSON serialization format 自体がボトルネック化しており、逐次的な最適化の限界に近づいている
+
+**次 frontier**: cache I/O 231ms（66.4%）が支配的だが、clone 除去・dirty-tracking・delta write の「構造を変えない最適化」は一巡した。次のブレイクスルーには構造的変更が必要:
+1. **binary serialization format**（bincode/rkyv 等）: JSON の serialize/deserialize overhead を根本排除。cache_load・cache_store 双方に効果
+2. **lazy partition load**: index のみ先行 read し、必要な partition blob だけを on-demand load。cache_load の disk I/O を O(changed) に削減
+3. **async/background cache_store**: store を non-blocking 化し、ユーザー体感の latency から除外
+4. **computation 最適化**: source_tree_load 23ms の差分取得化、typeset 56ms の更なるスコープ縮小。parse 22ms は Step 4（incremental parse）で対処可能だが優先度は低い

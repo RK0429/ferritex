@@ -54,7 +54,6 @@ pub struct CacheLookupResult {
     pub cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
     pub cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
     pub partition_hashes: BTreeMap<String, u64>,
-    pub partition_blobs: BTreeMap<String, PartitionBlob>,
     pub scope: Option<RecompilationScope>,
 }
 
@@ -139,10 +138,12 @@ impl CachedPagePayload {
 }
 
 impl CacheLookupResult {
-    pub fn warm_cache(&self) -> WarmPartitionCache {
+    pub fn into_warm_cache(self) -> WarmPartitionCache {
         WarmPartitionCache {
-            partition_hashes: self.partition_hashes.clone(),
-            partition_blobs: self.partition_blobs.clone(),
+            partition_hashes: self.partition_hashes,
+            cached_source_subtrees: self.cached_source_subtrees,
+            cached_typeset_fragments: self.cached_typeset_fragments,
+            cached_page_payloads: self.cached_page_payloads,
         }
     }
 }
@@ -177,7 +178,7 @@ struct CacheIndex {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PartitionBlob {
+struct PartitionBlob {
     #[serde(default)]
     cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     #[serde(default)]
@@ -186,10 +187,12 @@ pub struct PartitionBlob {
     cached_page_payloads: Option<Vec<CachedPagePayload>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct WarmPartitionCache {
     pub partition_hashes: BTreeMap<String, u64>,
-    pub partition_blobs: BTreeMap<String, PartitionBlob>,
+    pub cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
+    pub cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+    pub cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,8 +207,13 @@ struct LoadedCacheRecord {
     cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
     cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
     partition_hashes: BTreeMap<String, u64>,
-    partition_blobs: BTreeMap<String, PartitionBlob>,
     diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheStoreOutcome {
+    pub partition_hashes: BTreeMap<String, u64>,
+    pub diagnostic: Option<Diagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,7 +257,7 @@ impl<'a> CompileCache<'a> {
     pub fn lookup_with_warm_cache(
         &self,
         changed_paths_hint: &[PathBuf],
-        warm_cache: Option<&WarmPartitionCache>,
+        warm_cache: Option<WarmPartitionCache>,
     ) -> CacheLookupResult {
         let record = match self.load_record_with_warm_cache(warm_cache) {
             Ok(Some(record)) => record,
@@ -297,7 +305,6 @@ impl<'a> CompileCache<'a> {
                 cached_typeset_fragments: record.cached_typeset_fragments,
                 cached_page_payloads: record.cached_page_payloads,
                 partition_hashes: record.partition_hashes,
-                partition_blobs: record.partition_blobs,
                 scope: Some(scope),
             };
         }
@@ -321,7 +328,6 @@ impl<'a> CompileCache<'a> {
                     cached_typeset_fragments: BTreeMap::new(),
                     cached_page_payloads: BTreeMap::new(),
                     partition_hashes: BTreeMap::new(),
-                    partition_blobs: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -344,7 +350,6 @@ impl<'a> CompileCache<'a> {
                 cached_typeset_fragments: BTreeMap::new(),
                 cached_page_payloads: BTreeMap::new(),
                 partition_hashes: BTreeMap::new(),
-                partition_blobs: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -363,7 +368,6 @@ impl<'a> CompileCache<'a> {
             cached_typeset_fragments: record.cached_typeset_fragments,
             cached_page_payloads: record.cached_page_payloads,
             partition_hashes: record.partition_hashes,
-            partition_blobs: record.partition_blobs,
             scope: None,
         }
     }
@@ -376,7 +380,7 @@ impl<'a> CompileCache<'a> {
         cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
         cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
     ) -> Option<Diagnostic> {
-        self.store_with_page_payloads(
+        match self.store_with_page_payloads(
             dependency_graph,
             stable_compile_state,
             output_pdf_hash,
@@ -385,7 +389,10 @@ impl<'a> CompileCache<'a> {
             &BTreeMap::new(),
             None,
             None,
-        )
+        ) {
+            Ok(outcome) => outcome.diagnostic,
+            Err(diagnostic) => Some(diagnostic),
+        }
     }
 
     pub fn store_with_page_payloads(
@@ -398,23 +405,23 @@ impl<'a> CompileCache<'a> {
         cached_page_payloads: &BTreeMap<String, Vec<CachedPagePayload>>,
         dirty_partition_ids: Option<&BTreeSet<String>>,
         dirty_source_paths: Option<&BTreeSet<PathBuf>>,
-    ) -> Option<Diagnostic> {
+    ) -> Result<CacheStoreOutcome, Diagnostic> {
         if let Err(error) = self.file_access_gate.ensure_directory(&self.cache_dir) {
-            return Some(cache_info_diagnostic(
+            return Err(cache_info_diagnostic(
                 format!("failed to prepare compile cache directory: {error}"),
                 &self.cache_dir,
             ));
         }
 
         if let Err(error) = self.file_access_gate.ensure_directory(&self.record_dir) {
-            return Some(cache_info_diagnostic(
+            return Err(cache_info_diagnostic(
                 format!("failed to prepare compile cache record directory: {error}"),
                 &self.record_dir,
             ));
         }
 
         if let Err(error) = self.file_access_gate.ensure_directory(&self.partitions_dir) {
-            return Some(cache_info_diagnostic(
+            return Err(cache_info_diagnostic(
                 format!("failed to prepare compile cache partition directory: {error}"),
                 &self.partitions_dir,
             ));
@@ -464,7 +471,7 @@ impl<'a> CompileCache<'a> {
             let bytes = match serde_json::to_vec(&blob) {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    return Some(cache_info_diagnostic(
+                    return Err(cache_info_diagnostic(
                         format!("failed to serialize compile cache partition blob: {error}"),
                         &path,
                     ));
@@ -478,7 +485,7 @@ impl<'a> CompileCache<'a> {
             }
 
             if let Err(error) = self.file_access_gate.write_file(&path, &bytes) {
-                return Some(cache_info_diagnostic(
+                return Err(cache_info_diagnostic(
                     format!("failed to persist compile cache partition blob: {error}"),
                     &path,
                 ));
@@ -499,10 +506,10 @@ impl<'a> CompileCache<'a> {
             partition_hashes: new_hashes,
         };
 
-        let bytes = match serde_json::to_vec_pretty(&index) {
+        let bytes = match serde_json::to_vec(&index) {
             Ok(bytes) => bytes,
             Err(error) => {
-                return Some(cache_info_diagnostic(
+                return Err(cache_info_diagnostic(
                     format!("failed to serialize compile cache index: {error}"),
                     &self.metadata_path,
                 ));
@@ -513,7 +520,7 @@ impl<'a> CompileCache<'a> {
             .file_access_gate
             .write_file(&self.metadata_path, &bytes)
         {
-            return Some(cache_info_diagnostic(
+            return Err(cache_info_diagnostic(
                 format!("failed to persist compile cache index: {error}"),
                 &self.metadata_path,
             ));
@@ -528,9 +535,12 @@ impl<'a> CompileCache<'a> {
             )
         });
 
-        cleanup_diagnostic
-            .or(legacy_diagnostic)
-            .or(eviction_diagnostic)
+        Ok(CacheStoreOutcome {
+            partition_hashes: index.partition_hashes,
+            diagnostic: cleanup_diagnostic
+                .or(legacy_diagnostic)
+                .or(eviction_diagnostic),
+        })
     }
 
     fn detect_changes(
@@ -594,7 +604,7 @@ impl<'a> CompileCache<'a> {
 
     fn load_record_with_warm_cache(
         &self,
-        warm_cache: Option<&WarmPartitionCache>,
+        warm_cache: Option<WarmPartitionCache>,
     ) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
         match self.file_access_gate.read_file(&self.metadata_path) {
             Ok(bytes) => self.load_split_record_with_warm_cache(&bytes, warm_cache),
@@ -613,7 +623,7 @@ impl<'a> CompileCache<'a> {
     fn load_split_record_with_warm_cache(
         &self,
         bytes: &[u8],
-        warm_cache: Option<&WarmPartitionCache>,
+        warm_cache: Option<WarmPartitionCache>,
     ) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
         let index: CacheIndex = serde_json::from_slice(bytes).map_err(|error| {
             cache_info_diagnostic(
@@ -632,75 +642,89 @@ impl<'a> CompileCache<'a> {
             ));
         }
 
-        let mut cached_source_subtrees = BTreeMap::new();
-        let mut cached_typeset_fragments = BTreeMap::new();
-        let mut cached_page_payloads = BTreeMap::new();
-        let mut partition_blobs = BTreeMap::new();
+        let CacheIndex {
+            primary_input,
+            jobname,
+            output_pdf,
+            output_pdf_hash,
+            dependency_graph,
+            stable_compile_state,
+            partition_keys,
+            partition_hashes,
+            ..
+        } = index;
+
         let mut diagnostics = Vec::new();
-
-        for partition_key in &index.partition_keys {
-            let reused_blob = warm_cache.and_then(|cache| {
-                let index_hash = index.partition_hashes.get(partition_key)?;
-                if cache.partition_hashes.get(partition_key) != Some(index_hash) {
-                    return None;
-                }
-                cache.partition_blobs.get(partition_key).cloned()
-            });
-
-            let blob = match reused_blob {
-                Some(blob) => blob,
-                None => {
-                    let path = self.partition_blob_path(partition_key);
-                    let bytes = match self.file_access_gate.read_file(&path) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            diagnostics.push(cache_info_diagnostic(
-                                format!(
-                                    "failed to read compile cache partition blob `{partition_key}`: {error}"
-                                ),
-                                &path,
-                            ));
+        let (cached_source_subtrees, cached_typeset_fragments, cached_page_payloads) =
+            match warm_cache {
+                Some(WarmPartitionCache {
+                    partition_hashes: warm_partition_hashes,
+                    mut cached_source_subtrees,
+                    mut cached_typeset_fragments,
+                    mut cached_page_payloads,
+                }) => {
+                    for partition_key in &partition_keys {
+                        if partition_hashes.get(partition_key)
+                            == warm_partition_hashes.get(partition_key)
+                        {
                             continue;
                         }
-                    };
 
-                    match serde_json::from_slice(&bytes) {
-                        Ok(blob) => blob,
-                        Err(error) => {
-                            diagnostics.push(cache_info_diagnostic(
-                                format!(
-                                    "compile cache partition blob `{partition_key}` is invalid: {error}"
-                                ),
-                                &path,
-                            ));
-                            continue;
+                        if let Some(blob) =
+                            self.read_partition_blob(partition_key, &mut diagnostics)
+                        {
+                            extend_flat_maps_from_blob(
+                                blob,
+                                &mut cached_source_subtrees,
+                                &mut cached_typeset_fragments,
+                                &mut cached_page_payloads,
+                            );
                         }
                     }
+
+                    (
+                        cached_source_subtrees,
+                        cached_typeset_fragments,
+                        cached_page_payloads,
+                    )
+                }
+                None => {
+                    let mut cached_source_subtrees = BTreeMap::new();
+                    let mut cached_typeset_fragments = BTreeMap::new();
+                    let mut cached_page_payloads = BTreeMap::new();
+
+                    for partition_key in &partition_keys {
+                        if let Some(blob) =
+                            self.read_partition_blob(partition_key, &mut diagnostics)
+                        {
+                            extend_flat_maps_from_blob(
+                                blob,
+                                &mut cached_source_subtrees,
+                                &mut cached_typeset_fragments,
+                                &mut cached_page_payloads,
+                            );
+                        }
+                    }
+
+                    (
+                        cached_source_subtrees,
+                        cached_typeset_fragments,
+                        cached_page_payloads,
+                    )
                 }
             };
 
-            cached_source_subtrees.extend(blob.cached_source_subtrees.clone());
-            if let Some(page_payloads) = blob.cached_page_payloads.clone() {
-                if let Some(partition_id) = blob.cached_typeset_fragments.keys().next().cloned() {
-                    cached_page_payloads.insert(partition_id, page_payloads);
-                }
-            }
-            cached_typeset_fragments.extend(blob.cached_typeset_fragments.clone());
-            partition_blobs.insert(partition_key.clone(), blob);
-        }
-
         Ok(Some(LoadedCacheRecord {
-            primary_input: index.primary_input,
-            jobname: index.jobname,
-            output_pdf: index.output_pdf,
-            output_pdf_hash: index.output_pdf_hash,
-            dependency_graph: index.dependency_graph,
-            stable_compile_state: index.stable_compile_state,
+            primary_input,
+            jobname,
+            output_pdf,
+            output_pdf_hash,
+            dependency_graph,
+            stable_compile_state,
             cached_source_subtrees,
             cached_typeset_fragments,
             cached_page_payloads,
-            partition_hashes: index.partition_hashes,
-            partition_blobs,
+            partition_hashes,
             diagnostics,
         }))
     }
@@ -749,9 +773,39 @@ impl<'a> CompileCache<'a> {
             cached_typeset_fragments: record.cached_typeset_fragments,
             cached_page_payloads: BTreeMap::new(),
             partition_hashes: BTreeMap::new(),
-            partition_blobs: BTreeMap::new(),
             diagnostics: Vec::new(),
         }))
+    }
+
+    fn read_partition_blob(
+        &self,
+        partition_key: &str,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<PartitionBlob> {
+        let path = self.partition_blob_path(partition_key);
+        let bytes = match self.file_access_gate.read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                diagnostics.push(cache_info_diagnostic(
+                    format!(
+                        "failed to read compile cache partition blob `{partition_key}`: {error}"
+                    ),
+                    &path,
+                ));
+                return None;
+            }
+        };
+
+        match serde_json::from_slice(&bytes) {
+            Ok(blob) => Some(blob),
+            Err(error) => {
+                diagnostics.push(cache_info_diagnostic(
+                    format!("compile cache partition blob `{partition_key}` is invalid: {error}"),
+                    &path,
+                ));
+                None
+            }
+        }
     }
 
     fn remove_legacy_record_if_present(&self) -> Option<Diagnostic> {
@@ -998,6 +1052,30 @@ fn partition_blobs_for(
     partitions
 }
 
+fn extend_flat_maps_from_blob(
+    blob: PartitionBlob,
+    cached_source_subtrees: &mut BTreeMap<PathBuf, CachedSourceSubtree>,
+    cached_typeset_fragments: &mut BTreeMap<String, CachedTypesetFragment>,
+    cached_page_payloads: &mut BTreeMap<String, Vec<CachedPagePayload>>,
+) {
+    let PartitionBlob {
+        cached_source_subtrees: blob_source_subtrees,
+        cached_typeset_fragments: blob_typeset_fragments,
+        cached_page_payloads: blob_page_payloads,
+    } = blob;
+
+    cached_source_subtrees.extend(blob_source_subtrees);
+
+    let mut fragment_iter = blob_typeset_fragments.into_iter();
+    if let Some((partition_id, fragment)) = fragment_iter.next() {
+        if let Some(page_payloads) = blob_page_payloads {
+            cached_page_payloads.insert(partition_id.clone(), page_payloads);
+        }
+        cached_typeset_fragments.insert(partition_id, fragment);
+    }
+    cached_typeset_fragments.extend(fragment_iter);
+}
+
 fn empty_lookup_result(diagnostics: Vec<Diagnostic>) -> CacheLookupResult {
     CacheLookupResult {
         artifact: None,
@@ -1010,7 +1088,6 @@ fn empty_lookup_result(diagnostics: Vec<Diagnostic>) -> CacheLookupResult {
         cached_typeset_fragments: BTreeMap::new(),
         cached_page_payloads: BTreeMap::new(),
         partition_hashes: BTreeMap::new(),
-        partition_blobs: BTreeMap::new(),
         scope: None,
     }
 }
@@ -1640,7 +1717,7 @@ mod tests {
         )]);
 
         let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
-        cache
+        let outcome = cache
             .store_with_page_payloads(
                 &graph,
                 &stable_state(&input),
@@ -1651,7 +1728,12 @@ mod tests {
                 None,
                 None,
             )
-            .expect_none("cache stored");
+            .expect("cache stored");
+        assert!(
+            outcome.diagnostic.is_none(),
+            "unexpected diagnostic: {:?}",
+            outcome.diagnostic
+        );
 
         let lookup = cache.lookup(&[]);
 
@@ -1694,7 +1776,7 @@ mod tests {
         };
         fs::write(
             record_dir.join(super::CACHE_INDEX_FILENAME),
-            serde_json::to_vec_pretty(&index).expect("serialize v6 index"),
+            serde_json::to_vec(&index).expect("serialize v6 index"),
         )
         .expect("write v6 index");
         let blob = serde_json::json!({
@@ -2051,7 +2133,7 @@ mod tests {
             "fragment:document:0000:main",
         ));
 
-        cache
+        let outcome = cache
             .store_with_page_payloads(
                 &graph,
                 &state,
@@ -2062,7 +2144,12 @@ mod tests {
                 Some(&dirty_partition_ids),
                 Some(&dirty_source_paths),
             )
-            .expect_none("dirty-tracked cache stored");
+            .expect("dirty-tracked cache stored");
+        assert!(
+            outcome.diagnostic.is_none(),
+            "unexpected diagnostic: {:?}",
+            outcome.diagnostic
+        );
 
         let writes_after_second_store = gate.writes();
         let second_store_writes = &writes_after_second_store[writes_after_first_store.len()..];
@@ -2353,7 +2440,7 @@ mod tests {
             )
             .expect_none("cache stored");
 
-        let warm_cache = cache.lookup(&[]).warm_cache();
+        let warm_cache = cache.lookup(&[]).into_warm_cache();
 
         let updated_fragments = BTreeMap::from([
             (
@@ -2388,7 +2475,7 @@ mod tests {
             super::sanitize_partition_key(&format!("fragment:{second_partition}"));
         gate.reset();
 
-        let lookup = cache.lookup_with_warm_cache(&[], Some(&warm_cache));
+        let lookup = cache.lookup_with_warm_cache(&[], Some(warm_cache));
 
         assert!(lookup.artifact.is_some());
         assert_eq!(
@@ -2887,7 +2974,7 @@ mod tests {
     ) {
         fs::create_dir_all(path.join(super::CACHE_PARTITIONS_DIR_NAME))
             .expect("create cache record dir");
-        let bytes = serde_json::to_vec_pretty(&index).expect("serialize cache index");
+        let bytes = serde_json::to_vec(&index).expect("serialize cache index");
         fs::write(path.join(super::CACHE_INDEX_FILENAME), bytes).expect("write cache index");
         for (partition_key, blob) in partition_blobs {
             let bytes = serde_json::to_vec_pretty(&blob).expect("serialize partition blob");

@@ -72,6 +72,7 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 | REQ-NF-002 収束ループ分析 | `StageTiming.pass_count` 計装、`\ref` 付き benchmark | **完了** — incremental compile は 1-pass（seed が有効）。bottleneck は cache I/O であり multi-pass ではない |
 | REQ-NF-002 Cache I/O: Delta write | compact JSON・`partition_hashes`・未変更 blob write skip | **完了** — with-ref 5-run median 505ms、cache_store 289→245ms、cache_load 171→144ms、cache I/O 389ms（77.0%） |
 | REQ-NF-002 Cache I/O Round 2: Dirty-tracking store + warm-cache lookup | clean partition の serialization スキップ、前回 lookup blob 再利用 | **完了** — with-ref 5-run median 369ms、cache_store 245→101ms（-58.8%）、cache_load 144→151ms（+4.9%）、cache I/O 252ms（68.3%）。dominant stage が cache_store → cache_load にシフト |
+| REQ-NF-002 Cache I/O Round 3: Zero-clone warm-cache | WarmPartitionCache を flat map + move ベースへ再設計、clone 経路除去 | **完了** — with-ref 5-run median 348ms、cache_load 151→139ms（-7.9%）、cache_store 101→92ms（-8.9%）、cache I/O 231ms（66.4%）。clone 除去の効果は限定的、JSON serialization 自体がボトルネック |
 | Wave 4: TikZ + package compatibility + multicol MVP | long-tail 互換性の拡張 | **完了** — TikZ 側は xcolor 標準 19 色（+14）、mm/in/ex/em 単位（+4、計 6）、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity（ExtGState）、key-value arc 構文、`\foreach` ループ（simple list / numeric range / step inference / nested）を追加。package 側は `\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption` / `\DeclareOption*` / `\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard、compat primitives を実装。multicol MVP: `\begin{multicols}{N}` / `\end{multicols}` 環境パース、`\columnbreak` 指令、N カラムレイアウト組版（カラム幅自動計算、10pt columnsep、明示的/自動バランス分割）。残 frontier なし |
 
 ### Wave 1: Incremental Performance Evidence (REQ-FUNC-030) — 完了
@@ -146,7 +147,7 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 | 4 | テスト | core 3 件 + application 3 件 + 回帰 2 件 pass。`per_page_payload_reuse_matches_full_and_reduces_pdf_render_stage` で `reused_pages=39` / `rendered_pages=1`、`incremental_recompile_with_toc_matches_full` で TOC 文書の回帰を確認 |
 
 - **完了内容**: supported path では unchanged partition の page payload を再利用し、PDF 自体は毎回 deterministic に full rewrite する実装が入った
-- **制限 / 未完境界**: reuse 対象は `Cached` / `BlockReuse` partition のページに限定され、`SuffixRebuild` / `FullRebuild` partition は全ページ再 render する。fallback partition 文書と XObject-backed page は safety-first で対象外。Round 2 後の with-ref 5-run median は 369ms / `pass_count=1` で `REQ-NF-002` は未達。次は cache I/O 252ms（68.3%）の削減が必要（dominant: cache_load 151ms）
+- **制限 / 未完境界**: reuse 対象は `Cached` / `BlockReuse` partition のページに限定され、`SuffixRebuild` / `FullRebuild` partition は全ページ再 render する。fallback partition 文書と XObject-backed page は safety-first で対象外。Round 3 後の with-ref 5-run median は 348ms / `pass_count=1` で `REQ-NF-002` は未達。次は cache I/O 231ms（66.4%）の構造的改善（binary format + lazy load）が必要（dominant: cache_load 139ms）
 - **設計文書**: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)
 
 ### REQ-NF-002 Cache I/O Round 2: Dirty-tracking store + warm-cache lookup — 完了
@@ -160,6 +161,18 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 - **計測結果**: with-ref 5-run median 369ms（505ms → 369ms、-26.9%）。cache_store 245ms → 101ms（-58.8%）、cache_load 144ms → 151ms（+4.9%）、cache I/O 389ms → 252ms（-35.2%）
 - **分析**: cache_store の劇的改善は dirty-tracking の効果。cache_load は warm-cache lookup の条件付きスキップオーバーヘッドにより横ばい。根本的な read-side 改善には lazy partition load または binary format が必要
 - **後続 Frontier**: dominant stage が cache_store → cache_load 151ms（40.9%）にシフト。cache I/O 252ms（68.3%）が引き続き支配的。次の候補は (1) lazy partition load、(2) binary serialization format（bincode 等）、(3) index 分離（partition_hashes のみ先行 read）。cache_store 101ms は async/background write でさらに削減可能。Step 4（incremental parse）は parse 22ms（6.0%）のため cache I/O 改善後に再評価
+- **設計文書**: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)
+
+### REQ-NF-002 Cache I/O Round 3: Zero-clone warm-cache — 完了
+
+| # | タスク | 結果 |
+|---|---|---|
+| 1 | WarmPartitionCache の zero-clone 再設計 | flat map + move ベースへ再設計し、lookup/load/store/compile_job_service の clone 経路を除去。`store_with_page_payloads` が新しい `partition_hashes` を返し、post-compile data から warm cache を再構築 |
+
+- **完了内容**: Round 2 で warm-cache lookup が clone overhead により逆効果だった問題を解消。`WarmPartitionCache` を `HashMap<String, PartitionBlob>` の flat map + move ベースへ再設計し、~2000 partition blob の `Clone` を除去
+- **計測結果**: with-ref 5-run median 348ms（369ms → 348ms、-5.7%）。cache_load 151ms → 139ms（-7.9%）、cache_store 101ms → 92ms（-8.9%）、cache I/O 252ms → 231ms（-8.3%）
+- **分析**: clone 除去の効果は 21ms に留まった。cache_load のコストの大部分は JSON deserialize + disk I/O であり、clone overhead は全体の一部に過ぎなかった。「構造を変えない最適化」の限界に近づいている
+- **後続 Frontier**: cache I/O 231ms（66.4%）が支配的だが、clone 除去・dirty-tracking・delta write の逐次的最適化は一巡。次のブレイクスルーには構造的変更が必要: (1) binary serialization format（bincode/rkyv 等）で JSON overhead を根本排除、(2) lazy partition load で disk I/O を O(changed) に削減、(3) async/background cache_store で store latency を体感から除外。computation 113ms（32.5%）も 100ms を単独超過しており、cache I/O 削減だけでは目標未達
 - **設計文書**: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)
 
 ### Wave 4: TikZ + package compatibility + multicol MVP — 完了
@@ -183,12 +196,13 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 - **REQ-NF-002 Step 3: Per-page payload reuse 完了**。`PageRenderPayload.stream_hash`、`CachedPagePayload`、cache v7、pre-rendered payload 注入、Guard 1 + Guard 2 を実装し、supported path では unchanged partition の page payload を full rewrite に再利用できるようになった
 - **REQ-NF-002 Cache I/O Round 1（delta write）完了**。compact JSON serialization、`partition_hashes` 追跡、未変更 blob write skip を実装し、split cache write path の fixed cost を削減した
 - **REQ-NF-002 Cache I/O Round 2 完了**。dirty-tracking store（clean partition serialization スキップ）+ warm-cache lookup（前回 blob 再利用）を実装し、cache_store 245ms → 101ms（-58.8%）、total 505ms → 369ms（-26.9%）に改善した
+- **REQ-NF-002 Cache I/O Round 3 完了**。zero-clone warm-cache（`WarmPartitionCache` flat map + move 再設計）を実装し、cache_load 151ms → 139ms（-7.9%）、cache_store 101ms → 92ms（-8.9%）、total 369ms → 348ms（-5.7%）に改善した。clone 除去の効果は限定的であり、「構造を変えない最適化」は一巡した
 - **Wave 4: TikZ + package compatibility + multicol MVP 完了**。xcolor 標準 19 色、mm/in/ex/em 6 単位、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity、key-value arcに加え、package surface（`\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption` / `\DeclareOption*` / `\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard）と compat primitives（`\unless`、`\pdfmdfivesum`、`\pdfescapestring`、`\pdfescapehex`、`\pdfpagewidth`、`\pdfcreationdate`）を追加。parity / compile test pass
-- **残 Frontier**: `REQ-NF-002` は with-ref 5-run median 369ms により 100ms 未達。残件は cache I/O 最適化（cache_store 101ms + cache_load 151ms = 252ms, 68.3%）であり、dominant stage は cache_load 151ms（40.9%）。次の主対象は lazy partition load と binary serialization format による cache_load 改善である。cache_store は dirty-tracking で大幅改善済みだが async/background write でさらに削減可能。Step 4（incremental parse）は parse 22ms（6.0%）のため cache I/O 改善後に再評価する（設計文書: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)）。Wave 4 long-tail は multicol MVP 完了により解消（既知制限: region のページ跨ぎ未対応）
+- **残 Frontier**: `REQ-NF-002` は with-ref 5-run median 348ms により 100ms 未達。cache I/O 231ms（66.4%）+ computation 113ms（32.5%）で、100ms 目標との gap は 248ms。clone 除去・dirty-tracking・delta write の「構造を変えない最適化」は 3 ラウンドで一巡し、baseline 588ms から 348ms（-40.8%）まで改善したが、次のブレイクスルーには構造的変更が必要: (1) binary serialization format（bincode/rkyv）で JSON overhead を根本排除、(2) lazy partition load で cache_load を O(changed) に削減、(3) async/background cache_store で store latency を体感から除外、(4) computation 113ms の削減（source_tree_load 23ms の差分取得化等）。Step 4（incremental parse）は parse 22ms（6.3%）のため優先度は低い（設計文書: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)）。Wave 4 long-tail は multicol MVP 完了により解消（既知制限: region のページ跨ぎ未対応）
 - **profiling 現況**: WU-5 で `cargo test -p ferritex-application typeset_dominance_diagnostic -- --ignored --nocapture` を再実行し、`StageTiming.typeset_partition_details` の診断出力を確認した。1000-section staged input の 1 段落変更では `cached=999 partition`, `block_reuse=0`, `suffix_rebuild=1`, `full_rebuild=0` で、変更対象 partition は `reuse=SuffixRebuild, suffix=2/4, fallback=None` を記録した。`SuffixValidationFailed` は再現せず、suffix rebuild 改善は完了している
-- **incremental benchmark 実測（2026-04-05）**: `incremental_stage_timing_with_refs_5run`（with-ref）を Round 2（dirty-tracking store + warm-cache lookup）後に再実行し、hot incremental path の median 369ms、`pass_count` は `1, 1, 1, 1, 1` を確認した。Round 1（delta write）時は 505ms、baseline は 588ms
-- **bottleneck 実測（2026-04-05）**: with-ref 5-run median の dominant stage は `cache_load` 151ms（40.9%）にシフトした（Round 1 では `cache_store` 245ms が最大だった）。`cache_store` は dirty-tracking により 101ms（27.4%）に劇的改善。cache I/O 合計は 252ms（68.3%）で依然支配的。computation は 114ms（30.9%）: source_tree_load 24ms、parse 22ms、typeset 56ms、pdf_render 12ms
-- **直近の推奨**: (1) lazy partition load を導入して `cache_load` 151ms を削る（必要な partition blob のみ read + deserialize）。(2) binary serialization format（bincode 等）を検討して read/write 双方の encode/decode を高速化。(3) index 分離（partition_hashes のみ先行 read し blob 本体は遅延 load）。(4) cache_store 101ms の残りは async/background write で削減可能。その後に Step 4（incremental parse）の必要性を再判定する
+- **incremental benchmark 実測（2026-04-05）**: `incremental_stage_timing_with_refs_5run`（with-ref）を Round 3（zero-clone warm-cache）後に再実行し、hot incremental path の median 348ms、`pass_count` は `1, 1, 1, 1, 1` を確認した。Round 2 時は 369ms、Round 1（delta write）時は 505ms、baseline は 588ms。累積改善: -240ms（-40.8%）
+- **bottleneck 実測（2026-04-05）**: with-ref 5-run median の dominant stage は引き続き `cache_load` 139ms（40.0%）。`cache_store` は 92ms（26.4%）。cache I/O 合計は 231ms（66.4%）で依然支配的。computation は 113ms（32.5%）: source_tree_load 23ms、parse 22ms、typeset 56ms、pdf_render 12ms。computation 単独でも 100ms を超過
+- **直近の推奨**: clone 除去・dirty-tracking・delta write の「構造を変えない最適化」は 3 ラウンドで一巡した。次は構造的変更が必要: (1) binary serialization format（bincode/rkyv）で JSON serialize/deserialize overhead を根本排除（cache_load + cache_store 双方に効果）。(2) lazy partition load で cache_load を O(changed partitions) に削減。(3) async/background cache_store で store latency を体感から除外。(4) computation 113ms の削減（source_tree_load 23ms の watch-mode 差分取得化等）。Step 4（incremental parse）は parse 22ms のため優先度低
 
 ```mermaid
 graph LR
@@ -205,7 +219,8 @@ graph LR
     BM --> CA[Convergence: pass_count=1 ✓]
     CA --> DW[Delta write: cache I/O改善 ✓]
     DW --> R2[Round 2: dirty-track+warm-cache ✓]
-    R2 --> SX[Next: lazy load / binary format]
+    R2 --> R3[Round 3: zero-clone warm-cache ✓]
+    R3 --> SX[Next: binary format / lazy load]
     SX --> S4[Then Step 4: incremental parse ?]
     W4 --> W4R[Wave 4: long-tail 解消 ✓]
     style W1 fill:#9f9,stroke:#333
@@ -223,14 +238,15 @@ graph LR
     style CA fill:#9f9,stroke:#333
     style DW fill:#9f9,stroke:#333
     style R2 fill:#9f9,stroke:#333
+    style R3 fill:#9f9,stroke:#333
     style SX fill:#ff9,stroke:#333
 ```
 
 ## 5. 妥当性判定
 
-- **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・bundle archive CI 接続完了・Step 0 計装完了・Step 1 完了・Step 2 完了・Step 3 完了・Cache I/O Round 1（delta write）完了・Cache I/O Round 2（dirty-tracking + warm-cache）完了・Wave 4: TikZ + package compatibility + multicol MVP 完了
-- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1〜3 に加え、REQ-NF-002 は Step 0 の計装、Step 1 の fixed-cost 削減（`changed_paths` fast path、v5 split cache、watcher backend 抽象化）、Step 2 の block checkpoint reuse（`RecompilationScope::BlockLevel`、checkpoint 生成、suffix rebuild、fallback 条件）、Step 3 の per-page payload reuse（`PageRenderPayload.stream_hash`、`CachedPagePayload`、cache v7、pre-rendered payload 注入、Guard 1 + Guard 2）、収束ループ分析（`pass_count=1` 確認）、cache I/O Round 1（delta write: compact JSON・`partition_hashes`・未変更 blob write skip）、および cache I/O Round 2（dirty-tracking store + warm-cache lookup）まで完了した。Step 3 は partitioned report fixture で `reused_pages=39` / `rendered_pages=1` と full compile byte-identical を確認している一方、fallback partition 文書と XObject-backed page では fail-closed で無効化している。WU-5 再 profiling では `cached=999 partition`, `suffix_rebuild=1 partition`, `full_rebuild=0 partition`, `reuse=SuffixRebuild, suffix=2/4, fallback=None` が記録され、従来の `SuffixValidationFailed` fallback は解消された。Round 2 後の with-ref 5-run median は 369ms、cache I/O は 252ms（68.3%）であり、100ms 未達は残るが、残りは cache I/O 最適化（dominant: cache_load 151ms）であり multi-pass 対策ではない。Wave 4 では bounded TikZ 改善、package compatibility MVP、multicol MVP が全て完了し、long-tail frontier は解消された（multicol の既知制限: region のページ跨ぎ未対応）
-- **直近の推奨**: Round 2 後の with-ref benchmark で cache_load 151ms（40.9%）が dominant stage にシフトした。cache_store は dirty-tracking で 101ms（27.4%）に大幅改善済み。次は (1) lazy partition load で cache_load を根本改善、(2) binary serialization format（bincode 等）で read/write 双方を高速化、(3) async/background write で cache_store 残りを削減、その後に Step 4（incremental parse）の必要性を再評価する
+- **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・bundle archive CI 接続完了・Step 0 計装完了・Step 1 完了・Step 2 完了・Step 3 完了・Cache I/O Round 1（delta write）完了・Cache I/O Round 2（dirty-tracking + warm-cache）完了・Cache I/O Round 3（zero-clone warm-cache）完了・Wave 4: TikZ + package compatibility + multicol MVP 完了
+- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1〜3 に加え、REQ-NF-002 は Step 0〜3、収束ループ分析、cache I/O Round 1〜3 まで完了した。Round 3（zero-clone warm-cache）で total は 348ms、cache I/O は 231ms（66.4%）に到達。3 ラウンドの「構造を変えない最適化」（delta write、dirty-tracking、clone 除去）で baseline 588ms から 348ms（-40.8%）まで改善したが、100ms 目標との gap は 248ms。cache I/O の大部分は JSON serialize/deserialize + disk I/O であり、逐次的最適化の限界に近づいている。computation 113ms も 100ms を単独超過しており、cache I/O 削減だけでは不十分。次のブレイクスルーには binary serialization format + lazy partition load の構造的変更が必要
+- **直近の推奨**: (1) binary serialization format（bincode/rkyv）で JSON overhead を根本排除（cache_load 139ms + cache_store 92ms 双方に効果）、(2) lazy partition load で cache_load を O(changed) に削減、(3) async/background cache_store で store latency を体感から除外、(4) computation 113ms の削減（source_tree_load 23ms の差分取得化等）。Step 4（incremental parse）は parse 22ms のため優先度低
 
 ### Warm Incremental Benchmark 実績 (REQ-FUNC-030) — Wave 1 完了
 

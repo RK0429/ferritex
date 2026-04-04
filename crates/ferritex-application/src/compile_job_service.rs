@@ -66,8 +66,7 @@ use serde_json::json;
 
 use crate::compile_cache::{
     fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CachedPagePayload,
-    CachedSourceSubtree, CachedTypesetFragment, CompileCache, PendingFloat,
-    WarmPartitionCache,
+    CachedSourceSubtree, CachedTypesetFragment, CompileCache, PendingFloat, WarmPartitionCache,
 };
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
@@ -984,21 +983,14 @@ impl<'a> CompileJobService<'a> {
                 .lock()
                 .expect("lock warm partition cache")
                 .take();
-            let lookup =
-                compile_cache.lookup_with_warm_cache(changed_paths_hint, warm_cache.as_ref());
-            *self
-                .warm_partition_cache
-                .lock()
-                .expect("lock warm partition cache") = Some(lookup.warm_cache());
+            let mut lookup = compile_cache.lookup_with_warm_cache(changed_paths_hint, warm_cache);
             cached_cross_reference_seed = lookup
                 .baseline_state
                 .as_ref()
                 .map(|state| state.cross_reference_seed.clone());
             changed_paths = lookup.changed_paths.iter().cloned().collect();
-            cached_recompilation_scope = lookup.scope;
-            cached_typeset_fragments = lookup.cached_typeset_fragments.clone();
-            cached_page_payloads = lookup.cached_page_payloads.clone();
-            if let Some(cached_artifact) = lookup.artifact {
+            cached_recompilation_scope = lookup.scope.clone();
+            if let Some(cached_artifact) = lookup.artifact.take() {
                 tracing::info!(
                     jobname = %options.jobname,
                     input = %options.input_file.display(),
@@ -1006,6 +998,11 @@ impl<'a> CompileJobService<'a> {
                     "compile cache hit"
                 );
                 let diagnostics = cached_artifact.stable_compile_state.diagnostics.clone();
+                let warm_cache = lookup.into_warm_cache();
+                *self
+                    .warm_partition_cache
+                    .lock()
+                    .expect("lock warm partition cache") = Some(warm_cache);
                 stage_timing.cache_load = Some(cache_load_start.elapsed());
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -1016,24 +1013,30 @@ impl<'a> CompileJobService<'a> {
                 };
             }
 
+            let lookup_diagnostics = lookup.diagnostics;
+            let lookup_changed_paths_vec = lookup.changed_paths;
+            let lookup_rebuild_paths = lookup.rebuild_paths;
+            let lookup_cached_dependency_graph = lookup.cached_dependency_graph;
+            cached_typeset_fragments = lookup.cached_typeset_fragments;
+            cached_page_payloads = lookup.cached_page_payloads;
             if let Some(scope) = cached_recompilation_scope.as_ref() {
                 tracing::info!(
                     jobname = %options.jobname,
                     input = %options.input_file.display(),
-                    changed_paths = ?lookup.changed_paths,
-                    rebuild_paths = ?lookup.rebuild_paths,
+                    changed_paths = ?lookup_changed_paths_vec,
+                    rebuild_paths = ?lookup_rebuild_paths,
                     ?scope,
                     "compile cache miss due to changed dependencies"
                 );
             }
-            if let Some(cached_dependency_graph) = lookup.cached_dependency_graph {
+            if let Some(cached_dependency_graph) = lookup_cached_dependency_graph {
                 source_tree_reuse_plan = Some(SourceTreeReusePlan {
-                    rebuild_paths: lookup.rebuild_paths,
+                    rebuild_paths: lookup_rebuild_paths,
                     cached_dependency_graph,
                     cached_source_subtrees: lookup.cached_source_subtrees,
                 });
             }
-            cache_diagnostics.extend(lookup.diagnostics);
+            cache_diagnostics.extend(lookup_diagnostics);
             stage_timing.cache_load = Some(cache_load_start.elapsed());
         }
 
@@ -1690,7 +1693,7 @@ impl<'a> CompileJobService<'a> {
                 } else {
                     (None, None)
                 };
-            if let Some(diagnostic) = compile_cache.store_with_page_payloads(
+            let stored_partition_hashes = match compile_cache.store_with_page_payloads(
                 &source_tree.dependency_graph,
                 &provisional_stable_state,
                 output_pdf_hash,
@@ -1700,7 +1703,28 @@ impl<'a> CompileJobService<'a> {
                 opt_dirty_partitions,
                 opt_dirty_sources,
             ) {
-                diagnostics.push(diagnostic);
+                Ok(outcome) => {
+                    if let Some(diagnostic) = outcome.diagnostic {
+                        diagnostics.push(diagnostic);
+                    }
+                    Some(outcome.partition_hashes)
+                }
+                Err(diagnostic) => {
+                    diagnostics.push(diagnostic);
+                    None
+                }
+            };
+            if let Some(partition_hashes) = stored_partition_hashes {
+                let warm_cache = WarmPartitionCache {
+                    partition_hashes,
+                    cached_source_subtrees: source_tree.cached_source_subtrees,
+                    cached_typeset_fragments,
+                    cached_page_payloads,
+                };
+                *self
+                    .warm_partition_cache
+                    .lock()
+                    .expect("lock warm partition cache") = Some(warm_cache);
             }
             stage_timing.cache_store = Some(cache_store_start.elapsed());
         }
