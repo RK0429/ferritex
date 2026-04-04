@@ -7,6 +7,7 @@ use ferritex_core::compilation::SymbolLocation;
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::incremental::{DependencyGraph, RecompilationScope};
 use ferritex_core::kernel::api::{DimensionValue, SourceSpan};
+use ferritex_core::pdf::{OpacityGraphicsStateKey, PageRenderPayload, PdfLinkAnnotation};
 use ferritex_core::policy::{FileAccessError, FileAccessGate};
 use ferritex_core::synctex::SourceLineTrace;
 use ferritex_core::typesetting::{DocumentLayoutFragment, FloatContent, PlacementSpec};
@@ -14,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::stable_compile_state::StableCompileState;
 
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
+const PREVIOUS_SPLIT_CACHE_VERSION: u32 = 6;
 const LEGACY_CACHE_VERSION: u32 = 4;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
 const CACHE_INDEX_FILENAME: &str = "index.json";
@@ -50,6 +52,7 @@ pub struct CacheLookupResult {
     pub cached_dependency_graph: Option<DependencyGraph>,
     pub cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     pub cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+    pub cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
     pub scope: Option<RecompilationScope>,
 }
 
@@ -102,6 +105,37 @@ pub struct CachedTypesetFragment {
     pub block_checkpoints: Option<BlockCheckpointData>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedPagePayload {
+    pub stream_hash: u64,
+    pub stream: String,
+    pub annotations: Vec<PdfLinkAnnotation>,
+    pub opacity_graphics_states: BTreeSet<OpacityGraphicsStateKey>,
+}
+
+impl From<PageRenderPayload> for CachedPagePayload {
+    fn from(payload: PageRenderPayload) -> Self {
+        Self {
+            stream_hash: payload.stream_hash,
+            stream: payload.stream,
+            annotations: payload.annotations,
+            opacity_graphics_states: payload.opacity_graphics_states,
+        }
+    }
+}
+
+impl CachedPagePayload {
+    pub fn to_page_render_payload(&self, page_index: usize) -> Option<PageRenderPayload> {
+        PageRenderPayload::try_from_cached(
+            page_index,
+            self.stream_hash,
+            self.stream.clone(),
+            self.annotations.clone(),
+            self.opacity_graphics_states.clone(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LegacyCompileCacheRecord {
     version: u32,
@@ -135,6 +169,8 @@ struct PartitionBlob {
     cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     #[serde(default)]
     cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+    #[serde(default)]
+    cached_page_payloads: Option<Vec<CachedPagePayload>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +183,7 @@ struct LoadedCacheRecord {
     stable_compile_state: StableCompileState,
     cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+    cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -229,6 +266,7 @@ impl<'a> CompileCache<'a> {
                 cached_dependency_graph: Some(record.dependency_graph),
                 cached_source_subtrees: record.cached_source_subtrees,
                 cached_typeset_fragments: record.cached_typeset_fragments,
+                cached_page_payloads: record.cached_page_payloads,
                 scope: Some(scope),
             };
         }
@@ -250,6 +288,7 @@ impl<'a> CompileCache<'a> {
                     cached_dependency_graph: None,
                     cached_source_subtrees: BTreeMap::new(),
                     cached_typeset_fragments: BTreeMap::new(),
+                    cached_page_payloads: BTreeMap::new(),
                     scope: None,
                 };
             }
@@ -270,6 +309,7 @@ impl<'a> CompileCache<'a> {
                 cached_dependency_graph: None,
                 cached_source_subtrees: BTreeMap::new(),
                 cached_typeset_fragments: BTreeMap::new(),
+                cached_page_payloads: BTreeMap::new(),
                 scope: None,
             };
         }
@@ -286,6 +326,7 @@ impl<'a> CompileCache<'a> {
             cached_dependency_graph: Some(record.dependency_graph),
             cached_source_subtrees: record.cached_source_subtrees,
             cached_typeset_fragments: record.cached_typeset_fragments,
+            cached_page_payloads: record.cached_page_payloads,
             scope: None,
         }
     }
@@ -297,6 +338,25 @@ impl<'a> CompileCache<'a> {
         output_pdf_hash: u64,
         cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
         cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
+    ) -> Option<Diagnostic> {
+        self.store_with_page_payloads(
+            dependency_graph,
+            stable_compile_state,
+            output_pdf_hash,
+            cached_source_subtrees,
+            cached_typeset_fragments,
+            &BTreeMap::new(),
+        )
+    }
+
+    pub fn store_with_page_payloads(
+        &self,
+        dependency_graph: &DependencyGraph,
+        stable_compile_state: &StableCompileState,
+        output_pdf_hash: u64,
+        cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
+        cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
+        cached_page_payloads: &BTreeMap<String, Vec<CachedPagePayload>>,
     ) -> Option<Diagnostic> {
         if let Err(error) = self.file_access_gate.ensure_directory(&self.cache_dir) {
             return Some(cache_info_diagnostic(
@@ -319,7 +379,11 @@ impl<'a> CompileCache<'a> {
             ));
         }
 
-        let partition_blobs = partition_blobs_for(cached_source_subtrees, cached_typeset_fragments);
+        let partition_blobs = partition_blobs_for(
+            cached_source_subtrees,
+            cached_typeset_fragments,
+            cached_page_payloads,
+        );
         for (partition_key, blob) in &partition_blobs {
             let path = self.partition_blob_path(partition_key);
             let bytes = match serde_json::to_vec_pretty(&blob) {
@@ -467,11 +531,11 @@ impl<'a> CompileCache<'a> {
             )
         })?;
 
-        if index.version != CACHE_VERSION {
+        if !matches!(index.version, CACHE_VERSION | PREVIOUS_SPLIT_CACHE_VERSION) {
             return Err(cache_info_diagnostic(
                 format!(
-                    "compile cache version mismatch (found {}, expected {CACHE_VERSION})",
-                    index.version
+                    "compile cache version mismatch (found {}, expected {CACHE_VERSION} or {PREVIOUS_SPLIT_CACHE_VERSION})",
+                    index.version,
                 ),
                 &self.metadata_path,
             ));
@@ -479,6 +543,7 @@ impl<'a> CompileCache<'a> {
 
         let mut cached_source_subtrees = BTreeMap::new();
         let mut cached_typeset_fragments = BTreeMap::new();
+        let mut cached_page_payloads = BTreeMap::new();
         let mut diagnostics = Vec::new();
 
         for partition_key in &index.partition_keys {
@@ -510,6 +575,11 @@ impl<'a> CompileCache<'a> {
             };
 
             cached_source_subtrees.extend(blob.cached_source_subtrees);
+            if let Some(page_payloads) = blob.cached_page_payloads {
+                if let Some(partition_id) = blob.cached_typeset_fragments.keys().next().cloned() {
+                    cached_page_payloads.insert(partition_id, page_payloads);
+                }
+            }
             cached_typeset_fragments.extend(blob.cached_typeset_fragments);
         }
 
@@ -522,6 +592,7 @@ impl<'a> CompileCache<'a> {
             stable_compile_state: index.stable_compile_state,
             cached_source_subtrees,
             cached_typeset_fragments,
+            cached_page_payloads,
             diagnostics,
         }))
     }
@@ -568,6 +639,7 @@ impl<'a> CompileCache<'a> {
             stable_compile_state: record.stable_compile_state,
             cached_source_subtrees: record.cached_source_subtrees,
             cached_typeset_fragments: record.cached_typeset_fragments,
+            cached_page_payloads: BTreeMap::new(),
             diagnostics: Vec::new(),
         }))
     }
@@ -693,7 +765,9 @@ impl<'a> CompileCache<'a> {
                     Err(_) => continue,
                 };
                 let owned = serde_json::from_slice::<CacheIndex>(&bytes)
-                    .map(|index| index.version == CACHE_VERSION)
+                    .map(|index| {
+                        matches!(index.version, CACHE_VERSION | PREVIOUS_SPLIT_CACHE_VERSION)
+                    })
                     .unwrap_or(false);
                 let modified = fs::metadata(&index_path)
                     .and_then(|metadata| metadata.modified())
@@ -780,6 +854,7 @@ fn sanitize_partition_key(raw: &str) -> String {
 fn partition_blobs_for(
     cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
     cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
+    cached_page_payloads: &BTreeMap<String, Vec<CachedPagePayload>>,
 ) -> BTreeMap<String, PartitionBlob> {
     let mut partitions = BTreeMap::new();
 
@@ -790,6 +865,7 @@ fn partition_blobs_for(
             PartitionBlob {
                 cached_source_subtrees: BTreeMap::from([(path.clone(), subtree.clone())]),
                 cached_typeset_fragments: BTreeMap::new(),
+                cached_page_payloads: None,
             },
         );
     }
@@ -804,6 +880,7 @@ fn partition_blobs_for(
                     partition_id.clone(),
                     fragment.clone(),
                 )]),
+                cached_page_payloads: cached_page_payloads.get(partition_id).cloned(),
             },
         );
     }
@@ -821,6 +898,7 @@ fn empty_lookup_result(diagnostics: Vec<Diagnostic>) -> CacheLookupResult {
         cached_dependency_graph: None,
         cached_source_subtrees: BTreeMap::new(),
         cached_typeset_fragments: BTreeMap::new(),
+        cached_page_payloads: BTreeMap::new(),
         scope: None,
     }
 }
@@ -868,6 +946,7 @@ mod tests {
     use ferritex_core::diagnostics::Severity;
     use ferritex_core::incremental::RecompilationScope;
     use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
+    use ferritex_core::pdf::{PageRenderPayload, PdfLinkAnnotation, PdfLinkTarget};
     use ferritex_core::typesetting::{
         DocumentLayoutFragment, FloatContent, FloatRegion, PageBox, PlacementSpec, TextLine,
         TypesetNamedDestination, TypesetOutline, TypesetPage,
@@ -875,8 +954,9 @@ mod tests {
 
     use super::{
         fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CacheIndex,
-        CachedSourceSubtree, CachedTypesetFragment, CompileCache, LegacyCompileCacheRecord,
-        OwnedCacheRecordFile, PartitionBlob, PendingFloat, MAX_CACHE_RECORD_FILES,
+        CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment, CompileCache,
+        LegacyCompileCacheRecord, OwnedCacheRecordFile, PartitionBlob, PendingFloat,
+        MAX_CACHE_RECORD_FILES,
     };
     use crate::stable_compile_state::StableCompileState;
 
@@ -1420,6 +1500,110 @@ mod tests {
         let lookup = cache.lookup(&[]);
 
         assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn stores_and_restores_cached_page_payloads() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"stable"));
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+                block_checkpoints: None,
+            },
+        )]);
+        let cached_page_payloads = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            vec![test_cached_page_payload("cached page 1")],
+        )]);
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        cache
+            .store_with_page_payloads(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+                &cached_page_payloads,
+            )
+            .expect_none("cache stored");
+
+        let lookup = cache.lookup(&[]);
+
+        assert_eq!(lookup.cached_page_payloads, cached_page_payloads);
+    }
+
+    #[test]
+    fn split_cache_v6_without_page_payloads_is_compatible() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        let record_dir = cache.record_dir.clone();
+        fs::create_dir_all(record_dir.join(super::CACHE_PARTITIONS_DIR_NAME))
+            .expect("create record dir");
+
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+                block_checkpoints: None,
+            },
+        )]);
+        let partition_key = super::sanitize_partition_key("fragment:document:0000:main");
+        let index = CacheIndex {
+            version: super::PREVIOUS_SPLIT_CACHE_VERSION,
+            primary_input: input.clone(),
+            jobname: "main".to_string(),
+            output_pdf: output_dir.join("main.pdf"),
+            output_pdf_hash: fingerprint_bytes(pdf_bytes),
+            dependency_graph: dependency_graph_for(&input, "stable"),
+            stable_compile_state: stable_state(&input),
+            partition_keys: vec![partition_key.clone()],
+        };
+        fs::write(
+            record_dir.join(super::CACHE_INDEX_FILENAME),
+            serde_json::to_vec_pretty(&index).expect("serialize v6 index"),
+        )
+        .expect("write v6 index");
+        let blob = serde_json::json!({
+            "cached_source_subtrees": {},
+            "cached_typeset_fragments": {
+                "document:0000:main": {
+                    "fragment": test_fragment("document:0000:main"),
+                    "source_hash": 42_u64,
+                    "block_checkpoints": null
+                }
+            }
+        });
+        fs::write(
+            record_dir
+                .join(super::CACHE_PARTITIONS_DIR_NAME)
+                .join(format!("{partition_key}.json")),
+            serde_json::to_vec_pretty(&blob).expect("serialize v6 blob"),
+        )
+        .expect("write v6 blob");
+
+        let lookup = cache.lookup(&[]);
+
+        assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+        assert!(lookup.cached_page_payloads.is_empty());
     }
 
     #[test]
@@ -2342,6 +2526,23 @@ mod tests {
                 y: DimensionValue(0),
             }],
         }
+    }
+
+    fn test_cached_page_payload(text: &str) -> CachedPagePayload {
+        PageRenderPayload::new(
+            0,
+            vec![PdfLinkAnnotation {
+                object_id: 0,
+                target: PdfLinkTarget::Uri("https://example.com".to_string()),
+                x_start: DimensionValue::zero(),
+                x_end: DimensionValue(10),
+                y_bottom: DimensionValue(20),
+                y_top: DimensionValue(30),
+            }],
+            BTreeSet::new(),
+            text.to_string(),
+        )
+        .into()
     }
 
     trait ExpectNone<T> {

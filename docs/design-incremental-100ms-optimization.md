@@ -24,18 +24,18 @@ Wave 1（Incremental Performance Evidence）では `FTX-BENCH-001` 1000-section 
 
 ### 1.3 ボトルネック分析
 
-現行パイプラインで 100ms を超過する原因を、pipeline stage ごとに整理する。Step 0 の計装（`StageTiming`）により stage 別の定量計測基盤は整備済みであり、以下は Step 2 完了後のコード構造に基づく定性分析である。Step 3 以降の着手前に、`FTX-BENCH-001` 等で定量データを継続確認する。
+現行パイプラインで 100ms を超過する原因を、pipeline stage ごとに整理する。Step 0 の計装（`StageTiming`）により stage 別の定量計測基盤は整備済みであり、以下は Step 3 完了後のコード構造と WU-5 再 profiling 結果に基づく分析である。`FTX-BENCH-001` 等で定量データを継続確認し、追加最適化の優先順位を判断する。
 
 | Stage | 現状の問題 | 根拠 |
 |---|---|---|
-| **依存検出** | Step 1 で watcher/scheduler からの `changed_paths` fast path、v5 split cache、watcher backend 抽象化は導入済み。ただし empty hint 時は依存グラフ上の全 node 走査に fallback する | `compile_cache.rs:328` |
+| **依存検出** | Step 1 で watcher/scheduler からの `changed_paths` fast path、split cache、watcher backend 抽象化は導入済み。ただし empty hint 時は依存グラフ上の全 node 走査に fallback する | `compile_cache.rs:328` |
 | **Parse** | source subtree reuse は I/O 削減のみ。expanded 全文を毎回 parser に渡し直す | `compile_job_service.rs:2112` |
-| **Typeset** | Step 2 で block checkpoint reuse は導入済みだが、変更位置が partition の前方に寄ると suffix が大きくなりやすい。monolithic file や cross-ref 収束が必要な経路では依然として fallback が発生する | `typesetting/api.rs:447`, `compile_job_service.rs:2285` |
+| **Typeset** | Step 2 の block checkpoint reuse は benchmark 条件で有効化されており、WU-5 再 profiling では 1000-section staged input の 1 段落変更時に `cached=999 partition`, `suffix_rebuild=1 partition`, `full_rebuild=0 partition` を記録した。変更対象 partition は `reuse=SuffixRebuild, suffix=2/4, fallback=None` で処理され、以前の `SuffixValidationFailed` 起因の full rebuild fallback は解消された。ただし manual benchmark（5-run median 66,782ms）の結果から、typeset 以外の stage も含めた全体の律速要因はまだ stage 別に切り分けられていない | `compile_job_service.rs:120`, `compile_job_service.rs:3580`, `compile_job_service.rs:10882` |
 | **Cross-ref 収束** | `\pageref` 存在時は partial typeset 無効化。2〜3 pass 回り得る | `compile_job_service.rs:1026`, `compile_job_service.rs:1114` |
-| **PDF 出力** | 全 page を再 render し全 PDF bytes を再生成する | `pdf/api.rs:232`, `compile_job_service.rs:1380` |
-| **Cache 保存** | v5 split cache で monolithic JSON は解消したが、`index.json` と変更 partition blob の serialize/deserialize は依然として発生する | `compile_cache.rs:272` |
+| **PDF 出力** | Step 3 で per-page payload reuse は実装済み。ただし再利用対象は `Cached` / `BlockReuse` partition のページに限られ、fallback partition を含む文書や XObject-backed page は safety-first で再 render する | `compile_job_service.rs:1561`, `compile_job_service.rs:4710`, `pdf/api.rs:990` |
+| **Cache 保存** | split cache（現在の format は v7）で monolithic JSON は解消したが、`index.json` と変更 partition blob の serialize/deserialize は依然として発生する | `compile_cache.rs:272` |
 
-**構造的制約**: 上記の各 stage が O(full document) で動作するため、個別 stage の最適化では 100ms に到達できない。複数 stage を同時に sub-document 粒度に縮小する必要がある。
+**構造的制約**: typeset と render は sub-document 粒度まで縮小できているが、parse と一部 fixed-cost stage は依然として全文・全 partition 相当の処理を含む。manual benchmark（`FTX-BENCH-001` 1000-section staged input、cycle 900 の 1 段落を 5 回連続変更）の結果、incremental compile の 5-run median は **66,782ms**（runs: 65.487s / 67.097s / 66.669s / 66.782s / 67.418s）であり、100ms 目標に対し約 668× の乖離がある。次の frontier は、この 66.8s を支配している stage を `StageTiming` で特定し、その結果に応じて Step 4（incremental parse）か別 stage の最適化を選択することである。
 
 ## 2. 設計オプション比較
 
@@ -94,7 +94,7 @@ unchanged partition の parsed body も cache し、全文 parse を省略する
 
 ## 3. 推奨方針
 
-**A → B → C の順に段階的に実装する。** D は A〜C で 100ms に到達しない場合のみ着手する。
+**A → B → C は実装済み。** suffix rebuild 改善も完了した。manual benchmark（5-run median 66,782ms）により `REQ-NF-002` 100ms は大幅未達と確定した。次の主計画は benchmark path で支配 stage を `StageTiming` により特定することであり、D（incremental parse）は parse が支配的と確認された場合のみ着手する。
 
 ### 根拠
 
@@ -105,7 +105,7 @@ unchanged partition の parsed body も cache し、全文 parse を省略する
 
 ### 前提条件
 
-- **計装の先行実装（Step 0 完了済み）**: `StageTiming` により stage 別 timing の取得基盤が整った。Step 1 着手前に `FTX-BENCH-001` 5-run median で実測プロファイリングを行い、各 stage のコスト分布を定量的に確認すること
+- **計装の先行実装（Step 0 完了済み）**: `StageTiming` により stage 別 timing の取得基盤が整った。manual benchmark（5-run median 66,782ms）で end-to-end の実測値を取得済み。次は `StageTiming` で各 stage のコスト分布を定量的に確認すること
 - **`FTX-BENCH-001` の固定構成**: ベンチマークは 1000-section staged input を使用する。monolithic single-file ではなく partition entry file 単位への staged 変換が前提（Wave 1 の設計判断を踏襲）
 - **preamble 変更は full fallback を許容**: preamble 変更での 100ms 達成は scope 外。本文 1 段落変更が対象
 
@@ -150,24 +150,26 @@ unchanged partition の parsed body も cache し、全文 parse を省略する
 1. **`RecompilationScope::BlockLevel` 拡張**: `FullDocument | LocalRegion` に加えて `BlockLevel { affected_partitions, references_affected, pagination_affected }` を導入し、block-level reuse が可能な partition を明示できるようにした
 2. **Block checkpoint の導入**: `BlockCheckpoint`, `BlockLayoutState`, `PendingFloat`, `BlockCheckpointData` を追加し、`CachedTypesetFragment.block_checkpoints: Option<BlockCheckpointData>` を `#[serde(default)]` 付きで保持することで Step 1 cache との後方互換を維持した
 3. **Checkpoint 生成 + suffix rebuild**: `document_nodes_to_vlist_with_state()` で block 境界 checkpoint を収集し、`find_affected_block_index()` と `suffix_rebuild()` により変更 block 以降だけを rebuild する path を実装した。pagination は `paginate_vlist_continuing_with_state()` で初期 float queue を外部注入して継続できる
-4. **Fallback 条件の実装**: preamble 変更、`\pageref`、`typeset_callback_count > 1`、checkpoint 不在、block 構造変化、`affected_block_index == 0`、ページ数変化、float / footnote 不整合で partition または full document fallback する
+4. **Fallback 条件の実装**: preamble 変更、`\pageref`、`typeset_callback_count > 1`、checkpoint 不在、block 構造変化、float / footnote 不整合で partition または full document fallback する。先頭 block 変更（`affected_block_index == 0`）は suffix rebuild 経路で処理し、ページ数変化も `suffix_rebuild()` 側で許容する
 
 **実装結果**: 変更 block 以降のみ再 typeset する block-level reuse path と、横断参照収束パスで block reuse を無効化する guard が導入された。`block_checkpoint_single_paragraph_edit_parity`、`block_checkpoint_heading_addition_fallback`、suffix rebuild の footnote/float 系 test などで parity/fallback を検証済み。
 
-**有効化状態**: benchmark 条件で `BlockLevel` scope が生成・適用されることを確認済み。`compile_cache.rs` が block checkpoint を持つ partition で `LocalRegion` → `BlockLevel` に昇格し、`compile_job_service.rs` の `partial_typeset_available` が `BlockLevel` を受理し、`TypesetterReusePlan::create()` が `primary_input_changed` ガードをバイパスする。ただし staged `FTX-BENCH-001` では typeset が依然支配的であり、suffix rebuild の実効的なスコープ縮小効果について追加分析が必要（§7 参照）。
+**有効化状態**: benchmark 条件で `BlockLevel` scope が生成・適用されることを確認済み。`compile_cache.rs` が block checkpoint を持つ partition で `LocalRegion` → `BlockLevel` に昇格し、`compile_job_service.rs` の `partial_typeset_available` が `BlockLevel` を受理し、`TypesetterReusePlan::create()` が `primary_input_changed` ガードをバイパスする。WU-5 再 profiling では staged `FTX-BENCH-001` の変更 partition が `SuffixRebuild` として処理され、従来の `SuffixValidationFailed` fallback は再現しなかった。manual benchmark（5-run median 66,782ms）により、Step 2 の改善だけでは 100ms に遠く及ばないことが確定した。次の作業は benchmark path で支配 stage を特定し、Step 4 か別 stage 最適化かを判断すること（§7 参照）。
 
-### Step 3: Per-page payload reuse（deterministic full rewrite）
+### Step 3: Per-page payload reuse（deterministic full rewrite） — 完了
 
-1. **Per-page content stream cache**: 各ページの rendered PDF content stream を hash 付きで cache する。hash はページの typeset 結果（テキスト行、画像配置、graphics scene）から算出
-2. **Dirty page 判定**: Step 2 の suffix rebuild 結果から変更ページ集合を特定。未変更ページの content stream はキャッシュから復元し再 render をスキップ
-3. **Font/Image XObject 再利用**: 未変更ページが参照する font subset と image XObject をキャッシュから復元
-4. **Deterministic full rewrite**: 全ページの content stream（キャッシュ復元 + 再 render）を集約し、catalog/xref/trailer を含む完全な PDF を毎回生成する。incremental PDF update は採用しない。これにより fresh full compile との byte-identical 比較が常に有効となる
+1. **Cache v7 と page payload 永続化**: `PageRenderPayload.stream_hash` と `CachedPagePayload` を導入し、page content stream・annotation・opacity graphics state を split cache に保存する。`CACHE_VERSION` は 6 → 7 に更新した
+2. **Pre-rendered payload 注入経路**: `reusable_page_payloads_for_render()` が `PartitionTypesetDetail` から `Cached` / `BlockReuse` partition を抽出し、対応ページの cached payload を `PdfRenderer::render_with_partition_plan()` に注入する
+3. **Deterministic full rewrite**: `PageRenderPayload::try_from_cached()` による hash 検証を通過した payload のみ再利用しつつ、catalog/xref/trailer を含む PDF 全体は毎回 fresh に再生成する。粒度は「dirty page 厳密判定」ではなく「reuse 可能 partition 以外のページ再 render」である
+4. **Guard 1 + Guard 2**: Guard 1 として `compile_job_service.rs` 側で fallback partition を含む文書、先頭 partition が複数ページにまたがる frontmatter/TOC 系構成、reindexed XObject page を reuse 対象から除外する。Guard 2 として `pdf/api.rs` 側で XObject resource を持つページ、または stream hash 不一致 payload を必ず再 render する
 
-**受入基準**: PDF render stage timing が Step 2 比で 70% 以上削減。`FTX-BENCH-001` での 1 段落変更 median が 100ms 未満。出力 PDF が fresh full compile と byte-identical であること。
+**実装結果**: `per_page_payload_reuse_matches_full_and_reduces_pdf_render_stage` で 40 chapter report の 1 chapter edit に対して `reused_pages=39` / `rendered_pages=1` と fresh full compile との byte-identical を確認した。加えて TOC 文書回帰、XObject guard、invalid hash guard を含む core 3 件 + application 3 件 + 回帰 2 件の関連テストが pass している。
 
-### Step 4: Incremental parse（条件付き）
+**未完 / 制限**: page payload reuse は `Cached` / `BlockReuse` partition のページだけが対象で、`SuffixRebuild` / `FullRebuild` partition は全ページ再 render する。external image / embedded PDF graphic を含むページと fallback partition 文書では safety-first で reuse を無効化する。したがって Step 3 完了は render 側 frontier を閉じたことを意味するが、`REQ-NF-002` の 100ms 達成そのものは未完である。
 
-Step 0〜3 で 100ms 未達の場合のみ着手する。
+### Step 4: Incremental parse（未着手 / 条件付き）
+
+Step 3 完了後も parse は全文のまま残る。WU-5 再 profiling では typeset 側の `SuffixValidationFailed` fallback は再現せず、変更 partition は suffix rebuild 経路で処理された。したがって Step 4 は、この改善後の実 stage timing で parse が支配的と確認された場合のみ着手する。
 
 1. **Partition 単位の parsed IR cache**: 変更のない partition の parsed body をキャッシュし再 parse を省略
 2. **Invalidation scope**: preamble 変更・macro 定義変更は全 partition を invalidate。本文変更は affected partition のみ
@@ -181,7 +183,7 @@ Step 0〜3 で 100ms 未達の場合のみ着手する。
 |---|---|---|---|
 | **Footnote/float 継続状態の不整合** | 高 | 中 | `compile_job_service.rs:2650` 周辺の footnote merge を集中テスト。checkpoint に footnote queue 状態を含める |
 | **Cross-reference 収束の non-termination** | 高 | 低 | `\pageref` 含む文書で suffix rebuild 後の収束を byte-identical で検証（既存 `incremental_xref_convergence_after_page_shift` の拡張） |
-| **Stage timing 計測なしでの最適化着手** | 緩和済み | — | Step 0 完了により `StageTiming` 計装が稼働中。残タスクは `FTX-BENCH-001` 5-run median の実測プロファイリングのみ |
+| **Stage timing 計測なしでの最適化着手** | 緩和済み | — | Step 0 完了により `StageTiming` 計装が稼働中。manual benchmark（5-run median 66,782ms）を実施済み。残タスクは stage 別の律速内訳の取得 |
 | **Cache 分割による I/O パターン変化** | 中 | 中 | SSD/HDD 両環境でのベンチマーク。blob 数が過大にならないよう partition 粒度を維持 |
 | **Per-page cache の hash 不整合** | 中 | 低 | page content stream の hash 算出にページの全構成要素（テキスト行、画像、graphics scene、font 参照）を含める。hash mismatch 時は再 render に fallback |
 | **Monolithic file の full fallback 頻度** | 低 | 高 | `DocumentPartitionPlanner` が monolithic file でも section 境界で仮想 partition を生成する拡張を検討（ただし本設計の scope 外） |
@@ -221,15 +223,32 @@ Step 0〜3 で 100ms 未達の場合のみ着手する。
 Step 0〜3 の設計方針により、1 段落変更時のパイプラインは以下のように変化する:
 
 ```
-現状:  O(全 node hash) → O(全文 parse) → O(section typeset) → O(全 page render) → O(全文 cache serialize)
-目標:  O(changed files) → O(全文 parse) → O(suffix typeset) → O(changed pages render + full rewrite) → O(changed partition cache)
-         Step 1            (Step 4で改善)     Step 2              Step 3                   Step 1
+現時点: O(changed files) → O(全文 parse) → O(validated suffix typeset) → O(reuse 不能 partition の page render + full rewrite) → O(changed partition cache)
+次段階候補: O(changed files) → O(changed partitions parse) → O(validated suffix typeset) → O(changed pages render + full rewrite) → O(changed partition cache)
+            Step 1            (Step 4が必要なら改善)        Step 2 改善済み                 Step 3                   Step 1/3
 ```
 
-現時点で Step 1 と Step 2 は実装済みであり、依存検出は O(changed files)、typeset は O(suffix) まで縮小された。Step 2 は benchmark 条件で有効化されている: `CompileCache` が block checkpoint の存在する partition で `LocalRegion` → `BlockLevel` に scope を昇格し、`compile_job_service.rs` の `partial_typeset_available` が `BlockLevel` を受理し、`TypesetterReusePlan::create()` が `block_level_reuse` フラグにより `primary_input_changed` ガードをバイパスする。
+現時点で Step 1〜3 は実装済みであり、依存検出は O(changed files)、render は supported path で O(reuse 不能 partition のページ) まで縮小された。Step 3 では `PageRenderPayload.stream_hash` / `CachedPagePayload` / cache v7 を導入し、`PartitionTypesetDetail` が `Cached` / `BlockReuse` と判定した partition のページだけを full rewrite に再注入する。XObject-backed page と fallback partition 文書では safety-first で reuse を無効化する。
 
-**profiling 現況**: Step 2 有効化後の staged `FTX-BENCH-001` profiling では、typeset が依然支配的である。考えられる原因は: (1) suffix rebuild のスコープが期待より広い（変更位置が partition 前方に寄ると suffix が大きくなる）、(2) fallback 条件（`\pageref`、`typeset_callback_count > 1` 等）による full typeset 回帰の頻度、(3) checkpoint 未生成 partition の存在。Step 3 着手前に、typeset stage の内訳（suffix 範囲、fallback 発生頻度、partition ごとの reuse/rebuild 状態）を計測し、追加の typeset 縮小が必要かを判断すべきである。
+**profiling 現況**: WU-5 で `cargo test -p ferritex-application typeset_dominance_diagnostic -- --ignored --nocapture` を再実行し、`StageTiming.typeset_partition_details` の診断出力を確認した。1000-section staged input の 1 段落変更では `cached=999 partition`, `block_reuse=0`, `suffix_rebuild=1`, `full_rebuild=0` であり、変更対象 partition は `reuse=SuffixRebuild, suffix=2/4, fallback=None` を記録した。以前の `SuffixValidationFailed` fallback は再現せず、suffix rebuild 経路が正常化したことが確認できる。
 
-残る主要ボトルネックは Step 3 の render 側 reuse と、typeset コストの追加分析である。parse が全文のまま残るが、1000-section 文書でも parse 自体は typeset/render と比較して軽量である可能性が高い（Step 0 の `StageTiming` 計装で確認可能）。parse が支配的と判明した場合のみ Step 4 に進む。
+**manual benchmark 実測（2026-04-05）**: staged `FTX-BENCH-001` 1000-section input で cache / 依存グラフ構築後、cycle 900 の 1 段落を 5 回連続変更して incremental compile を計測した。
 
-Step 4 なしで 100ms を達成できるかは、typeset 側の追加分析結果と Step 3 の効果に依存する。typeset と render の sub-document 化（Step 2 + 3）で大半の固定費を除去できる見込みだが、Step 2 の実効縮小が限定的である場合は Step 3 の前に typeset 側の追加施策（suffix 範囲の更なる限定、fallback 条件の緩和等）が必要になる可能性がある。したがって残る主計画は (1) typeset 支配原因の分析、(2) Step 3、その次点が条件付きの Step 4 である。
+| Run | 時間 (s) |
+|---|---|
+| 1 | 65.487 |
+| 2 | 67.097 |
+| 3 | 66.669 |
+| 4 | 66.782 |
+| 5 | 67.418 |
+| **Median** | **66.782** |
+
+5-run median は **66,782ms** であり、`REQ-NF-002` の 100ms 目標に対し約 668× の乖離がある。旧来の主要ボトルネックだった `SuffixValidationFailed` 起因の full rebuild fallback は診断上解消されたが、Step 1〜3 の改善を経てもなお end-to-end の incremental compile 時間は目標から 2 桁以上離れている。
+
+**次の frontier**: 66.8s を支配している stage を `StageTiming` の stage 別計測で特定し、その結果に応じて次の最適化対象を決定する。具体的には:
+
+1. benchmark path で `StageTiming` の各 stage（parse / typeset / pdf_render / cache_load / cache_store / source_tree_load）の内訳を取得する
+2. 支配 stage が parse であれば Step 4（incremental parse）に進む
+3. 支配 stage が parse 以外（例: pdf_render の fixed-cost、cache I/O）であれば、その stage の guard 条件または fixed-cost を先に最適化する
+
+Step 4 の必要性は現時点で条件付きのままである。typeset と render の sub-document 化（Step 2 + 3）は実装済みであり、suffix rebuild の診断上の不具合も解消した。しかし end-to-end の実測値から、現在の改善だけでは 100ms に到達し得ないことが確定した。stage 別の律速分析が次のゲートとなる。

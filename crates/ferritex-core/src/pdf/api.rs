@@ -1,5 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::thread;
+
+use serde::{Deserialize, Serialize};
 
 use crate::compilation::{DocumentPartitionPlan, LinkStyle};
 use crate::graphics::api::{
@@ -29,6 +32,12 @@ pub struct PdfDocument {
     pub bytes: Vec<u8>,
     pub page_count: usize,
     pub total_lines: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedPdfDocument {
+    pub document: PdfDocument,
+    pub page_payloads: Vec<PageRenderPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,18 +155,18 @@ pub struct PdfRenderer {
     page_form_xobjects: Vec<Vec<PlacedFormXObject>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PdfLinkAnnotation {
-    object_id: usize,
-    target: PdfLinkTarget,
-    x_start: DimensionValue,
-    x_end: DimensionValue,
-    y_bottom: DimensionValue,
-    y_top: DimensionValue,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PdfLinkAnnotation {
+    pub object_id: usize,
+    pub target: PdfLinkTarget,
+    pub x_start: DimensionValue,
+    pub x_end: DimensionValue,
+    pub y_bottom: DimensionValue,
+    pub y_top: DimensionValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PdfLinkTarget {
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PdfLinkTarget {
     Uri(String),
     InternalDestination(String),
 }
@@ -228,7 +237,14 @@ impl PdfRenderer {
         document: &TypesetDocument,
         parallelism: usize,
     ) -> PdfDocument {
-        self.render_with_partition_plan(document, parallelism, 1, &DocumentPartitionPlan::default())
+        self.render_with_partition_plan(
+            document,
+            parallelism,
+            1,
+            &DocumentPartitionPlan::default(),
+            None,
+        )
+        .document
     }
 
     pub fn render_with_partition_plan(
@@ -237,7 +253,8 @@ impl PdfRenderer {
         parallelism: usize,
         pass_number: u32,
         partition_plan: &DocumentPartitionPlan,
-    ) -> PdfDocument {
+        pre_rendered_page_payloads: Option<&BTreeMap<usize, PageRenderPayload>>,
+    ) -> RenderedPdfDocument {
         let page_count = document.pages.len();
         let total_lines = document.pages.iter().map(|page| page.lines.len()).sum();
         let link_style = &document.navigation.default_link_style;
@@ -259,6 +276,7 @@ impl PdfRenderer {
             &page_partition_ids,
             parallelism,
             pass_number,
+            pre_rendered_page_payloads,
         );
         let mut page_annotations = page_payloads
             .iter()
@@ -501,10 +519,13 @@ impl PdfRenderer {
             .as_bytes(),
         );
 
-        PdfDocument {
-            bytes: pdf,
-            page_count,
-            total_lines,
+        RenderedPdfDocument {
+            document: PdfDocument {
+                bytes: pdf,
+                page_count,
+                total_lines,
+            },
+            page_payloads,
         }
     }
 }
@@ -522,11 +543,12 @@ struct FontObjectSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PageRenderPayload {
-    page_index: usize,
-    annotations: Vec<PdfLinkAnnotation>,
-    opacity_graphics_states: BTreeSet<OpacityGraphicsStateKey>,
-    stream: String,
+pub struct PageRenderPayload {
+    pub page_index: usize,
+    pub annotations: Vec<PdfLinkAnnotation>,
+    pub opacity_graphics_states: BTreeSet<OpacityGraphicsStateKey>,
+    pub stream_hash: u64,
+    pub stream: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,14 +563,60 @@ struct PageRenderWorkload {
     page_indices: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct OpacityGraphicsStateKey {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OpacityGraphicsStateKey {
     stroke_opacity_bits: u64,
     fill_opacity_bits: u64,
 }
 
+impl PageRenderPayload {
+    pub fn new(
+        page_index: usize,
+        annotations: Vec<PdfLinkAnnotation>,
+        opacity_graphics_states: BTreeSet<OpacityGraphicsStateKey>,
+        stream: String,
+    ) -> Self {
+        let stream_hash =
+            hash_page_payload_content(&stream, &annotations, &opacity_graphics_states);
+        Self {
+            page_index,
+            annotations,
+            opacity_graphics_states,
+            stream_hash,
+            stream,
+        }
+    }
+
+    pub fn try_from_cached(
+        page_index: usize,
+        stream_hash: u64,
+        stream: String,
+        annotations: Vec<PdfLinkAnnotation>,
+        opacity_graphics_states: BTreeSet<OpacityGraphicsStateKey>,
+    ) -> Option<Self> {
+        let computed_hash =
+            hash_page_payload_content(&stream, &annotations, &opacity_graphics_states);
+        (computed_hash == stream_hash).then_some(Self {
+            page_index,
+            annotations,
+            opacity_graphics_states,
+            stream_hash,
+            stream,
+        })
+    }
+
+    fn has_valid_stream_hash(&self) -> bool {
+        self.stream_hash
+            == hash_page_payload_content(
+                &self.stream,
+                &self.annotations,
+                &self.opacity_graphics_states,
+            )
+    }
+}
+
 impl OpacityGraphicsStateKey {
-    fn new(stroke_opacity: f64, fill_opacity: f64) -> Option<Self> {
+    pub fn new(stroke_opacity: f64, fill_opacity: f64) -> Option<Self> {
         if !stroke_opacity.is_finite() || !fill_opacity.is_finite() {
             return None;
         }
@@ -569,6 +637,18 @@ impl OpacityGraphicsStateKey {
     fn fill_opacity(self) -> f64 {
         f64::from_bits(self.fill_opacity_bits)
     }
+}
+
+fn hash_page_payload_content(
+    stream: &str,
+    annotations: &[PdfLinkAnnotation],
+    opacity_graphics_states: &BTreeSet<OpacityGraphicsStateKey>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    stream.hash(&mut hasher);
+    annotations.hash(&mut hasher);
+    opacity_graphics_states.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn opacity_graphics_state_name(key: OpacityGraphicsStateKey) -> String {
@@ -823,6 +903,7 @@ fn render_page_payloads(
     page_partition_ids: &[String],
     parallelism: usize,
     _pass_number: u32,
+    pre_rendered_page_payloads: Option<&BTreeMap<usize, PageRenderPayload>>,
 ) -> Vec<PageRenderPayload> {
     let workloads = page_render_workloads(page_partition_ids, pages.len(), parallelism);
     if workloads.len() <= 1 {
@@ -832,26 +913,17 @@ fn render_page_payloads(
                 workload
                     .page_indices
                     .into_iter()
-                    .map(|page_index| PageRenderPayload {
-                        page_index,
-                        annotations: page_link_annotations(&pages[page_index]),
-                        opacity_graphics_states: collect_page_opacity_graphics_states(
-                            &pages[page_index],
-                        ),
-                        stream: render_page_stream(
-                            &pages[page_index],
-                            page_images
-                                .get(page_index)
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[]),
+                    .map(|page_index| {
+                        render_page_payload_for_index(
+                            pages,
+                            page_images,
                             image_objects,
-                            page_form_xobjects
-                                .get(page_index)
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[]),
+                            page_form_xobjects,
                             form_xobjects,
                             link_style,
-                        ),
+                            pre_rendered_page_payloads,
+                            page_index,
+                        )
                     })
                     .collect::<Vec<_>>()
             })
@@ -867,26 +939,16 @@ fn render_page_payloads(
                     .iter()
                     .copied()
                     .map(|page_index| {
-                        let page = &pages[page_index];
-                        PageRenderPayload {
+                        render_page_payload_for_index(
+                            pages,
+                            page_images,
+                            image_objects,
+                            page_form_xobjects,
+                            form_xobjects,
+                            link_style,
+                            pre_rendered_page_payloads,
                             page_index,
-                            annotations: page_link_annotations(page),
-                            opacity_graphics_states: collect_page_opacity_graphics_states(page),
-                            stream: render_page_stream(
-                                page,
-                                page_images
-                                    .get(page_index)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                                image_objects,
-                                page_form_xobjects
-                                    .get(page_index)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]),
-                                form_xobjects,
-                                link_style,
-                            ),
-                        }
+                        )
                     })
                     .collect::<Vec<_>>();
                 page_payloads.sort_by_key(|payload| payload.page_index);
@@ -911,7 +973,64 @@ fn render_page_payloads(
         .collect()
 }
 
-fn page_partition_ids_for_plan(
+#[allow(clippy::too_many_arguments)]
+fn render_page_payload_for_index(
+    pages: &[TypesetPage],
+    page_images: &[Vec<PlacedImage>],
+    image_objects: &[PdfImageXObject],
+    page_form_xobjects: &[Vec<PlacedFormXObject>],
+    form_xobjects: &[PdfFormXObject],
+    link_style: &LinkStyle,
+    pre_rendered_page_payloads: Option<&BTreeMap<usize, PageRenderPayload>>,
+    page_index: usize,
+) -> PageRenderPayload {
+    if !page_has_xobject_resources(page_images, page_form_xobjects, page_index) {
+        if let Some(payload) = pre_rendered_page_payloads
+            .and_then(|payloads| payloads.get(&page_index))
+            .filter(|payload| payload.has_valid_stream_hash())
+        {
+            let mut cached_payload = payload.clone();
+            cached_payload.page_index = page_index;
+            return cached_payload;
+        }
+    }
+
+    let page = &pages[page_index];
+    PageRenderPayload::new(
+        page_index,
+        page_link_annotations(page),
+        collect_page_opacity_graphics_states(page),
+        render_page_stream(
+            page,
+            page_images
+                .get(page_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            image_objects,
+            page_form_xobjects
+                .get(page_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            form_xobjects,
+            link_style,
+        ),
+    )
+}
+
+fn page_has_xobject_resources(
+    page_images: &[Vec<PlacedImage>],
+    page_form_xobjects: &[Vec<PlacedFormXObject>],
+    page_index: usize,
+) -> bool {
+    page_images
+        .get(page_index)
+        .is_some_and(|images| !images.is_empty())
+        || page_form_xobjects
+            .get(page_index)
+            .is_some_and(|forms| !forms.is_empty())
+}
+
+pub fn page_partition_ids_for_plan(
     document: &TypesetDocument,
     partition_plan: &DocumentPartitionPlan,
 ) -> Vec<String> {
@@ -2149,10 +2268,13 @@ fn escape_pdf_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::{
         opacity_graphics_state_name, render_vector_primitive, resolve_named_color, FontResource,
-        ImageColorSpace, ImageFilter, OpacityGraphicsStateKey, PdfFormXObject, PdfImageXObject,
-        PdfRenderer, PlacedFormXObject, PlacedImage,
+        ImageColorSpace, ImageFilter, OpacityGraphicsStateKey, PageRenderPayload, PdfFormXObject,
+        PdfImageXObject, PdfLinkAnnotation, PdfLinkTarget, PdfRenderer, PlacedFormXObject,
+        PlacedImage,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::compilation::{
@@ -2870,11 +2992,198 @@ mod tests {
         let renderer = PdfRenderer::default();
 
         let sequential = renderer.render(&document);
-        let parallel = renderer.render_with_partition_plan(&document, 4, 2, &plan);
+        let parallel = renderer.render_with_partition_plan(&document, 4, 2, &plan, None);
 
-        assert_eq!(parallel.page_count, sequential.page_count);
-        assert_eq!(parallel.total_lines, sequential.total_lines);
-        assert_eq!(parallel.bytes, sequential.bytes);
+        assert_eq!(parallel.document.page_count, sequential.page_count);
+        assert_eq!(parallel.document.total_lines, sequential.total_lines);
+        assert_eq!(parallel.document.bytes, sequential.bytes);
+    }
+
+    #[test]
+    fn render_with_partition_plan_reuses_pre_rendered_page_payloads() {
+        let mut document = single_page(&["1 Intro", "Page 1 body"]);
+        document.pages.push(page(&["Page 2 body before edit"]));
+        document.pages.push(page(&["2 Results", "Page 3 body"]));
+        document.outlines = vec![
+            TypesetOutline {
+                level: 0,
+                title: "1 Intro".to_string(),
+                page_index: 0,
+                y: points(720),
+            },
+            TypesetOutline {
+                level: 0,
+                title: "2 Results".to_string(),
+                page_index: 2,
+                y: points(720),
+            },
+        ];
+        let plan = DocumentPartitionPlan {
+            fallback_partition_id: "document:0000:book".to_string(),
+            work_units: vec![
+                DocumentWorkUnit {
+                    partition_id: "chapter:0001:1-intro".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 0,
+                        title: "1 Intro".to_string(),
+                    },
+                    title: "1 Intro".to_string(),
+                },
+                DocumentWorkUnit {
+                    partition_id: "chapter:0002:2-results".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 1,
+                        title: "2 Results".to_string(),
+                    },
+                    title: "2 Results".to_string(),
+                },
+            ],
+        };
+        let renderer = PdfRenderer::default();
+        let baseline = renderer.render_with_partition_plan(&document, 1, 1, &plan, None);
+
+        let mut edited_document = document.clone();
+        edited_document.pages[1] = page(&["Page 2 body after edit"]);
+        let overrides = BTreeMap::from([
+            (0usize, baseline.page_payloads[0].clone()),
+            (2usize, baseline.page_payloads[2].clone()),
+        ]);
+
+        let reused =
+            renderer.render_with_partition_plan(&edited_document, 1, 1, &plan, Some(&overrides));
+        let full = renderer.render_with_partition_plan(&edited_document, 1, 1, &plan, None);
+
+        assert_eq!(reused.document.bytes, full.document.bytes);
+        assert_eq!(reused.page_payloads[0], baseline.page_payloads[0]);
+        assert_eq!(reused.page_payloads[2], baseline.page_payloads[2]);
+        assert_eq!(reused.page_payloads[1], full.page_payloads[1]);
+    }
+
+    #[test]
+    fn render_with_partition_plan_rerenders_pages_with_xobject_resources() {
+        let document = single_page_with_images(
+            &[],
+            vec![TypesetImage {
+                scene: raster_scene(),
+                x: points(72),
+                y: points(600),
+                display_width: points(100),
+                display_height: points(100),
+            }],
+        );
+        let renderer = PdfRenderer::default().with_images(
+            vec![PdfImageXObject {
+                object_id: 0,
+                width: 1,
+                height: 1,
+                color_space: ImageColorSpace::DeviceRGB,
+                bits_per_component: 8,
+                data: vec![120, 156, 99, 248, 207, 192, 0, 0, 3, 1, 1, 0],
+                filter: ImageFilter::FlateDecode,
+            }],
+            vec![vec![PlacedImage {
+                xobject_index: 0,
+                x: points(72),
+                y: points(600),
+                display_width: points(100),
+                display_height: points(100),
+            }]],
+        );
+        let full = renderer.render_with_partition_plan(
+            &document,
+            1,
+            1,
+            &DocumentPartitionPlan::default(),
+            None,
+        );
+        let bogus_payload = PageRenderPayload::new(
+            0,
+            Vec::new(),
+            BTreeSet::new(),
+            "q 1 0 0 1 0 0 cm /Im999 Do Q\n".to_string(),
+        );
+        let overrides = BTreeMap::from([(0usize, bogus_payload)]);
+
+        let rendered = renderer.render_with_partition_plan(
+            &document,
+            1,
+            1,
+            &DocumentPartitionPlan::default(),
+            Some(&overrides),
+        );
+
+        assert_eq!(rendered.document.bytes, full.document.bytes);
+        assert_eq!(rendered.page_payloads[0], full.page_payloads[0]);
+        assert_eq!(
+            rendered.page_payloads[0].stream,
+            "q 100 0 0 100 72 600 cm /Im1 Do Q\n"
+        );
+    }
+
+    #[test]
+    fn render_with_partition_plan_ignores_invalid_cached_page_payload_hash() {
+        let document = single_page(&["Payload hash guard"]);
+        let renderer = PdfRenderer::default();
+        let baseline = renderer.render_with_partition_plan(
+            &document,
+            1,
+            1,
+            &DocumentPartitionPlan::default(),
+            None,
+        );
+        let mut invalid_payload = baseline.page_payloads[0].clone();
+        invalid_payload.stream.push_str("%tampered\n");
+        let overrides = BTreeMap::from([(0usize, invalid_payload)]);
+
+        let rendered = renderer.render_with_partition_plan(
+            &document,
+            1,
+            1,
+            &DocumentPartitionPlan::default(),
+            Some(&overrides),
+        );
+
+        assert_eq!(rendered.document.bytes, baseline.document.bytes);
+        assert_eq!(rendered.page_payloads[0], baseline.page_payloads[0]);
+    }
+
+    #[test]
+    fn page_render_payload_hash_includes_annotations_and_opacity_graphics_states() {
+        let base = PageRenderPayload::new(
+            0,
+            Vec::new(),
+            BTreeSet::new(),
+            "BT\n(Alpha) Tj\nET\n".to_string(),
+        );
+        let with_annotation = PageRenderPayload::new(
+            0,
+            vec![PdfLinkAnnotation {
+                object_id: 0,
+                target: PdfLinkTarget::Uri("https://example.com".to_string()),
+                x_start: points(72),
+                x_end: points(144),
+                y_bottom: points(690),
+                y_top: points(702),
+            }],
+            BTreeSet::new(),
+            "BT\n(Alpha) Tj\nET\n".to_string(),
+        );
+        let with_opacity = PageRenderPayload::new(
+            0,
+            Vec::new(),
+            BTreeSet::from([OpacityGraphicsStateKey::new(0.5, 0.5).expect("opacity key")]),
+            "BT\n(Alpha) Tj\nET\n".to_string(),
+        );
+
+        assert_ne!(base.stream_hash, with_annotation.stream_hash);
+        assert_ne!(base.stream_hash, with_opacity.stream_hash);
+        assert_ne!(with_annotation.stream_hash, with_opacity.stream_hash);
     }
 
     #[test]

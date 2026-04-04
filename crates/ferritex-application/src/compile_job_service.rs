@@ -42,8 +42,8 @@ use ferritex_core::parser::{
     MinimalLatexParser, ParseError, ParseOutput, ParsedDocument, RegisterStore,
 };
 use ferritex_core::pdf::{
-    FontResource, ImageFilter, PdfFormXObject, PdfImageXObject, PdfRenderer, PlacedFormXObject,
-    PlacedImage,
+    page_partition_ids_for_plan, FontResource, ImageFilter, PageRenderPayload, PdfFormXObject,
+    PdfImageXObject, PdfRenderer, PlacedFormXObject, PlacedImage,
 };
 use ferritex_core::policy::{ExecutionPolicy, OutputArtifactRegistry, PreviewPublicationPolicy};
 use ferritex_core::policy::{
@@ -64,8 +64,8 @@ use ferritex_core::typesetting::{
 use serde_json::json;
 
 use crate::compile_cache::{
-    fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CachedSourceSubtree,
-    CachedTypesetFragment, CompileCache, PendingFloat,
+    fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CachedPagePayload,
+    CachedSourceSubtree, CachedTypesetFragment, CompileCache, PendingFloat,
 };
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
@@ -109,7 +109,38 @@ pub struct CompileResult {
     pub stage_timing: StageTiming,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PartitionTypesetReuseType {
+    BlockReuse,
+    SuffixRebuild,
+    FullRebuild,
+    Cached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionTypesetFallbackReason {
+    Pageref,
+    TypesetCallbackCount,
+    ReusePlanRequiresFull,
+    NoPartitionsToRebuild,
+    CheckpointMissing,
+    BlockStructureChanged,
+    AffectedBlockIndexZero,
+    SuffixValidationFailed(SuffixRebuildFailure),
+    ParallelPartialTypeset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionTypesetDetail {
+    pub partition_id: String,
+    pub reuse_type: PartitionTypesetReuseType,
+    pub suffix_block_count: usize,
+    pub total_block_count: usize,
+    pub elapsed: Option<std::time::Duration>,
+    pub fallback_reason: Option<PartitionTypesetFallbackReason>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StageTiming {
     pub cache_load: Option<std::time::Duration>,
     pub source_tree_load: Option<std::time::Duration>,
@@ -117,6 +148,7 @@ pub struct StageTiming {
     pub typeset: Option<std::time::Duration>,
     pub pdf_render: Option<std::time::Duration>,
     pub cache_store: Option<std::time::Duration>,
+    pub typeset_partition_details: Option<Vec<PartitionTypesetDetail>>,
 }
 
 impl StageTiming {
@@ -938,6 +970,7 @@ impl<'a> CompileJobService<'a> {
         let mut changed_paths = BTreeSet::new();
         let mut cached_recompilation_scope = None;
         let mut cached_typeset_fragments = BTreeMap::new();
+        let mut cached_page_payloads = BTreeMap::new();
         let mut source_tree_reuse_plan = None;
         if !options.no_cache {
             let cache_load_start = std::time::Instant::now();
@@ -949,6 +982,7 @@ impl<'a> CompileJobService<'a> {
             changed_paths = lookup.changed_paths.iter().cloned().collect();
             cached_recompilation_scope = lookup.scope;
             cached_typeset_fragments = lookup.cached_typeset_fragments.clone();
+            cached_page_payloads = lookup.cached_page_payloads.clone();
             if let Some(cached_artifact) = lookup.artifact {
                 tracing::info!(
                     jobname = %options.jobname,
@@ -1096,6 +1130,7 @@ impl<'a> CompileJobService<'a> {
         let mut font_resolution_fatal = false;
         let mut typeset_callback_count = 0usize;
         let mut typeset_accumulated = std::time::Duration::ZERO;
+        let mut typeset_partition_details = None;
         let parse_and_typeset_start = std::time::Instant::now();
         let parse_pass_result = self.parse_document_with_cross_references(
             &source_tree.source,
@@ -1111,6 +1146,7 @@ impl<'a> CompileJobService<'a> {
                 let typeset_iter_start = std::time::Instant::now();
                 let result = {
                     typeset_callback_count += 1;
+                    typeset_partition_details = None;
                     if compile_font_selection.is_none() {
                         let (selection, families, diagnostics, fatal) = self.select_compile_fonts(
                             &input_path,
@@ -1194,6 +1230,13 @@ impl<'a> CompileJobService<'a> {
                     ) && !cached_typeset_fragments.is_empty()
                         && !document.has_pageref_markers();
                     if partial_typeset_available && typeset_callback_count > 1 {
+                        let partition_plan =
+                            partition_plan_for_document(&options.input_file, document, &source_tree);
+                        typeset_partition_details = Some(synthetic_full_rebuild_partition_details(
+                            &partition_plan,
+                            &cached_typeset_fragments,
+                            PartitionTypesetFallbackReason::TypesetCallbackCount,
+                        ));
                         tracing::info!(
                             jobname = %options.jobname,
                             input = %options.input_file.display(),
@@ -1201,6 +1244,26 @@ impl<'a> CompileJobService<'a> {
                         );
                         full_typeset()
                     } else if !partial_typeset_available || typeset_callback_count != 1 {
+                        if document.has_pageref_markers()
+                            && matches!(
+                                cached_recompilation_scope,
+                                Some(RecompilationScope::LocalRegion)
+                                    | Some(RecompilationScope::BlockLevel { .. })
+                            )
+                            && !cached_typeset_fragments.is_empty()
+                        {
+                            let partition_plan = partition_plan_for_document(
+                                &options.input_file,
+                                document,
+                                &source_tree,
+                            );
+                            typeset_partition_details =
+                                Some(synthetic_full_rebuild_partition_details(
+                                    &partition_plan,
+                                    &cached_typeset_fragments,
+                                    PartitionTypesetFallbackReason::Pageref,
+                                ));
+                        }
                         full_typeset()
                     } else if let Some(reuse_plan) = source_tree_reuse_plan.as_ref() {
                         let partition_plan =
@@ -1227,6 +1290,12 @@ impl<'a> CompileJobService<'a> {
                         );
 
                         if typesetter_reuse_plan.requires_full_typeset {
+                            typeset_partition_details =
+                                Some(synthetic_full_rebuild_partition_details(
+                                    &partition_plan,
+                                    &cached_typeset_fragments,
+                                    PartitionTypesetFallbackReason::ReusePlanRequiresFull,
+                                ));
                             tracing::info!(
                                 jobname = %options.jobname,
                                 input = %options.input_file.display(),
@@ -1234,6 +1303,12 @@ impl<'a> CompileJobService<'a> {
                             );
                             full_typeset()
                         } else if typesetter_reuse_plan.rebuild_partition_ids.is_empty() {
+                            typeset_partition_details =
+                                Some(synthetic_full_rebuild_partition_details(
+                                    &partition_plan,
+                                    &cached_typeset_fragments,
+                                    PartitionTypesetFallbackReason::NoPartitionsToRebuild,
+                                ));
                             tracing::info!(
                                 jobname = %options.jobname,
                                 input = %options.input_file.display(),
@@ -1259,14 +1334,16 @@ impl<'a> CompileJobService<'a> {
                                 &source_tree.cached_source_subtrees,
                                 &reuse_plan.cached_source_subtrees,
                             ) {
-                                Ok(document) => {
+                                Ok(execution) => {
+                                    typeset_partition_details =
+                                        Some(execution.partition_details.clone());
                                     tracing::info!(
                                         jobname = %options.jobname,
                                         input = %options.input_file.display(),
                                         rebuilt_partitions = ?typesetter_reuse_plan.rebuild_partition_ids,
                                         "partial typeset reuse applied"
                                     );
-                                    document
+                                    execution.document
                                 }
                                 Err(reason) => {
                                     tracing::info!(
@@ -1290,6 +1367,7 @@ impl<'a> CompileJobService<'a> {
         let total_parse_and_typeset = parse_and_typeset_start.elapsed();
         stage_timing.typeset = Some(typeset_accumulated);
         stage_timing.parse = Some(total_parse_and_typeset - typeset_accumulated);
+        stage_timing.typeset_partition_details = typeset_partition_details;
         let pdf_renderer = match (
             compile_font_selection.as_ref(),
             font_family_selection.as_ref(),
@@ -1474,12 +1552,35 @@ impl<'a> CompileJobService<'a> {
         };
         let partition_plan =
             partition_plan_for_document(&options.input_file, &parsed_document, &source_tree);
+        let reusable_page_payloads = reusable_page_payloads_for_render(
+            &typeset_document,
+            &partition_plan,
+            stage_timing.typeset_partition_details.as_deref(),
+            &cached_page_payloads,
+        );
+        let reused_page_count = reusable_page_payloads.len();
+        if reused_page_count > 0 {
+            tracing::info!(
+                jobname = %options.jobname,
+                input = %options.input_file.display(),
+                "pdf page payload reuse applied (reused_pages={}, rendered_pages={})",
+                reused_page_count,
+                typeset_document.pages.len().saturating_sub(reused_page_count),
+            );
+        } else if stage_timing.typeset_partition_details.is_some() {
+            tracing::info!(
+                jobname = %options.jobname,
+                input = %options.input_file.display(),
+                "pdf page payload reuse skipped (reused_pages=0)"
+            );
+        }
         let pdf_render_start = std::time::Instant::now();
         let pdf_document = pdf_renderer.render_with_partition_plan(
             &typeset_document,
             options.parallelism,
             pass_count,
             &partition_plan,
+            (!reusable_page_payloads.is_empty()).then_some(&reusable_page_payloads),
         );
         stage_timing.pdf_render = Some(pdf_render_start.elapsed());
         let compilation_job = compilation_job(
@@ -1504,7 +1605,7 @@ impl<'a> CompileJobService<'a> {
 
         if let Err(error) = self
             .file_access_gate
-            .write_file(&output_pdf, &pdf_document.bytes)
+            .write_file(&output_pdf, &pdf_document.document.bytes)
         {
             diagnostics.push(diagnostic_for_output_error(error, &output_pdf));
 
@@ -1538,24 +1639,30 @@ impl<'a> CompileJobService<'a> {
             }
         }
 
-        let output_pdf_hash = fingerprint_bytes(&pdf_document.bytes);
+        let output_pdf_hash = fingerprint_bytes(&pdf_document.document.bytes);
         let provisional_stable_state = stable_compile_state(
             &compilation_job,
             source_tree.document_state.clone(),
             cross_reference_seed.clone(),
             pass_count,
-            pdf_document.page_count,
+            pdf_document.document.page_count,
             true,
             cacheable_diagnostics.clone(),
         );
         if !options.no_cache {
             let cache_store_start = std::time::Instant::now();
-            if let Some(diagnostic) = compile_cache.store(
+            let cached_page_payloads = cached_page_payloads_for(
+                &typeset_document,
+                &partition_plan,
+                &pdf_document.page_payloads,
+            );
+            if let Some(diagnostic) = compile_cache.store_with_page_payloads(
                 &source_tree.dependency_graph,
                 &provisional_stable_state,
                 output_pdf_hash,
                 &source_tree.cached_source_subtrees,
                 &cached_typeset_fragments,
+                &cached_page_payloads,
             ) {
                 diagnostics.push(diagnostic);
             }
@@ -1567,7 +1674,7 @@ impl<'a> CompileJobService<'a> {
             source_tree.document_state,
             cross_reference_seed,
             pass_count,
-            pdf_document.page_count,
+            pdf_document.document.page_count,
             true,
             diagnostics.clone(),
         );
@@ -1589,8 +1696,8 @@ impl<'a> CompileJobService<'a> {
             output = %output_pdf.display(),
             document_class = %parsed_document.document_class,
             package_count = parsed_document.package_count,
-            page_count = pdf_document.page_count,
-            total_lines = pdf_document.total_lines,
+            page_count = pdf_document.document.page_count,
+            total_lines = pdf_document.document.total_lines,
             "compile succeeded"
         );
 
@@ -2622,6 +2729,7 @@ fn checkpoint_suffix_range<T>(
     (end <= nodes_len && start <= end).then_some((start, end))
 }
 
+#[cfg(test)]
 fn find_affected_block_index(
     cached_checkpoints: &[BlockCheckpoint],
     cached_nodes: &[DocumentNode],
@@ -2892,6 +3000,219 @@ fn raw_checkpoints_to_block_checkpoint_data(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockReuseDecision {
+    BlockReuse {
+        total_block_count: usize,
+    },
+    SuffixRebuild {
+        affected_checkpoint_index: usize,
+        suffix_block_count: usize,
+        total_block_count: usize,
+    },
+    FullRebuild {
+        reason: PartitionTypesetFallbackReason,
+        total_block_count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuffixRebuildFailure {
+    FootnoteCountMismatch,
+    FloatCountMismatch,
+    #[allow(dead_code)]
+    PageCountChanged {
+        expected: usize,
+        got: usize,
+    },
+    FloatPlacementCountMismatch,
+    FootnoteMarkerCountMismatch,
+    SlicingFailed,
+}
+
+#[derive(Debug)]
+struct PartialTypesetExecution {
+    document: TypesetDocument,
+    partition_details: Vec<PartitionTypesetDetail>,
+}
+
+fn block_count_from_checkpoint_count(checkpoint_count: usize, has_content: bool) -> usize {
+    if has_content {
+        checkpoint_count.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+fn partition_block_count_from_cached_fragment(fragment: Option<&CachedTypesetFragment>) -> usize {
+    fragment
+        .and_then(|fragment| fragment.block_checkpoints.as_ref())
+        .map(|data| {
+            block_count_from_checkpoint_count(
+                data.checkpoints.len(),
+                !data.partition_body.trim().is_empty(),
+            )
+        })
+        .unwrap_or(0)
+}
+
+fn cached_partition_detail(
+    partition_id: &str,
+    total_block_count: usize,
+    reuse_type: PartitionTypesetReuseType,
+) -> PartitionTypesetDetail {
+    PartitionTypesetDetail {
+        partition_id: partition_id.to_string(),
+        reuse_type,
+        suffix_block_count: 0,
+        total_block_count,
+        elapsed: Some(std::time::Duration::ZERO),
+        fallback_reason: None,
+    }
+}
+
+fn full_rebuild_partition_detail(
+    partition_id: &str,
+    total_block_count: usize,
+    elapsed: Option<std::time::Duration>,
+    reason: PartitionTypesetFallbackReason,
+) -> PartitionTypesetDetail {
+    PartitionTypesetDetail {
+        partition_id: partition_id.to_string(),
+        reuse_type: PartitionTypesetReuseType::FullRebuild,
+        suffix_block_count: total_block_count,
+        total_block_count,
+        elapsed,
+        fallback_reason: Some(reason),
+    }
+}
+
+fn synthetic_full_rebuild_partition_details(
+    partition_plan: &DocumentPartitionPlan,
+    cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
+    reason: PartitionTypesetFallbackReason,
+) -> Vec<PartitionTypesetDetail> {
+    partition_plan
+        .work_units
+        .iter()
+        .map(|work_unit| {
+            full_rebuild_partition_detail(
+                &work_unit.partition_id,
+                partition_block_count_from_cached_fragment(
+                    cached_typeset_fragments.get(&work_unit.partition_id),
+                ),
+                None,
+                reason,
+            )
+        })
+        .collect()
+}
+
+fn classify_block_reuse_decision(
+    cached_checkpoints: &[BlockCheckpoint],
+    cached_nodes: &[DocumentNode],
+    cached_source_lines: &[SourceLineTrace],
+    current_checkpoints: &[RawBlockCheckpoint],
+    current_nodes: &[DocumentNode],
+    current_source_lines: &[SourceLineTrace],
+    cached_source: &str,
+    current_source: &str,
+) -> BlockReuseDecision {
+    let total_block_count =
+        block_count_from_checkpoint_count(current_checkpoints.len(), !current_nodes.is_empty());
+    if cached_source == current_source {
+        return BlockReuseDecision::BlockReuse { total_block_count };
+    }
+    if cached_checkpoints.is_empty() || current_checkpoints.is_empty() {
+        return BlockReuseDecision::FullRebuild {
+            reason: PartitionTypesetFallbackReason::CheckpointMissing,
+            total_block_count,
+        };
+    }
+    if cached_checkpoints.len() != current_checkpoints.len() {
+        return BlockReuseDecision::FullRebuild {
+            reason: PartitionTypesetFallbackReason::BlockStructureChanged,
+            total_block_count,
+        };
+    }
+
+    for index in 0..cached_checkpoints.len() {
+        let cached_checkpoint = &cached_checkpoints[index];
+        let current_checkpoint = &current_checkpoints[index];
+        let mismatched = match (
+            cached_checkpoint.source_span,
+            current_checkpoint.source_span,
+        ) {
+            (Some(cached_span), Some(current_span)) => {
+                extract_text_for_span(cached_source_lines, cached_span)
+                    != extract_text_for_span(current_source_lines, current_span)
+            }
+            (None, None) => {
+                let Some(cached_range) = checkpoint_suffix_range(
+                    cached_checkpoints,
+                    index,
+                    cached_nodes.len(),
+                    |item| item.node_index,
+                ) else {
+                    return BlockReuseDecision::FullRebuild {
+                        reason: PartitionTypesetFallbackReason::BlockStructureChanged,
+                        total_block_count,
+                    };
+                };
+                let Some(current_range) = checkpoint_suffix_range(
+                    current_checkpoints,
+                    index,
+                    current_nodes.len(),
+                    |item| item.node_index,
+                ) else {
+                    return BlockReuseDecision::FullRebuild {
+                        reason: PartitionTypesetFallbackReason::BlockStructureChanged,
+                        total_block_count,
+                    };
+                };
+                let cached_signature = block_signature(
+                    &cached_nodes[cached_range.0..cached_range.1],
+                    cached_source_lines,
+                );
+                let current_signature = block_signature(
+                    &current_nodes[current_range.0..current_range.1],
+                    current_source_lines,
+                );
+                cached_signature != current_signature
+            }
+            _ => {
+                return BlockReuseDecision::FullRebuild {
+                    reason: PartitionTypesetFallbackReason::BlockStructureChanged,
+                    total_block_count,
+                };
+            }
+        };
+
+        if !mismatched {
+            continue;
+        }
+
+        if index == 0 {
+            return BlockReuseDecision::SuffixRebuild {
+                affected_checkpoint_index: 0,
+                suffix_block_count: total_block_count,
+                total_block_count,
+            };
+        }
+
+        return BlockReuseDecision::SuffixRebuild {
+            affected_checkpoint_index: index,
+            suffix_block_count: total_block_count.saturating_sub(index + 1),
+            total_block_count,
+        };
+    }
+
+    BlockReuseDecision::FullRebuild {
+        reason: PartitionTypesetFallbackReason::AffectedBlockIndexZero,
+        total_block_count,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn suffix_rebuild(
     service: &CompileJobService<'_>,
@@ -2902,9 +3223,15 @@ fn suffix_rebuild(
     cached_fragment: &CachedTypesetFragment,
     checkpoint_data: &BlockCheckpointData,
     affected_block_index: usize,
-) -> Option<DocumentLayoutFragment> {
-    let checkpoint = checkpoint_data.checkpoints.get(affected_block_index)?;
-    let prefix_nodes = current_nodes.get(..checkpoint.node_index)?.to_vec();
+) -> Result<DocumentLayoutFragment, SuffixRebuildFailure> {
+    let checkpoint = checkpoint_data
+        .checkpoints
+        .get(affected_block_index)
+        .ok_or(SuffixRebuildFailure::SlicingFailed)?;
+    let prefix_nodes = current_nodes
+        .get(..checkpoint.node_index)
+        .ok_or(SuffixRebuildFailure::SlicingFailed)?
+        .to_vec();
     let prefix_vlist_result = service.build_vlist_from_body_nodes_with_selection(
         context_document,
         prefix_nodes,
@@ -2924,7 +3251,8 @@ fn suffix_rebuild(
     let mut result_pages = cached_fragment
         .fragment
         .pages
-        .get(..checkpoint.layout_state.completed_page_count)?
+        .get(..checkpoint.layout_state.completed_page_count)
+        .ok_or(SuffixRebuildFailure::SlicingFailed)?
         .to_vec();
     let mut prefix_active_page = prefix_snapshot.current_page;
     if let (Some(page), Some(cached_page)) = (
@@ -2936,7 +3264,10 @@ fn suffix_rebuild(
     ) {
         append_cached_footnote_lines(page, cached_page, checkpoint.layout_state.footnote_count);
     }
-    let suffix_nodes = current_nodes.get(checkpoint.node_index..)?.to_vec();
+    let suffix_nodes = current_nodes
+        .get(checkpoint.node_index..)
+        .ok_or(SuffixRebuildFailure::SlicingFailed)?
+        .to_vec();
     let total_footnotes = count_footnotes_in_nodes(current_nodes);
     let (total_figures, total_tables) = count_floats_in_nodes(current_nodes);
     let (suffix_figures, suffix_tables) = count_floats_in_nodes(&suffix_nodes);
@@ -2966,13 +3297,13 @@ fn suffix_rebuild(
             .collect(),
     );
     if checkpoint.layout_state.footnote_count + vlist_result.footnotes.len() != total_footnotes {
-        return None;
+        return Err(SuffixRebuildFailure::FootnoteCountMismatch);
     }
 
     if checkpoint.layout_state.figure_count + suffix_figures != total_figures
         || checkpoint.layout_state.table_count + suffix_tables != total_tables
     {
-        return None;
+        return Err(SuffixRebuildFailure::FloatCountMismatch);
     }
 
     let pagination = paginate_vlist_continuing_with_state(
@@ -2985,7 +3316,9 @@ fn suffix_rebuild(
     let mut rebuilt_pages = pagination.pages;
 
     if pagination.continued_on_initial_page {
-        let first_page = rebuilt_pages.first_mut()?;
+        let first_page = rebuilt_pages
+            .first_mut()
+            .ok_or(SuffixRebuildFailure::SlicingFailed)?;
         append_footnotes_to_pages_starting_at(
             std::slice::from_mut(first_page),
             &vlist_result.footnotes,
@@ -3013,20 +3346,16 @@ fn suffix_rebuild(
         result_pages.extend(rebuilt_pages);
     }
 
-    if result_pages.len() != cached_fragment.fragment.pages.len() {
-        return None;
-    }
-
     if count_rendered_float_placements(&result_pages) != (total_figures + total_tables) as usize {
-        return None;
+        return Err(SuffixRebuildFailure::FloatPlacementCountMismatch);
     }
 
     if count_rendered_footnote_markers(&result_pages) != total_footnotes {
-        return None;
+        return Err(SuffixRebuildFailure::FootnoteMarkerCountMismatch);
     }
 
     let finalized = finalize_partitioned_typeset_document(context_document, result_pages);
-    Some(DocumentLayoutFragment {
+    Ok(DocumentLayoutFragment {
         partition_id: cached_fragment.fragment.partition_id.clone(),
         pages: finalized.pages,
         local_label_pages: finalized
@@ -3056,12 +3385,33 @@ fn try_partial_typeset_document(
     cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
     current_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
     cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
-) -> Result<TypesetDocument, &'static str> {
+) -> Result<PartialTypesetExecution, &'static str> {
     let body_ranges =
         partition_body_ranges(document, partition_plan).ok_or("partition body slicing failed")?;
     let section_ranges = partition_section_ranges(document, partition_plan)
         .ok_or("partition section slicing failed")?;
     let mut fragments = reuse_plan.reuse_fragments.clone();
+    let mut partition_details = partition_plan
+        .work_units
+        .iter()
+        .filter(|work_unit| {
+            reuse_plan
+                .reuse_fragments
+                .contains_key(&work_unit.partition_id)
+        })
+        .map(|work_unit| {
+            (
+                work_unit.partition_id.clone(),
+                cached_partition_detail(
+                    &work_unit.partition_id,
+                    partition_block_count_from_cached_fragment(
+                        cached_typeset_fragments.get(&work_unit.partition_id),
+                    ),
+                    PartitionTypesetReuseType::Cached,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let rebuild_work_units = partition_plan
         .work_units
         .iter()
@@ -3094,15 +3444,26 @@ fn try_partial_typeset_document(
             asset_bundle_path,
         )?;
         if has_cross_partition_layout_collision(
-            rebuilt_fragments.iter().map(|(_, fragment, _)| fragment),
+            rebuilt_fragments.iter().map(|result| &result.fragment),
         ) {
             return Err("authority key collision in parallel typeset, falling back to sequential");
         }
-        for (partition_id, fragment, diagnostics) in rebuilt_fragments {
-            for diagnostic in diagnostics {
+        for rebuilt in rebuilt_fragments {
+            for diagnostic in rebuilt.diagnostics {
                 graphics_resolver.push_diagnostic(diagnostic);
             }
-            fragments.insert(partition_id, fragment);
+            partition_details.insert(
+                rebuilt.partition_id.clone(),
+                full_rebuild_partition_detail(
+                    &rebuilt.partition_id,
+                    partition_block_count_from_cached_fragment(
+                        cached_typeset_fragments.get(&rebuilt.partition_id),
+                    ),
+                    Some(rebuilt.elapsed),
+                    PartitionTypesetFallbackReason::ParallelPartialTypeset,
+                ),
+            );
+            fragments.insert(rebuilt.partition_id, rebuilt.fragment);
         }
     } else {
         for work_unit in rebuild_work_units {
@@ -3125,78 +3486,104 @@ fn try_partial_typeset_document(
             let current_subtree = current_source_subtrees.get(&work_unit.locator.entry_file);
             let cached_subtree = cached_source_subtrees.get(&work_unit.locator.entry_file);
 
-            let fragment =
-                if let (Some(checkpoint_data), Some(current_subtree), Some(cached_subtree)) = (
-                    cached_fragment.block_checkpoints.as_ref(),
-                    current_subtree,
-                    cached_subtree,
-                ) {
-                    let (_annotated_current_document, current_nodes) = annotated_body_nodes(
-                        &partition_document,
-                        Some(&current_subtree.source_lines),
-                    )
-                    .ok_or("failed to annotate current partition body nodes")?;
-                    let mut current_raw_checkpoints = Vec::new();
-                    let _ = service.build_vlist_from_body_nodes_with_selection(
-                        &partition_document,
-                        current_nodes.clone(),
-                        selection,
-                        graphics_resolver,
-                        false,
-                        FloatCounters::default(),
-                        Some(&mut current_raw_checkpoints),
-                    );
+            let (fragment, detail) = if let (
+                Some(checkpoint_data),
+                Some(current_subtree),
+                Some(cached_subtree),
+            ) = (
+                cached_fragment.block_checkpoints.as_ref(),
+                current_subtree,
+                cached_subtree,
+            ) {
+                let (_annotated_current_document, current_nodes) =
+                    annotated_body_nodes(&partition_document, Some(&current_subtree.source_lines))
+                        .ok_or("failed to annotate current partition body nodes")?;
+                let mut current_raw_checkpoints = Vec::new();
+                let _ = service.build_vlist_from_body_nodes_with_selection(
+                    &partition_document,
+                    current_nodes.clone(),
+                    selection,
+                    graphics_resolver,
+                    false,
+                    FloatCounters::default(),
+                    Some(&mut current_raw_checkpoints),
+                );
 
-                    let cached_partition_document = if checkpoint_data.partition_body.is_empty() {
-                        parse_partition_body_document(
-                            service,
-                            &document.document_class,
-                            &cached_subtree.text,
-                        )
-                        .ok_or("failed to parse cached partition body")?
-                    } else {
-                        ParsedDocument {
-                            document_class: document.document_class.clone(),
-                            class_options: document.class_options.clone(),
-                            loaded_packages: document.loaded_packages.clone(),
-                            package_count: document.package_count,
-                            main_font_name: document.main_font_name.clone(),
-                            sans_font_name: document.sans_font_name.clone(),
-                            mono_font_name: document.mono_font_name.clone(),
-                            body: checkpoint_data.partition_body.clone(),
-                            labels: document.labels.clone(),
-                            bibliography_state: document.bibliography_state.clone(),
-                            has_maketitle: document.has_maketitle,
-                            has_unresolved_refs: document.has_unresolved_refs,
-                        }
-                    };
-                    let (_annotated_cached_document, cached_nodes) = annotated_body_nodes(
-                        &cached_partition_document,
-                        Some(&cached_subtree.source_lines),
-                    )
-                    .ok_or("failed to annotate cached partition body nodes")?;
-
-                    match find_affected_block_index(
-                        &checkpoint_data.checkpoints,
-                        &cached_nodes,
-                        &cached_subtree.source_lines,
-                        &current_raw_checkpoints,
-                        &current_nodes,
-                        &current_subtree.source_lines,
+                let cached_partition_document = if checkpoint_data.partition_body.is_empty() {
+                    parse_partition_body_document(
+                        service,
+                        &document.document_class,
                         &cached_subtree.text,
-                        &current_subtree.text,
-                    ) {
-                        None => cached_fragment.fragment.clone(),
-                        Some(0) => {
-                            let partition_typeset = service.typeset_document_with_selection(
-                                &partition_document,
-                                Some(source_lines),
-                                selection,
-                                graphics_resolver,
-                            );
-                            extract_rebuilt_fragment(partition_typeset, work_unit)?
-                        }
-                        Some(affected_block_index) => suffix_rebuild(
+                    )
+                    .ok_or("failed to parse cached partition body")?
+                } else {
+                    ParsedDocument {
+                        document_class: document.document_class.clone(),
+                        class_options: document.class_options.clone(),
+                        loaded_packages: document.loaded_packages.clone(),
+                        package_count: document.package_count,
+                        main_font_name: document.main_font_name.clone(),
+                        sans_font_name: document.sans_font_name.clone(),
+                        mono_font_name: document.mono_font_name.clone(),
+                        body: checkpoint_data.partition_body.clone(),
+                        labels: document.labels.clone(),
+                        bibliography_state: document.bibliography_state.clone(),
+                        has_maketitle: document.has_maketitle,
+                        has_unresolved_refs: document.has_unresolved_refs,
+                    }
+                };
+                let (_annotated_cached_document, cached_nodes) = annotated_body_nodes(
+                    &cached_partition_document,
+                    Some(&cached_subtree.source_lines),
+                )
+                .ok_or("failed to annotate cached partition body nodes")?;
+
+                match classify_block_reuse_decision(
+                    &checkpoint_data.checkpoints,
+                    &cached_nodes,
+                    &cached_subtree.source_lines,
+                    &current_raw_checkpoints,
+                    &current_nodes,
+                    &current_subtree.source_lines,
+                    &cached_subtree.text,
+                    &current_subtree.text,
+                ) {
+                    BlockReuseDecision::BlockReuse { total_block_count } => (
+                        cached_fragment.fragment.clone(),
+                        cached_partition_detail(
+                            &work_unit.partition_id,
+                            total_block_count,
+                            PartitionTypesetReuseType::BlockReuse,
+                        ),
+                    ),
+                    BlockReuseDecision::FullRebuild {
+                        reason,
+                        total_block_count,
+                    } => {
+                        let partition_typeset_start = std::time::Instant::now();
+                        let partition_typeset = service.typeset_document_with_selection(
+                            &partition_document,
+                            Some(source_lines),
+                            selection,
+                            graphics_resolver,
+                        );
+                        (
+                            extract_rebuilt_fragment(partition_typeset, work_unit)?,
+                            full_rebuild_partition_detail(
+                                &work_unit.partition_id,
+                                total_block_count,
+                                Some(partition_typeset_start.elapsed()),
+                                reason,
+                            ),
+                        )
+                    }
+                    BlockReuseDecision::SuffixRebuild {
+                        affected_checkpoint_index,
+                        suffix_block_count,
+                        total_block_count,
+                    } => {
+                        let partition_typeset_start = std::time::Instant::now();
+                        let rebuild_result = suffix_rebuild(
                             service,
                             &partition_document,
                             &current_nodes,
@@ -3204,28 +3591,61 @@ fn try_partial_typeset_document(
                             graphics_resolver,
                             cached_fragment,
                             checkpoint_data,
-                            affected_block_index,
-                        )
-                        .unwrap_or_else(|| {
-                            let partition_typeset = service.typeset_document_with_selection(
-                                &partition_document,
-                                Some(source_lines),
-                                selection,
-                                graphics_resolver,
-                            );
-                            extract_rebuilt_fragment(partition_typeset, work_unit)
-                                .expect("fallback partition rebuild should succeed")
-                        }),
+                            affected_checkpoint_index,
+                        );
+                        match rebuild_result {
+                            Ok(fragment) => (
+                                fragment,
+                                PartitionTypesetDetail {
+                                    partition_id: work_unit.partition_id.clone(),
+                                    reuse_type: PartitionTypesetReuseType::SuffixRebuild,
+                                    suffix_block_count,
+                                    total_block_count,
+                                    elapsed: Some(partition_typeset_start.elapsed()),
+                                    fallback_reason: None,
+                                },
+                            ),
+                            Err(failure) => {
+                                let partition_typeset = service.typeset_document_with_selection(
+                                    &partition_document,
+                                    Some(source_lines),
+                                    selection,
+                                    graphics_resolver,
+                                );
+                                (
+                                    extract_rebuilt_fragment(partition_typeset, work_unit)?,
+                                    full_rebuild_partition_detail(
+                                        &work_unit.partition_id,
+                                        total_block_count,
+                                        Some(partition_typeset_start.elapsed()),
+                                        PartitionTypesetFallbackReason::SuffixValidationFailed(
+                                            failure,
+                                        ),
+                                    ),
+                                )
+                            }
+                        }
                     }
-                } else {
-                    let partition_typeset = service.typeset_document_with_selection(
-                        &partition_document,
-                        Some(source_lines),
-                        selection,
-                        graphics_resolver,
-                    );
-                    extract_rebuilt_fragment(partition_typeset, work_unit)?
-                };
+                }
+            } else {
+                let partition_typeset_start = std::time::Instant::now();
+                let partition_typeset = service.typeset_document_with_selection(
+                    &partition_document,
+                    Some(source_lines),
+                    selection,
+                    graphics_resolver,
+                );
+                (
+                    extract_rebuilt_fragment(partition_typeset, work_unit)?,
+                    full_rebuild_partition_detail(
+                        &work_unit.partition_id,
+                        partition_block_count_from_cached_fragment(Some(cached_fragment)),
+                        Some(partition_typeset_start.elapsed()),
+                        PartitionTypesetFallbackReason::CheckpointMissing,
+                    ),
+                )
+            };
+            partition_details.insert(work_unit.partition_id.clone(), detail);
             fragments.insert(work_unit.partition_id.clone(), fragment);
         }
     }
@@ -3239,7 +3659,14 @@ fn try_partial_typeset_document(
         return Err("merged reuse fragments did not preserve cached label/page counts");
     }
 
-    Ok(merged)
+    Ok(PartialTypesetExecution {
+        document: merged,
+        partition_details: partition_plan
+            .work_units
+            .iter()
+            .filter_map(|work_unit| partition_details.get(&work_unit.partition_id).cloned())
+            .collect(),
+    })
 }
 
 fn try_parallel_full_typeset(
@@ -3468,6 +3895,14 @@ struct BuiltPartitionVList {
     diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug)]
+struct TypesetPartitionResult {
+    partition_id: String,
+    fragment: DocumentLayoutFragment,
+    diagnostics: Vec<Diagnostic>,
+    elapsed: std::time::Duration,
+}
+
 fn distribute_round_robin<T>(items: Vec<T>, concurrency: usize) -> Vec<Vec<T>> {
     if items.is_empty() {
         return Vec::new();
@@ -3516,7 +3951,7 @@ fn run_parallel_partial_typeset(
     project_root: &Path,
     overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
-) -> Result<Vec<(String, DocumentLayoutFragment, Vec<Diagnostic>)>, &'static str> {
+) -> Result<Vec<TypesetPartitionResult>, &'static str> {
     let concurrency = parallelism.max(1);
     let work_item_count = work_items.len();
     let mut groups = distribute_round_robin(work_items, concurrency);
@@ -3799,7 +4234,7 @@ fn execute_partial_typeset_group(
     project_root: &Path,
     overlay_roots: &[PathBuf],
     asset_bundle_path: Option<&Path>,
-) -> Result<Vec<(String, DocumentLayoutFragment, Vec<Diagnostic>)>, &'static str> {
+) -> Result<Vec<TypesetPartitionResult>, &'static str> {
     let thread_resolver = CompileGraphicAssetResolver {
         file_access_gate,
         input_dir,
@@ -3817,6 +4252,7 @@ fn execute_partial_typeset_group(
             work_item.section_range,
         )
         .ok_or("failed to build partition-scoped parsed document")?;
+        let partition_typeset_start = std::time::Instant::now();
         let partition_typeset = service.typeset_document_with_selection(
             &partition_document,
             Some(source_lines),
@@ -3824,11 +4260,12 @@ fn execute_partial_typeset_group(
             &thread_resolver,
         );
         let fragment = extract_rebuilt_fragment(partition_typeset, &work_item.work_unit)?;
-        worker_results.push((
-            work_item.work_unit.partition_id,
+        worker_results.push(TypesetPartitionResult {
+            partition_id: work_item.work_unit.partition_id,
             fragment,
-            thread_resolver.take_diagnostics(),
-        ));
+            diagnostics: thread_resolver.take_diagnostics(),
+            elapsed: partition_typeset_start.elapsed(),
+        });
     }
     Ok(worker_results)
 }
@@ -4270,6 +4707,131 @@ fn cached_typeset_fragments_for(
             )
         })
         .collect()
+}
+
+fn cached_page_payloads_for(
+    document: &TypesetDocument,
+    partition_plan: &DocumentPartitionPlan,
+    page_payloads: &[PageRenderPayload],
+) -> BTreeMap<String, Vec<CachedPagePayload>> {
+    ordered_partition_page_ranges(document, partition_plan)
+        .into_iter()
+        .filter_map(|(partition_id, range)| {
+            page_payloads.get(range.clone()).map(|payloads| {
+                (
+                    partition_id,
+                    payloads
+                        .iter()
+                        .cloned()
+                        .map(CachedPagePayload::from)
+                        .collect::<Vec<_>>(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn reusable_page_payloads_for_render(
+    document: &TypesetDocument,
+    partition_plan: &DocumentPartitionPlan,
+    partition_details: Option<&[PartitionTypesetDetail]>,
+    cached_page_payloads: &BTreeMap<String, Vec<CachedPagePayload>>,
+) -> BTreeMap<usize, PageRenderPayload> {
+    let Some(partition_details) = partition_details else {
+        return BTreeMap::new();
+    };
+
+    let reusable_partition_ids = partition_details
+        .iter()
+        .filter(|detail| {
+            matches!(
+                detail.reuse_type,
+                PartitionTypesetReuseType::Cached | PartitionTypesetReuseType::BlockReuse
+            )
+        })
+        .map(|detail| detail.partition_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let ordered_ranges = ordered_partition_page_ranges(document, partition_plan);
+    if ordered_ranges
+        .iter()
+        .any(|(partition_id, _)| partition_id == &partition_plan.fallback_partition_id)
+        || ordered_ranges
+            .first()
+            .is_some_and(|(_, range)| range.len() > 1)
+    {
+        return BTreeMap::new();
+    }
+
+    let mut reusable_page_payloads = BTreeMap::new();
+    for (partition_id, range) in ordered_ranges {
+        if !reusable_partition_ids.contains(&partition_id) {
+            continue;
+        }
+        if range.clone().any(|page_index| {
+            document
+                .pages
+                .get(page_index)
+                .is_some_and(page_uses_reindexed_xobjects)
+        }) {
+            continue;
+        }
+
+        let Some(payloads) = cached_page_payloads.get(&partition_id) else {
+            continue;
+        };
+        if payloads.len() != range.len() {
+            continue;
+        }
+
+        let restored_payloads = payloads
+            .iter()
+            .enumerate()
+            .map(|(offset, payload)| payload.to_page_render_payload(range.start + offset))
+            .collect::<Option<Vec<_>>>();
+        let Some(restored_payloads) = restored_payloads else {
+            continue;
+        };
+
+        for payload in restored_payloads {
+            reusable_page_payloads.insert(payload.page_index, payload);
+        }
+    }
+
+    reusable_page_payloads
+}
+
+fn page_uses_reindexed_xobjects(page: &TypesetPage) -> bool {
+    page.images.iter().any(|image| {
+        image.scene.nodes.len() == 1
+            && matches!(
+                image.scene.nodes.first(),
+                Some(GraphicNode::External(_) | GraphicNode::Pdf(_))
+            )
+    })
+}
+
+fn ordered_partition_page_ranges(
+    document: &TypesetDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> Vec<(String, std::ops::Range<usize>)> {
+    let page_partition_ids = page_partition_ids_for_plan(document, partition_plan);
+    if page_partition_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < page_partition_ids.len() {
+        let partition_id = page_partition_ids[start].clone();
+        let mut end = start + 1;
+        while end < page_partition_ids.len() && page_partition_ids[end] == partition_id {
+            end += 1;
+        }
+        ranges.push((partition_id, start..end));
+        start = end;
+    }
+    ranges
 }
 
 fn cross_reference_seed_from_document(
@@ -7062,19 +7624,30 @@ mod tests {
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Subscriber};
 
-    use super::{run_font_tasks, CompileJobService, StageTiming};
-    use crate::compile_cache::{BlockCheckpoint, BlockLayoutState, CachedTypesetFragment};
+    use super::{
+        reusable_page_payloads_for_render, run_font_tasks, CompileJobService,
+        PartitionTypesetDetail, PartitionTypesetFallbackReason, PartitionTypesetReuseType,
+        StageTiming,
+    };
+    use crate::compile_cache::{
+        BlockCheckpoint, BlockLayoutState, CachedTypesetFragment, CompileCache,
+    };
     use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput};
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
+    use ferritex_core::compilation::PartitionLocator;
     use ferritex_core::diagnostics::Severity;
     use ferritex_core::font::OpenTypeFont;
+    use ferritex_core::graphics::api::ImageColorSpace;
+    use ferritex_core::graphics::GraphicsScene;
     use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use ferritex_core::parser::api::{DocumentNode, MinimalLatexParser, Parser};
+    use ferritex_core::pdf::PageRenderPayload;
     use ferritex_core::policy::{FileAccessError, FileAccessGate, PathAccessDecision};
     use ferritex_core::synctex::{SourceLineTrace, SyncTexData};
     use ferritex_core::typesetting::{
         DocumentLayoutFragment, FloatContent, FloatCounters, FloatPlacement, FloatRegion, PageBox,
-        RawBlockCheckpoint, TextLine, TypesetDocument, TypesetNamedDestination, TypesetPage,
+        RawBlockCheckpoint, TextLine, TypesetDocument, TypesetImage, TypesetNamedDestination,
+        TypesetOutline, TypesetPage,
     };
     use tempfile::tempdir;
 
@@ -7710,6 +8283,61 @@ mod tests {
             .collect()
     }
 
+    fn partition_detail<'a>(
+        details: &'a [super::PartitionTypesetDetail],
+        partition_id: &str,
+    ) -> &'a super::PartitionTypesetDetail {
+        details
+            .iter()
+            .find(|detail| detail.partition_id == partition_id)
+            .unwrap_or_else(|| panic!("missing detail for {partition_id}"))
+    }
+
+    fn partition_detail_diagnostic_lines(details: &[super::PartitionTypesetDetail]) -> Vec<String> {
+        let mut counts = BTreeMap::new();
+        for detail in details {
+            *counts.entry(detail.reuse_type).or_insert(0usize) += 1;
+        }
+
+        let mut lines = vec![format!(
+            "summary cached={} block_reuse={} suffix_rebuild={} full_rebuild={}",
+            counts
+                .get(&PartitionTypesetReuseType::Cached)
+                .copied()
+                .unwrap_or(0),
+            counts
+                .get(&PartitionTypesetReuseType::BlockReuse)
+                .copied()
+                .unwrap_or(0),
+            counts
+                .get(&PartitionTypesetReuseType::SuffixRebuild)
+                .copied()
+                .unwrap_or(0),
+            counts
+                .get(&PartitionTypesetReuseType::FullRebuild)
+                .copied()
+                .unwrap_or(0),
+        )];
+
+        lines.extend(details.iter().filter_map(|detail| {
+            (detail.reuse_type != PartitionTypesetReuseType::Cached).then(|| {
+                format!(
+                    "partition={} reuse={:?} suffix={}/{} fallback={:?} elapsed_us={}",
+                    detail.partition_id,
+                    detail.reuse_type,
+                    detail.suffix_block_count,
+                    detail.total_block_count,
+                    detail.fallback_reason,
+                    detail
+                        .elapsed
+                        .map(|elapsed| elapsed.as_micros())
+                        .unwrap_or_default(),
+                )
+            })
+        }));
+        lines
+    }
+
     fn read_synctex(path: &Path) -> SyncTexData {
         serde_json::from_slice(&fs::read(path).expect("read output synctex"))
             .expect("parse output synctex")
@@ -8235,6 +8863,235 @@ mod tests {
         assert_eq!(rebuilt_fragment.pages, expected_fragment.pages);
     }
 
+    #[test]
+    fn suffix_rebuild_reports_footnote_count_mismatch() {
+        let loader = MockAssetBundleLoader::valid();
+        let service = service(&FsTestFileAccessGate, &loader);
+        let selection = super::CompileFontSelection::Basic;
+        let temp = tempdir().expect("create tempdir");
+        let overlay_roots: Vec<PathBuf> = Vec::new();
+        let resolver = super::CompileGraphicAssetResolver {
+            file_access_gate: &FsTestFileAccessGate,
+            input_dir: temp.path(),
+            project_root: temp.path(),
+            overlay_roots: &overlay_roots,
+            asset_bundle_path: None,
+            diagnostics: RefCell::new(Vec::new()),
+        };
+
+        let cached_source = document(concat!(
+            "Alpha\\footnote{one}\n\n",
+            "Beta.\n\n",
+            "Gamma\\footnote{two}."
+        ));
+        let current_source = document(concat!(
+            "Alpha\\footnote{one}\n\n",
+            "Beta.\n\n",
+            "Gamma revised\\footnote{two}."
+        ));
+        let cached_source_lines = source_lines_for("main.tex", &cached_source);
+        let current_source_lines = source_lines_for("main.tex", &current_source);
+        let cached_document = parse_article_document(&cached_source);
+        let current_document = parse_article_document(&current_source);
+        let (_annotated_cached_document, cached_nodes) =
+            super::annotated_body_nodes(&cached_document, Some(&cached_source_lines))
+                .expect("annotate cached document");
+        let (_annotated_current_document, current_nodes) =
+            super::annotated_body_nodes(&current_document, Some(&current_source_lines))
+                .expect("annotate current document");
+        let mut cached_raw_checkpoints = Vec::new();
+        let cached_vlist = service.build_vlist_from_body_nodes_with_selection(
+            &cached_document,
+            cached_nodes.clone(),
+            &selection,
+            &resolver,
+            false,
+            FloatCounters::default(),
+            Some(&mut cached_raw_checkpoints),
+        );
+        let cached_typeset = service.typeset_document_with_selection(
+            &cached_document,
+            Some(&cached_source_lines),
+            &selection,
+            &resolver,
+        );
+        let cached_fragment = CachedTypesetFragment {
+            fragment: fragment_from_typeset_document("main", &cached_typeset),
+            source_hash: 1,
+            block_checkpoints: Some(super::raw_checkpoints_to_block_checkpoint_data(
+                &cached_raw_checkpoints,
+                &cached_nodes,
+                &cached_vlist,
+                1,
+                cached_document.body.clone(),
+            )),
+        };
+        let mut current_raw_checkpoints = Vec::new();
+        let _ = service.build_vlist_from_body_nodes_with_selection(
+            &current_document,
+            current_nodes.clone(),
+            &selection,
+            &resolver,
+            false,
+            FloatCounters::default(),
+            Some(&mut current_raw_checkpoints),
+        );
+        let affected_block_index = super::find_affected_block_index(
+            &cached_fragment
+                .block_checkpoints
+                .as_ref()
+                .expect("cached checkpoints")
+                .checkpoints,
+            &cached_nodes,
+            &cached_source_lines,
+            &current_raw_checkpoints,
+            &current_nodes,
+            &current_source_lines,
+            &cached_source,
+            &current_source,
+        )
+        .expect("affected block index");
+        assert_eq!(affected_block_index, 1);
+
+        let mut checkpoint_data = cached_fragment
+            .block_checkpoints
+            .as_ref()
+            .expect("cached checkpoint data")
+            .clone();
+        checkpoint_data.checkpoints[affected_block_index]
+            .layout_state
+            .footnote_count += 1;
+
+        let failure = super::suffix_rebuild(
+            &service,
+            &current_document,
+            &current_nodes,
+            &selection,
+            &resolver,
+            &cached_fragment,
+            &checkpoint_data,
+            affected_block_index,
+        )
+        .expect_err("suffix rebuild should report validation failure");
+
+        assert_eq!(failure, super::SuffixRebuildFailure::FootnoteCountMismatch);
+    }
+
+    #[test]
+    fn suffix_rebuild_allows_page_count_changes() {
+        let loader = MockAssetBundleLoader::valid();
+        let service = service(&FsTestFileAccessGate, &loader);
+        let selection = super::CompileFontSelection::Basic;
+        let temp = tempdir().expect("create tempdir");
+        let overlay_roots: Vec<PathBuf> = Vec::new();
+        let resolver = super::CompileGraphicAssetResolver {
+            file_access_gate: &FsTestFileAccessGate,
+            input_dir: temp.path(),
+            project_root: temp.path(),
+            overlay_roots: &overlay_roots,
+            asset_bundle_path: None,
+            diagnostics: RefCell::new(Vec::new()),
+        };
+
+        let long_paragraph = std::iter::repeat_n("Expanded paragraph text.", 1_600)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cached_source = document("Alpha.\n\nBeta.\n\nGamma.");
+        let current_source = document(&format!("Alpha.\n\nBeta.\n\n{long_paragraph}"));
+        let cached_source_lines = source_lines_for("main.tex", &cached_source);
+        let current_source_lines = source_lines_for("main.tex", &current_source);
+        let cached_document = parse_article_document(&cached_source);
+        let current_document = parse_article_document(&current_source);
+        let (_annotated_cached_document, cached_nodes) =
+            super::annotated_body_nodes(&cached_document, Some(&cached_source_lines))
+                .expect("annotate cached document");
+        let (_annotated_current_document, current_nodes) =
+            super::annotated_body_nodes(&current_document, Some(&current_source_lines))
+                .expect("annotate current document");
+        let mut cached_raw_checkpoints = Vec::new();
+        let cached_vlist = service.build_vlist_from_body_nodes_with_selection(
+            &cached_document,
+            cached_nodes.clone(),
+            &selection,
+            &resolver,
+            false,
+            FloatCounters::default(),
+            Some(&mut cached_raw_checkpoints),
+        );
+        let cached_typeset = service.typeset_document_with_selection(
+            &cached_document,
+            Some(&cached_source_lines),
+            &selection,
+            &resolver,
+        );
+        let cached_fragment = CachedTypesetFragment {
+            fragment: fragment_from_typeset_document("main", &cached_typeset),
+            source_hash: 1,
+            block_checkpoints: Some(super::raw_checkpoints_to_block_checkpoint_data(
+                &cached_raw_checkpoints,
+                &cached_nodes,
+                &cached_vlist,
+                1,
+                cached_document.body.clone(),
+            )),
+        };
+        let mut current_raw_checkpoints = Vec::new();
+        let _ = service.build_vlist_from_body_nodes_with_selection(
+            &current_document,
+            current_nodes.clone(),
+            &selection,
+            &resolver,
+            false,
+            FloatCounters::default(),
+            Some(&mut current_raw_checkpoints),
+        );
+        let affected_block_index = super::find_affected_block_index(
+            &cached_fragment
+                .block_checkpoints
+                .as_ref()
+                .expect("cached checkpoints")
+                .checkpoints,
+            &cached_nodes,
+            &cached_source_lines,
+            &current_raw_checkpoints,
+            &current_nodes,
+            &current_source_lines,
+            &cached_source,
+            &current_source,
+        )
+        .expect("affected block index");
+        assert_eq!(affected_block_index, 1);
+
+        let rebuilt_fragment = super::suffix_rebuild(
+            &service,
+            &current_document,
+            &current_nodes,
+            &selection,
+            &resolver,
+            &cached_fragment,
+            cached_fragment
+                .block_checkpoints
+                .as_ref()
+                .expect("cached checkpoint data"),
+            affected_block_index,
+        )
+        .expect("suffix rebuild should allow page count change");
+        let full_current_typeset = service.typeset_document_with_selection(
+            &current_document,
+            Some(&current_source_lines),
+            &selection,
+            &resolver,
+        );
+        let expected_fragment = fragment_from_typeset_document("main", &full_current_typeset);
+
+        assert_ne!(
+            cached_fragment.fragment.pages.len(),
+            expected_fragment.pages.len(),
+            "test must exercise a page-count-changing edit"
+        );
+        assert_eq!(rebuilt_fragment.pages, expected_fragment.pages);
+    }
+
     #[derive(Clone)]
     struct CapturingSubscriber {
         messages: Arc<Mutex<Vec<String>>>,
@@ -8314,6 +9171,7 @@ mod tests {
             typeset: Some(Duration::from_micros(400)),
             pdf_render: None,
             cache_store: Some(Duration::from_micros(50)),
+            typeset_partition_details: None,
         };
 
         assert_eq!(timing.total(), Duration::from_micros(1050));
@@ -8330,6 +9188,7 @@ mod tests {
         assert!(timing.typeset.is_none());
         assert!(timing.pdf_render.is_none());
         assert!(timing.cache_store.is_none());
+        assert!(timing.typeset_partition_details.is_none());
     }
 
     #[test]
@@ -8355,6 +9214,7 @@ mod tests {
         assert!(result.stage_timing.typeset.is_some());
         assert!(result.stage_timing.pdf_render.is_some());
         assert!(result.stage_timing.cache_store.is_some());
+        assert!(result.stage_timing.typeset_partition_details.is_none());
         assert!(result.stage_timing.total() > Duration::ZERO);
     }
 
@@ -8391,6 +9251,76 @@ mod tests {
             index_entries: Vec::new(),
             has_unresolved_index: false,
         }
+    }
+
+    #[test]
+    fn reusable_page_payloads_skip_pages_with_xobject_resources() {
+        let mut document = test_typeset_document(Vec::new());
+        document.pages[0].images.push(TypesetImage {
+            scene: GraphicsScene {
+                nodes: vec![super::GraphicNode::External(super::ExternalGraphic {
+                    path: "image.png".to_string(),
+                    asset_handle: super::AssetHandle {
+                        id: super::LogicalAssetId(super::StableId(1)),
+                    },
+                    metadata: super::ImageMetadata {
+                        width: 1,
+                        height: 1,
+                        color_space: ImageColorSpace::DeviceRGB,
+                        bits_per_component: 8,
+                    },
+                })],
+            },
+            x: points(72),
+            y: points(600),
+            display_width: points(100),
+            display_height: points(100),
+        });
+        document.outlines = vec![TypesetOutline {
+            level: 0,
+            title: "One".to_string(),
+            page_index: 0,
+            y: points(720),
+        }];
+        let partition_id = "chapter:0001:one".to_string();
+        let plan = super::DocumentPartitionPlan {
+            fallback_partition_id: "document:0000:book".to_string(),
+            work_units: vec![super::DocumentWorkUnit {
+                partition_id: partition_id.clone(),
+                kind: super::PartitionKind::Chapter,
+                locator: PartitionLocator {
+                    entry_file: "book.tex".into(),
+                    level: 0,
+                    ordinal: 0,
+                    title: "One".to_string(),
+                },
+                title: "One".to_string(),
+            }],
+        };
+        let partition_details = vec![PartitionTypesetDetail {
+            partition_id: partition_id.clone(),
+            reuse_type: PartitionTypesetReuseType::Cached,
+            suffix_block_count: 0,
+            total_block_count: 0,
+            elapsed: None,
+            fallback_reason: None,
+        }];
+        let cached_page_payloads = BTreeMap::from([(
+            partition_id,
+            vec![
+                PageRenderPayload::new(0, Vec::new(), BTreeSet::new(), "BT\nET\n".to_string())
+                    .into(),
+            ],
+        )]);
+
+        let reusable = reusable_page_payloads_for_render(
+            &document,
+            &plan,
+            Some(&partition_details),
+            &cached_page_payloads,
+        );
+
+        assert!(reusable.is_empty());
     }
 
     fn build_test_tfm() -> Vec<u8> {
@@ -9594,6 +10524,144 @@ mod tests {
     }
 
     #[test]
+    fn block_checkpoint_page_count_change_uses_suffix_rebuild() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = write_partitioned_report_project(
+            dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nStable opening chapter.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nAlpha paragraph.\n\nBeta paragraph.\n\nGamma paragraph.\n",
+                ),
+            ],
+        );
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0);
+
+        let expanded_paragraph = std::iter::repeat("Expanded body text for page growth.")
+            .take(1_600)
+            .collect::<Vec<_>>()
+            .join(" ");
+        fs::write(
+            dir.path().join("chapter-two.tex"),
+            format!(
+                "\\chapter{{Two}}\\label{{chap:two}}\nAlpha paragraph.\n\nBeta paragraph.\n\n{expanded_paragraph}\n"
+            ),
+        )
+        .expect("update chapter two");
+
+        let (incremental, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(incremental.exit_code, 0, "{:?}", incremental.diagnostics);
+        assert!(
+            trace_messages
+                .iter()
+                .any(|message| message.contains("partial typeset reuse applied")),
+            "{trace_messages:?}"
+        );
+        assert!(
+            trace_messages
+                .iter()
+                .all(|message| !message.contains("partial typeset fallback to full typeset")),
+            "{trace_messages:?}"
+        );
+
+        let details = incremental
+            .stage_timing
+            .typeset_partition_details
+            .as_ref()
+            .expect("partition details should be recorded");
+        let rebuilt_detail = partition_detail(details, "chapter:0002:2-two");
+        assert_eq!(
+            rebuilt_detail.reuse_type,
+            PartitionTypesetReuseType::SuffixRebuild
+        );
+        assert_eq!(rebuilt_detail.fallback_reason, None);
+
+        let incremental_pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0, "{:?}", full.diagnostics);
+
+        let full_pdf = read_pdf(&full_options.output_dir.join("main.pdf"));
+        assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn block_checkpoint_single_paragraph_edit_records_partition_details() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = write_partitioned_report_project(
+            dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nStable opening chapter.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nAlpha paragraph.\n\nBeta paragraph.\n\nGamma paragraph.\n",
+                ),
+            ],
+        );
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0);
+
+        fs::write(
+            dir.path().join("chapter-two.tex"),
+            "\\chapter{Two}\\label{chap:two}\nAlpha paragraph.\n\nBeta paragraph after diagnostic edit.\n\nGamma paragraph.\n",
+        )
+        .expect("update chapter two");
+
+        let incremental = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(incremental.exit_code, 0, "{:?}", incremental.diagnostics);
+
+        let details = incremental
+            .stage_timing
+            .typeset_partition_details
+            .as_ref()
+            .expect("partition details should be recorded");
+        eprintln!("pageref details: {details:?}");
+        assert_eq!(details.len(), 2);
+
+        let cached_detail = partition_detail(details, "chapter:0001:1-one");
+        assert_eq!(cached_detail.reuse_type, PartitionTypesetReuseType::Cached);
+        assert_eq!(cached_detail.suffix_block_count, 0);
+        assert!(cached_detail.total_block_count >= 1, "{cached_detail:?}");
+        assert_eq!(cached_detail.elapsed, Some(Duration::ZERO));
+        assert_eq!(cached_detail.fallback_reason, None);
+
+        let rebuilt_detail = partition_detail(details, "chapter:0002:2-two");
+        assert_eq!(
+            rebuilt_detail.reuse_type,
+            PartitionTypesetReuseType::SuffixRebuild
+        );
+        assert!(rebuilt_detail.total_block_count >= 2, "{rebuilt_detail:?}");
+        assert!(rebuilt_detail.suffix_block_count > 0, "{rebuilt_detail:?}");
+        assert!(
+            rebuilt_detail.suffix_block_count < rebuilt_detail.total_block_count,
+            "{rebuilt_detail:?}"
+        );
+        assert_eq!(rebuilt_detail.fallback_reason, None);
+        assert!(
+            rebuilt_detail.elapsed.unwrap_or_default() > Duration::ZERO,
+            "{rebuilt_detail:?}"
+        );
+    }
+
+    #[test]
     fn block_checkpoint_single_paragraph_edit_with_packages() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -9732,6 +10800,20 @@ mod tests {
         let incremental_pdf = read_pdf(&options.output_dir.join("main.pdf"));
         assert!(incremental_pdf.contains("Inserted heading"));
         assert!(incremental_pdf.contains("Inserted paragraph after heading."));
+        let details = incremental
+            .stage_timing
+            .typeset_partition_details
+            .as_ref()
+            .expect("partition details should be recorded");
+        let rebuilt_detail = partition_detail(details, "chapter:0002:2-two");
+        assert_eq!(
+            rebuilt_detail.reuse_type,
+            PartitionTypesetReuseType::FullRebuild
+        );
+        assert_eq!(
+            rebuilt_detail.fallback_reason,
+            Some(PartitionTypesetFallbackReason::BlockStructureChanged)
+        );
 
         let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
         full_options.no_cache = true;
@@ -9740,6 +10822,123 @@ mod tests {
 
         let full_pdf = read_pdf(&full_options.output_dir.join("main.pdf"));
         assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn incremental_pageref_records_full_rebuild_reason() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = write_partitioned_report_project(
+            dir.path(),
+            &[
+                (
+                    "chapter-one.tex",
+                    "\\chapter{One}\\label{chap:one}\nSee Chapter Two on page \\pageref{chap:two}.\n",
+                ),
+                (
+                    "chapter-two.tex",
+                    "\\chapter{Two}\\label{chap:two}\nStable target chapter.\n",
+                ),
+            ],
+        );
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0, "{:?}", warmup.diagnostics);
+
+        fs::write(
+            dir.path().join("chapter-one.tex"),
+            "\\chapter{One}\\label{chap:one}\nEdited body with \\pageref{chap:two} still present.\n",
+        )
+        .expect("update chapter one");
+
+        let incremental = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(incremental.exit_code, 0, "{:?}", incremental.diagnostics);
+
+        let details = incremental
+            .stage_timing
+            .typeset_partition_details
+            .as_ref()
+            .expect("partition details should be recorded");
+        assert_eq!(details.len(), 2);
+        assert!(
+            details.iter().any(|detail| {
+                detail.reuse_type == PartitionTypesetReuseType::FullRebuild
+                    && detail.fallback_reason
+                        == Some(PartitionTypesetFallbackReason::TypesetCallbackCount)
+            }),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| { detail.reuse_type != PartitionTypesetReuseType::SuffixRebuild }),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic profiling output for 1000-section staged input"]
+    fn typeset_dominance_diagnostic() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let mut body = String::new();
+        for index in 1..=1000 {
+            let stem = format!("section-{index:04}");
+            body.push_str(&format!("\\input{{{stem}}}\n"));
+            fs::write(
+                dir.path().join(format!("{stem}.tex")),
+                format!(
+                    "\\section{{Section {index:04}}}\\label{{sec:{index:04}}}\nAlpha paragraph {index:04}.\n\nBeta paragraph {index:04}.\n\nGamma paragraph {index:04}.\n"
+                ),
+            )
+            .expect("write section input");
+        }
+        fs::write(&input_file, document(&body)).expect("write main input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0, "{:?}", warmup.diagnostics);
+
+        fs::write(
+            dir.path().join("section-0900.tex"),
+            "\\section{Section 0900}\\label{sec:0900}\nAlpha paragraph 0900.\n\nBeta paragraph 0900 after diagnostic edit.\n\nGamma paragraph 0900.\n",
+        )
+        .expect("update staged section");
+
+        let incremental = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(incremental.exit_code, 0, "{:?}", incremental.diagnostics);
+
+        let details = incremental
+            .stage_timing
+            .typeset_partition_details
+            .as_ref()
+            .expect("partition details should be recorded");
+        assert_eq!(details.len(), 1000);
+
+        for line in partition_detail_diagnostic_lines(details) {
+            println!("{line}");
+        }
+
+        let non_cached = details
+            .iter()
+            .filter(|detail| detail.reuse_type != PartitionTypesetReuseType::Cached)
+            .collect::<Vec<_>>();
+        assert!(!non_cached.is_empty(), "{details:?}");
+        assert!(
+            details.iter().all(|detail| {
+                !matches!(
+                    detail.fallback_reason,
+                    Some(PartitionTypesetFallbackReason::SuffixValidationFailed(_))
+                )
+            }),
+            "{:?}",
+            partition_detail_diagnostic_lines(details)
+        );
     }
 
     #[test]
@@ -10340,6 +11539,99 @@ mod tests {
         let final_full_pdf =
             fs::read(final_full_options.output_dir.join("main.pdf")).expect("read final full pdf");
         assert_eq!(second_incremental_pdf, final_full_pdf);
+    }
+
+    #[test]
+    fn per_page_payload_reuse_matches_full_and_reduces_pdf_render_stage() {
+        let dir = tempdir().expect("create tempdir");
+        let loader = MockAssetBundleLoader::valid();
+        let chapters = (0..40)
+            .map(|index| {
+                let body = (0..12)
+                    .map(|line| format!("Stable chapter {index:02} line {line:02}.\n"))
+                    .collect::<String>();
+                (
+                    format!("chapter-{index:02}.tex"),
+                    format!("\\chapter{{Chapter {index:02}}}\\label{{chap:{index:02}}}\n{body}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let chapter_refs = chapters
+            .iter()
+            .map(|(file_name, content)| (file_name.as_str(), content.as_str()))
+            .collect::<Vec<_>>();
+        let input_file = write_partitioned_report_project(dir.path(), &chapter_refs);
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0, "{:?}", warmup.diagnostics);
+
+        let edited_chapter = dir.path().join("chapter-06.tex");
+        fs::write(
+            &edited_chapter,
+            "\\chapter{Chapter 06}\\label{chap:06}\nEdited chapter 06 line 00.\nEdited chapter 06 line 01.\nEdited chapter 06 line 02.\nEdited chapter 06 line 03.\nEdited chapter 06 line 04.\nEdited chapter 06 line 05.\nEdited chapter 06 line 06.\nEdited chapter 06 line 07.\nEdited chapter 06 line 08.\nEdited chapter 06 line 09.\nEdited chapter 06 line 10.\nEdited chapter 06 line 11.\n",
+        )
+        .expect("update chapter");
+        let lookup = CompileCache::new(
+            &FsTestFileAccessGate,
+            &options.output_dir,
+            &input_file,
+            "main",
+        )
+        .lookup(&[]);
+        assert_eq!(
+            lookup.cached_page_payloads.len(),
+            40,
+            "{:?}",
+            lookup.cached_page_payloads.keys().collect::<Vec<_>>()
+        );
+        assert!(lookup
+            .cached_page_payloads
+            .values()
+            .flat_map(|payloads| payloads.iter())
+            .all(|payload| payload.to_page_render_payload(0).is_some()));
+
+        let (incremental, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(incremental.exit_code, 0, "{:?}", incremental.diagnostics);
+        let partition_details = incremental
+            .stage_timing
+            .typeset_partition_details
+            .as_ref()
+            .expect("partition details");
+        assert!(
+            partition_details
+                .iter()
+                .any(|detail| detail.reuse_type == PartitionTypesetReuseType::Cached),
+            "{partition_details:?}"
+        );
+        assert!(
+            trace_messages
+                .iter()
+                .any(|message| message.contains("partial typeset reuse applied")),
+            "{trace_messages:?}"
+        );
+        assert!(
+            trace_messages.iter().any(|message| {
+                message.contains("pdf page payload reuse applied")
+                    && message.contains("reused_pages=39")
+                    && message.contains("rendered_pages=1")
+            }),
+            "{trace_messages:?}"
+        );
+
+        let incremental_pdf =
+            fs::read(options.output_dir.join("main.pdf")).expect("read incremental pdf");
+        let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0, "{:?}", full.diagnostics);
+        let full_pdf = fs::read(full_options.output_dir.join("main.pdf")).expect("read full pdf");
+
+        assert_eq!(incremental_pdf, full_pdf);
+        assert!(incremental.stage_timing.pdf_render.is_some());
+        assert!(full.stage_timing.pdf_render.is_some());
     }
 
     #[test]

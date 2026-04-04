@@ -12734,9 +12734,15 @@ mod tests {
             "\\usepackage{multicol}\n\\begin{multicols}{2}\nLeft column.\n\nRight column.\n\\end{multicols}",
         );
         let nodes = document.body_nodes();
-        let multicol_node = nodes.iter().find(|node| matches!(node, DocumentNode::Multicols { .. }));
+        let multicol_node = nodes
+            .iter()
+            .find(|node| matches!(node, DocumentNode::Multicols { .. }));
         assert!(multicol_node.is_some(), "should produce a Multicols node");
-        if let Some(DocumentNode::Multicols { column_count, children }) = multicol_node {
+        if let Some(DocumentNode::Multicols {
+            column_count,
+            children,
+        }) = multicol_node
+        {
             assert_eq!(*column_count, 2);
             assert!(!children.is_empty(), "children should not be empty");
         }
@@ -12748,7 +12754,9 @@ mod tests {
             "\\usepackage{multicol}\n\\begin{multicols}{3}\nA\n\nB\n\nC\n\\end{multicols}",
         );
         let nodes = document.body_nodes();
-        let multicol_node = nodes.iter().find(|node| matches!(node, DocumentNode::Multicols { .. }));
+        let multicol_node = nodes
+            .iter()
+            .find(|node| matches!(node, DocumentNode::Multicols { .. }));
         assert!(multicol_node.is_some());
         if let Some(DocumentNode::Multicols { column_count, .. }) = multicol_node {
             assert_eq!(*column_count, 3);
@@ -12761,10 +12769,14 @@ mod tests {
             "\\usepackage{multicol}\n\\begin{multicols}{2}\nLeft.\n\\columnbreak\nRight.\n\\end{multicols}",
         );
         let nodes = document.body_nodes();
-        let multicol_node = nodes.iter().find(|node| matches!(node, DocumentNode::Multicols { .. }));
+        let multicol_node = nodes
+            .iter()
+            .find(|node| matches!(node, DocumentNode::Multicols { .. }));
         assert!(multicol_node.is_some());
         if let Some(DocumentNode::Multicols { children, .. }) = multicol_node {
-            let has_break = children.iter().any(|n| matches!(n, DocumentNode::ColumnBreak));
+            let has_break = children
+                .iter()
+                .any(|n| matches!(n, DocumentNode::ColumnBreak));
             assert!(has_break, "should contain a ColumnBreak node");
         }
     }
