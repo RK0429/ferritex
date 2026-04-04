@@ -188,6 +188,38 @@ fn count_pdf_pages(pdf_bytes: &[u8]) -> usize {
 }
 
 #[test]
+fn stage_timing_instrumentation_smoke() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("stage-timing.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nStage timing smoke test.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = std::process::Command::new(ferritex_bin())
+        .args([
+            "compile",
+            "--no-cache",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        dir.path().join("stage-timing.pdf").exists(),
+        "compile should produce a PDF"
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8");
+    assert!(
+        !stderr.contains("panicked at"),
+        "compile stderr should not contain a panic: {stderr}"
+    );
+}
+
+#[test]
 fn full_bench_compiles_with_jobs_1_and_jobs_4() {
     let (_temp_dir, cases) = stage_full_bench_cases();
 

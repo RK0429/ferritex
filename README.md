@@ -12,7 +12,11 @@ Warm incremental recompilation is functional: on the current test configuration 
 
 Bundle distribution Wave 3 is now wired into CI: `scripts/build_bundle_archive.sh` reproducibly emits `FTX-ASSET-BUNDLE-001.tar.gz`, and `bundle-ci.yml` uploads the archive artifact, downloads it in a dependent job, and runs `bundle_archive_smoke_proof` against the downloaded archive under `--reproducible`.
 
-The largest remaining gaps against `docs/requirements.md` are the `REQ-NF-002` differential compile target (median differential compile < 100ms) and long-tail `tikz`/`pgf` plus package compatibility work (Wave 4).
+Stage timing instrumentation (Step 0) is now live: `StageTiming` in `CompileJobService` measures cache_load, source_tree_load, parse, typeset, pdf_render, and cache_store individually, providing the quantitative foundation for the remaining `REQ-NF-002` optimization steps.
+
+TikZ support has been expanded with xcolor-standard named colors (19 total), mm/in length units, ellipse path operations, `\path` command routing, arc paths, and line width presets.
+
+The largest remaining gaps against `docs/requirements.md` are: `REQ-NF-002` Steps 1–3 (the actual differential compile < 100ms optimization, building on the Step 0 instrumentation) and Wave 4 remaining long-tail work (key-value arc syntax, dash pattern/dotted/dashed, opacity/line cap/line join, `\foreach` loops, ex/em units, and package compatibility — see `docs/planning_report.md` §3 for the full scope-out list).
 
 ## Quick start
 

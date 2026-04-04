@@ -68,6 +68,7 @@ struct ClipGroupSpec {
 
 #[derive(Debug, Clone, Copy)]
 enum PathCommandKind {
+    Path,
     Draw,
     Fill,
     FillDraw,
@@ -255,6 +256,12 @@ fn parse_statement(
         return;
     };
     match command {
+        "path" => {
+            let command_kind = infer_path_command_kind(remainder);
+            if let Some(node) = parse_path_statement(remainder, state, command_kind, diagnostics) {
+                items.push(ParsedStatement::Node(node));
+            }
+        }
         "draw" => {
             if let Some(node) =
                 parse_path_statement(remainder, state, PathCommandKind::Draw, diagnostics)
@@ -302,7 +309,7 @@ fn split_tikz_command(rest: &str) -> Option<(&str, &str)> {
         }
     }
 
-    for command in ["filldraw", "draw", "fill", "clip", "node"] {
+    for command in ["filldraw", "draw", "fill", "clip", "path", "node"] {
         let Some(remainder) = rest.strip_prefix(command) else {
             continue;
         };
@@ -485,6 +492,17 @@ fn parse_path_segments(
         };
         return Some(circle_path(start, radius));
     }
+    if cursor.consume_keyword("ellipse") {
+        cursor.skip_whitespace();
+        let Some((x_radius, y_radius)) = cursor.parse_ellipse_radii() else {
+            emit_parse_error(
+                diagnostics,
+                "ellipse requires `(x_radius and y_radius)`".to_string(),
+            );
+            return None;
+        };
+        return Some(ellipse_path(start, x_radius, y_radius));
+    }
 
     let mut path = vec![PathSegment::MoveTo(start)];
     let mut current_point = start;
@@ -619,6 +637,75 @@ fn circle_path(center: Point, radius: f64) -> Vec<PathSegment> {
     ]
 }
 
+fn ellipse_path(center: Point, x_radius: f64, y_radius: f64) -> Vec<PathSegment> {
+    let x_control = x_radius * KAPPA;
+    let y_control = y_radius * KAPPA;
+
+    vec![
+        PathSegment::MoveTo(Point {
+            x: center.x + x_radius,
+            y: center.y,
+        }),
+        PathSegment::CurveTo {
+            control1: Point {
+                x: center.x + x_radius,
+                y: center.y + y_control,
+            },
+            control2: Point {
+                x: center.x + x_control,
+                y: center.y + y_radius,
+            },
+            end: Point {
+                x: center.x,
+                y: center.y + y_radius,
+            },
+        },
+        PathSegment::CurveTo {
+            control1: Point {
+                x: center.x - x_control,
+                y: center.y + y_radius,
+            },
+            control2: Point {
+                x: center.x - x_radius,
+                y: center.y + y_control,
+            },
+            end: Point {
+                x: center.x - x_radius,
+                y: center.y,
+            },
+        },
+        PathSegment::CurveTo {
+            control1: Point {
+                x: center.x - x_radius,
+                y: center.y - y_control,
+            },
+            control2: Point {
+                x: center.x - x_control,
+                y: center.y - y_radius,
+            },
+            end: Point {
+                x: center.x,
+                y: center.y - y_radius,
+            },
+        },
+        PathSegment::CurveTo {
+            control1: Point {
+                x: center.x + x_control,
+                y: center.y - y_radius,
+            },
+            control2: Point {
+                x: center.x + x_radius,
+                y: center.y - y_control,
+            },
+            end: Point {
+                x: center.x + x_radius,
+                y: center.y,
+            },
+        },
+        PathSegment::ClosePath,
+    ]
+}
+
 fn arc_segments(
     center_x: f64,
     center_y: f64,
@@ -718,8 +805,14 @@ impl PathStyle {
         diagnostics: &mut Vec<TikzDiagnostic>,
     ) -> Self {
         let mut style = Self {
-            stroke: state.default_stroke,
-            fill: state.default_fill,
+            stroke: match command_kind {
+                PathCommandKind::Path => None,
+                _ => state.default_stroke,
+            },
+            fill: match command_kind {
+                PathCommandKind::Path => None,
+                _ => state.default_fill,
+            },
             line_width: state.default_line_width.unwrap_or(DEFAULT_LINE_WIDTH_PT),
             transform: Transform2D::default(),
             arrows: ArrowSpec::None,
@@ -1055,6 +1148,29 @@ impl<'a> Cursor<'a> {
         Some(radius)
     }
 
+    fn parse_ellipse_radii(&mut self) -> Option<(f64, f64)> {
+        self.skip_whitespace();
+        if !self.consume_prefix("(") {
+            return None;
+        }
+
+        self.skip_whitespace();
+        let x_radius = self.parse_length_token(true)?;
+        self.skip_whitespace();
+        if !self.consume_keyword("and") {
+            return None;
+        }
+
+        self.skip_whitespace();
+        let y_radius = self.parse_length_token(true)?;
+        self.skip_whitespace();
+        if !self.consume_prefix(")") {
+            return None;
+        }
+
+        Some((x_radius, y_radius))
+    }
+
     /// Parses the colon-separated arc spec `(start:end:radius)`.
     /// The key-value form `[start angle=..., end angle=..., radius=...]` is not yet supported.
     fn parse_arc_spec(&mut self) -> Option<(f64, f64, f64)> {
@@ -1178,6 +1294,11 @@ fn parse_length(token: &str, default_cm: bool) -> Option<f64> {
     let token = token.trim();
     let (number, unit_factor) = if let Some(number) = token.strip_suffix("cm") {
         (number, CM_IN_PT)
+    } else if let Some(number) = token.strip_suffix("mm") {
+        (number, CM_IN_PT / 10.0)
+    } else if let Some(number) = token.strip_suffix("in") {
+        // Graphics coordinates use PostScript points (bp), so 1in == 72bp.
+        (number, 72.0)
     } else if let Some(number) = token.strip_suffix("pt") {
         (number, 1.0)
     } else {
@@ -1204,6 +1325,34 @@ fn split_option(option: &str) -> (&str, Option<&str>) {
         .split_once('=')
         .map(|(key, value)| (key.trim(), Some(value.trim())))
         .unwrap_or((option.trim(), None))
+}
+
+fn infer_path_command_kind(statement: &str) -> PathCommandKind {
+    let mut cursor = Cursor::new(statement);
+    let Some(options) = cursor.parse_optional_bracket_group() else {
+        return PathCommandKind::Path;
+    };
+    let Some(options) = options else {
+        return PathCommandKind::Path;
+    };
+
+    let mut has_draw = false;
+    let mut has_fill = false;
+
+    for option in split_options(&options) {
+        match split_option(option) {
+            ("draw", _) => has_draw = true,
+            ("fill", _) => has_fill = true,
+            _ => {}
+        }
+    }
+
+    match (has_draw, has_fill) {
+        (true, true) => PathCommandKind::FillDraw,
+        (true, false) => PathCommandKind::Draw,
+        (false, true) => PathCommandKind::Fill,
+        (false, false) => PathCommandKind::Path,
+    }
 }
 
 fn parse_arrow_option(option: &str) -> Option<ArrowSpec> {
@@ -1284,12 +1433,41 @@ fn resolve_named_color(name: &str) -> Option<Color> {
         "red" => Some(named_color("red")),
         "green" => Some(named_color("green")),
         "blue" => Some(named_color("blue")),
+        "gray" => Some(named_color("gray")),
+        "darkgray" => Some(named_color("darkgray")),
+        "lightgray" => Some(named_color("lightgray")),
+        "cyan" => Some(named_color("cyan")),
+        "magenta" => Some(named_color("magenta")),
+        "yellow" => Some(named_color("yellow")),
+        "orange" => Some(named_color("orange")),
+        "purple" => Some(named_color("purple")),
+        "brown" => Some(named_color("brown")),
+        "pink" => Some(named_color("pink")),
+        "violet" => Some(named_color("violet")),
+        "olive" => Some(named_color("olive")),
+        "lime" => Some(named_color("lime")),
+        "teal" => Some(named_color("teal")),
         _ => None,
     }
 }
 
 fn named_color(name: &str) -> Color {
     match name {
+        "gray" => Color {
+            r: 0.5,
+            g: 0.5,
+            b: 0.5,
+        },
+        "darkgray" => Color {
+            r: 0.25,
+            g: 0.25,
+            b: 0.25,
+        },
+        "lightgray" => Color {
+            r: 0.75,
+            g: 0.75,
+            b: 0.75,
+        },
         "white" => Color {
             r: 1.0,
             g: 1.0,
@@ -1310,6 +1488,61 @@ fn named_color(name: &str) -> Color {
             g: 0.0,
             b: 1.0,
         },
+        "cyan" => Color {
+            r: 0.0,
+            g: 1.0,
+            b: 1.0,
+        },
+        "magenta" => Color {
+            r: 1.0,
+            g: 0.0,
+            b: 1.0,
+        },
+        "yellow" => Color {
+            r: 1.0,
+            g: 1.0,
+            b: 0.0,
+        },
+        "orange" => Color {
+            r: 1.0,
+            g: 0.5,
+            b: 0.0,
+        },
+        "purple" => Color {
+            r: 0.75,
+            g: 0.0,
+            b: 0.25,
+        },
+        "brown" => Color {
+            r: 0.75,
+            g: 0.5,
+            b: 0.25,
+        },
+        "pink" => Color {
+            r: 1.0,
+            g: 0.75,
+            b: 0.75,
+        },
+        "violet" => Color {
+            r: 0.5,
+            g: 0.0,
+            b: 0.5,
+        },
+        "olive" => Color {
+            r: 0.5,
+            g: 0.5,
+            b: 0.0,
+        },
+        "lime" => Color {
+            r: 0.75,
+            g: 1.0,
+            b: 0.0,
+        },
+        "teal" => Color {
+            r: 0.0,
+            g: 0.5,
+            b: 0.5,
+        },
         _ => Color {
             r: 0.0,
             g: 0.0,
@@ -1329,13 +1562,13 @@ fn emit_parse_error(diagnostics: &mut Vec<TikzDiagnostic>, message: String) {
 #[cfg(test)]
 mod tests {
     use crate::graphics::api::{
-        compile_graphics_scene, ArrowSpec, GraphicGroup, GraphicNode, GraphicText, GraphicsScene,
-        PathSegment, Point, Transform2D, VectorPrimitive,
+        compile_graphics_scene, ArrowSpec, Color, GraphicGroup, GraphicNode, GraphicText,
+        GraphicsScene, PathSegment, Point, Transform2D, VectorPrimitive,
     };
 
     use super::{
-        arc_segments, circle_path, named_color, parse_tikzpicture, resolve_line_width_preset,
-        TikzDiagnostic, CM_IN_PT, KAPPA,
+        arc_segments, circle_path, ellipse_path, named_color, parse_length, parse_tikzpicture,
+        resolve_line_width_preset, resolve_named_color, TikzDiagnostic, CM_IN_PT, KAPPA,
     };
 
     fn assert_point_close(actual: Point, expected: Point) {
@@ -1347,6 +1580,199 @@ mod tests {
             (actual.y - expected.y).abs() < 1e-9,
             "y mismatch: {actual:?} != {expected:?}"
         );
+    }
+
+    #[test]
+    fn resolves_extended_named_colors() {
+        for (color, expected) in [
+            (
+                "gray",
+                Color {
+                    r: 0.5,
+                    g: 0.5,
+                    b: 0.5,
+                },
+            ),
+            (
+                "darkgray",
+                Color {
+                    r: 0.25,
+                    g: 0.25,
+                    b: 0.25,
+                },
+            ),
+            (
+                "lightgray",
+                Color {
+                    r: 0.75,
+                    g: 0.75,
+                    b: 0.75,
+                },
+            ),
+            (
+                "cyan",
+                Color {
+                    r: 0.0,
+                    g: 1.0,
+                    b: 1.0,
+                },
+            ),
+            (
+                "magenta",
+                Color {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 1.0,
+                },
+            ),
+            (
+                "yellow",
+                Color {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 0.0,
+                },
+            ),
+            (
+                "orange",
+                Color {
+                    r: 1.0,
+                    g: 0.5,
+                    b: 0.0,
+                },
+            ),
+            (
+                "purple",
+                Color {
+                    r: 0.75,
+                    g: 0.0,
+                    b: 0.25,
+                },
+            ),
+            (
+                "brown",
+                Color {
+                    r: 0.75,
+                    g: 0.5,
+                    b: 0.25,
+                },
+            ),
+            (
+                "pink",
+                Color {
+                    r: 1.0,
+                    g: 0.75,
+                    b: 0.75,
+                },
+            ),
+            (
+                "violet",
+                Color {
+                    r: 0.5,
+                    g: 0.0,
+                    b: 0.5,
+                },
+            ),
+            (
+                "olive",
+                Color {
+                    r: 0.5,
+                    g: 0.5,
+                    b: 0.0,
+                },
+            ),
+            (
+                "lime",
+                Color {
+                    r: 0.75,
+                    g: 1.0,
+                    b: 0.0,
+                },
+            ),
+            (
+                "teal",
+                Color {
+                    r: 0.0,
+                    g: 0.5,
+                    b: 0.5,
+                },
+            ),
+        ] {
+            assert_eq!(
+                resolve_named_color(color),
+                Some(expected),
+                "expected {color} to match xcolor RGB"
+            );
+        }
+    }
+
+    #[test]
+    fn representative_xcolor_named_colors_match_expected_rgb_values() {
+        for (color, expected) in [
+            (
+                "orange",
+                Color {
+                    r: 1.0,
+                    g: 0.5,
+                    b: 0.0,
+                },
+            ),
+            (
+                "purple",
+                Color {
+                    r: 0.75,
+                    g: 0.0,
+                    b: 0.25,
+                },
+            ),
+            (
+                "brown",
+                Color {
+                    r: 0.75,
+                    g: 0.5,
+                    b: 0.25,
+                },
+            ),
+            (
+                "pink",
+                Color {
+                    r: 1.0,
+                    g: 0.75,
+                    b: 0.75,
+                },
+            ),
+            (
+                "violet",
+                Color {
+                    r: 0.5,
+                    g: 0.0,
+                    b: 0.5,
+                },
+            ),
+            (
+                "lime",
+                Color {
+                    r: 0.75,
+                    g: 1.0,
+                    b: 0.0,
+                },
+            ),
+        ] {
+            assert_eq!(
+                named_color(color),
+                expected,
+                "expected {color} to match xcolor RGB"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_length_mm_and_in_units() {
+        let millimeters = parse_length("1mm", false).expect("1mm should parse");
+        let inches = parse_length("1in", false).expect("1in should parse");
+
+        assert!((millimeters - (CM_IN_PT / 10.0)).abs() < 1e-9);
+        assert!((inches - 72.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1476,6 +1902,41 @@ mod tests {
             },
         );
         assert_eq!(end, Point { x: 10.0, y: 25.0 });
+        assert!(matches!(path[2], PathSegment::CurveTo { .. }));
+        assert!(matches!(path[3], PathSegment::CurveTo { .. }));
+        assert!(matches!(path[4], PathSegment::CurveTo { .. }));
+        assert_eq!(path[5], PathSegment::ClosePath);
+    }
+
+    #[test]
+    fn ellipse_path_produces_correct_bezier_approximation() {
+        let path = ellipse_path(Point { x: 10.0, y: 20.0 }, 5.0, 3.0);
+
+        assert_eq!(path.len(), 6);
+        assert_eq!(path[0], PathSegment::MoveTo(Point { x: 15.0, y: 20.0 }));
+        let PathSegment::CurveTo {
+            control1,
+            control2,
+            end,
+        } = path[1]
+        else {
+            panic!("expected first arc to be cubic bezier");
+        };
+        assert_point_close(
+            control1,
+            Point {
+                x: 15.0,
+                y: 20.0 + 3.0 * KAPPA,
+            },
+        );
+        assert_point_close(
+            control2,
+            Point {
+                x: 10.0 + 5.0 * KAPPA,
+                y: 23.0,
+            },
+        );
+        assert_eq!(end, Point { x: 10.0, y: 23.0 });
         assert!(matches!(path[2], PathSegment::CurveTo { .. }));
         assert!(matches!(path[3], PathSegment::CurveTo { .. }));
         assert!(matches!(path[4], PathSegment::CurveTo { .. }));
@@ -1652,6 +2113,94 @@ mod tests {
         assert_eq!(primitive.stroke, Some(named_color("black")));
         assert_eq!(primitive.fill, Some(named_color("blue")));
         assert_eq!(primitive.arrows, ArrowSpec::None);
+    }
+
+    #[test]
+    fn parses_ellipse_path() {
+        let result = parse_tikzpicture(r"\draw (1,1) ellipse (2 and 1);");
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.stroke, Some(named_color("black")));
+        assert_eq!(primitive.fill, None);
+        assert_eq!(primitive.line_width, 0.4);
+        assert_eq!(primitive.path.len(), 6);
+        assert_eq!(
+            primitive.path[0],
+            PathSegment::MoveTo(Point {
+                x: 3.0 * CM_IN_PT,
+                y: CM_IN_PT,
+            })
+        );
+        let PathSegment::CurveTo {
+            control1,
+            control2,
+            end,
+        } = primitive.path[1]
+        else {
+            panic!("expected ellipse arc to be cubic bezier");
+        };
+        assert_point_close(
+            control1,
+            Point {
+                x: 3.0 * CM_IN_PT,
+                y: CM_IN_PT + CM_IN_PT * KAPPA,
+            },
+        );
+        assert_point_close(
+            control2,
+            Point {
+                x: CM_IN_PT + 2.0 * CM_IN_PT * KAPPA,
+                y: 2.0 * CM_IN_PT,
+            },
+        );
+        assert_point_close(
+            end,
+            Point {
+                x: CM_IN_PT,
+                y: 2.0 * CM_IN_PT,
+            },
+        );
+        assert_eq!(primitive.path[5], PathSegment::ClosePath);
+    }
+
+    #[test]
+    fn parses_path_command_with_draw_option() {
+        let result = parse_tikzpicture(r"\path[draw] (0,0) -- (1,0);");
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.stroke, Some(named_color("black")));
+        assert_eq!(primitive.fill, None);
+    }
+
+    #[test]
+    fn parses_path_command_with_fill_option() {
+        let result = parse_tikzpicture(r"\path[fill=red] (0,0) rectangle (1,1);");
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.stroke, None);
+        assert_eq!(primitive.fill, Some(named_color("red")));
+    }
+
+    #[test]
+    fn parses_path_command_without_draw_fill() {
+        let result = parse_tikzpicture(r"\path (0,0) -- (1,0);");
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.stroke, None);
+        assert_eq!(primitive.fill, None);
+        assert_eq!(primitive.line_width, 0.4);
     }
 
     #[test]

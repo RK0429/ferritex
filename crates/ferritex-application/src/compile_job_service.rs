@@ -102,6 +102,33 @@ pub struct CompileResult {
     pub exit_code: i32,
     pub output_pdf: Option<PathBuf>,
     pub stable_compile_state: Option<StableCompileState>,
+    pub stage_timing: StageTiming,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageTiming {
+    pub cache_load: Option<std::time::Duration>,
+    pub source_tree_load: Option<std::time::Duration>,
+    pub parse: Option<std::time::Duration>,
+    pub typeset: Option<std::time::Duration>,
+    pub pdf_render: Option<std::time::Duration>,
+    pub cache_store: Option<std::time::Duration>,
+}
+
+impl StageTiming {
+    pub fn total(&self) -> std::time::Duration {
+        [
+            self.cache_load,
+            self.source_tree_load,
+            self.parse,
+            self.typeset,
+            self.pdf_render,
+            self.cache_store,
+        ]
+        .iter()
+        .filter_map(|duration| *duration)
+        .sum()
+    }
 }
 
 pub struct CompileJobService<'a> {
@@ -767,6 +794,7 @@ impl<'a> CompileJobService<'a> {
         let input_path = options.input_file.to_string_lossy().into_owned();
         let execution_policy = ExecutionPolicyFactory::create(options);
         let project_root = project_root_for_policy(&execution_policy, &options.input_file);
+        let mut stage_timing = StageTiming::default();
 
         if let Some(bundle_path) = &options.asset_bundle {
             let manifest_path = bundle_path.join("manifest.json");
@@ -785,6 +813,7 @@ impl<'a> CompileJobService<'a> {
                     diagnostics,
                     output_pdf: None,
                     stable_compile_state: None,
+                    stage_timing,
                 };
             }
 
@@ -799,6 +828,7 @@ impl<'a> CompileJobService<'a> {
                     diagnostics,
                     output_pdf: None,
                     stable_compile_state: None,
+                    stage_timing,
                 };
             }
         }
@@ -813,6 +843,7 @@ impl<'a> CompileJobService<'a> {
                 diagnostics,
                 output_pdf: None,
                 stable_compile_state: None,
+                stage_timing,
             };
         }
 
@@ -831,6 +862,7 @@ impl<'a> CompileJobService<'a> {
                 diagnostics,
                 output_pdf: None,
                 stable_compile_state: None,
+                stage_timing,
             };
         }
 
@@ -847,6 +879,7 @@ impl<'a> CompileJobService<'a> {
                 diagnostics,
                 output_pdf: None,
                 stable_compile_state: None,
+                stage_timing,
             };
         }
 
@@ -862,6 +895,7 @@ impl<'a> CompileJobService<'a> {
                 diagnostics,
                 output_pdf: None,
                 stable_compile_state: None,
+                stage_timing,
             };
         }
 
@@ -878,6 +912,7 @@ impl<'a> CompileJobService<'a> {
         let mut cached_typeset_fragments = BTreeMap::new();
         let mut source_tree_reuse_plan = None;
         if !options.no_cache {
+            let cache_load_start = std::time::Instant::now();
             let lookup = compile_cache.lookup();
             cached_cross_reference_seed = lookup
                 .baseline_state
@@ -894,11 +929,13 @@ impl<'a> CompileJobService<'a> {
                     "compile cache hit"
                 );
                 let diagnostics = cached_artifact.stable_compile_state.diagnostics.clone();
+                stage_timing.cache_load = Some(cache_load_start.elapsed());
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
                     diagnostics,
                     output_pdf: Some(cached_artifact.output_pdf),
                     stable_compile_state: Some(cached_artifact.stable_compile_state),
+                    stage_timing,
                 };
             }
 
@@ -920,8 +957,10 @@ impl<'a> CompileJobService<'a> {
                 });
             }
             cache_diagnostics.extend(lookup.diagnostics);
+            stage_timing.cache_load = Some(cache_load_start.elapsed());
         }
 
+        let source_tree_load_start = std::time::Instant::now();
         let mut source_tree = match self.load_source_tree(
             &options.input_file,
             &project_root,
@@ -929,8 +968,12 @@ impl<'a> CompileJobService<'a> {
             options.asset_bundle.as_deref(),
             source_tree_reuse_plan.as_ref(),
         ) {
-            Ok(tree) => tree,
+            Ok(tree) => {
+                stage_timing.source_tree_load = Some(source_tree_load_start.elapsed());
+                tree
+            }
             Err(diagnostic) => {
+                stage_timing.source_tree_load = Some(source_tree_load_start.elapsed());
                 let mut diagnostics = cache_diagnostics;
                 diagnostics.push(diagnostic);
 
@@ -939,6 +982,7 @@ impl<'a> CompileJobService<'a> {
                     diagnostics,
                     output_pdf: None,
                     stable_compile_state: None,
+                    stage_timing,
                 };
             }
         };
@@ -1023,6 +1067,8 @@ impl<'a> CompileJobService<'a> {
         let mut font_diagnostics = Vec::new();
         let mut font_resolution_fatal = false;
         let mut typeset_callback_count = 0usize;
+        let mut typeset_accumulated = std::time::Duration::ZERO;
+        let parse_and_typeset_start = std::time::Instant::now();
         let parse_pass_result = self.parse_document_with_cross_references(
             &source_tree.source,
             &options.input_file,
@@ -1034,169 +1080,174 @@ impl<'a> CompileJobService<'a> {
             source_tree.document_state.index_state.entries.clone(),
             cached_cross_reference_seed.as_ref(),
             |document| {
-                typeset_callback_count += 1;
-                if compile_font_selection.is_none() {
-                    let (selection, families, diagnostics, fatal) = self.select_compile_fonts(
-                        &input_path,
-                        document.main_font_name.as_deref(),
-                        document.sans_font_name.as_deref(),
-                        document.mono_font_name.as_deref(),
-                        &input_dir,
-                        &project_root,
-                        &options.overlay_roots,
-                        options.asset_bundle.as_deref(),
-                        if options.host_font_fallback {
-                            &options.host_font_roots
-                        } else {
-                            &[]
-                        },
-                        options.parallelism,
-                        options.trace_font_tasks,
-                    );
-                    font_diagnostics.extend(diagnostics);
-                    font_resolution_fatal = fatal;
-                    compile_font_selection = Some(selection);
-                    font_family_selection = Some(families);
-                }
+                let typeset_iter_start = std::time::Instant::now();
+                let result = {
+                    typeset_callback_count += 1;
+                    if compile_font_selection.is_none() {
+                        let (selection, families, diagnostics, fatal) = self.select_compile_fonts(
+                            &input_path,
+                            document.main_font_name.as_deref(),
+                            document.sans_font_name.as_deref(),
+                            document.mono_font_name.as_deref(),
+                            &input_dir,
+                            &project_root,
+                            &options.overlay_roots,
+                            options.asset_bundle.as_deref(),
+                            if options.host_font_fallback {
+                                &options.host_font_roots
+                            } else {
+                                &[]
+                            },
+                            options.parallelism,
+                            options.trace_font_tasks,
+                        );
+                        font_diagnostics.extend(diagnostics);
+                        font_resolution_fatal = fatal;
+                        compile_font_selection = Some(selection);
+                        font_family_selection = Some(families);
+                    }
 
-                let selection = compile_font_selection
-                    .as_ref()
-                    .expect("font selection initialized");
+                    let selection = compile_font_selection
+                        .as_ref()
+                        .expect("font selection initialized");
 
-                let full_typeset = || {
-                    let sequential_typeset = || {
-                        self.typeset_document_with_selection(
+                    let full_typeset = || {
+                        let sequential_typeset = || {
+                            self.typeset_document_with_selection(
+                                document,
+                                Some(&source_tree.source_lines),
+                                selection,
+                                &graphics_resolver,
+                            )
+                        };
+
+                        if options.parallelism <= 1 {
+                            return sequential_typeset();
+                        }
+
+                        let partition_plan =
+                            partition_plan_for_document(&options.input_file, document, &source_tree);
+                        if partition_plan.work_units.len() < 2 {
+                            return sequential_typeset();
+                        }
+
+                        match try_parallel_full_typeset(
+                            self,
                             document,
-                            Some(&source_tree.source_lines),
+                            &source_tree.source_lines,
                             selection,
                             &graphics_resolver,
-                        )
+                            options.parallelism,
+                            &partition_plan,
+                            graphics_resolver.file_access_gate,
+                            graphics_resolver.input_dir,
+                            graphics_resolver.project_root,
+                            graphics_resolver.overlay_roots,
+                            graphics_resolver.asset_bundle_path,
+                            typeset_callback_count as u32,
+                        ) {
+                            Ok(document) => document,
+                            Err(reason) => {
+                                tracing::info!(
+                                    jobname = %options.jobname,
+                                    input = %options.input_file.display(),
+                                    "{}",
+                                    format!("full typeset fallback to sequential ({reason})")
+                                );
+                                sequential_typeset()
+                            }
+                        }
                     };
 
-                    if options.parallelism <= 1 {
-                        return sequential_typeset();
-                    }
+                    let partial_typeset_available = cached_recompilation_scope
+                        == Some(RecompilationScope::LocalRegion)
+                        && !cached_typeset_fragments.is_empty()
+                        && !document.has_pageref_markers();
+                    if partial_typeset_available && typeset_callback_count > 1 {
+                        tracing::info!(
+                            jobname = %options.jobname,
+                            input = %options.input_file.display(),
+                            "partial typeset fallback to full typeset"
+                        );
+                        full_typeset()
+                    } else if !partial_typeset_available || typeset_callback_count != 1 {
+                        full_typeset()
+                    } else if let Some(reuse_plan) = source_tree_reuse_plan.as_ref() {
+                        let partition_plan =
+                            partition_plan_for_document(&options.input_file, document, &source_tree);
+                        let usable_cached_fragments = cached_document_layout_fragments_for(
+                            &partition_plan,
+                            &source_tree,
+                            &cached_typeset_fragments,
+                        );
+                        let typesetter_reuse_plan = TypesetterReusePlan::create(
+                            &partition_plan,
+                            &reuse_plan.rebuild_paths,
+                            &usable_cached_fragments,
+                            changed_paths.contains(&normalized_input_file),
+                        );
 
-                    let partition_plan =
-                        partition_plan_for_document(&options.input_file, document, &source_tree);
-                    if partition_plan.work_units.len() < 2 {
-                        return sequential_typeset();
-                    }
-
-                    match try_parallel_full_typeset(
-                        self,
-                        document,
-                        &source_tree.source_lines,
-                        selection,
-                        &graphics_resolver,
-                        options.parallelism,
-                        &partition_plan,
-                        graphics_resolver.file_access_gate,
-                        graphics_resolver.input_dir,
-                        graphics_resolver.project_root,
-                        graphics_resolver.overlay_roots,
-                        graphics_resolver.asset_bundle_path,
-                        typeset_callback_count as u32,
-                    ) {
-                        Ok(document) => document,
-                        Err(reason) => {
+                        if typesetter_reuse_plan.requires_full_typeset {
                             tracing::info!(
                                 jobname = %options.jobname,
                                 input = %options.input_file.display(),
-                                "{}",
-                                format!("full typeset fallback to sequential ({reason})")
+                                "partial typeset fallback to full typeset (reuse plan requires full)"
                             );
-                            sequential_typeset()
+                            full_typeset()
+                        } else if typesetter_reuse_plan.rebuild_partition_ids.is_empty() {
+                            tracing::info!(
+                                jobname = %options.jobname,
+                                input = %options.input_file.display(),
+                                "partial typeset fallback to full typeset (no partitions to rebuild)"
+                            );
+                            full_typeset()
+                        } else {
+                            match try_partial_typeset_document(
+                                self,
+                                document,
+                                &source_tree.source_lines,
+                                selection,
+                                &graphics_resolver,
+                                options.parallelism,
+                                graphics_resolver.file_access_gate,
+                                graphics_resolver.input_dir,
+                                graphics_resolver.project_root,
+                                graphics_resolver.overlay_roots,
+                                graphics_resolver.asset_bundle_path,
+                                &partition_plan,
+                                &typesetter_reuse_plan,
+                            ) {
+                                Ok(document) => {
+                                    tracing::info!(
+                                        jobname = %options.jobname,
+                                        input = %options.input_file.display(),
+                                        rebuilt_partitions = ?typesetter_reuse_plan.rebuild_partition_ids,
+                                        "partial typeset reuse applied"
+                                    );
+                                    document
+                                }
+                                Err(reason) => {
+                                    tracing::info!(
+                                        jobname = %options.jobname,
+                                        input = %options.input_file.display(),
+                                        "{}",
+                                        format!("partial typeset fallback to full typeset ({reason})")
+                                    );
+                                    full_typeset()
+                                }
+                            }
                         }
-                    }
-                };
-
-                let partial_typeset_available = cached_recompilation_scope
-                    == Some(RecompilationScope::LocalRegion)
-                    && !cached_typeset_fragments.is_empty()
-                    && !document.has_pageref_markers();
-                if partial_typeset_available && typeset_callback_count > 1 {
-                    tracing::info!(
-                        jobname = %options.jobname,
-                        input = %options.input_file.display(),
-                        "partial typeset fallback to full typeset"
-                    );
-                    return full_typeset();
-                }
-                if !partial_typeset_available || typeset_callback_count != 1 {
-                    return full_typeset();
-                }
-
-                let Some(reuse_plan) = source_tree_reuse_plan.as_ref() else {
-                    return full_typeset();
-                };
-                let partition_plan =
-                    partition_plan_for_document(&options.input_file, document, &source_tree);
-                let usable_cached_fragments = cached_document_layout_fragments_for(
-                    &partition_plan,
-                    &source_tree,
-                    &cached_typeset_fragments,
-                );
-                let typesetter_reuse_plan = TypesetterReusePlan::create(
-                    &partition_plan,
-                    &reuse_plan.rebuild_paths,
-                    &usable_cached_fragments,
-                    changed_paths.contains(&normalized_input_file),
-                );
-
-                if typesetter_reuse_plan.requires_full_typeset {
-                    tracing::info!(
-                        jobname = %options.jobname,
-                        input = %options.input_file.display(),
-                        "partial typeset fallback to full typeset (reuse plan requires full)"
-                    );
-                    return full_typeset();
-                }
-                if typesetter_reuse_plan.rebuild_partition_ids.is_empty() {
-                    tracing::info!(
-                        jobname = %options.jobname,
-                        input = %options.input_file.display(),
-                        "partial typeset fallback to full typeset (no partitions to rebuild)"
-                    );
-                    return full_typeset();
-                }
-
-                match try_partial_typeset_document(
-                    self,
-                    document,
-                    &source_tree.source_lines,
-                    selection,
-                    &graphics_resolver,
-                    options.parallelism,
-                    graphics_resolver.file_access_gate,
-                    graphics_resolver.input_dir,
-                    graphics_resolver.project_root,
-                    graphics_resolver.overlay_roots,
-                    graphics_resolver.asset_bundle_path,
-                    &partition_plan,
-                    &typesetter_reuse_plan,
-                ) {
-                    Ok(document) => {
-                        tracing::info!(
-                            jobname = %options.jobname,
-                            input = %options.input_file.display(),
-                            rebuilt_partitions = ?typesetter_reuse_plan.rebuild_partition_ids,
-                            "partial typeset reuse applied"
-                        );
-                        document
-                    }
-                    Err(reason) => {
-                        tracing::info!(
-                            jobname = %options.jobname,
-                            input = %options.input_file.display(),
-                            "{}",
-                            format!("partial typeset fallback to full typeset ({reason})")
-                        );
+                    } else {
                         full_typeset()
                     }
-                }
+                };
+                typeset_accumulated += typeset_iter_start.elapsed();
+                result
             },
         );
+        let total_parse_and_typeset = parse_and_typeset_start.elapsed();
+        stage_timing.typeset = Some(typeset_accumulated);
+        stage_timing.parse = Some(total_parse_and_typeset - typeset_accumulated);
         let pdf_renderer = match (
             compile_font_selection.as_ref(),
             font_family_selection.as_ref(),
@@ -1255,6 +1306,7 @@ impl<'a> CompileJobService<'a> {
                 diagnostics,
                 output_pdf: None,
                 stable_compile_state: None,
+                stage_timing,
             };
         }
         if let Some(loaded_bibliography_state) = &loaded_bibliography_state {
@@ -1316,6 +1368,7 @@ impl<'a> CompileJobService<'a> {
                         false,
                         diagnostics,
                     )),
+                    stage_timing,
                 };
             }
         };
@@ -1347,6 +1400,7 @@ impl<'a> CompileJobService<'a> {
                 diagnostics,
                 output_pdf: None,
                 stable_compile_state: None,
+                stage_timing,
             };
         }
         let cross_reference_seed =
@@ -1372,17 +1426,20 @@ impl<'a> CompileJobService<'a> {
                     diagnostics,
                     output_pdf: None,
                     stable_compile_state: None,
+                    stage_timing,
                 };
             }
         };
         let partition_plan =
             partition_plan_for_document(&options.input_file, &parsed_document, &source_tree);
+        let pdf_render_start = std::time::Instant::now();
         let pdf_document = pdf_renderer.render_with_partition_plan(
             &typeset_document,
             options.parallelism,
             pass_count,
             &partition_plan,
         );
+        stage_timing.pdf_render = Some(pdf_render_start.elapsed());
         let compilation_job = compilation_job(
             options.input_file.clone(),
             options.jobname.clone(),
@@ -1405,6 +1462,7 @@ impl<'a> CompileJobService<'a> {
                 diagnostics,
                 output_pdf: None,
                 stable_compile_state: None,
+                stage_timing,
             };
         }
 
@@ -1440,6 +1498,7 @@ impl<'a> CompileJobService<'a> {
             cacheable_diagnostics.clone(),
         );
         if !options.no_cache {
+            let cache_store_start = std::time::Instant::now();
             if let Some(diagnostic) = compile_cache.store(
                 &source_tree.dependency_graph,
                 &provisional_stable_state,
@@ -1449,6 +1508,7 @@ impl<'a> CompileJobService<'a> {
             ) {
                 diagnostics.push(diagnostic);
             }
+            stage_timing.cache_store = Some(cache_store_start.elapsed());
         }
 
         let stable_compile_state = stable_compile_state(
@@ -1459,6 +1519,17 @@ impl<'a> CompileJobService<'a> {
             pdf_document.page_count,
             true,
             diagnostics.clone(),
+        );
+
+        tracing::info!(
+            cache_load_us = stage_timing.cache_load.map(|d| d.as_micros() as u64),
+            source_tree_load_us = stage_timing.source_tree_load.map(|d| d.as_micros() as u64),
+            parse_us = stage_timing.parse.map(|d| d.as_micros() as u64),
+            typeset_us = stage_timing.typeset.map(|d| d.as_micros() as u64),
+            pdf_render_us = stage_timing.pdf_render.map(|d| d.as_micros() as u64),
+            cache_store_us = stage_timing.cache_store.map(|d| d.as_micros() as u64),
+            total_us = stage_timing.total().as_micros() as u64,
+            "compile stage timing"
         );
 
         tracing::info!(
@@ -1477,6 +1548,7 @@ impl<'a> CompileJobService<'a> {
             diagnostics,
             output_pdf: Some(output_pdf),
             stable_compile_state: Some(stable_compile_state),
+            stage_timing,
         }
     }
 
@@ -6247,7 +6319,7 @@ mod tests {
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Subscriber};
 
-    use super::{run_font_tasks, CompileJobService};
+    use super::{run_font_tasks, CompileJobService, StageTiming};
     use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput};
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
     use ferritex_core::diagnostics::Severity;
@@ -6924,6 +6996,59 @@ mod tests {
         let trace_messages = messages.lock().expect("lock tracing messages").clone();
 
         (result, trace_messages)
+    }
+
+    #[test]
+    fn stage_timing_total_sums_present_stages() {
+        let timing = StageTiming {
+            cache_load: Some(Duration::from_micros(100)),
+            source_tree_load: Some(Duration::from_micros(200)),
+            parse: Some(Duration::from_micros(300)),
+            typeset: Some(Duration::from_micros(400)),
+            pdf_render: None,
+            cache_store: Some(Duration::from_micros(50)),
+        };
+
+        assert_eq!(timing.total(), Duration::from_micros(1050));
+    }
+
+    #[test]
+    fn stage_timing_default_is_all_none() {
+        let timing = StageTiming::default();
+
+        assert_eq!(timing.total(), Duration::ZERO);
+        assert!(timing.cache_load.is_none());
+        assert!(timing.source_tree_load.is_none());
+        assert!(timing.parse.is_none());
+        assert!(timing.typeset.is_none());
+        assert!(timing.pdf_render.is_none());
+        assert!(timing.cache_store.is_none());
+    }
+
+    #[test]
+    fn compile_success_populates_stage_timing_on_success_path() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            document("\\section{Timing}\nStage timing instrumentation smoke.\n"),
+        )
+        .expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0, "{:?}", result.diagnostics);
+        assert!(result.stage_timing.cache_load.is_some());
+        assert!(result.stage_timing.source_tree_load.is_some());
+        assert!(result.stage_timing.parse.is_some());
+        assert!(result.stage_timing.typeset.is_some());
+        assert!(result.stage_timing.pdf_render.is_some());
+        assert!(result.stage_timing.cache_store.is_some());
+        assert!(result.stage_timing.total() > Duration::ZERO);
     }
 
     struct ParallelFullTypesetCollisionGuard;

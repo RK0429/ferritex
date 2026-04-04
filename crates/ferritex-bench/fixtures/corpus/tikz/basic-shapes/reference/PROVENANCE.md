@@ -21,6 +21,7 @@
 - `path_operations.tex` -> `path_operations.pdf`
 - `arc_basic.tex` -> `arc_basic.pdf` (generated `2026-04-04 JST`)
 - `line_width_presets.tex` -> `line_width_presets.pdf` (generated `2026-04-04 JST`)
+- `ellipse_native.tex` -> `ellipse_native.pdf` (generated `2026-04-04 JST`)
 
 ## Notes
 
