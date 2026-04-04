@@ -477,6 +477,59 @@ mod tests {
     };
     use crate::parser::{CatCode, MacroDef, MacroEngine, Token, TokenKind};
 
+    const FTXUTILS_STY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../ferritex-bench/fixtures/bundle/texmf/tex/latex/ftxutils.sty"
+    ));
+    const FTXCOMPAT_STY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../ferritex-bench/fixtures/bundle/texmf/tex/latex/ftxcompat.sty"
+    ));
+    const FTXDEPCHAIN_STY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../ferritex-bench/fixtures/bundle/texmf/tex/latex/ftxdepchain.sty"
+    ));
+
+    fn ftx_bundle_source(name: &str) -> Option<&'static str> {
+        match name {
+            "ftxutils" => Some(FTXUTILS_STY),
+            "ftxcompat" => Some(FTXCOMPAT_STY),
+            "ftxdepchain" => Some(FTXDEPCHAIN_STY),
+            _ => None,
+        }
+    }
+
+    fn expanded_macro_text(engine: &MacroEngine, name: &str) -> Option<String> {
+        engine
+            .lookup(name)
+            .map(|definition| expand_token_text(engine, &definition.body, 0))
+    }
+
+    fn expand_token_text(engine: &MacroEngine, tokens: &[Token], depth: usize) -> String {
+        assert!(depth < 16, "macro expansion depth exceeded");
+
+        let mut text = String::new();
+        for token in tokens {
+            match &token.kind {
+                TokenKind::CharToken { char, .. } => text.push(*char),
+                TokenKind::ControlWord(name) => {
+                    if let Some(definition) = engine.lookup(name) {
+                        if definition.parameter_count == 0 {
+                            text.push_str(&expand_token_text(
+                                engine,
+                                &engine.expand(name, &[]),
+                                depth + 1,
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        text
+    }
+
     #[test]
     fn package_registry_prevents_duplicate_loads() {
         let mut registry = PackageRegistry::default();
@@ -646,6 +699,110 @@ mod tests {
         assert!(engine.lookup("mypkgboldtrue").is_some());
         assert!(engine.lookup("mypkgboldfalse").is_some());
         assert!(engine.lookup("mypkg@flag").is_some());
+    }
+
+    #[test]
+    fn load_package_interprets_ftxutils_sty_directly() {
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+        let resolver = |name: &str| ftx_bundle_source(name).map(ToOwned::to_owned);
+
+        assert!(load_package(
+            "ftxutils",
+            &[],
+            &mut registry,
+            &mut engine,
+            None,
+            Some(&resolver)
+        )
+        .expect("load ftxutils"));
+
+        assert!(registry.is_loaded("ftxutils"));
+        assert_eq!(
+            expanded_macro_text(&engine, "ftxutilsinfo"),
+            Some("UTILS:utils-defined-ok".to_string())
+        );
+        assert!(engine.lookup("ftxutils@version").is_some());
+        assert_eq!(
+            engine
+                .lookup("ftxutilscheck")
+                .map(|definition| token_text(&definition.body)),
+            Some("utils-defined-ok".to_string())
+        );
+    }
+
+    #[test]
+    fn load_package_interprets_ftxcompat_sty_with_options() {
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+        let resolver = |name: &str| ftx_bundle_source(name).map(ToOwned::to_owned);
+
+        assert!(load_package(
+            "ftxcompat",
+            &["draft".to_string()],
+            &mut registry,
+            &mut engine,
+            None,
+            Some(&resolver),
+        )
+        .expect("load ftxcompat"));
+
+        assert!(registry.is_loaded("ftxcompat"));
+        assert!(registry.is_loaded("ftxutils"));
+        assert_eq!(
+            engine
+                .lookup("ftxcompatstyle")
+                .map(|definition| token_text(&definition.body)),
+            Some("draft-mode".to_string())
+        );
+        assert_eq!(
+            engine
+                .lookup("ftxcompatdep")
+                .map(|definition| token_text(&definition.body)),
+            Some("compat-loaded-ftxutils".to_string())
+        );
+        assert!(engine.lookup("ifftxcompatdraft").is_some());
+        assert!(engine.lookup("ftxcompatdrafttrue").is_some());
+        assert!(engine.lookup("ftxcompatdraftfalse").is_some());
+    }
+
+    #[test]
+    fn load_package_interprets_ftxdepchain_recursive_dependencies() {
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+        let resolver = |name: &str| ftx_bundle_source(name).map(ToOwned::to_owned);
+
+        assert!(load_package(
+            "ftxdepchain",
+            &[],
+            &mut registry,
+            &mut engine,
+            None,
+            Some(&resolver),
+        )
+        .expect("load ftxdepchain"));
+
+        assert!(registry.is_loaded("ftxdepchain"));
+        assert!(registry.is_loaded("ftxcompat"));
+        assert!(registry.is_loaded("ftxutils"));
+        assert_eq!(
+            engine
+                .lookup("ftxdepchainroot")
+                .map(|definition| token_text(&definition.body)),
+            Some("chain-loaded-compat".to_string())
+        );
+        assert_eq!(
+            engine
+                .lookup("ftxdepchaintrans")
+                .map(|definition| token_text(&definition.body)),
+            Some("chain-has-utils".to_string())
+        );
+        assert_eq!(
+            engine
+                .lookup("ftxcompatstyle")
+                .map(|definition| token_text(&definition.body)),
+            Some("final-mode".to_string())
+        );
     }
 
     #[test]

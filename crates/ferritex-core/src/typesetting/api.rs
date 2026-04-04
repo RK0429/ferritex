@@ -327,6 +327,14 @@ pub struct PaginatedVListContinuation {
     pub continued_on_initial_page: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginationStateSnapshot {
+    pub content_used: DimensionValue,
+    pub completed_page_count: usize,
+    pub pending_floats: Vec<FloatItem>,
+    pub current_page: Option<TypesetPage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypesetOutline {
     pub level: u8,
@@ -359,7 +367,7 @@ pub enum FloatRegion {
     Page,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementSpec {
     pub priority_order: Vec<FloatRegion>,
     pub force: bool,
@@ -392,10 +400,10 @@ impl PlacementSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FootnoteEntry {
-    text: String,
-    source_span: Option<SourceSpan>,
+    pub text: String,
+    pub source_span: Option<SourceSpan>,
 }
 
 fn push_float_region(regions: &mut Vec<FloatRegion>, region: FloatRegion) {
@@ -411,7 +419,7 @@ pub struct FloatContent {
     pub height: DimensionValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloatItem {
     pub spec: PlacementSpec,
     pub content: FloatContent,
@@ -815,6 +823,10 @@ impl FloatQueue {
         }
     }
 
+    pub fn from_items(items: Vec<FloatItem>) -> Self {
+        Self { pending: items }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -866,7 +878,7 @@ impl FloatQueue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeXBox {
     pub width: DimensionValue,
     pub height: DimensionValue,
@@ -895,7 +907,7 @@ impl TeXBox {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum GlueOrder {
     #[default]
     Normal,
@@ -904,7 +916,7 @@ pub enum GlueOrder {
     Filll,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GlueComponent {
     pub value: DimensionValue,
     pub order: GlueOrder,
@@ -919,7 +931,7 @@ impl GlueComponent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HListItem {
     Char {
         codepoint: char,
@@ -948,7 +960,7 @@ pub enum HListItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VListItem {
     Box {
         tex_box: TeXBox,
@@ -982,10 +994,17 @@ pub enum VListItem {
     ClearPage,
 }
 
-#[derive(Debug, Default)]
-struct FloatCounters {
-    figure: u32,
-    table: u32,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FloatCounters {
+    pub figure: u32,
+    pub table: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawBlockCheckpoint {
+    pub node_index: usize,
+    pub source_span: Option<SourceSpan>,
+    pub vlist_position: usize,
 }
 
 impl FloatCounters {
@@ -1134,13 +1153,16 @@ impl MinimalTypesetter {
         )
     }
 
-    pub fn build_vlist_for_partition_continuing(
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_vlist_for_partition_continuing_with_state(
         &self,
         document: &ParsedDocument,
         body_nodes: Vec<DocumentNode>,
         provider: &dyn CharWidthProvider,
         graphics_resolver: Option<&dyn GraphicAssetResolver>,
         continues_from_previous_block: bool,
+        initial_float_counters: FloatCounters,
+        checkpoint_collector: Option<&mut Vec<RawBlockCheckpoint>>,
     ) -> PartitionVListResult {
         let page_box = page_box_for_class(&document.document_class);
         let (body_nodes, footnotes) = extract_footnotes_from_nodes(body_nodes);
@@ -1154,7 +1176,8 @@ impl MinimalTypesetter {
         }
         let params = break_params_for_provider(provider);
         let hyphenator = TexPatternHyphenator::english();
-        let vlist = document_nodes_to_vlist_with_document(
+        let mut float_counters = initial_float_counters;
+        let vlist = document_nodes_to_vlist_with_state(
             document,
             &body_nodes,
             provider,
@@ -1162,7 +1185,9 @@ impl MinimalTypesetter {
             &params,
             layout,
             graphics_resolver,
-            continues_from_previous_block,
+            continues_from_previous_block.then_some(SegmentBlockKind::Paragraph),
+            &mut float_counters,
+            checkpoint_collector,
         );
 
         PartitionVListResult {
@@ -1171,6 +1196,25 @@ impl MinimalTypesetter {
             layout,
             page_box,
         }
+    }
+
+    pub fn build_vlist_for_partition_continuing(
+        &self,
+        document: &ParsedDocument,
+        body_nodes: Vec<DocumentNode>,
+        provider: &dyn CharWidthProvider,
+        graphics_resolver: Option<&dyn GraphicAssetResolver>,
+        continues_from_previous_block: bool,
+    ) -> PartitionVListResult {
+        self.build_vlist_for_partition_continuing_with_state(
+            document,
+            body_nodes,
+            provider,
+            graphics_resolver,
+            continues_from_previous_block,
+            FloatCounters::default(),
+            None,
+        )
     }
 }
 
@@ -1275,6 +1319,15 @@ pub fn append_footnotes_to_pages(
     footnotes: &[FootnoteEntry],
     layout: ClassLayout,
 ) {
+    append_footnotes_to_pages_starting_at(pages, footnotes, layout, 0);
+}
+
+pub fn append_footnotes_to_pages_starting_at(
+    pages: &mut [TypesetPage],
+    footnotes: &[FootnoteEntry],
+    layout: ClassLayout,
+    initial_index: usize,
+) {
     let Some(page) = pages.first_mut() else {
         return;
     };
@@ -1285,10 +1338,11 @@ pub fn append_footnotes_to_pages(
     let footnote_step_pt = layout.footnote_font_size_pt + 2;
 
     for (index, footnote) in footnotes.iter().enumerate() {
-        let offset_pt = footnote_step_pt * index as i64;
+        let offset_pt = footnote_step_pt * (initial_index + index) as i64;
+        let footnote_number = initial_index + index + 1;
 
         page.lines.push(TextLine {
-            text: (index + 1).to_string(),
+            text: footnote_number.to_string(),
             y: points(layout.footnote_marker_y_pt - offset_pt),
             links: Vec::new(),
             font_index: 0,
@@ -1824,6 +1878,7 @@ fn document_nodes_to_vlist_with_document(
         graphics_resolver,
         continues_from_previous_block.then_some(SegmentBlockKind::Paragraph),
         &mut float_counters,
+        None,
     )
 }
 
@@ -1859,6 +1914,11 @@ enum SegmentSemantic {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentCheckpointCandidate {
+    source_span: Option<SourceSpan>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn document_nodes_to_vlist_with_state(
     document: &ParsedDocument,
@@ -1870,6 +1930,7 @@ fn document_nodes_to_vlist_with_state(
     graphics_resolver: Option<&dyn GraphicAssetResolver>,
     initial_previous_block: Option<SegmentBlockKind>,
     float_counters: &mut FloatCounters,
+    mut checkpoint_collector: Option<&mut Vec<RawBlockCheckpoint>>,
 ) -> Vec<VListItem> {
     let mut vlist = Vec::new();
     let mut segment_start = 0;
@@ -1878,7 +1939,7 @@ fn document_nodes_to_vlist_with_state(
     for (index, node) in nodes.iter().enumerate() {
         match node {
             DocumentNode::ParBreak => {
-                append_nodes_segment_to_vlist(
+                let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -1891,10 +1952,16 @@ fn document_nodes_to_vlist_with_state(
                 vlist.push(VListItem::Glue {
                     height: points(layout.parskip_pt),
                 });
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
                 segment_start = index + 1;
             }
             DocumentNode::PageBreak => {
-                append_nodes_segment_to_vlist(
+                let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -1907,11 +1974,17 @@ fn document_nodes_to_vlist_with_state(
                 vlist.push(VListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
                 previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::ClearPage => {
-                append_nodes_segment_to_vlist(
+                let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -1922,11 +1995,17 @@ fn document_nodes_to_vlist_with_state(
                     &mut previous_block,
                 );
                 vlist.push(VListItem::ClearPage);
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
                 previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::ClearDoublePage => {
-                append_nodes_segment_to_vlist(
+                let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -1940,11 +2019,17 @@ fn document_nodes_to_vlist_with_state(
                     vlist.push(VListItem::ClearPage);
                 }
                 vlist.push(VListItem::OpenRightBreak);
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
                 previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::IncludeGraphics { path, options } => {
-                append_nodes_segment_to_vlist(
+                let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -1959,11 +2044,17 @@ fn document_nodes_to_vlist_with_state(
                         vlist.push(VListItem::Image { graphics_box });
                     }
                 }
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
                 previous_block = None;
                 segment_start = index + 1;
             }
             DocumentNode::TikzPicture { graphics_box } => {
-                append_nodes_segment_to_vlist(
+                let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -1976,11 +2067,36 @@ fn document_nodes_to_vlist_with_state(
                 vlist.push(VListItem::Image {
                     graphics_box: graphics_box.clone(),
                 });
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
                 previous_block = None;
                 segment_start = index + 1;
             }
+            DocumentNode::DisplayMath(_, _) | DocumentNode::EquationEnv { .. } => {
+                let _ = append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    document,
+                    &nodes[segment_start..index + 1],
+                    provider,
+                    hyphenator,
+                    params,
+                    layout,
+                    &mut previous_block,
+                );
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
+                segment_start = index + 1;
+            }
             DocumentNode::IndexMarker(entry) => {
-                append_nodes_segment_to_vlist(
+                if let Some(candidate) = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -1989,7 +2105,14 @@ fn document_nodes_to_vlist_with_state(
                     params,
                     layout,
                     &mut previous_block,
-                );
+                ) {
+                    collect_raw_block_checkpoint(
+                        &mut checkpoint_collector,
+                        index,
+                        candidate.source_span,
+                        vlist.len(),
+                    );
+                }
                 vlist.push(VListItem::IndexMarker {
                     entry: entry.clone(),
                 });
@@ -2003,7 +2126,7 @@ fn document_nodes_to_vlist_with_state(
                 caption_span,
                 ..
             } => {
-                append_nodes_segment_to_vlist(
+                let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
                     &nodes[segment_start..index],
@@ -2027,6 +2150,7 @@ fn document_nodes_to_vlist_with_state(
                     graphics_resolver,
                     None,
                     float_counters,
+                    None,
                 );
 
                 let number = float_counters.next(*float_type);
@@ -2055,6 +2179,12 @@ fn document_nodes_to_vlist_with_state(
                     spec: PlacementSpec::parse(specifier.as_deref()),
                     content: float_content_from_vlist(&float_vlist),
                 });
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
 
                 previous_block = None;
                 segment_start = index + 1;
@@ -2063,7 +2193,7 @@ fn document_nodes_to_vlist_with_state(
         }
     }
 
-    append_nodes_segment_to_vlist(
+    if let Some(candidate) = append_nodes_segment_to_vlist(
         &mut vlist,
         document,
         &nodes[segment_start..],
@@ -2072,9 +2202,33 @@ fn document_nodes_to_vlist_with_state(
         params,
         layout,
         &mut previous_block,
-    );
+    ) {
+        collect_raw_block_checkpoint(
+            &mut checkpoint_collector,
+            nodes.len(),
+            candidate.source_span,
+            vlist.len(),
+        );
+    }
 
     vlist
+}
+
+fn collect_raw_block_checkpoint(
+    checkpoint_collector: &mut Option<&mut Vec<RawBlockCheckpoint>>,
+    node_index: usize,
+    source_span: Option<SourceSpan>,
+    vlist_position: usize,
+) {
+    let Some(collector) = checkpoint_collector.as_deref_mut() else {
+        return;
+    };
+
+    collector.push(RawBlockCheckpoint {
+        node_index,
+        source_span,
+        vlist_position,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2087,9 +2241,9 @@ fn append_nodes_segment_to_vlist(
     params: &BreakParams,
     layout: ClassLayout,
     previous_block: &mut Option<SegmentBlockKind>,
-) {
+) -> Option<SegmentCheckpointCandidate> {
     if nodes.is_empty() {
-        return;
+        return None;
     }
 
     if let Some(line_height_pt) = display_math_line_height_for_segment(nodes, layout) {
@@ -2110,7 +2264,7 @@ fn append_nodes_segment_to_vlist(
             Some(source_span),
         );
         *previous_block = Some(SegmentBlockKind::Paragraph);
-        return;
+        return Some(SegmentCheckpointCandidate { source_span });
     }
 
     let segment_text = visible_text_from_nodes(nodes);
@@ -2168,7 +2322,7 @@ fn append_nodes_segment_to_vlist(
                 });
             }
             *previous_block = Some(SegmentBlockKind::TitleBlock);
-            return;
+            return None;
         }
         SegmentSemantic::ChapterHeading {
             number,
@@ -2199,7 +2353,9 @@ fn append_nodes_segment_to_vlist(
                 source_span: segment_source_span,
             });
             *previous_block = Some(SegmentBlockKind::ChapterTitle);
-            return;
+            return Some(SegmentCheckpointCandidate {
+                source_span: segment_source_span,
+            });
         }
         SegmentSemantic::Heading {
             level,
@@ -2238,7 +2394,9 @@ fn append_nodes_segment_to_vlist(
                 Some(segment_source_span),
             );
             *previous_block = Some(SegmentBlockKind::Heading);
-            return;
+            return Some(SegmentCheckpointCandidate {
+                source_span: segment_source_span,
+            });
         }
         SegmentSemantic::ListItem => {
             append_styled_nodes_to_vlist(
@@ -2252,7 +2410,7 @@ fn append_nodes_segment_to_vlist(
                 Some(segment_source_span),
             );
             *previous_block = Some(SegmentBlockKind::ListItem);
-            return;
+            return None;
         }
         SegmentSemantic::DescriptionItem => {
             append_styled_nodes_to_vlist(
@@ -2266,7 +2424,7 @@ fn append_nodes_segment_to_vlist(
                 Some(segment_source_span),
             );
             *previous_block = Some(SegmentBlockKind::DescriptionItem);
-            return;
+            return None;
         }
         SegmentSemantic::Paragraph => {}
     }
@@ -2282,6 +2440,7 @@ fn append_nodes_segment_to_vlist(
         Some(segment_source_span),
     );
     *previous_block = Some(SegmentBlockKind::Paragraph);
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3038,6 +3197,22 @@ pub fn paginate_vlist_continuing_detailed(
     layout: ClassLayout,
     initial_content_used: DimensionValue,
 ) -> PaginatedVListContinuation {
+    paginate_vlist_continuing_with_state(
+        vlist,
+        page_box,
+        layout,
+        initial_content_used,
+        FloatQueue::new(),
+    )
+}
+
+pub fn paginate_vlist_continuing_with_state(
+    vlist: &[VListItem],
+    page_box: &PageBox,
+    layout: ClassLayout,
+    initial_content_used: DimensionValue,
+    initial_float_queue: FloatQueue,
+) -> PaginatedVListContinuation {
     let content_height = page_content_height(page_box, layout);
 
     if vlist.is_empty() {
@@ -3054,7 +3229,7 @@ pub fn paginate_vlist_continuing_detailed(
     let mut page_start_height = initial_content_used;
     let mut last_page_content_used = initial_content_used;
     let mut best_break_candidate: Option<VListBreakCandidate> = None;
-    let mut float_queue = FloatQueue::new();
+    let mut float_queue = initial_float_queue;
     let mut continued_on_initial_page = false;
 
     for item in vlist {
@@ -3155,7 +3330,10 @@ pub fn paginate_vlist_continuing_detailed(
         }
 
         let item_height = vlist_item_height(item);
-        if current_page.is_empty() && !float_queue.is_empty() {
+        if current_page.is_empty()
+            && !float_queue.is_empty()
+            && current_height == DimensionValue::zero()
+        {
             place_pending_floats_in_region(
                 &mut current_page,
                 &mut current_height,
@@ -3292,12 +3470,14 @@ pub fn paginate_vlist_continuing_detailed(
         };
     }
 
-    place_pending_top_floats_before_content(
-        &mut current_page,
-        &mut current_height,
-        &mut float_queue,
-        content_height,
-    );
+    if current_height == DimensionValue::zero() {
+        place_pending_top_floats_before_content(
+            &mut current_page,
+            &mut current_height,
+            &mut float_queue,
+            content_height,
+        );
+    }
     place_pending_floats_in_region(
         &mut current_page,
         &mut current_height,
@@ -3328,6 +3508,251 @@ pub fn paginate_vlist_continuing_detailed(
         pages,
         final_content_used: last_page_content_used,
         continued_on_initial_page,
+    }
+}
+
+pub fn snapshot_paginated_vlist_state(
+    vlist: &[VListItem],
+    page_box: &PageBox,
+    layout: ClassLayout,
+    initial_content_used: DimensionValue,
+    initial_float_queue: FloatQueue,
+) -> PaginationStateSnapshot {
+    let content_height = page_content_height(page_box, layout);
+
+    if vlist.is_empty() {
+        return PaginationStateSnapshot {
+            content_used: initial_content_used,
+            completed_page_count: 0,
+            pending_floats: Vec::new(),
+            current_page: None,
+        };
+    }
+
+    let mut pages = Vec::new();
+    let mut current_page = Vec::new();
+    let mut current_height = initial_content_used;
+    let mut page_start_height = initial_content_used;
+    let mut last_page_content_used = initial_content_used;
+    let mut best_break_candidate: Option<VListBreakCandidate> = None;
+    let mut float_queue = initial_float_queue;
+    let mut continued_on_initial_page = false;
+
+    for item in vlist {
+        match item {
+            VListItem::Float { spec, content } => {
+                if spec.priority_order.first() == Some(&FloatRegion::Here)
+                    && current_height + content.height <= content_height
+                {
+                    push_placed_float(&mut current_page, FloatRegion::Here, content.clone());
+                    current_height = current_height + content.height;
+                } else {
+                    float_queue.enqueue(FloatItem {
+                        spec: spec.clone(),
+                        content: content.clone(),
+                        defer_count: 0,
+                    });
+                }
+                continue;
+            }
+            VListItem::ClearPage => {
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    float_queue.is_empty(),
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
+
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
+                best_break_candidate = None;
+                append_flushed_float_pages(
+                    &mut pages,
+                    &mut last_page_content_used,
+                    &mut float_queue,
+                    page_box,
+                    layout,
+                );
+                continue;
+            }
+            VListItem::OpenRightBreak => {
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    float_queue.is_empty(),
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
+
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
+                best_break_candidate = None;
+                append_flushed_float_pages(
+                    &mut pages,
+                    &mut last_page_content_used,
+                    &mut float_queue,
+                    page_box,
+                    layout,
+                );
+                if pages.len() % 2 == 1 {
+                    emit_current_page(
+                        &mut pages,
+                        &current_page,
+                        current_height,
+                        page_start_height,
+                        page_box,
+                        layout,
+                        true,
+                        &mut last_page_content_used,
+                        &mut continued_on_initial_page,
+                    );
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        let item_height = vlist_item_height(item);
+
+        if current_page.is_empty() && current_height == DimensionValue::zero() {
+            place_pending_top_floats_before_content(
+                &mut current_page,
+                &mut current_height,
+                &mut float_queue,
+                content_height,
+            );
+            if page_start_height == initial_content_used
+                && current_height == DimensionValue::zero()
+                && !current_page.is_empty()
+            {
+                page_start_height = current_height;
+            }
+        }
+
+        if current_height + item_height > content_height {
+            if let Some(candidate) = best_break_candidate {
+                if candidate.split_after > 0 && candidate.split_after < current_page.len() {
+                    let split_after = candidate.split_after;
+                    let overflow_items = current_page.split_off(split_after);
+                    let overflow_height = vlist_total_height(&overflow_items);
+                    current_height = current_height - overflow_height;
+                    place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    false,
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
+                if !float_queue.is_empty() {
+                    float_queue.increment_defer_counts();
+                }
+
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
+                best_break_candidate = find_best_break_candidate(&overflow_items);
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Top,
+                    content_height,
+                );
+                for overflow_item in overflow_items {
+                    current_height = current_height + vlist_item_height(&overflow_item);
+                    current_page.push(overflow_item);
+                }
+            }
+            }
+
+            if !current_page.is_empty() && current_height + item_height > content_height {
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Bottom,
+                    content_height,
+                );
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    false,
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
+                if !float_queue.is_empty() {
+                    float_queue.increment_defer_counts();
+                }
+
+                current_page.clear();
+                current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
+                best_break_candidate = None;
+                place_pending_floats_in_region(
+                    &mut current_page,
+                    &mut current_height,
+                    &mut float_queue,
+                    FloatRegion::Top,
+                    content_height,
+                );
+            }
+        }
+
+        current_page.push(item.clone());
+        current_height = current_height + item_height;
+        if let VListItem::Penalty { value } = item {
+            maybe_record_break_candidate(&mut best_break_candidate, current_page.len(), *value);
+        }
+    }
+
+    let current_page = should_emit_paginated_page(&current_page, pages.is_empty(), page_start_height, false)
+        .then(|| typeset_page_from_vlist_with_offset(&current_page, page_box, layout, page_start_height));
+
+    PaginationStateSnapshot {
+        content_used: current_height,
+        completed_page_count: pages.len(),
+        pending_floats: float_queue.pending,
+        current_page,
     }
 }
 
@@ -3995,10 +4420,11 @@ mod tests {
         strip_test_script_markers, vlist_item_height, wrap_body, wrap_hlist, CharWidthProvider,
         DocumentLayoutFragment, FloatContent, FloatItem, FloatQueue, FloatRegion, FootnoteEntry,
         GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PageBox,
-        PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TfmWidthProvider,
-        TypesetNamedDestination, TypesetOutline, TypesetPage, TypesetterReusePlan, VBox, VListItem,
-        DEFAULT_BODY_FONT_SIZE_PT, LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH,
-        PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
+        PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TextLineLink,
+        TfmWidthProvider, TypesetNamedDestination, TypesetOutline, TypesetPage,
+        TypesetterReusePlan, VBox, VListItem, DEFAULT_BODY_FONT_SIZE_PT, LEFT_MARGIN_PT,
+        LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN,
+        PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::bibliography::api::{parse_bbl, BibliographyState};
@@ -4401,6 +4827,77 @@ mod tests {
     }
 
     #[test]
+    fn paginate_vlist_continuing_with_initial_floats_places_pending_float() {
+        let layout = class_layout_for("article");
+        let page_box = page_box_for_class("article");
+        let vlist = vec![VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: "Body".to_string(),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+            source_span: None,
+        }];
+
+        let result = super::paginate_vlist_continuing_with_state(
+            &vlist,
+            &page_box,
+            layout,
+            DimensionValue::zero(),
+            FloatQueue::from_items(vec![FloatItem {
+                spec: PlacementSpec::parse(Some("t")),
+                content: sample_float_content("Queued", LINE_HEIGHT_PT),
+                defer_count: 0,
+            }]),
+        );
+
+        assert!(!result.continued_on_initial_page);
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.pages[0].float_placements.len(), 1);
+        assert_eq!(
+            result.pages[0].float_placements[0].content.lines[0].text,
+            "Queued"
+        );
+        assert_eq!(result.pages[0].lines[0].text, "Body");
+    }
+
+    #[test]
+    fn paginate_vlist_continuing_with_initial_floats_waits_for_next_page_when_page_has_content() {
+        let layout = class_layout_for("article");
+        let page_box = page_box_for_class("article");
+        let vlist = vec![VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: "Body".to_string(),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+            source_span: None,
+        }];
+
+        let result = super::paginate_vlist_continuing_with_state(
+            &vlist,
+            &page_box,
+            layout,
+            points(LINE_HEIGHT_PT),
+            FloatQueue::from_items(vec![FloatItem {
+                spec: PlacementSpec::parse(Some("t")),
+                content: sample_float_content("Queued", LINE_HEIGHT_PT),
+                defer_count: 0,
+            }]),
+        );
+
+        assert!(result.continued_on_initial_page);
+        assert_eq!(result.pages.len(), 2);
+        assert!(result.pages[0].float_placements.is_empty());
+        assert_eq!(result.pages[0].lines[0].text, "Body");
+        assert_eq!(result.pages[1].float_placements.len(), 1);
+        assert_eq!(
+            result.pages[1].float_placements[0].content.lines[0].text,
+            "Queued"
+        );
+    }
+
+    #[test]
     fn height_based_pagination_respects_content_area() {
         let mut vlist = (1..=35)
             .map(|index| VListItem::Box {
@@ -4522,6 +5019,287 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn block_checkpoint_collected_at_par_break() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let mut layout = class_layout_for("article");
+        super::adjust_layout_for_core_tests(&mut layout);
+        let document = parsed_document("Alpha\n\nBeta");
+        let nodes = vec![
+            DocumentNode::Text("Alpha".to_string(), None),
+            DocumentNode::ParBreak,
+            DocumentNode::Text("Beta".to_string(), None),
+        ];
+        let mut float_counters = super::FloatCounters::default();
+        let mut checkpoints = Vec::new();
+
+        let _ = super::document_nodes_to_vlist_with_state(
+            &document,
+            &nodes,
+            &provider,
+            None,
+            &params,
+            layout,
+            None,
+            None,
+            &mut float_counters,
+            Some(&mut checkpoints),
+        );
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_index, 2);
+        assert_eq!(checkpoints[0].source_span, None);
+        assert_eq!(checkpoints[0].vlist_position, 2);
+    }
+
+    #[test]
+    fn block_checkpoint_collected_at_heading() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let mut layout = class_layout_for("article");
+        super::adjust_layout_for_core_tests(&mut layout);
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 2,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 2,
+                column: 8,
+            },
+        };
+        let mut document = parsed_document("1 Intro");
+        document.section_entries.push(SectionEntry {
+            level: 1,
+            number: "1".to_string(),
+            title: "Intro".to_string(),
+            span: Some(span),
+        });
+        let nodes = vec![
+            DocumentNode::Text("1 Intro".to_string(), None),
+            DocumentNode::IncludeGraphics {
+                path: "figure.png".to_string(),
+                options: IncludeGraphicsOptions::default(),
+            },
+        ];
+        let mut float_counters = super::FloatCounters::default();
+        let mut checkpoints = Vec::new();
+
+        let _ = super::document_nodes_to_vlist_with_state(
+            &document,
+            &nodes,
+            &provider,
+            None,
+            &params,
+            layout,
+            None,
+            None,
+            &mut float_counters,
+            Some(&mut checkpoints),
+        );
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_index, 2);
+        assert_eq!(checkpoints[0].source_span, None);
+        assert_eq!(checkpoints[0].vlist_position, 1);
+    }
+
+    #[test]
+    fn block_checkpoint_collected_at_float() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let mut layout = class_layout_for("article");
+        super::adjust_layout_for_core_tests(&mut layout);
+        let document = parsed_document("Body");
+        let nodes = vec![DocumentNode::Float {
+            float_type: FloatType::Figure,
+            specifier: Some("h".to_string()),
+            content: vec![DocumentNode::Text("Body".to_string(), None)],
+            caption: Some("Caption".to_string()),
+            caption_span: None,
+            label: None,
+        }];
+        let mut float_counters = super::FloatCounters::default();
+        let mut checkpoints = Vec::new();
+
+        let _ = super::document_nodes_to_vlist_with_state(
+            &document,
+            &nodes,
+            &provider,
+            None,
+            &params,
+            layout,
+            None,
+            None,
+            &mut float_counters,
+            Some(&mut checkpoints),
+        );
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_index, 1);
+        assert_eq!(checkpoints[0].source_span, None);
+        assert_eq!(checkpoints[0].vlist_position, 1);
+    }
+
+    #[test]
+    fn block_checkpoint_collected_at_display_math() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let mut layout = class_layout_for("article");
+        super::adjust_layout_for_core_tests(&mut layout);
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 4,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 4,
+                column: 4,
+            },
+        };
+        let document = parsed_document("x+y");
+        let nodes = vec![DocumentNode::DisplayMath(
+            vec![
+                MathNode::Ordinary('x'),
+                MathNode::Ordinary('+'),
+                MathNode::Ordinary('y'),
+            ],
+            Some(span),
+        )];
+        let mut float_counters = super::FloatCounters::default();
+        let mut checkpoints = Vec::new();
+
+        let vlist = super::document_nodes_to_vlist_with_state(
+            &document,
+            &nodes,
+            &provider,
+            None,
+            &params,
+            layout,
+            None,
+            None,
+            &mut float_counters,
+            Some(&mut checkpoints),
+        );
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_index, 1);
+        assert_eq!(checkpoints[0].source_span, Some(span));
+        assert_eq!(checkpoints[0].vlist_position, vlist.len());
+    }
+
+    #[test]
+    fn block_checkpoint_collected_at_equation_env() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let mut layout = class_layout_for("article");
+        super::adjust_layout_for_core_tests(&mut layout);
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 6,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 8,
+                column: 13,
+            },
+        };
+        let document = parsed_document("\\begin{equation}x=y\\end{equation}");
+        let nodes = vec![DocumentNode::EquationEnv {
+            lines: vec![MathLine {
+                segments: vec![vec![
+                    MathNode::Ordinary('x'),
+                    MathNode::Ordinary('='),
+                    MathNode::Ordinary('y'),
+                ]],
+                tag: LineTag::Auto,
+                display_tag: Some("1".to_string()),
+            }],
+            numbered: true,
+            aligned: false,
+            source_span: Some(span),
+        }];
+        let mut float_counters = super::FloatCounters::default();
+        let mut checkpoints = Vec::new();
+
+        let vlist = super::document_nodes_to_vlist_with_state(
+            &document,
+            &nodes,
+            &provider,
+            None,
+            &params,
+            layout,
+            None,
+            None,
+            &mut float_counters,
+            Some(&mut checkpoints),
+        );
+
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].node_index, 1);
+        assert_eq!(checkpoints[0].source_span, Some(span));
+        assert_eq!(checkpoints[0].vlist_position, vlist.len());
+    }
+
+    #[test]
+    fn checkpoint_collector_none_is_noop() {
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let mut layout = class_layout_for("article");
+        super::adjust_layout_for_core_tests(&mut layout);
+        let document = parsed_document("Alpha\n\nBeta");
+        let nodes = vec![
+            DocumentNode::Text("Alpha".to_string(), None),
+            DocumentNode::ParBreak,
+            DocumentNode::DisplayMath(vec![MathNode::Ordinary('x')], None),
+            DocumentNode::Float {
+                float_type: FloatType::Figure,
+                specifier: Some("h".to_string()),
+                content: vec![DocumentNode::Text("Body".to_string(), None)],
+                caption: None,
+                caption_span: None,
+                label: None,
+            },
+        ];
+        let mut float_counters_without = super::FloatCounters::default();
+        let without_collector = super::document_nodes_to_vlist_with_state(
+            &document,
+            &nodes,
+            &provider,
+            None,
+            &params,
+            layout,
+            None,
+            None,
+            &mut float_counters_without,
+            None,
+        );
+        let mut float_counters_with = super::FloatCounters::default();
+        let mut checkpoints = Vec::new();
+        let with_collector = super::document_nodes_to_vlist_with_state(
+            &document,
+            &nodes,
+            &provider,
+            None,
+            &params,
+            layout,
+            None,
+            None,
+            &mut float_counters_with,
+            Some(&mut checkpoints),
+        );
+
+        assert_eq!(with_collector, without_collector);
+        assert!(!checkpoints.is_empty());
     }
 
     #[test]
@@ -4808,6 +5586,75 @@ mod tests {
                 force: false,
             }
         );
+    }
+
+    #[test]
+    fn placement_spec_serializes_roundtrip() {
+        let spec = PlacementSpec::parse(Some("ht!"));
+
+        let serialized = serde_json::to_string(&spec).expect("serialize placement spec");
+        let restored: PlacementSpec =
+            serde_json::from_str(&serialized).expect("deserialize placement spec");
+
+        assert_eq!(restored, spec);
+    }
+
+    #[test]
+    fn footnote_entry_serializes_roundtrip() {
+        let footnote = FootnoteEntry {
+            text: "Serialized footnote".to_string(),
+            source_span: Some(SourceSpan {
+                start: SourceLocation {
+                    file_id: 1,
+                    line: 10,
+                    column: 2,
+                },
+                end: SourceLocation {
+                    file_id: 1,
+                    line: 10,
+                    column: 21,
+                },
+            }),
+        };
+
+        let serialized = serde_json::to_string(&footnote).expect("serialize footnote entry");
+        let restored: FootnoteEntry =
+            serde_json::from_str(&serialized).expect("deserialize footnote entry");
+
+        assert_eq!(restored, footnote);
+    }
+
+    #[test]
+    fn vlist_item_serializes_roundtrip() {
+        let item = VListItem::Box {
+            tex_box: TeXBox::new(points(12), points(18), points(3)),
+            content: "serialized vlist item".to_string(),
+            links: vec![TextLineLink {
+                url: "https://example.test".to_string(),
+                start_char: 0,
+                end_char: 10,
+            }],
+            font_index: 2,
+            font_size: points(11),
+            source_span: Some(SourceSpan {
+                start: SourceLocation {
+                    file_id: 3,
+                    line: 4,
+                    column: 1,
+                },
+                end: SourceLocation {
+                    file_id: 3,
+                    line: 4,
+                    column: 22,
+                },
+            }),
+        };
+
+        let serialized = serde_json::to_string(&item).expect("serialize vlist item");
+        let restored: VListItem =
+            serde_json::from_str(&serialized).expect("deserialize vlist item");
+
+        assert_eq!(restored, item);
     }
 
     #[test]
@@ -5721,6 +6568,39 @@ mod tests {
                 ("First footnote".to_string(), points(169)),
                 ("2".to_string(), points(162)),
                 ("Second footnote".to_string(), points(159)),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_footnotes_to_pages_starting_at_offsets_positions_from_initial_index() {
+        let mut pages = vec![TypesetPage {
+            lines: Vec::new(),
+            images: Vec::new(),
+            page_box: page_box_for_class("article"),
+            float_placements: Vec::new(),
+            index_entries: Vec::new(),
+        }];
+
+        super::append_footnotes_to_pages_starting_at(
+            &mut pages,
+            &[FootnoteEntry {
+                text: "Third footnote".to_string(),
+                source_span: None,
+            }],
+            class_layout_for("article"),
+            2,
+        );
+
+        assert_eq!(
+            pages[0]
+                .lines
+                .iter()
+                .map(|line| (line.text.clone(), line.y))
+                .collect::<Vec<_>>(),
+            vec![
+                ("3".to_string(), points(152)),
+                ("Third footnote".to_string(), points(149)),
             ]
         );
     }

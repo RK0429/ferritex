@@ -8,10 +8,15 @@ use crate::compilation::{
     PartitionLocator, SectionOutlineEntry,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RecompilationScope {
     FullDocument,
     LocalRegion,
+    BlockLevel {
+        affected_partitions: Vec<String>,
+        references_affected: bool,
+        pagination_affected: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +161,7 @@ mod tests {
 
     use crate::compilation::SectionOutlineEntry;
 
-    use super::{DependencyGraph, DocumentPartitionPlanner, PartitionKind};
+    use super::{DependencyGraph, DocumentPartitionPlanner, PartitionKind, RecompilationScope};
 
     #[test]
     fn affected_paths_include_transitive_parents() {
@@ -175,6 +180,28 @@ mod tests {
             affected.into_iter().collect::<Vec<_>>(),
             vec![chapter, root, section]
         );
+    }
+
+    #[test]
+    fn recompilation_scope_block_level_carries_partition_metadata() {
+        let scope = RecompilationScope::BlockLevel {
+            affected_partitions: vec!["chapter:0001:intro".to_string()],
+            references_affected: true,
+            pagination_affected: false,
+        };
+
+        match scope {
+            RecompilationScope::BlockLevel {
+                affected_partitions,
+                references_affected,
+                pagination_affected,
+            } => {
+                assert_eq!(affected_partitions, vec!["chapter:0001:intro".to_string()]);
+                assert!(references_affected);
+                assert!(!pagination_affected);
+            }
+            other => panic!("expected BlockLevel scope, got {other:?}"),
+        }
     }
 
     #[test]

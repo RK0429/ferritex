@@ -8,14 +8,14 @@
 |---|---|---|
 | CLI / Runtime Options | 実用 | compile/watch/preview/lsp の 4 サブコマンド。`--jobs` / `--asset-bundle` / `--reproducible` / `--synctex` / `--trace-font-tasks` 等の共通 runtime option 正規化 |
 | Parser / Macro | 中〜高 | `\def` / `\gdef` / `\edef`、`\expandafter`、`\noexpand`、`\csname`、`\newcommand`、`\newenvironment`、`\begingroup` / `\endgroup`、`\if` / `\ifx` / `\ifcat` / `\ifnum` / `\ifdim` / `\ifcase`、`\numexpr` / `\dimexpr`、32768 register family、recoverable parse diagnostics |
-| File Input / Package Loading | 中 | `\input` / `\include` / `\InputIfFileExists`、current-file/project/overlay/bundle fallback、`.sty` 読み込み、`\RequirePackage` 再帰、class/package registry |
+| File Input / Package Loading | 中〜高 | `\input` / `\include` / `\InputIfFileExists`、current-file/project/overlay/bundle fallback、`.sty` 読み込み、`\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption` / `\DeclareOption*` / `\ProcessOptions*`、`\RequirePackage` 再帰、`\@ifpackageloaded`、duplicate-load guard、class/package registry |
 | Typesetting | 中〜高 | Knuth-Plass line breaking、hyphenation、hbox/vbox、page breaking、float queue、inline/display math、equation/align 系、TOC/LOF/LOT/index の multi-pass 解決。`TypesetterReusePlan` によるパーティション単位の rebuild/reuse 判定と `PaginationMergeCoordinator` によるフラグメント merge 済み |
 | PDF / Graphics | 中 | PDF 1.4 出力、TrueType subset embedding + ToUnicode、hyperref link annotation / named destination / metadata、PNG/JPEG `\includegraphics` 埋め込み、outline-derived document partition planning、deterministic parallel page-render commit。math superscript/subscript の script positioning 修正済み（`contains_script_markers` で全 6 マーカーを検出）。TikZ: xcolor 標準 19 色、cm/pt/mm/in/ex/em 6 単位、circle/ellipse/arc path（位置引数 / key-value 構文対応）、`\draw`/`\fill`/`\filldraw`/`\path` command、7 種 line width preset、8 種 dash pattern、line cap（butt/round/rect）/ line join（miter/round/bevel）、stroke/fill opacity（ExtGState ベース） |
 | Font | 中 | TFM / OpenType 読み込み、fontspec named-font resolution、project/overlay/bundle/host catalog fallback、asset index 経由の bundle font / TFM 解決、`--reproducible` で host fallback 無効化 |
-| Incremental / Cache | 中 | `DependencyGraph` による依存グラフ構築・reverse-propagation・`affected_paths` 算出。persistent cache metadata（v4）による warm compile 再利用、cache metadata / cached PDF 破損時の full compile fallback。`CachedSourceSubtree` / `CachedTypesetFragment` によるサブツリー・フラグメント単位のキャッシュ再利用。`RecompilationScope` (FullDocument / LocalRegion) 判定。`TypesetterReusePlan` が変更パーティションのみ再 typeset し、未変更パーティションはキャッシュ済みフラグメントを再利用する部分再コンパイルパスが動作。**Step 0 計装完了**: `StageTiming` により cache_load / source_tree_load / parse / typeset / pdf_render / cache_store の 6 stage を個別計測可能（parse と typeset は分離計測）。**Step 1 Slice 1 完了**: watcher/scheduler の `changed_paths` hint を `CompileJobService` 経由で `CompileCache::lookup(changed_paths_hint)` へ伝播し、canonical path hint がある場合は依存グラフ全走査を避ける fast path が動作 |
+| Incremental / Cache | 中 | `DependencyGraph` による依存グラフ構築・reverse-propagation・`affected_paths` 算出。persistent cache metadata（v4）による warm compile 再利用、cache metadata / cached PDF 破損時の full compile fallback。`CachedSourceSubtree` / `CachedTypesetFragment` によるサブツリー・フラグメント単位のキャッシュ再利用。`RecompilationScope` (FullDocument / LocalRegion / BlockLevel) 判定。`TypesetterReusePlan` が変更パーティションのみ再 typeset し、未変更パーティションはキャッシュ済みフラグメントを再利用する部分再コンパイルパスに加え、block checkpoint による変更 block 以降の suffix rebuild パスが動作。**Step 0 計装完了**: `StageTiming` により cache_load / source_tree_load / parse / typeset / pdf_render / cache_store の 6 stage を個別計測可能（parse と typeset は分離計測）。**Step 1 完了**: watcher/scheduler の `changed_paths` hint を `CompileJobService` 経由で `CompileCache::lookup(changed_paths_hint)` へ伝播し、`CompileCache` を v5 split cache 形式（`{cache_key}/index.json` + `partitions/*.json`）へ移行。v4 fallback 互換、partition 個別破損の graceful degrade、directory-based eviction を実装済み。**Step 2 完了**: partition 内 block 粒度 checkpoint と suffix rebuild パスを導入。変更 block 以降のみを再 typeset する。横断参照収束パスでは block reuse を無効化。fallback 条件を網羅的に実装 |
 | Bibliography | 中 | `.bbl` 読み込み、citation 解決、stale `.bbl` warning、reference list 組版 |
 | Preview | 中〜高 | `PreviewSessionService` による session lifecycle 管理（create / invalidate / advance revision / check publish）。loopback transport で PDF publish / revision events / view state sync。session reuse・page fallback・active-job-only ポリシー |
-| Watch | 中 | `PollingFileWatcher` による依存パス監視・`replace_paths` での再同期。`RecompileScheduler` による変更 coalesce と排他制御。`WorkspaceJobScheduler` によるワークスペース単位の直列化 |
+| Watch | 中 | `FileWatcher` trait による監視 backend 抽象化、`PollingFileWatcher` による依存パス監視・`replace_paths` での再同期。path canonicalize 内包と debounce を実装済みで、`RecompileScheduler` による変更 coalesce / 排他制御、および inotify/kqueue backend 追加の受け皿が整っている。`WorkspaceJobScheduler` によるワークスペース単位の直列化 |
 | LSP | 中 | `LspCapabilityService` が diagnostics / completion / definition / hover / codeAction を提供。`LiveAnalysisSnapshot` が `StableCompileState` を基に最新の compile 結果を LSP に公開 |
 | SyncTeX | 中 | `SyncTexData::build_line_based` による行ベース trace（column-precise fragment 分割・multi-file 対応）。`SyncTexData::build_from_placed_nodes` による `PlacedTextNode.sourceSpan` ベースのフラグメント精度 trace。forward / inverse search 両方向とも実装・テスト済み |
 | Parallel Pipeline | 中 | `CommitBarrier` が 4 ステージ（MacroSession / DocumentReference / LayoutMerge / ArtifactCache）すべてをカバー。`AuthorityKey` 衝突検出と fallback。`DocumentPartitionPlanner` が document class と section outline から chapter / section 単位の stable `partitionId` を生成。partition-book / partition-article コーパスで `--jobs=1` と `--jobs=4` の出力等価性が確認済み |
@@ -40,17 +40,17 @@
 
 | ID | 要件領域 | 深刻度 | 現状と残差分 |
 |---|---|---|---|
-| A | Incremental compilation (REQ-FUNC-027-030) | 低 | 依存グラフ・persistent cache・corruption fallback・reverse propagation・subtree cache 再利用・TypesetterReusePlan による部分再 typeset まで実装済み。**Wave 1 完了**: `full_bench_warm_incremental_evidence` で 1.84× speedup を point-in-time 計測（full --no-cache 28.614s vs incremental 15.550s、`FTX-BENCH-001` 1000-section staged input）。`incremental_xref_convergence_after_page_shift` でページ番号ずれ後の TOC/相互参照収束を byte-identical で確認。**Wave 1 残差分なし**。`REQ-NF-002` Step 0（stage timing 計装）完了: `StageTiming` で 6 stage を個別計測可能。**Step 1 Slice 1 完了**: watcher/scheduler から `changed_paths` fast path を `CompileJobService` / `CompileCache` まで接続し、依存検出の caller hint 伝播を導入。Step 1 の残差分は cache split（`index.json` + per-partition blob）と inotify/kqueue 連携。Step 2/3/4 は block checkpoint reuse / per-page payload reuse / incremental parse |
+| A | Incremental compilation (REQ-FUNC-027-030) | 低 | 依存グラフ・persistent cache・corruption fallback・reverse propagation・subtree cache 再利用・TypesetterReusePlan による部分再 typeset まで実装済み。**Wave 1 完了**: `full_bench_warm_incremental_evidence` で 1.84× speedup を point-in-time 計測（full --no-cache 28.614s vs incremental 15.550s、`FTX-BENCH-001` 1000-section staged input）。`incremental_xref_convergence_after_page_shift` でページ番号ずれ後の TOC/相互参照収束を byte-identical で確認。**Wave 1 残差分なし**。`REQ-NF-002` Step 0（stage timing 計装）完了: `StageTiming` で 6 stage を個別計測可能。**Step 1 完了**: watcher/scheduler から `changed_paths` fast path を `CompileJobService` / `CompileCache` まで接続し、`CompileCache` を v5 split cache 形式（`{cache_key}/index.json` + `partitions/*.json`）へ移行。v4 fallback 互換、partition 個別破損の graceful degrade、directory-based eviction、および `FileWatcher` trait + `PollingFileWatcher` canonicalize/debounce による watcher backend 抽象化まで完了。**Step 2 完了**: partition 内 block 粒度 checkpoint と suffix rebuild を導入し、変更 block 以降のみ再 typeset する。横断参照収束パスでは block reuse を無効化。残差分は Step 3/4（per-page payload reuse / incremental parse）のみ |
 | B | Parallel pipeline (REQ-FUNC-031-033) | 低 | CommitBarrier 4 ステージ・AuthorityKey 衝突検出・DocumentPartitionPlanner・PaginationMergeCoordinator・partition bench corpus まで実装済み。full-compile determinism 修正では HashMap→BTreeMap、named_destinations first-wins、page-lines y-sort normalization に加え、section-level パーティション向けの pipelined VList build + sequential pagination を適用して、article の連続フローを崩さずに strict proof 条件を維持する。**Wave 2 完了**: `partition_bench_multisecond_speedup_evidence` で book/article 両 heavy corpus について output identity = true かつ speedup > 1.0 を検証済み。残差分なし |
-| C | Long-tail compatibility (Wave 4) | 中 | **Wave 4 bounded TikZ 改善完了**: xcolor 標準 19 色（+14）、mm/in/ex/em 単位（+4、計 6）、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity（ExtGState）、key-value arc 構文を追加。parity 全件 pass、TikZ 関連テスト 42+ 件 pass。**スコープ外として残るもの**: `\foreach` ループ、package compatibility 拡張。long-tail の残 frontier は loop/package 系に縮小した |
+| C | Long-tail compatibility (Wave 4) | 中 | **Wave 4 bounded TikZ 改善 + package compatibility MVP 完了**: xcolor 標準 19 色（+14）、mm/in/ex/em 単位（+4、計 6）、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity（ExtGState）、key-value arc 構文に加え、`\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption`、`\DeclareOption*`、`\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard、および compat primitives（`\unless`、`\pdfmdfivesum`、`\pdfescapestring`、`\pdfescapehex`、`\pdfpagewidth`、`\pdfcreationdate`）を実装。parity / compile test pass。long-tail の残 frontier は `multicol` に縮小した |
 
 ## 2. 到達点の評価
 
 Must 要件の大部分は動作しており、高難度領域（incremental / parallel / SyncTeX / asset bundle）もそれぞれ実装の核心部分を通過している。parity evidence 計測インフラ（layout-core / navigation / bibliography / embedded-assets / tikz の 5 カテゴリ）がテストに接続済みで、全カテゴリ pass が確認されている。`math_equations` regression も修正済み（0.286 → 0.000）。Wave 3 では deterministic bundle archive 生成、artifact upload/download、archive-based smoke proof が CI に接続され、`REQ-FUNC-046` の配布面の残差分は解消された。
 
-Wave 1（Incremental Performance Evidence）が完了し、warm incremental compile の機構が動作することを point-in-time 計測で確認した（1.84× speedup、`FTX-BENCH-001` 1000-section staged input）。Cross-reference 収束の byte-identical 検証も確立された。Wave 2（Partition Parallel Speedup Evidence）が完了し、book/article 両 heavy corpus で output identity = true かつ speedup > 1.0 の strict proof が確立された。Wave 3 も完了し、`FTX-ASSET-BUNDLE-001` の deterministic archive 生成と CI 上の archive-based smoke proof が定着した。`REQ-NF-002` は Step 0（stage timing 計装）に続き、**Step 1 Slice 1** として watcher/scheduler の `changed_paths` fast path を `CompileJobService` / `CompileCache` まで伝播する固定費削減が完了した。Wave 4 bounded TikZ 改善も完了し、TikZ の bounded long-tail は named colors / 6 単位 / ellipse / `\path` / dash patterns / line cap/join / opacity / key-value arc まで閉じられ、残差分は `\foreach` ループと package compatibility に縮小した。ただし Wave 1 は incremental mechanism の初期実証であり、`REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成を意味するものではない。残差分は「`REQ-NF-002` Step 1 残差分（cache split / inotify-kqueue）・Step 2/3/4（block checkpoint reuse / per-page payload reuse / incremental parse）と Wave 4 残 long-tail 互換性」に整理される。
+Wave 1（Incremental Performance Evidence）が完了し、warm incremental compile の機構が動作することを point-in-time 計測で確認した（1.84× speedup、`FTX-BENCH-001` 1000-section staged input）。Cross-reference 収束の byte-identical 検証も確立された。Wave 2（Partition Parallel Speedup Evidence）が完了し、book/article 両 heavy corpus で output identity = true かつ speedup > 1.0 の strict proof が確立された。Wave 3 も完了し、`FTX-ASSET-BUNDLE-001` の deterministic archive 生成と CI 上の archive-based smoke proof が定着した。`REQ-NF-002` は Step 0（stage timing 計装）に続き、**Step 1: Fixed-cost 削減** と **Step 2: Block checkpoint reuse** が完了した。watcher/scheduler の `changed_paths` fast path 伝播、v5 split cache（`{cache_key}/index.json` + `partitions/*.json`）、`FileWatcher` trait 導入と `PollingFileWatcher` の canonicalize / debounce 改善に加え、partition 内 block 粒度 checkpoint と変更 block 以降の suffix rebuild パスが入り、横断参照収束パスでは block reuse を無効化している。Wave 4 では bounded TikZ 改善に加えて package compatibility MVP も完了し、`\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption`、`\DeclareOption*`、`\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard、および compat primitives（`\unless`、`\pdfmdfivesum`、`\pdfescapestring`、`\pdfescapehex`、`\pdfpagewidth`、`\pdfcreationdate`）まで閉じられた。残差分は `multicol` のみである。ただし Wave 1 は incremental mechanism の初期実証であり、`REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成を意味するものではない。残差分は「`REQ-NF-002` Step 3/4（per-page payload reuse / incremental parse）と Wave 4 残 long-tail 互換性」に整理される。
 
-現在の到達点は「incremental compile 機構の初期実証、parallel pipeline の strict proof 確立、bundle archive 配布 CI 接続、parity 計測基盤が揃った working product」であり、REQ-NF-007 の parity 5 カテゴリ全 pass、REQ-FUNC-030 の収束要件、REQ-FUNC-032 の strict proof、REQ-FUNC-046 の bundle archive smoke proof が確認されている段階にある。加えて、`REQ-NF-002` は Step 0（stage timing 計装）に続いて Step 1 Slice 1（watcher/scheduler から cache lookup までの `changed_paths` fast path 伝播）が完了し、fixed-cost 削減の最初の slice が入った。Wave 4 では bounded TikZ long-tail 改善（named colors / 6 単位 / ellipse / `\path` / dash patterns / line cap/join / opacity / key-value arc）が完了し、TikZ parity が前進した。残る Frontier は `REQ-NF-002` Step 1 残差分（cache split / inotify-kqueue）と Step 2/3/4（block checkpoint reuse / per-page payload reuse / incremental parse）、および Wave 4 の残 long-tail 互換性（`\foreach` / package compatibility）である。
+現在の到達点は「incremental compile 機構の初期実証、parallel pipeline の strict proof 確立、bundle archive 配布 CI 接続、parity 計測基盤が揃った working product」であり、REQ-NF-007 の parity 5 カテゴリ全 pass、REQ-FUNC-030 の収束要件、REQ-FUNC-032 の strict proof、REQ-FUNC-046 の bundle archive smoke proof が確認されている段階にある。加えて、`REQ-NF-002` は Step 0（stage timing 計装）、Step 1（watcher/scheduler から cache lookup までの `changed_paths` fast path 伝播、v5 split cache、watcher backend 抽象化）、Step 2（partition 内 block 粒度 checkpoint と suffix rebuild）の 3 段階が完了し、typeset 側の再利用粒度が前進した。Wave 4 では bounded TikZ long-tail 改善に加えて package compatibility MVP も完了し、TikZ / package 周辺 parity が前進した。残る Frontier は Step 3/4（per-page payload reuse / incremental parse）と Wave 4 の残 long-tail 互換性（`multicol`）である。
 
 ## 3. 残 Frontier と推奨 Wave
 
@@ -66,7 +66,9 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 | Wave 3: Bundle Distribution CI 接続 (REQ-FUNC-046) | deterministic archive 生成 + artifact upload/download + archive-based smoke proof | **完了** — `scripts/build_bundle_archive.sh` が `FTX-ASSET-BUNDLE-001.tar.gz` を再現可能に生成し、`bundle-ci.yml` が download した archive を `bundle_archive_smoke_proof` に渡して layout-core 4 クラスの `--reproducible` compile を検証 |
 | REQ-NF-002 Step 0: Pipeline 計装 | `CompileJobService` に 6 stage の timing 計装を追加 | **完了** — `StageTiming` で cache_load / source_tree_load / parse / typeset / pdf_render / cache_store を個別計測。parse/typeset 分離計測。unit test 3 件 + CLI smoke 1 件 pass |
 | REQ-NF-002 Step 1 Slice 1: changed_paths fast path | watcher/scheduler から `CompileCache` まで change hint を伝播 | **完了** — `CompileCache::lookup(changed_paths_hint)` / `CompileJobService::compile_with_changed_paths()` / watch runner plumbing を接続。unit test 3 件追加（`fast_path_detects_change_for_hinted_path`, `fast_path_with_empty_hint_falls_back_to_full_scan`, `fast_path_ignores_hint_paths_not_in_dependency_graph`） |
-| Wave 4 bounded: TikZ long-tail 改善 | bounded な TikZ 幾何パターンの拡張 | **完了** — xcolor 標準 19 色（+14）、mm/in/ex/em 単位（+4、計 6）、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity（ExtGState）、key-value arc 構文を追加。TikZ 関連テスト 42+ 件 pass。bounded scope の残なし。残 frontier は `\foreach` / package compatibility |
+| REQ-NF-002 Step 1: Fixed-cost 削減 | changed_paths fast path・v5 split cache・watcher abstraction upgrade | **完了** — `CompileCache` を v5 split cache 形式（`{cache_key}/index.json` + `partitions/*.json`）へ移行し、v4 fallback 互換、partition 個別破損の graceful degrade、directory-based eviction を実装。`FileWatcher` trait と `PollingFileWatcher` の canonicalize / debounce により inotify/kqueue backend 追加準備も完了 |
+| REQ-NF-002 Step 2: Block checkpoint reuse | partition 内 block 粒度 checkpoint による suffix rebuild | **完了** — RecompilationScope::BlockLevel、BlockCheckpointData、suffix rebuild パス、fallback 条件、e2e parity test 実装済み。設計文書: [design-step2-block-checkpoint-reuse.md](design-step2-block-checkpoint-reuse.md) |
+| Wave 4 bounded: TikZ + package compatibility MVP | bounded な long-tail 互換性の拡張 | **完了** — TikZ 側は xcolor 標準 19 色（+14）、mm/in/ex/em 単位（+4、計 6）、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity（ExtGState）、key-value arc 構文、`\foreach` ループ（simple list / numeric range / step inference / nested）を追加。package 側は `\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption` / `\DeclareOption*` / `\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard、compat primitives（`\unless`、`\pdfmdfivesum`、`\pdfescapestring`、`\pdfescapehex`、`\pdfpagewidth`、`\pdfcreationdate`）を実装。残 frontier は `multicol` |
 
 ### Wave 1: Incremental Performance Evidence (REQ-FUNC-030) — 完了
 
@@ -100,27 +102,45 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 - **既知の制約**: 初回 typeset callback で font selection 時間が `typeset` に含まれる（Step 0 として許容。Step 1 以降で分離が望ましい）
 - **設計文書**: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)
 
-### REQ-NF-002 Step 1 Slice 1: changed_paths fast path — 完了
+### REQ-NF-002 Step 1: Fixed-cost 削減 — 完了
 
 | # | タスク | 結果 |
 |---|---|---|
 | 1 | watcher/scheduler の `changed_paths` を cache lookup まで伝播 | `CompileCache::lookup(changed_paths_hint)`、`CompileJobService::compile_with_changed_paths()`、watch runner plumbing を接続し、scheduler が既に知っている変更ファイルを `CompileCache::detect_changes()` に渡す fast path を導入 |
+| 2 | compile cache を split 形式へ移行 | `CompileCache` を v5 split cache 形式（`{cache_key}/index.json` + `partitions/*.json`）へ移行し、v4 fallback 互換、partition 個別破損の graceful degrade、directory-based eviction を実装 |
+| 3 | watcher backend を trait 抽象化 | `FileWatcher` trait を導入し、`PollingFileWatcher` に path canonicalize 内包と debounce を実装。inotify/kqueue backend が同じ trait を実装できる構造へ整理 |
 
-- **完了内容**: `changed_paths` fast path を watcher/scheduler から `CompileJobService` を経由して `CompileCache` まで伝播
-- **テスト**: unit test 3 件追加済み（`fast_path_detects_change_for_hinted_path`、`fast_path_with_empty_hint_falls_back_to_full_scan`、`fast_path_ignores_hint_paths_not_in_dependency_graph`）
-- **Step 1 の残差分**: cache split（`index.json` + per-partition blob）、inotify/kqueue 連携
-- **Step 2/3/4 の残差分**: block checkpoint reuse、per-page payload reuse、incremental parse
+- **完了内容**: `changed_paths` fast path を watcher/scheduler から `CompileJobService` を経由して `CompileCache` まで伝播し、`CompileCache` の v5 split cache 化と watcher backend 抽象化まで完了
+- **テスト**: `fast_path_detects_change_for_hinted_path`、`fast_path_with_empty_hint_falls_back_to_full_scan`、`fast_path_ignores_hint_paths_not_in_dependency_graph`、`lookup_reads_legacy_v4_cache_record_as_fallback`、`corrupted_partition_blob_only_drops_that_partition`、`evicts_oldest_owned_cache_records_and_keeps_newer_entries`、`eviction_continues_after_individual_delete_failure`、`suppresses_repeated_changes_within_debounce_window`、`supports_trait_objects_for_polling`、`normalizes_symlink_paths_to_canonical_targets`
+- **Step 1 の残差分**: なし
+- **Step 3/4 の残差分**: per-page payload reuse、incremental parse
 - **設計文書**: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)
+
+### REQ-NF-002 Step 2: Block checkpoint reuse — 完了
+
+| # | タスク | 結果 |
+|---|---|---|
+| 1 | `RecompilationScope::BlockLevel` 拡張 | `FullDocument \| LocalRegion` の 2 値 enum を `BlockLevel { affected_partitions, references_affected, pagination_affected }` で拡張。`Copy` を削除し `Clone` に統一 |
+| 2 | Block checkpoint データ構造 | `BlockCheckpoint`, `BlockLayoutState`, `PendingFloat`, `BlockCheckpointData` を `compile_cache.rs` に追加。`CachedTypesetFragment` に `block_checkpoints: Option<BlockCheckpointData>` を `#[serde(default)]` 付きで追加（Step 1 cache 後方互換維持） |
+| 3 | Checkpoint 生成パス | `document_nodes_to_vlist_with_state()` に `checkpoint_collector` パラメータを追加。ParBreak / Heading / Float / DisplayMath / EquationEnv / IncludeGraphics の block 境界で `RawBlockCheckpoint` を収集 |
+| 4 | Suffix rebuild パス | `find_affected_block_index()` で変更 block を特定、`suffix_rebuild()` で prefix pages を cache から切り出し suffix のみ rebuild。`paginate_vlist_continuing_with_state()` で初期 float queue を外部注入 |
+| 5 | Fallback 条件 | preamble 変更 / pageref / typeset_callback_count > 1 / checkpoint なし / block 構造変化 / affected_block_index == 0 / ページ数変化 / float・footnote 不整合 で partition または full document fallback |
+| 6 | テスト | `block_checkpoint_single_paragraph_edit_parity`, `block_checkpoint_heading_addition_fallback`, suffix rebuild with footnotes/floats, find_affected_block unit tests 等 20+ 件追加 |
+
+- **完了内容**: partition 内 block 粒度の checkpoint 生成と、変更 block 以降の suffix rebuild パスを導入。横断参照収束パスでは block reuse を無効化するガードを実装
+- **Step 2 の残差分**: なし
+- **Step 3/4 の残差分**: per-page payload reuse、incremental parse
+- **設計文書**: [design-step2-block-checkpoint-reuse.md](design-step2-block-checkpoint-reuse.md)、[design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)
 
 ### Wave 4: Long-tail 互換性改善（部分完了）
 
 | # | タスク | 状態 | 結果 |
 |---|---|---|---|
-| 7 | TikZ long-tail parity 改善 | **完了** | xcolor 標準 19 色（+14）、mm/in/ex/em 単位（+4、計 6）、ellipse path（Bézier 近似）、`\path` command、dash patterns 8 種、line cap/join、opacity（ExtGState）、key-value arc 構文を追加。TikZ 関連テスト 42+ 件 pass |
-| 8 | package compatibility 拡張 | 未着手 | — |
+| 7 | TikZ long-tail parity 改善 | **完了** | xcolor 標準 19 色（+14）、mm/in/ex/em 単位（+4、計 6）、ellipse path（Bézier 近似）、`\path` command、dash patterns 8 種、line cap/join、opacity（ExtGState）、key-value arc 構文、`\foreach` ループ（simple list / numeric range / step inference / nested）を追加。TikZ 関連テスト 42+ 件 pass |
+| 8 | package compatibility MVP | **完了** | `\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption`、`\DeclareOption*`、`\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard、compat primitives（`\unless`、`\pdfmdfivesum`、`\pdfescapestring`、`\pdfescapehex`、`\pdfpagewidth`、`\pdfcreationdate`）を実装。bundle package/compat fixture compile test 追加済み |
 
-- **閉じた gap**: named colors（5→19、xcolor 標準準拠）、length units（2→6、mm/in/ex/em 追加）、ellipse path operation、`\path` command routing、dash patterns 8 種、line cap/join、opacity（stroke/fill、ExtGState）、key-value arc 構文
-- **スコープ外**: `\foreach` ループ、package compatibility 拡張
+- **閉じた gap**: named colors（5→19、xcolor 標準準拠）、length units（2→6、mm/in/ex/em 追加）、ellipse path operation、`\path` command routing、dash patterns 8 種、line cap/join、opacity（stroke/fill、ExtGState）、key-value arc 構文、`\foreach` ループ（simple list / numeric range with `...` / step inference / nested / depth limit）、package loading/interpreter surface（`\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption` / `\DeclareOption*` / `\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard）、compat primitives（`\unless`、`\pdfmdfivesum`、`\pdfescapestring`、`\pdfescapehex`、`\pdfpagewidth`、`\pdfcreationdate`）
+- **スコープ外**: `multicol`
 
 ## 4. 実行戦略
 
@@ -128,9 +148,11 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 - **Wave 2 完了**。pipelined VList build + sequential pagination を section-level path に適用し、book/article 両 heavy corpus で output identity と speedup > 1.0 の strict proof を確立
 - **Wave 3 完了**。bundle archive 生成、artifact upload/download、archive-based smoke proof まで CI に接続された
 - **REQ-NF-002 Step 0 完了**。`StageTiming` により 6 stage の個別計測が可能になり、Step 1 以降の最適化優先順位を定量的に判断できる状態になった
-- **REQ-NF-002 Step 1 Slice 1 完了**。watcher/scheduler 由来の canonical `changed_paths` を `CompileJobService` / `CompileCache` へ伝播し、依存検出の fixed-cost を O(changed files) 側へ寄せる最初の slice を実装した
-- **Wave 4 bounded TikZ 完了**。xcolor 標準 19 色、mm/in/ex/em 6 単位、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity、key-value arc を追加。parity 全件 pass
-- **残 Frontier**: `REQ-NF-002` Step 1 残差分（cache split / inotify-kqueue）、Step 2/3/4（block checkpoint reuse / per-page payload reuse / incremental parse、設計文書: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)）と Wave 4 残 long-tail（`\foreach` / package compatibility）
+- **REQ-NF-002 Step 1 完了**。watcher/scheduler 由来の canonical `changed_paths` を `CompileJobService` / `CompileCache` へ伝播し、`CompileCache` の v5 split cache 化、`FileWatcher` trait 導入、`PollingFileWatcher` の canonicalize / debounce まで実装した
+- **REQ-NF-002 Step 2: Block checkpoint reuse 完了**。`RecompilationScope::BlockLevel`、`BlockCheckpointData`、checkpoint 生成、suffix rebuild、fallback 条件、e2e parity test まで実装し、変更 block 以降のみ再 typeset できるようになった
+- **Wave 4 bounded TikZ + package compatibility MVP 完了**。xcolor 標準 19 色、mm/in/ex/em 6 単位、ellipse path、`\path` command、dash patterns 8 種、line cap/join、opacity、key-value arcに加え、package surface（`\NeedsTeXFormat`、`\ProvidesPackage`、`\makeatletter` / `\makeatother`、`\@namedef`、`\@ifundefined`、`\newif`、`\DeclareOption` / `\DeclareOption*` / `\ProcessOptions*`、`\RequirePackage`、`\@ifpackageloaded`、duplicate-load guard）と compat primitives（`\unless`、`\pdfmdfivesum`、`\pdfescapestring`、`\pdfescapehex`、`\pdfpagewidth`、`\pdfcreationdate`）を追加。parity / compile test pass
+- **残 Frontier**: `REQ-NF-002` Step 3/4（per-page payload reuse / incremental parse、設計文書: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)）と Wave 4 残 long-tail（`multicol`）
+- **直近の推奨**: `REQ-NF-002` Step 3（per-page payload reuse）に進み、Step 2 で縮小した typeset 範囲に対応する render 側 reuse を閉じる
 
 ```mermaid
 graph LR
@@ -139,22 +161,25 @@ graph LR
     W3 --> S0[Step 0: Pipeline 計装 ✓]
     S0 --> S1A[Step 1 Slice 1: changed_paths ✓]
     W3 --> W4[Wave 4: TikZ bounded ✓]
-    S1A --> S1R[Step 1 残差分: cache split / inotify]
-    S1R --> S234[Step 2-4: typeset / render / parse]
-    W4 --> W4R[Wave 4: foreach / package compat]
+    S1A --> S1R[Step 1 完了: cache split / watcher ✓]
+    S1R --> S2[Step 2: Block checkpoint ✓]
+    S2 --> S34[Step 3-4: render / parse]
+    W4 --> W4R[Wave 4: multicol]
     style W1 fill:#9f9,stroke:#333
     style W2 fill:#9f9,stroke:#333
     style W3 fill:#9f9,stroke:#333
     style S0 fill:#9f9,stroke:#333
     style S1A fill:#9f9,stroke:#333
+    style S1R fill:#9f9,stroke:#333
+    style S2 fill:#9f9,stroke:#333
     style W4 fill:#9f9,stroke:#333
 ```
 
 ## 5. 妥当性判定
 
-- **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・bundle archive CI 接続完了・Step 0 計装完了・Step 1 Slice 1 完了・Wave 4 bounded TikZ 完了
-- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1〜3 に加え、REQ-NF-002 は Step 0 の計装と Step 1 Slice 1 の `changed_paths` fast path 伝播まで完了し、100ms 最適化の fixed-cost 削減が着手済みになった。Wave 4 では bounded TikZ 改善（named colors 19 色 / 6 単位 / ellipse / `\path` / dash patterns / line cap/join / opacity / key-value arc）が完了し、TikZ parity が前進した。残りは `REQ-NF-002` Step 1 残差分（cache split / inotify-kqueue）と Step 2/3/4（block checkpoint reuse / per-page payload reuse / incremental parse）、および Wave 4 残 long-tail（`\foreach` / package compatibility）
-- **直近の推奨**: `REQ-NF-002` Step 1 の残差分である cache split（`index.json` + per-partition blob）と inotify/kqueue 連携に進む。Wave 4 残 long-tail は `\foreach` と package compatibility のみで、独立して継続可能
+- **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・bundle archive CI 接続完了・Step 0 計装完了・Step 1 完了・Step 2 完了・Wave 4 bounded TikZ + package compatibility MVP 完了
+- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1〜3 に加え、REQ-NF-002 は Step 0 の計装、Step 1 の fixed-cost 削減（`changed_paths` fast path、v5 split cache、watcher backend 抽象化）、Step 2 の block checkpoint reuse（`RecompilationScope::BlockLevel`、checkpoint 生成、suffix rebuild、fallback 条件）まで完了し、typeset 側の sub-document reuse が導入された。Wave 4 では bounded TikZ 改善と package compatibility MVP が完了し、TikZ / package parity が前進した。残りは `REQ-NF-002` Step 3/4（per-page payload reuse / incremental parse）と、Wave 4 残 long-tail（`multicol`）
+- **直近の推奨**: `REQ-NF-002` Step 3（per-page payload reuse）に進む。Wave 4 残 long-tail は `multicol` のみで、独立して継続可能
 
 ### Warm Incremental Benchmark 実績 (REQ-FUNC-030) — Wave 1 完了
 

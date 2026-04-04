@@ -12428,6 +12428,24 @@ mod tests {
     }
 
     #[test]
+    fn compat_primitives_fixture_expands_expected_outputs_end_to_end() {
+        let document = parse_source(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../ferritex-bench/fixtures/corpus/layout-core/compat_primitives.tex"
+        )));
+
+        assert!(document.body.contains("True branch."));
+        assert!(!document.body.contains("False branch."));
+        assert!(document
+            .body
+            .contains("Digest: 900150983cd24fb0d6963f7d28e17f72"));
+        assert!(document.body.contains(r"Escaped string: A \(B\)"));
+        assert!(document.body.contains("Escaped hex: 417A"));
+        assert!(document.body.contains("Page width: 614.29375pt"));
+        assert!(document.body.contains("Created: D:"));
+    }
+
+    #[test]
     fn dimexpr_supports_parentheses_multiply_divide_and_registers() {
         let document =
             parse_document("\\dimen0=2pt\\skip0=4pt\\dimexpr(\\dimen0+\\skip0)*3/2\\relax");

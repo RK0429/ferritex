@@ -6,6 +6,7 @@ use crate::graphics::api::{
 const CM_IN_PT: f64 = 28.3465;
 const DEFAULT_LINE_WIDTH_PT: f64 = 0.4;
 const KAPPA: f64 = 0.552_284_749_830_793_6;
+const MAX_FOREACH_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TikzParseResult {
@@ -26,6 +27,7 @@ pub fn parse_tikzpicture(content: &str) -> TikzParseResult {
             content,
             ScopeState::default(),
             &mut diagnostics,
+            0,
         )),
     };
 
@@ -103,7 +105,16 @@ fn parse_scope_items(
     content: &str,
     state: ScopeState,
     diagnostics: &mut Vec<TikzDiagnostic>,
+    depth: usize,
 ) -> Vec<ParsedStatement> {
+    if depth > MAX_FOREACH_DEPTH {
+        emit_parse_error(
+            diagnostics,
+            format!("foreach nesting exceeds maximum depth {MAX_FOREACH_DEPTH}"),
+        );
+        return Vec::new();
+    }
+
     let mut items = Vec::new();
     let mut cursor = Cursor::new(content);
 
@@ -113,10 +124,15 @@ fn parse_scope_items(
             break;
         }
 
-        if cursor.remaining().starts_with("\\begin") {
-            if let Some(group) = parse_scope_block(&mut cursor, state, diagnostics) {
+        if cursor.starts_with_control_word("begin") {
+            if let Some(group) = parse_scope_block(&mut cursor, state, diagnostics, depth) {
                 items.push(ParsedStatement::Node(GraphicNode::Group(group)));
             }
+            continue;
+        }
+
+        if cursor.starts_with_control_word("foreach") {
+            items.extend(parse_foreach_items(&mut cursor, state, diagnostics, depth));
             continue;
         }
 
@@ -127,6 +143,230 @@ fn parse_scope_items(
     }
 
     items
+}
+
+fn parse_foreach_items(
+    cursor: &mut Cursor<'_>,
+    state: ScopeState,
+    diagnostics: &mut Vec<TikzDiagnostic>,
+    depth: usize,
+) -> Vec<ParsedStatement> {
+    if !cursor.consume_prefix("\\foreach") {
+        return Vec::new();
+    }
+
+    cursor.skip_whitespace();
+    let Some(variable) = cursor.parse_control_sequence_name() else {
+        emit_parse_error(
+            diagnostics,
+            "foreach requires a control-sequence loop variable".to_string(),
+        );
+        cursor.index = cursor.input.len();
+        return Vec::new();
+    };
+
+    cursor.skip_whitespace();
+    if !cursor.consume_keyword("in") {
+        emit_parse_error(diagnostics, "foreach requires `in`".to_string());
+        cursor.index = cursor.input.len();
+        return Vec::new();
+    }
+
+    let Some(list) = cursor.parse_braced_text() else {
+        emit_parse_error(diagnostics, "foreach requires braced list".to_string());
+        cursor.index = cursor.input.len();
+        return Vec::new();
+    };
+    let Some(body) = cursor.parse_braced_text() else {
+        emit_parse_error(diagnostics, "foreach requires braced body".to_string());
+        cursor.index = cursor.input.len();
+        return Vec::new();
+    };
+
+    if depth >= MAX_FOREACH_DEPTH {
+        emit_parse_error(
+            diagnostics,
+            format!("foreach nesting exceeds maximum depth {MAX_FOREACH_DEPTH}"),
+        );
+        return Vec::new();
+    }
+
+    let Some(values) = expand_foreach_list(&list, diagnostics) else {
+        cursor.index = cursor.input.len();
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    for value in values {
+        let expanded = substitute_foreach_variable(&body, &variable, &value);
+        items.extend(parse_scope_items(&expanded, state, diagnostics, depth + 1));
+    }
+    items
+}
+
+fn expand_foreach_list(list: &str, diagnostics: &mut Vec<TikzDiagnostic>) -> Option<Vec<String>> {
+    let entries: Vec<&str> = split_options(list)
+        .into_iter()
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    match entries.as_slice() {
+        [] => Some(Vec::new()),
+        entries if !entries.iter().any(|entry| *entry == "...") => {
+            Some(entries.iter().map(|entry| entry.to_string()).collect())
+        }
+        [start, "...", end] => {
+            let start = parse_foreach_number(start, "start", diagnostics)?;
+            let end = parse_foreach_number(end, "end", diagnostics)?;
+            expand_numeric_foreach_range(
+                start,
+                if end >= start { 1.0 } else { -1.0 },
+                end,
+                diagnostics,
+            )
+        }
+        [first, second, "...", end] => {
+            let first = parse_foreach_number(first, "start", diagnostics)?;
+            let second = parse_foreach_number(second, "step", diagnostics)?;
+            let end = parse_foreach_number(end, "end", diagnostics)?;
+            expand_numeric_foreach_range(first, second - first, end, diagnostics)
+        }
+        _ => {
+            emit_parse_error(
+                diagnostics,
+                format!("unsupported foreach list `{}`", list.trim()),
+            );
+            None
+        }
+    }
+}
+
+fn parse_foreach_number(
+    token: &str,
+    role: &str,
+    diagnostics: &mut Vec<TikzDiagnostic>,
+) -> Option<f64> {
+    match parse_style_number(token) {
+        Some(number) => Some(number),
+        None => {
+            emit_parse_error(
+                diagnostics,
+                format!("invalid foreach range {role} `{}`", token.trim()),
+            );
+            None
+        }
+    }
+}
+
+fn expand_numeric_foreach_range(
+    start: f64,
+    step: f64,
+    end: f64,
+    diagnostics: &mut Vec<TikzDiagnostic>,
+) -> Option<Vec<String>> {
+    const EPSILON: f64 = 1e-9;
+    const MAX_VALUES: usize = 10_000;
+
+    if !step.is_finite() || step.abs() < EPSILON {
+        emit_parse_error(
+            diagnostics,
+            "foreach range step must be non-zero".to_string(),
+        );
+        return None;
+    }
+
+    if step > 0.0 && start > end + EPSILON {
+        emit_parse_error(
+            diagnostics,
+            "foreach range step does not progress toward end".to_string(),
+        );
+        return None;
+    }
+    if step < 0.0 && start < end - EPSILON {
+        emit_parse_error(
+            diagnostics,
+            "foreach range step does not progress toward end".to_string(),
+        );
+        return None;
+    }
+
+    let mut values = Vec::new();
+    let mut current = start;
+    for _ in 0..MAX_VALUES {
+        if step > 0.0 {
+            if current > end + EPSILON {
+                break;
+            }
+        } else if current < end - EPSILON {
+            break;
+        }
+
+        let display = if (current - end).abs() <= EPSILON {
+            end
+        } else {
+            current
+        };
+        values.push(format_foreach_number(display));
+        current += step;
+    }
+
+    if values.is_empty() {
+        emit_parse_error(diagnostics, "foreach range produced no values".to_string());
+        return None;
+    }
+
+    Some(values)
+}
+
+fn format_foreach_number(value: f64) -> String {
+    const EPSILON: f64 = 1e-9;
+
+    let value = if value.abs() <= EPSILON { 0.0 } else { value };
+    let rounded = value.round();
+    if (value - rounded).abs() <= EPSILON {
+        return format!("{}", rounded as i64);
+    }
+
+    let mut text = format!("{value:.12}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text
+}
+
+fn substitute_foreach_variable(body: &str, variable: &str, value: &str) -> String {
+    let mut expanded = String::with_capacity(body.len());
+    let mut index = 0usize;
+
+    while index < body.len() {
+        let remaining = &body[index..];
+        let Some(ch) = remaining.chars().next() else {
+            break;
+        };
+
+        if ch == '\\' {
+            let after_slash = &remaining[ch.len_utf8()..];
+            if let Some(tail) = after_slash.strip_prefix(variable) {
+                if tail
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !next.is_ascii_alphabetic())
+                {
+                    expanded.push_str(value);
+                    index += ch.len_utf8() + variable.len();
+                    continue;
+                }
+            }
+        }
+
+        expanded.push(ch);
+        index += ch.len_utf8();
+    }
+
+    expanded
 }
 
 fn materialize_statements(statements: Vec<ParsedStatement>) -> Vec<GraphicNode> {
@@ -155,6 +395,7 @@ fn parse_scope_block(
     cursor: &mut Cursor<'_>,
     parent_state: ScopeState,
     diagnostics: &mut Vec<TikzDiagnostic>,
+    depth: usize,
 ) -> Option<GraphicGroup> {
     if !cursor.consume_prefix("\\begin") {
         return None;
@@ -207,6 +448,7 @@ fn parse_scope_block(
             &cursor.input[body_start..body_end],
             child_state,
             diagnostics,
+            depth,
         )),
         default_stroke: scope_options.default_stroke,
         default_fill: scope_options.default_fill,
@@ -1212,6 +1454,39 @@ impl<'a> Cursor<'a> {
         true
     }
 
+    fn starts_with_control_word(&self, command: &str) -> bool {
+        let Some(rest) = self.remaining().strip_prefix('\\') else {
+            return false;
+        };
+        let Some(tail) = rest.strip_prefix(command) else {
+            return false;
+        };
+        tail.chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphabetic())
+    }
+
+    fn parse_control_sequence_name(&mut self) -> Option<String> {
+        if !self.consume_prefix("\\") {
+            return None;
+        }
+
+        let rest = self.remaining();
+        let name_len = rest
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_alphabetic())
+            .map(|(index, ch)| index + ch.len_utf8())
+            .last()
+            .unwrap_or(0);
+        if name_len == 0 {
+            return None;
+        }
+
+        let name = rest[..name_len].to_string();
+        self.index += name_len;
+        Some(name)
+    }
+
     fn consume_arrow_spec(&mut self) -> Option<ArrowSpec> {
         for (token, arrows) in [
             ("<->", ArrowSpec::Both),
@@ -1782,7 +2057,7 @@ mod tests {
     use super::{
         arc_segments, circle_path, ellipse_path, named_color, parse_length, parse_tikzpicture,
         resolve_dash_pattern_preset, resolve_line_width_preset, resolve_named_color,
-        TikzDiagnostic, CM_IN_PT, KAPPA,
+        TikzDiagnostic, CM_IN_PT, KAPPA, MAX_FOREACH_DEPTH,
     };
 
     fn assert_point_close(actual: Point, expected: Point) {
@@ -1794,6 +2069,17 @@ mod tests {
             (actual.y - expected.y).abs() < 1e-9,
             "y mismatch: {actual:?} != {expected:?}"
         );
+    }
+
+    fn count_vector_nodes(nodes: &[GraphicNode]) -> usize {
+        nodes
+            .iter()
+            .map(|node| match node {
+                GraphicNode::Vector(_) => 1,
+                GraphicNode::Group(group) => count_vector_nodes(&group.children),
+                GraphicNode::Text(_) | GraphicNode::External(_) | GraphicNode::Pdf(_) => 0,
+            })
+            .sum()
     }
 
     #[test]
@@ -2596,6 +2882,84 @@ mod tests {
         assert_eq!(level2.default_stroke, Some(named_color("green")));
         assert_eq!(level3.default_stroke, Some(named_color("blue")));
         assert_eq!(line.stroke, Some(named_color("blue")));
+    }
+
+    #[test]
+    fn foreach_simple_list() {
+        let result = parse_tikzpicture(
+            r"\foreach \x in {1,2,3} {
+                \draw (\x,0) -- (\x,1);
+            }",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(count_vector_nodes(&result.scene.nodes), 3);
+    }
+
+    #[test]
+    fn foreach_range_with_dots() {
+        let result = parse_tikzpicture(
+            r"\foreach \x in {1,...,4} {
+                \draw (\x,0) -- (\x,1);
+            }",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(count_vector_nodes(&result.scene.nodes), 4);
+    }
+
+    #[test]
+    fn foreach_step_inferred() {
+        let result = parse_tikzpicture(
+            r"\foreach \x in {0,0.5,...,2} {
+                \draw (\x,0) -- (\x,1);
+            }",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(count_vector_nodes(&result.scene.nodes), 5);
+    }
+
+    #[test]
+    fn foreach_nested() {
+        let result = parse_tikzpicture(
+            r"\foreach \x in {0,1} {
+                \foreach \y in {0,1} {
+                    \draw (\x,\y) -- (\x,1);
+                }
+            }",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(count_vector_nodes(&result.scene.nodes), 4);
+    }
+
+    #[test]
+    fn foreach_rejects_excessive_nesting() {
+        let mut input = String::new();
+        for offset in 0..=MAX_FOREACH_DEPTH {
+            let variable = char::from(b'a' + offset as u8);
+            input.push_str(&format!("\\foreach \\{variable} in {{0}} {{"));
+        }
+        input.push_str(r"\draw (0,0) -- (1,0);");
+        for _ in 0..=MAX_FOREACH_DEPTH {
+            input.push('}');
+        }
+
+        let result = parse_tikzpicture(&input);
+
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic,
+                TikzDiagnostic::ParseError { message }
+                    if message == &format!(
+                        "foreach nesting exceeds maximum depth {MAX_FOREACH_DEPTH}"
+                    )
+            )),
+            "expected foreach depth diagnostic, got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(count_vector_nodes(&result.scene.nodes), 0);
     }
 
     #[test]

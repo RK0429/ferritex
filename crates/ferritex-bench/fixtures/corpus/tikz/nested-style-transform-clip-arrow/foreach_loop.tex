@@ -1,10 +1,9 @@
 \documentclass{article}
 \begin{document}
 \begin{tikzpicture}
-\filldraw[draw=blue,fill=green] (0,0) circle (0.4);
-\filldraw[draw=blue,fill=green] (1.5,0) circle (0.4);
-\filldraw[draw=blue,fill=green] (3,0) circle (0.4);
-\filldraw[draw=blue,fill=green] (4.5,0) circle (0.4);
+\foreach \x in {0,1.5,3,4.5} {
+  \filldraw[draw=blue,fill=green] (\x,0) circle (0.4);
+}
 \node at (0,0) {A};
 \node at (1.5,0) {B};
 \node at (3,0) {C};
@@ -12,9 +11,9 @@
 \draw[->,line width=1pt] (0.4,0) -- (1.1,0);
 \draw[->,line width=1pt] (1.9,0) -- (2.6,0);
 \draw[->,line width=1pt] (3.4,0) -- (4.1,0);
-\draw[green] (-0.5,1) -- (5,1);
-\draw[green] (-0.5,2) -- (5,2);
-\draw[green] (-0.5,3) -- (5,3);
+\foreach \y in {1,2,3} {
+  \draw[green] (-0.5,\y) -- (5,\y);
+}
 \node at (2.2,3.4) {manual repetition pattern};
 \end{tikzpicture}
 \end{document}

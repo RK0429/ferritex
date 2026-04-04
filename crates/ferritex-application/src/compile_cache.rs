@@ -6,15 +6,19 @@ use std::time::UNIX_EPOCH;
 use ferritex_core::compilation::SymbolLocation;
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::incremental::{DependencyGraph, RecompilationScope};
+use ferritex_core::kernel::api::{DimensionValue, SourceSpan};
 use ferritex_core::policy::{FileAccessError, FileAccessGate};
 use ferritex_core::synctex::SourceLineTrace;
-use ferritex_core::typesetting::DocumentLayoutFragment;
+use ferritex_core::typesetting::{DocumentLayoutFragment, FloatContent, PlacementSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::stable_compile_state::StableCompileState;
 
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
+const LEGACY_CACHE_VERSION: u32 = 4;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
+const CACHE_INDEX_FILENAME: &str = "index.json";
+const CACHE_PARTITIONS_DIR_NAME: &str = "partitions";
 const CACHE_RECORD_EXTENSION: &str = "json";
 const MAX_CACHE_RECORD_FILES: usize = 64;
 
@@ -24,7 +28,10 @@ pub struct CompileCache<'a> {
     jobname: String,
     output_pdf: PathBuf,
     cache_dir: PathBuf,
+    record_dir: PathBuf,
+    partitions_dir: PathBuf,
     metadata_path: PathBuf,
+    legacy_metadata_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,14 +62,46 @@ pub struct CachedSourceSubtree {
     pub citations: BTreeMap<String, SymbolLocation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockCheckpoint {
+    pub node_index: usize,
+    pub source_span: Option<SourceSpan>,
+    pub layout_state: BlockLayoutState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockLayoutState {
+    pub content_used: DimensionValue,
+    pub completed_page_count: usize,
+    pub pending_floats: Vec<PendingFloat>,
+    pub footnote_count: usize,
+    pub figure_count: u32,
+    pub table_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFloat {
+    pub spec: PlacementSpec,
+    pub content: FloatContent,
+    pub defer_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockCheckpointData {
+    pub checkpoints: Vec<BlockCheckpoint>,
+    pub source_hash: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedTypesetFragment {
     pub fragment: DocumentLayoutFragment,
     pub source_hash: u64,
+    #[serde(default)]
+    pub block_checkpoints: Option<BlockCheckpointData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CompileCacheRecord {
+struct LegacyCompileCacheRecord {
     version: u32,
     primary_input: PathBuf,
     jobname: String,
@@ -74,6 +113,39 @@ struct CompileCacheRecord {
     cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     #[serde(default)]
     cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CacheIndex {
+    version: u32,
+    primary_input: PathBuf,
+    jobname: String,
+    output_pdf: PathBuf,
+    output_pdf_hash: u64,
+    dependency_graph: DependencyGraph,
+    stable_compile_state: StableCompileState,
+    partition_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PartitionBlob {
+    #[serde(default)]
+    cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
+    #[serde(default)]
+    cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedCacheRecord {
+    primary_input: PathBuf,
+    jobname: String,
+    output_pdf: PathBuf,
+    output_pdf_hash: u64,
+    dependency_graph: DependencyGraph,
+    stable_compile_state: StableCompileState,
+    cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
+    cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
+    diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,108 +167,33 @@ impl<'a> CompileCache<'a> {
             sanitize_cache_key(jobname),
             fingerprint_bytes(primary_input.to_string_lossy().as_bytes())
         );
+        let record_dir = cache_dir.join(&cache_key);
 
         Self {
             file_access_gate,
             primary_input: primary_input.to_path_buf(),
             jobname: jobname.to_string(),
             output_pdf: output_dir.join(format!("{jobname}.pdf")),
-            metadata_path: cache_dir.join(format!("{cache_key}.json")),
+            record_dir: record_dir.clone(),
+            partitions_dir: record_dir.join(CACHE_PARTITIONS_DIR_NAME),
+            metadata_path: record_dir.join(CACHE_INDEX_FILENAME),
+            legacy_metadata_path: cache_dir.join(format!("{cache_key}.json")),
             cache_dir,
         }
     }
 
     pub fn lookup(&self, changed_paths_hint: &[PathBuf]) -> CacheLookupResult {
-        let bytes = match self.file_access_gate.read_file(&self.metadata_path) {
-            Ok(bytes) => bytes,
-            Err(FileAccessError::Io { source })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                return CacheLookupResult {
-                    artifact: None,
-                    baseline_state: None,
-                    diagnostics: Vec::new(),
-                    changed_paths: Vec::new(),
-                    rebuild_paths: BTreeSet::new(),
-                    cached_dependency_graph: None,
-                    cached_source_subtrees: BTreeMap::new(),
-                    cached_typeset_fragments: BTreeMap::new(),
-                    scope: None,
-                };
-            }
-            Err(error) => {
-                return CacheLookupResult {
-                    artifact: None,
-                    baseline_state: None,
-                    diagnostics: vec![cache_info_diagnostic(
-                        format!("failed to read compile cache metadata: {error}"),
-                        &self.metadata_path,
-                    )],
-                    changed_paths: Vec::new(),
-                    rebuild_paths: BTreeSet::new(),
-                    cached_dependency_graph: None,
-                    cached_source_subtrees: BTreeMap::new(),
-                    cached_typeset_fragments: BTreeMap::new(),
-                    scope: None,
-                };
-            }
+        let record = match self.load_record() {
+            Ok(Some(record)) => record,
+            Ok(None) => return empty_lookup_result(Vec::new()),
+            Err(diagnostic) => return empty_lookup_result(vec![diagnostic]),
         };
-
-        let record: CompileCacheRecord = match serde_json::from_slice(&bytes) {
-            Ok(record) => record,
-            Err(error) => {
-                return CacheLookupResult {
-                    artifact: None,
-                    baseline_state: None,
-                    diagnostics: vec![cache_info_diagnostic(
-                        format!("compile cache metadata is invalid: {error}"),
-                        &self.metadata_path,
-                    )],
-                    changed_paths: Vec::new(),
-                    rebuild_paths: BTreeSet::new(),
-                    cached_dependency_graph: None,
-                    cached_source_subtrees: BTreeMap::new(),
-                    cached_typeset_fragments: BTreeMap::new(),
-                    scope: None,
-                };
-            }
-        };
-
-        if record.version != CACHE_VERSION {
-            return CacheLookupResult {
-                artifact: None,
-                baseline_state: None,
-                diagnostics: vec![cache_info_diagnostic(
-                    format!(
-                        "compile cache version mismatch (found {}, expected {CACHE_VERSION})",
-                        record.version
-                    ),
-                    &self.metadata_path,
-                )],
-                changed_paths: Vec::new(),
-                rebuild_paths: BTreeSet::new(),
-                cached_dependency_graph: None,
-                cached_source_subtrees: BTreeMap::new(),
-                cached_typeset_fragments: BTreeMap::new(),
-                scope: None,
-            };
-        }
 
         if record.primary_input != self.primary_input
             || record.jobname != self.jobname
             || record.output_pdf != self.output_pdf
         {
-            return CacheLookupResult {
-                artifact: None,
-                baseline_state: None,
-                diagnostics: Vec::new(),
-                changed_paths: Vec::new(),
-                rebuild_paths: BTreeSet::new(),
-                cached_dependency_graph: None,
-                cached_source_subtrees: BTreeMap::new(),
-                cached_typeset_fragments: BTreeMap::new(),
-                scope: None,
-            };
+            return empty_lookup_result(Vec::new());
         }
 
         let baseline_state = record.stable_compile_state.clone();
@@ -206,7 +203,7 @@ impl<'a> CompileCache<'a> {
             return CacheLookupResult {
                 artifact: None,
                 baseline_state: Some(baseline_state),
-                diagnostics: Vec::new(),
+                diagnostics: record.diagnostics,
                 changed_paths: change_summary.changed_paths,
                 rebuild_paths: change_summary.rebuild_paths,
                 cached_dependency_graph: Some(record.dependency_graph),
@@ -219,13 +216,15 @@ impl<'a> CompileCache<'a> {
         let output_pdf_hash = match self.file_access_gate.read_file(&self.output_pdf) {
             Ok(bytes) => fingerprint_bytes(&bytes),
             Err(error) => {
+                let mut diagnostics = record.diagnostics;
+                diagnostics.push(cache_info_diagnostic(
+                    format!("cached PDF artifact is unavailable: {error}"),
+                    &self.output_pdf,
+                ));
                 return CacheLookupResult {
                     artifact: None,
                     baseline_state: Some(baseline_state),
-                    diagnostics: vec![cache_info_diagnostic(
-                        format!("cached PDF artifact is unavailable: {error}"),
-                        &self.output_pdf,
-                    )],
+                    diagnostics,
                     changed_paths: Vec::new(),
                     rebuild_paths: BTreeSet::new(),
                     cached_dependency_graph: None,
@@ -237,13 +236,15 @@ impl<'a> CompileCache<'a> {
         };
 
         if output_pdf_hash != record.output_pdf_hash {
+            let mut diagnostics = record.diagnostics;
+            diagnostics.push(cache_info_diagnostic(
+                "cached PDF artifact hash mismatch; falling back to full compile",
+                &self.output_pdf,
+            ));
             return CacheLookupResult {
                 artifact: None,
                 baseline_state: Some(baseline_state),
-                diagnostics: vec![cache_info_diagnostic(
-                    "cached PDF artifact hash mismatch; falling back to full compile",
-                    &self.output_pdf,
-                )],
+                diagnostics,
                 changed_paths: Vec::new(),
                 rebuild_paths: BTreeSet::new(),
                 cached_dependency_graph: None,
@@ -259,7 +260,7 @@ impl<'a> CompileCache<'a> {
                 output_pdf: record.output_pdf,
             }),
             baseline_state: Some(baseline_state),
-            diagnostics: Vec::new(),
+            diagnostics: record.diagnostics,
             changed_paths: Vec::new(),
             rebuild_paths: BTreeSet::new(),
             cached_dependency_graph: Some(record.dependency_graph),
@@ -284,7 +285,42 @@ impl<'a> CompileCache<'a> {
             ));
         }
 
-        let record = CompileCacheRecord {
+        if let Err(error) = self.file_access_gate.ensure_directory(&self.record_dir) {
+            return Some(cache_info_diagnostic(
+                format!("failed to prepare compile cache record directory: {error}"),
+                &self.record_dir,
+            ));
+        }
+
+        if let Err(error) = self.file_access_gate.ensure_directory(&self.partitions_dir) {
+            return Some(cache_info_diagnostic(
+                format!("failed to prepare compile cache partition directory: {error}"),
+                &self.partitions_dir,
+            ));
+        }
+
+        let partition_blobs = partition_blobs_for(cached_source_subtrees, cached_typeset_fragments);
+        for (partition_key, blob) in &partition_blobs {
+            let path = self.partition_blob_path(partition_key);
+            let bytes = match serde_json::to_vec_pretty(&blob) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Some(cache_info_diagnostic(
+                        format!("failed to serialize compile cache partition blob: {error}"),
+                        &path,
+                    ));
+                }
+            };
+
+            if let Err(error) = self.file_access_gate.write_file(&path, &bytes) {
+                return Some(cache_info_diagnostic(
+                    format!("failed to persist compile cache partition blob: {error}"),
+                    &path,
+                ));
+            }
+        }
+
+        let index = CacheIndex {
             version: CACHE_VERSION,
             primary_input: self.primary_input.clone(),
             jobname: self.jobname.clone(),
@@ -292,37 +328,41 @@ impl<'a> CompileCache<'a> {
             output_pdf_hash,
             dependency_graph: dependency_graph.clone(),
             stable_compile_state: stable_compile_state.clone(),
-            cached_source_subtrees: cached_source_subtrees.clone(),
-            cached_typeset_fragments: cached_typeset_fragments.clone(),
+            partition_keys: partition_blobs.keys().cloned().collect(),
         };
 
-        let bytes = match serde_json::to_vec_pretty(&record) {
+        let bytes = match serde_json::to_vec_pretty(&index) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return Some(cache_info_diagnostic(
-                    format!("failed to serialize compile cache metadata: {error}"),
+                    format!("failed to serialize compile cache index: {error}"),
                     &self.metadata_path,
                 ));
             }
         };
 
-        self.file_access_gate
+        if let Err(error) = self
+            .file_access_gate
             .write_file(&self.metadata_path, &bytes)
-            .err()
-            .map(|error| {
-                cache_info_diagnostic(
-                    format!("failed to persist compile cache metadata: {error}"),
-                    &self.metadata_path,
-                )
-            })
-            .or_else(|| {
-                self.evict_excess_records().err().map(|error| {
-                    cache_cleanup_diagnostic(
-                        format!("failed to evict old compile cache metadata: {error}"),
-                        &self.cache_dir,
-                    )
-                })
-            })
+        {
+            return Some(cache_info_diagnostic(
+                format!("failed to persist compile cache index: {error}"),
+                &self.metadata_path,
+            ));
+        }
+
+        let cleanup_diagnostic = self.cleanup_orphaned_partitions(&index.partition_keys);
+        let legacy_diagnostic = self.remove_legacy_record_if_present();
+        let eviction_diagnostic = self.evict_excess_records().err().map(|error| {
+            cache_cleanup_diagnostic(
+                format!("failed to evict old compile cache records: {error}"),
+                &self.cache_dir,
+            )
+        });
+
+        cleanup_diagnostic
+            .or(legacy_diagnostic)
+            .or(eviction_diagnostic)
     }
 
     fn detect_changes(
@@ -384,6 +424,196 @@ impl<'a> CompileCache<'a> {
         current_hash != expected_hash
     }
 
+    fn load_record(&self) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
+        match self.file_access_gate.read_file(&self.metadata_path) {
+            Ok(bytes) => self.load_split_record(&bytes),
+            Err(FileAccessError::Io { source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                self.load_legacy_record()
+            }
+            Err(error) => Err(cache_info_diagnostic(
+                format!("failed to read compile cache index: {error}"),
+                &self.metadata_path,
+            )),
+        }
+    }
+
+    fn load_split_record(&self, bytes: &[u8]) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
+        let index: CacheIndex = serde_json::from_slice(bytes).map_err(|error| {
+            cache_info_diagnostic(
+                format!("compile cache index is invalid: {error}"),
+                &self.metadata_path,
+            )
+        })?;
+
+        if index.version != CACHE_VERSION {
+            return Err(cache_info_diagnostic(
+                format!(
+                    "compile cache version mismatch (found {}, expected {CACHE_VERSION})",
+                    index.version
+                ),
+                &self.metadata_path,
+            ));
+        }
+
+        let mut cached_source_subtrees = BTreeMap::new();
+        let mut cached_typeset_fragments = BTreeMap::new();
+        let mut diagnostics = Vec::new();
+
+        for partition_key in &index.partition_keys {
+            let path = self.partition_blob_path(partition_key);
+            let bytes = match self.file_access_gate.read_file(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    diagnostics.push(cache_info_diagnostic(
+                        format!(
+                            "failed to read compile cache partition blob `{partition_key}`: {error}"
+                        ),
+                        &path,
+                    ));
+                    continue;
+                }
+            };
+
+            let blob: PartitionBlob = match serde_json::from_slice(&bytes) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    diagnostics.push(cache_info_diagnostic(
+                        format!(
+                            "compile cache partition blob `{partition_key}` is invalid: {error}"
+                        ),
+                        &path,
+                    ));
+                    continue;
+                }
+            };
+
+            cached_source_subtrees.extend(blob.cached_source_subtrees);
+            cached_typeset_fragments.extend(blob.cached_typeset_fragments);
+        }
+
+        Ok(Some(LoadedCacheRecord {
+            primary_input: index.primary_input,
+            jobname: index.jobname,
+            output_pdf: index.output_pdf,
+            output_pdf_hash: index.output_pdf_hash,
+            dependency_graph: index.dependency_graph,
+            stable_compile_state: index.stable_compile_state,
+            cached_source_subtrees,
+            cached_typeset_fragments,
+            diagnostics,
+        }))
+    }
+
+    fn load_legacy_record(&self) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
+        let bytes = match self.file_access_gate.read_file(&self.legacy_metadata_path) {
+            Ok(bytes) => bytes,
+            Err(FileAccessError::Io { source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(cache_info_diagnostic(
+                    format!("failed to read compile cache metadata: {error}"),
+                    &self.legacy_metadata_path,
+                ));
+            }
+        };
+
+        let record: LegacyCompileCacheRecord = serde_json::from_slice(&bytes).map_err(|error| {
+            cache_info_diagnostic(
+                format!("compile cache metadata is invalid: {error}"),
+                &self.legacy_metadata_path,
+            )
+        })?;
+
+        if record.version != LEGACY_CACHE_VERSION {
+            return Err(cache_info_diagnostic(
+                format!(
+                    "compile cache legacy version mismatch (found {}, expected {LEGACY_CACHE_VERSION})",
+                    record.version
+                ),
+                &self.legacy_metadata_path,
+            ));
+        }
+
+        Ok(Some(LoadedCacheRecord {
+            primary_input: record.primary_input,
+            jobname: record.jobname,
+            output_pdf: record.output_pdf,
+            output_pdf_hash: record.output_pdf_hash,
+            dependency_graph: record.dependency_graph,
+            stable_compile_state: record.stable_compile_state,
+            cached_source_subtrees: record.cached_source_subtrees,
+            cached_typeset_fragments: record.cached_typeset_fragments,
+            diagnostics: Vec::new(),
+        }))
+    }
+
+    fn remove_legacy_record_if_present(&self) -> Option<Diagnostic> {
+        match fs::remove_file(&self.legacy_metadata_path) {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(cache_cleanup_diagnostic(
+                format!("failed to remove legacy compile cache metadata: {error}"),
+                &self.legacy_metadata_path,
+            )),
+        }
+    }
+
+    fn cleanup_orphaned_partitions(&self, valid_keys: &[String]) -> Option<Diagnostic> {
+        let valid_filenames: BTreeSet<_> = valid_keys
+            .iter()
+            .map(|key| format!("{key}.{CACHE_RECORD_EXTENSION}"))
+            .collect();
+        let entries = match fs::read_dir(&self.partitions_dir) {
+            Ok(entries) => entries,
+            Err(_) => return None,
+        };
+
+        let mut first_error = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map(|file_type| file_type.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str())
+                != Some(CACHE_RECORD_EXTENSION)
+            {
+                continue;
+            }
+
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            if valid_filenames.contains(&filename) {
+                continue;
+            }
+
+            if let Err(error) = fs::remove_file(&path) {
+                first_error.get_or_insert_with(|| {
+                    cache_partition_cleanup_diagnostic(
+                        format!(
+                            "failed to remove orphaned compile cache partition blob `{filename}`: {error}"
+                        ),
+                        &path,
+                    )
+                });
+            }
+        }
+
+        first_error
+    }
+
+    fn partition_blob_path(&self, partition_key: &str) -> PathBuf {
+        self.partitions_dir
+            .join(format!("{partition_key}.{CACHE_RECORD_EXTENSION}"))
+    }
+
     fn evict_excess_records(&self) -> std::io::Result<()> {
         let records = Self::owned_cache_record_files(&self.cache_dir)?;
         Self::evict_oldest_records(records, MAX_CACHE_RECORD_FILES)
@@ -406,7 +636,12 @@ impl<'a> CompileCache<'a> {
 
         let mut first_error = None;
         for record in records.into_iter().take(excess) {
-            if let Err(error) = fs::remove_file(record.path) {
+            let delete_result = if record.path.is_dir() {
+                fs::remove_dir_all(&record.path)
+            } else {
+                fs::remove_file(&record.path)
+            };
+            if let Err(error) = delete_result {
                 first_error.get_or_insert(error);
             }
         }
@@ -429,29 +664,45 @@ impl<'a> CompileCache<'a> {
                 Ok(file_type) => file_type,
                 Err(_) => continue,
             };
-            if !file_type.is_file() {
-                continue;
-            }
 
             let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str())
-                != Some(CACHE_RECORD_EXTENSION)
+            let (owned, modified) = if file_type.is_dir() {
+                let index_path = path.join(CACHE_INDEX_FILENAME);
+                let bytes = match fs::read(&index_path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                let owned = serde_json::from_slice::<CacheIndex>(&bytes)
+                    .map(|index| index.version == CACHE_VERSION)
+                    .unwrap_or(false);
+                let modified = fs::metadata(&index_path)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (owned, modified)
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str())
+                    == Some(CACHE_RECORD_EXTENSION)
             {
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                };
+                let owned = serde_json::from_slice::<LegacyCompileCacheRecord>(&bytes)
+                    .map(|record| record.version == LEGACY_CACHE_VERSION)
+                    .unwrap_or(false);
+                let modified = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(UNIX_EPOCH);
+                (owned, modified)
+            } else {
                 continue;
-            }
-
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
             };
-            if serde_json::from_slice::<CompileCacheRecord>(&bytes).is_err() {
+
+            if !owned {
                 continue;
             }
 
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(UNIX_EPOCH);
             records.push(OwnedCacheRecordFile { path, modified });
         }
 
@@ -485,6 +736,75 @@ fn sanitize_cache_key(jobname: &str) -> String {
     }
 }
 
+fn sanitize_partition_key(raw: &str) -> String {
+    let sanitized = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+
+    let stem = if sanitized.is_empty() {
+        "partition"
+    } else {
+        sanitized.as_str()
+    };
+    format!("{stem}-{:016x}", fingerprint_bytes(raw.as_bytes()))
+}
+
+fn partition_blobs_for(
+    cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
+    cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
+) -> BTreeMap<String, PartitionBlob> {
+    let mut partitions = BTreeMap::new();
+
+    for (path, subtree) in cached_source_subtrees {
+        let raw_key = format!("source:{}", path.to_string_lossy());
+        partitions.insert(
+            sanitize_partition_key(&raw_key),
+            PartitionBlob {
+                cached_source_subtrees: BTreeMap::from([(path.clone(), subtree.clone())]),
+                cached_typeset_fragments: BTreeMap::new(),
+            },
+        );
+    }
+
+    for (partition_id, fragment) in cached_typeset_fragments {
+        let raw_key = format!("fragment:{partition_id}");
+        partitions.insert(
+            sanitize_partition_key(&raw_key),
+            PartitionBlob {
+                cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::from([(
+                    partition_id.clone(),
+                    fragment.clone(),
+                )]),
+            },
+        );
+    }
+
+    partitions
+}
+
+fn empty_lookup_result(diagnostics: Vec<Diagnostic>) -> CacheLookupResult {
+    CacheLookupResult {
+        artifact: None,
+        baseline_state: None,
+        diagnostics,
+        changed_paths: Vec::new(),
+        rebuild_paths: BTreeSet::new(),
+        cached_dependency_graph: None,
+        cached_source_subtrees: BTreeMap::new(),
+        cached_typeset_fragments: BTreeMap::new(),
+        scope: None,
+    }
+}
+
 fn cache_info_diagnostic(message: impl Into<String>, path: &Path) -> Diagnostic {
     Diagnostic::new(Severity::Info, message.into())
         .with_file(path.to_string_lossy().into_owned())
@@ -495,7 +815,15 @@ fn cache_cleanup_diagnostic(message: impl Into<String>, path: &Path) -> Diagnost
     Diagnostic::new(Severity::Info, message.into())
         .with_file(path.to_string_lossy().into_owned())
         .with_suggestion(
-            "Ferritex kept the current cache entry but could not clean up older metadata files",
+            "Ferritex kept the current cache entry but could not clean up older cache records",
+        )
+}
+
+fn cache_partition_cleanup_diagnostic(message: impl Into<String>, path: &Path) -> Diagnostic {
+    Diagnostic::new(Severity::Info, message.into())
+        .with_file(path.to_string_lossy().into_owned())
+        .with_suggestion(
+            "Ferritex kept the current cache entry but could not clean up stale partition blobs",
         )
 }
 
@@ -510,7 +838,7 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -519,15 +847,16 @@ mod tests {
     use ferritex_core::compilation::{CompilationSnapshot, DocumentState};
     use ferritex_core::diagnostics::Severity;
     use ferritex_core::incremental::RecompilationScope;
-    use ferritex_core::kernel::api::DimensionValue;
+    use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use ferritex_core::typesetting::{
-        DocumentLayoutFragment, PageBox, TextLine, TypesetNamedDestination, TypesetOutline,
-        TypesetPage,
+        DocumentLayoutFragment, FloatContent, FloatRegion, PageBox, PlacementSpec, TextLine,
+        TypesetNamedDestination, TypesetOutline, TypesetPage,
     };
 
     use super::{
-        fingerprint_bytes, CachedTypesetFragment, CompileCache, CompileCacheRecord,
-        OwnedCacheRecordFile, MAX_CACHE_RECORD_FILES,
+        fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CacheIndex,
+        CachedSourceSubtree, CachedTypesetFragment, CompileCache, LegacyCompileCacheRecord,
+        OwnedCacheRecordFile, PartitionBlob, PendingFloat, MAX_CACHE_RECORD_FILES,
     };
     use crate::stable_compile_state::StableCompileState;
 
@@ -670,6 +999,80 @@ mod tests {
         }
     }
 
+    struct RecordingFsGate {
+        writes: Mutex<Vec<PathBuf>>,
+    }
+
+    impl RecordingFsGate {
+        fn new() -> Self {
+            Self {
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn writes(&self) -> Vec<PathBuf> {
+            self.writes.lock().expect("lock writes").clone()
+        }
+    }
+
+    impl ferritex_core::policy::FileAccessGate for RecordingFsGate {
+        fn ensure_directory(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<(), ferritex_core::policy::FileAccessError> {
+            fs::create_dir_all(path).map_err(Into::into)
+        }
+
+        fn check_read(&self, _path: &std::path::Path) -> ferritex_core::policy::PathAccessDecision {
+            ferritex_core::policy::PathAccessDecision::Allowed
+        }
+
+        fn check_write(
+            &self,
+            _path: &std::path::Path,
+        ) -> ferritex_core::policy::PathAccessDecision {
+            ferritex_core::policy::PathAccessDecision::Allowed
+        }
+
+        fn check_readback(
+            &self,
+            _path: &std::path::Path,
+            _primary_input: &std::path::Path,
+            _jobname: &str,
+        ) -> ferritex_core::policy::PathAccessDecision {
+            ferritex_core::policy::PathAccessDecision::Allowed
+        }
+
+        fn read_file(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<Vec<u8>, ferritex_core::policy::FileAccessError> {
+            fs::read(path).map_err(Into::into)
+        }
+
+        fn write_file(
+            &self,
+            path: &std::path::Path,
+            content: &[u8],
+        ) -> Result<(), ferritex_core::policy::FileAccessError> {
+            fs::write(path, content).map_err(ferritex_core::policy::FileAccessError::from)?;
+            self.writes
+                .lock()
+                .expect("lock writes")
+                .push(path.to_path_buf());
+            Ok(())
+        }
+
+        fn read_readback(
+            &self,
+            path: &std::path::Path,
+            _primary_input: &std::path::Path,
+            _jobname: &str,
+        ) -> Result<Vec<u8>, ferritex_core::policy::FileAccessError> {
+            fs::read(path).map_err(Into::into)
+        }
+    }
+
     fn stable_state(input: &std::path::Path) -> StableCompileState {
         StableCompileState {
             snapshot: CompilationSnapshot {
@@ -687,6 +1090,83 @@ mod tests {
             success: true,
             diagnostics: Vec::new(),
         }
+    }
+
+    fn test_source_span() -> SourceSpan {
+        SourceSpan {
+            start: SourceLocation {
+                file_id: 7,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 7,
+                line: 3,
+                column: 18,
+            },
+        }
+    }
+
+    fn test_block_checkpoint_data() -> BlockCheckpointData {
+        BlockCheckpointData {
+            checkpoints: vec![BlockCheckpoint {
+                node_index: 4,
+                source_span: Some(test_source_span()),
+                layout_state: BlockLayoutState {
+                    content_used: DimensionValue(12 * 65_536),
+                    completed_page_count: 2,
+                    pending_floats: vec![PendingFloat {
+                        spec: PlacementSpec {
+                            priority_order: vec![FloatRegion::Top, FloatRegion::Page],
+                            force: true,
+                        },
+                        content: FloatContent {
+                            lines: vec![TextLine {
+                                text: "pending float".to_string(),
+                                y: DimensionValue(0),
+                                links: Vec::new(),
+                                font_index: 0,
+                                font_size: DimensionValue(10 * 65_536),
+                                source_span: Some(test_source_span()),
+                            }],
+                            images: Vec::new(),
+                            height: DimensionValue(18 * 65_536),
+                        },
+                        defer_count: 3,
+                    }],
+                    footnote_count: 5,
+                    figure_count: 2,
+                    table_count: 1,
+                },
+            }],
+            source_hash: 99,
+        }
+    }
+
+    #[test]
+    fn block_checkpoint_data_serializes_roundtrip() {
+        let data = test_block_checkpoint_data();
+
+        let serialized = serde_json::to_string(&data).expect("serialize checkpoint data");
+        let restored: BlockCheckpointData =
+            serde_json::from_str(&serialized).expect("deserialize checkpoint data");
+
+        assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn cached_fragment_v1_without_checkpoints_compatible() {
+        let payload = serde_json::json!({
+            "fragment": test_fragment("section:0001:intro"),
+            "source_hash": 77_u64,
+        });
+
+        let restored: CachedTypesetFragment =
+            serde_json::from_value(payload).expect("deserialize cached typeset fragment");
+
+        assert_eq!(restored.fragment, test_fragment("section:0001:intro"));
+        assert_eq!(restored.source_hash, 77);
+        assert_eq!(restored.block_checkpoints, None);
     }
 
     #[test]
@@ -833,6 +1313,7 @@ mod tests {
             CachedTypesetFragment {
                 fragment: test_fragment("document:0000:main"),
                 source_hash: 42,
+                block_checkpoints: None,
             },
         )]);
 
@@ -850,6 +1331,397 @@ mod tests {
         let lookup = cache.lookup(&[]);
 
         assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn split_cache_round_trip_persists_index_and_partition_blobs() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}").expect("write input");
+        fs::write(&chapter, "chapter body").expect("write chapter");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"\\input{chapter}"));
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"chapter body"));
+        graph.record_edge(input.clone(), chapter.clone());
+
+        let cached_source_subtrees = BTreeMap::from([
+            (
+                input.clone(),
+                test_cached_subtree(&input, "\\input{chapter}"),
+            ),
+            (
+                chapter.clone(),
+                test_cached_subtree(&chapter, "chapter body"),
+            ),
+        ]);
+        let cached_typeset_fragments = BTreeMap::from([
+            (
+                "document:0000:main".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0000:main"),
+                    source_hash: 11,
+                    block_checkpoints: None,
+                },
+            ),
+            (
+                "chapter:0001:intro".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("chapter:0001:intro"),
+                    source_hash: 22,
+                    block_checkpoints: None,
+                },
+            ),
+        ]);
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &cached_source_subtrees,
+                &cached_typeset_fragments,
+            )
+            .expect_none("cache stored");
+
+        assert!(
+            cache.record_dir.exists(),
+            "split cache directory should exist"
+        );
+        assert!(cache.metadata_path.exists(), "cache index should exist");
+        assert!(
+            cache.partitions_dir.exists(),
+            "partition blob directory should exist"
+        );
+
+        let index: CacheIndex =
+            serde_json::from_slice(&fs::read(&cache.metadata_path).expect("read cache index"))
+                .expect("deserialize cache index");
+        assert_eq!(index.version, super::CACHE_VERSION);
+        assert_eq!(
+            index.partition_keys.len(),
+            cached_source_subtrees.len() + cached_typeset_fragments.len()
+        );
+        for partition_key in &index.partition_keys {
+            assert!(
+                cache.partition_blob_path(partition_key).exists(),
+                "partition blob should exist for {partition_key}"
+            );
+        }
+
+        let lookup = cache.lookup(&[]);
+
+        assert!(lookup.diagnostics.is_empty());
+        assert_eq!(lookup.cached_source_subtrees, cached_source_subtrees);
+        assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn store_writes_partition_blobs_before_index_commit_point() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}").expect("write input");
+        fs::write(&chapter, "chapter body").expect("write chapter");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"\\input{chapter}"));
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"chapter body"));
+        graph.record_edge(input.clone(), chapter.clone());
+
+        let cached_source_subtrees = BTreeMap::from([
+            (
+                input.clone(),
+                test_cached_subtree(&input, "\\input{chapter}"),
+            ),
+            (
+                chapter.clone(),
+                test_cached_subtree(&chapter, "chapter body"),
+            ),
+        ]);
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+                block_checkpoints: None,
+            },
+        )]);
+
+        let gate = RecordingFsGate::new();
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &cached_source_subtrees,
+                &cached_typeset_fragments,
+            )
+            .expect_none("cache stored");
+
+        let writes = gate.writes();
+        assert_eq!(writes.last(), Some(&cache.metadata_path));
+        let index_position = writes
+            .iter()
+            .position(|path| *path == cache.metadata_path)
+            .expect("index write recorded");
+        assert_eq!(index_position, writes.len() - 1);
+        assert!(writes[..index_position]
+            .iter()
+            .all(|path| path.starts_with(&cache.partitions_dir)));
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|path| path.starts_with(&cache.partitions_dir))
+                .count(),
+            cached_source_subtrees.len() + cached_typeset_fragments.len()
+        );
+    }
+
+    #[test]
+    fn store_removes_orphaned_partition_blobs_after_index_commit() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}").expect("write input");
+        fs::write(&chapter, "chapter body").expect("write chapter");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"\\input{chapter}"));
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"chapter body"));
+        graph.record_edge(input.clone(), chapter.clone());
+
+        let initial_subtrees = BTreeMap::from([
+            (
+                input.clone(),
+                test_cached_subtree(&input, "\\input{chapter}"),
+            ),
+            (
+                chapter.clone(),
+                test_cached_subtree(&chapter, "chapter body"),
+            ),
+        ]);
+        let fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 11,
+                block_checkpoints: None,
+            },
+        )]);
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &initial_subtrees,
+                &fragments,
+            )
+            .expect_none("initial cache stored");
+
+        let initial_index: CacheIndex =
+            serde_json::from_slice(&fs::read(&cache.metadata_path).expect("read initial index"))
+                .expect("deserialize initial index");
+        let initial_keys = initial_index
+            .partition_keys
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        let updated_subtrees = BTreeMap::from([(
+            input.clone(),
+            test_cached_subtree(&input, "\\input{chapter}"),
+        )]);
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &updated_subtrees,
+                &fragments,
+            )
+            .expect_none("updated cache stored");
+
+        let updated_index: CacheIndex =
+            serde_json::from_slice(&fs::read(&cache.metadata_path).expect("read updated index"))
+                .expect("deserialize updated index");
+        let updated_keys = updated_index
+            .partition_keys
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let orphaned_keys = initial_keys
+            .difference(&updated_keys)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(
+            !orphaned_keys.is_empty(),
+            "expected at least one partition blob to become orphaned"
+        );
+        for partition_key in orphaned_keys {
+            assert!(
+                !cache.partition_blob_path(&partition_key).exists(),
+                "orphaned partition blob should be removed: {partition_key}"
+            );
+        }
+
+        let partition_blob_count = fs::read_dir(&cache.partitions_dir)
+            .expect("read partition dir")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some(super::CACHE_RECORD_EXTENSION)
+            })
+            .count();
+        assert_eq!(partition_blob_count, updated_keys.len());
+    }
+
+    #[test]
+    fn lookup_reads_legacy_v4_cache_record_as_fallback() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}").expect("write input");
+        fs::write(&chapter, "chapter body").expect("write chapter");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"\\input{chapter}"));
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"chapter body"));
+        graph.record_edge(input.clone(), chapter.clone());
+
+        let cached_source_subtrees = BTreeMap::from([(
+            chapter.clone(),
+            test_cached_subtree(&chapter, "chapter body"),
+        )]);
+        let cached_typeset_fragments = BTreeMap::from([(
+            "chapter:0001:intro".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("chapter:0001:intro"),
+                source_hash: 22,
+                block_checkpoints: None,
+            },
+        )]);
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        write_legacy_cache_record(
+            &cache.legacy_metadata_path,
+            LegacyCompileCacheRecord {
+                version: super::LEGACY_CACHE_VERSION,
+                primary_input: input.clone(),
+                jobname: "main".to_string(),
+                output_pdf: output_dir.join("main.pdf"),
+                output_pdf_hash: fingerprint_bytes(pdf_bytes),
+                dependency_graph: graph,
+                stable_compile_state: stable_state(&input),
+                cached_source_subtrees: cached_source_subtrees.clone(),
+                cached_typeset_fragments: cached_typeset_fragments.clone(),
+            },
+        );
+
+        let lookup = cache.lookup(&[]);
+
+        assert!(lookup.diagnostics.is_empty());
+        assert!(lookup.artifact.is_some());
+        assert_eq!(lookup.cached_source_subtrees, cached_source_subtrees);
+        assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn corrupted_partition_blob_only_drops_that_partition() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"stable"));
+        let cached_typeset_fragments = BTreeMap::from([
+            (
+                "document:0000:one".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0000:one"),
+                    source_hash: 1,
+                    block_checkpoints: None,
+                },
+            ),
+            (
+                "document:0001:two".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0001:two"),
+                    source_hash: 2,
+                    block_checkpoints: None,
+                },
+            ),
+        ]);
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+            )
+            .expect_none("cache stored");
+
+        let corrupt_partition_key = super::sanitize_partition_key("fragment:document:0000:one");
+        fs::write(
+            cache.partition_blob_path(&corrupt_partition_key),
+            b"{broken",
+        )
+        .expect("corrupt partition blob");
+
+        let lookup = cache.lookup(&[]);
+
+        assert!(lookup.artifact.is_some());
+        assert!(
+            lookup
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("partition blob")),
+            "expected partition corruption diagnostic, got {:?}",
+            lookup.diagnostics
+        );
+        assert!(!lookup
+            .cached_typeset_fragments
+            .contains_key("document:0000:one"));
+        assert_eq!(
+            lookup
+                .cached_typeset_fragments
+                .get("document:0001:two")
+                .expect("healthy partition retained"),
+            cached_typeset_fragments
+                .get("document:0001:two")
+                .expect("expected fragment")
+        );
     }
 
     #[test]
@@ -1027,7 +1899,7 @@ mod tests {
         fs::create_dir_all(&output_dir).expect("create output dir");
         let cache_dir = output_dir.join(super::CACHE_DIR_NAME);
         let base_time = UNIX_EPOCH + Duration::from_secs(10_000);
-        let mut metadata_paths = Vec::new();
+        let mut record_paths = Vec::new();
 
         fs::create_dir_all(&cache_dir).expect("create cache dir");
         fs::write(cache_dir.join("notes.txt"), "keep me").expect("write unrelated text file");
@@ -1047,7 +1919,7 @@ mod tests {
                     &BTreeMap::new(),
                 )
                 .expect_none("cache stored");
-            metadata_paths.push(cache.metadata_path.clone());
+            record_paths.push(cache.record_dir.clone());
 
             if index < MAX_CACHE_RECORD_FILES {
                 set_modified_time(
@@ -1058,10 +1930,10 @@ mod tests {
         }
 
         assert!(
-            !metadata_paths[0].exists(),
+            !record_paths[0].exists(),
             "oldest cache record should be evicted"
         );
-        for path in metadata_paths.iter().skip(1) {
+        for path in record_paths.iter().skip(1) {
             assert!(path.exists(), "newer cache records should be retained");
         }
         assert!(
@@ -1137,13 +2009,13 @@ mod tests {
         fs::write(&unreadable_input, "unreadable").expect("write unreadable input");
         fs::write(&valid_b_input, "valid-b").expect("write valid input b");
 
-        let valid_a_path = cache_dir.join("valid-a.json");
-        let unreadable_path = cache_dir.join("unreadable.json");
-        let valid_b_path = cache_dir.join("valid-b.json");
+        let valid_a_path = cache_dir.join("valid-a");
+        let unreadable_path = cache_dir.join("unreadable");
+        let valid_b_path = cache_dir.join("valid-b");
 
-        write_owned_cache_record(
+        write_owned_cache_record_dir(
             &valid_a_path,
-            CompileCacheRecord {
+            CacheIndex {
                 version: super::CACHE_VERSION,
                 primary_input: valid_a_input.clone(),
                 jobname: "valid-a".to_string(),
@@ -1151,13 +2023,13 @@ mod tests {
                 output_pdf_hash: fingerprint_bytes(b"valid-a-pdf"),
                 dependency_graph: dependency_graph_for(&valid_a_input, "valid-a"),
                 stable_compile_state: stable_state(&valid_a_input),
-                cached_source_subtrees: BTreeMap::new(),
-                cached_typeset_fragments: BTreeMap::new(),
+                partition_keys: Vec::new(),
             },
+            BTreeMap::new(),
         );
-        write_owned_cache_record(
+        write_owned_cache_record_dir(
             &unreadable_path,
-            CompileCacheRecord {
+            CacheIndex {
                 version: super::CACHE_VERSION,
                 primary_input: unreadable_input.clone(),
                 jobname: "unreadable".to_string(),
@@ -1165,13 +2037,13 @@ mod tests {
                 output_pdf_hash: fingerprint_bytes(b"unreadable-pdf"),
                 dependency_graph: dependency_graph_for(&unreadable_input, "unreadable"),
                 stable_compile_state: stable_state(&unreadable_input),
-                cached_source_subtrees: BTreeMap::new(),
-                cached_typeset_fragments: BTreeMap::new(),
+                partition_keys: Vec::new(),
             },
+            BTreeMap::new(),
         );
-        write_owned_cache_record(
+        write_owned_cache_record_dir(
             &valid_b_path,
-            CompileCacheRecord {
+            CacheIndex {
                 version: super::CACHE_VERSION,
                 primary_input: valid_b_input.clone(),
                 jobname: "valid-b".to_string(),
@@ -1179,26 +2051,27 @@ mod tests {
                 output_pdf_hash: fingerprint_bytes(b"valid-b-pdf"),
                 dependency_graph: dependency_graph_for(&valid_b_input, "valid-b"),
                 stable_compile_state: stable_state(&valid_b_input),
-                cached_source_subtrees: BTreeMap::new(),
-                cached_typeset_fragments: BTreeMap::new(),
+                partition_keys: Vec::new(),
             },
+            BTreeMap::new(),
         );
 
-        let mut permissions = fs::metadata(&unreadable_path)
+        let unreadable_index_path = unreadable_path.join(super::CACHE_INDEX_FILENAME);
+        let mut permissions = fs::metadata(&unreadable_index_path)
             .expect("unreadable record metadata")
             .permissions();
         let original_mode = permissions.mode();
         permissions.set_mode(0o000);
-        fs::set_permissions(&unreadable_path, permissions).expect("set unreadable record");
+        fs::set_permissions(&unreadable_index_path, permissions).expect("set unreadable record");
 
         let records =
             CompileCache::owned_cache_record_files(&cache_dir).expect("owned cache record listing");
 
-        let mut restored = fs::metadata(&unreadable_path)
+        let mut restored = fs::metadata(&unreadable_index_path)
             .expect("restore unreadable record metadata")
             .permissions();
         restored.set_mode(original_mode);
-        fs::set_permissions(&unreadable_path, restored).expect("restore unreadable record");
+        fs::set_permissions(&unreadable_index_path, restored).expect("restore unreadable record");
 
         let listed_paths = records
             .into_iter()
@@ -1235,11 +2108,11 @@ mod tests {
 
         for index in 0..MAX_CACHE_RECORD_FILES {
             let extra_input = dir.path().join(format!("extra-{index}.tex"));
-            let record_path = cache_dir.join(format!("manual-{index:03}.json"));
+            let record_path = cache_dir.join(format!("manual-{index:03}"));
             fs::write(&extra_input, format!("extra-{index}")).expect("write extra input");
-            write_owned_cache_record(
+            write_owned_cache_record_dir(
                 &record_path,
-                CompileCacheRecord {
+                CacheIndex {
                     version: super::CACHE_VERSION,
                     primary_input: extra_input.clone(),
                     jobname: format!("extra-{index:03}"),
@@ -1247,11 +2120,14 @@ mod tests {
                     output_pdf_hash: fingerprint_bytes(format!("pdf-extra-{index}").as_bytes()),
                     dependency_graph: dependency_graph_for(&extra_input, &format!("extra-{index}")),
                     stable_compile_state: stable_state(&extra_input),
-                    cached_source_subtrees: BTreeMap::new(),
-                    cached_typeset_fragments: BTreeMap::new(),
+                    partition_keys: Vec::new(),
                 },
+                BTreeMap::new(),
             );
-            set_modified_time(&record_path, UNIX_EPOCH + Duration::from_secs(index as u64));
+            set_modified_time(
+                &record_path.join(super::CACHE_INDEX_FILENAME),
+                UNIX_EPOCH + Duration::from_secs(index as u64),
+            );
         }
 
         let mut permissions = fs::metadata(&cache_dir)
@@ -1277,7 +2153,7 @@ mod tests {
         assert!(
             diagnostic
                 .message
-                .contains("failed to evict old compile cache metadata"),
+                .contains("failed to evict old compile cache records"),
             "expected eviction failure diagnostic, got {:?}",
             diagnostic.message
         );
@@ -1305,9 +2181,42 @@ mod tests {
             .expect("set file modified time");
     }
 
-    fn write_owned_cache_record(path: &std::path::Path, record: CompileCacheRecord) {
-        let bytes = serde_json::to_vec_pretty(&record).expect("serialize cache record");
+    fn write_owned_cache_record_dir(
+        path: &std::path::Path,
+        index: CacheIndex,
+        partition_blobs: BTreeMap<String, PartitionBlob>,
+    ) {
+        fs::create_dir_all(path.join(super::CACHE_PARTITIONS_DIR_NAME))
+            .expect("create cache record dir");
+        let bytes = serde_json::to_vec_pretty(&index).expect("serialize cache index");
+        fs::write(path.join(super::CACHE_INDEX_FILENAME), bytes).expect("write cache index");
+        for (partition_key, blob) in partition_blobs {
+            let bytes = serde_json::to_vec_pretty(&blob).expect("serialize partition blob");
+            fs::write(
+                path.join(super::CACHE_PARTITIONS_DIR_NAME)
+                    .join(format!("{partition_key}.json")),
+                bytes,
+            )
+            .expect("write partition blob");
+        }
+    }
+
+    fn write_legacy_cache_record(path: &std::path::Path, record: LegacyCompileCacheRecord) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create legacy cache dir");
+        }
+        let bytes = serde_json::to_vec_pretty(&record).expect("serialize legacy cache record");
         fs::write(path, bytes).expect("write cache record");
+    }
+
+    fn test_cached_subtree(path: &Path, text: &str) -> CachedSourceSubtree {
+        CachedSourceSubtree {
+            text: text.to_string(),
+            source_lines: Vec::new(),
+            source_files: vec![path.to_path_buf()],
+            labels: BTreeMap::new(),
+            citations: BTreeMap::new(),
+        }
     }
 
     fn test_fragment(partition_id: &str) -> DocumentLayoutFragment {

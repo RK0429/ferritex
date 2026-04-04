@@ -902,6 +902,20 @@ mod tests {
         fn resolve_tex_input(&self, _bundle_path: &Path, _relative_path: &str) -> Option<PathBuf> {
             None
         }
+
+        fn resolve_package(
+            &self,
+            bundle_path: &Path,
+            package_name: &str,
+            _project_root: Option<&Path>,
+        ) -> Option<PathBuf> {
+            let candidate = bundle_path
+                .join("texmf")
+                .join("tex")
+                .join("latex")
+                .join(format!("{package_name}.sty"));
+            candidate.exists().then_some(candidate)
+        }
     }
 
     struct NoopShellCommandGateway;
@@ -995,6 +1009,58 @@ mod tests {
                 duration: start.elapsed(),
                 output_bytes,
             })
+        }
+    }
+
+    fn extract_pdf_literal_strings(pdf_bytes: &[u8]) -> Vec<String> {
+        let mut strings = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0_u32;
+        let mut escaped = false;
+
+        for &byte in pdf_bytes {
+            if depth == 0 {
+                if byte == b'(' {
+                    current.clear();
+                    depth = 1;
+                }
+                continue;
+            }
+
+            if escaped {
+                current.push(byte as char);
+                escaped = false;
+                continue;
+            }
+
+            match byte {
+                b'\\' => escaped = true,
+                b'(' => {
+                    depth += 1;
+                    current.push('(');
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        strings.push(current.clone());
+                    } else {
+                        current.push(')');
+                    }
+                }
+                _ => current.push(byte as char),
+            }
+        }
+
+        strings
+    }
+
+    fn assert_pdf_contains_text(pdf_bytes: &[u8], expected_fragments: &[&str]) {
+        let pdf_text = extract_pdf_literal_strings(pdf_bytes).join("");
+        for fragment in expected_fragments {
+            assert!(
+                pdf_text.contains(fragment),
+                "expected PDF output to contain {fragment:?}"
+            );
         }
     }
 
@@ -1415,6 +1481,83 @@ mod tests {
         let names: Vec<_> = cases.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"bundle-pkg-compat_options"));
         assert!(names.contains(&"bundle-pkg-depchain_recursive"));
+    }
+
+    #[test]
+    fn test_bundle_package_compat_options_compile_smoke() {
+        let fixture_base = fixtures_root();
+        let base_case = bundle_package_loading_cases(&fixture_base)
+            .into_iter()
+            .find(|case| case.name == "bundle-pkg-compat_options")
+            .expect("compat_options fixture should exist");
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let case = stage_cases_in_tempdir(&[base_case], temp_dir.path())
+            .into_iter()
+            .next()
+            .expect("staged case should exist");
+        let backend = ServiceCompileBackend;
+
+        let output = backend
+            .compile(
+                &case.input_fixture,
+                case.asset_bundle.as_deref(),
+                case.jobs,
+                case.reproducible,
+                case.no_cache,
+            )
+            .unwrap_or_else(|error| panic!("{} should compile successfully: {error}", case.name));
+
+        assert!(
+            !output.output_bytes.is_empty(),
+            "{} should produce a non-empty PDF",
+            case.name
+        );
+        assert_pdf_contains_text(
+            &output.output_bytes,
+            &[
+                "COMPAT:compat-loaded-ftxutils:draft-mode",
+                "UTILS:utils-defined-ok",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_bundle_package_depchain_recursive_compile_smoke() {
+        let fixture_base = fixtures_root();
+        let base_case = bundle_package_loading_cases(&fixture_base)
+            .into_iter()
+            .find(|case| case.name == "bundle-pkg-depchain_recursive")
+            .expect("depchain_recursive fixture should exist");
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let case = stage_cases_in_tempdir(&[base_case], temp_dir.path())
+            .into_iter()
+            .next()
+            .expect("staged case should exist");
+        let backend = ServiceCompileBackend;
+
+        let output = backend
+            .compile(
+                &case.input_fixture,
+                case.asset_bundle.as_deref(),
+                case.jobs,
+                case.reproducible,
+                case.no_cache,
+            )
+            .unwrap_or_else(|error| panic!("{} should compile successfully: {error}", case.name));
+
+        assert!(
+            !output.output_bytes.is_empty(),
+            "{} should produce a non-empty PDF",
+            case.name
+        );
+        assert_pdf_contains_text(
+            &output.output_bytes,
+            &[
+                "DEPCHAIN:chain-loaded-compat:chain-has-utils",
+                "COMPAT:compat-loaded-ftxutils:final-mode",
+                "UTILS:utils-defined-ok",
+            ],
+        );
     }
 
     #[test]
