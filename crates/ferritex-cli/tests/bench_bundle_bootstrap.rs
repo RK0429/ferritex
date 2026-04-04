@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use ferritex_bench::{
     bench_fixtures_root, bundle_bootstrap_cases, bundle_package_loading_cases,
@@ -46,6 +49,37 @@ fn copy_dir_all(src: &Path, dst: &Path) {
             });
         }
     }
+}
+
+fn extract_bundle_archive(archive_path: &Path, destination: &Path) -> PathBuf {
+    let output = Command::new("tar")
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(destination)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to run tar for bundle archive {}: {error}",
+                archive_path.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "failed to extract bundle archive {}: stdout={} stderr={}",
+        archive_path.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bundle_root = destination.join("FTX-ASSET-BUNDLE-001");
+    assert!(
+        bundle_root.is_dir(),
+        "bundle archive {} should extract root directory {}",
+        archive_path.display(),
+        bundle_root.display()
+    );
+    bundle_root
 }
 
 fn partition_subset(case_name: &str) -> &'static str {
@@ -936,6 +970,106 @@ fn bundle_only_reproducible_corpus_proof() {
         assert!(
             !pdf_bytes.is_empty(),
             "reproducible bundle proof should produce a non-empty PDF for {}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn bundle_archive_smoke_proof() {
+    let archive_path = match std::env::var_os("FERRITEX_BUNDLE_ARCHIVE") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            eprintln!(
+                "[REQ-FUNC-046 SKIPPED] bundle archive smoke proof requires FERRITEX_BUNDLE_ARCHIVE"
+            );
+            return;
+        }
+    };
+    assert!(
+        archive_path.is_file(),
+        "bundle archive should exist at {}",
+        archive_path.display()
+    );
+
+    let extracted_archive = tempfile::tempdir().expect("create tempdir");
+    let extracted_bundle_root = extract_bundle_archive(&archive_path, extracted_archive.path());
+    assert!(extracted_bundle_root.join("manifest.json").is_file());
+    assert!(extracted_bundle_root.join("asset-index.json").is_file());
+    assert!(extracted_bundle_root.join("texmf").is_dir());
+
+    let bench_fixtures = bench_fixtures_root();
+    let base_cases = bundle_reproducible_cases(&bench_fixtures);
+
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let cases = base_cases
+        .iter()
+        .map(|case| {
+            let fixture_name = case
+                .input_fixture
+                .file_name()
+                .expect("fixture should have filename");
+            let temp_input = temp_dir.path().join(fixture_name);
+            std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+            BenchCase {
+                input_fixture: temp_input,
+                asset_bundle: Some(extracted_bundle_root.clone()),
+                ..case.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases.clone(),
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "bundle archive smoke proof failed: {:?}",
+        report.failures
+    );
+    assert_eq!(
+        report.results.len(),
+        cases.len(),
+        "expected all layout-core archive bundle cases to run"
+    );
+    assert!(report.results.iter().all(|result| result.case.reproducible));
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.case.asset_bundle.as_deref()
+                == Some(extracted_bundle_root.as_path()))
+    );
+    assert!(report
+        .results
+        .iter()
+        .map(|result| result.case.name.as_str())
+        .eq([
+            "layout-core-article-bundle-reproducible",
+            "layout-core-book-bundle-reproducible",
+            "layout-core-report-bundle-reproducible",
+            "layout-core-letter-bundle-reproducible",
+        ]
+        .into_iter()));
+
+    for case in &cases {
+        let pdf_path = case.input_fixture.with_extension("pdf");
+        let metadata = std::fs::metadata(&pdf_path).unwrap_or_else(|error| {
+            panic!("failed to stat output PDF {}: {error}", pdf_path.display())
+        });
+        assert!(
+            metadata.len() > 0,
+            "bundle archive smoke proof should produce a non-empty PDF for {}",
             case.name
         );
     }

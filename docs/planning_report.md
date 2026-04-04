@@ -19,7 +19,7 @@
 | LSP | 中 | `LspCapabilityService` が diagnostics / completion / definition / hover / codeAction を提供。`LiveAnalysisSnapshot` が `StableCompileState` を基に最新の compile 結果を LSP に公開 |
 | SyncTeX | 中 | `SyncTexData::build_line_based` による行ベース trace（column-precise fragment 分割・multi-file 対応）。`SyncTexData::build_from_placed_nodes` による `PlacedTextNode.sourceSpan` ベースのフラグメント精度 trace。forward / inverse search 両方向とも実装・テスト済み |
 | Parallel Pipeline | 中 | `CommitBarrier` が 4 ステージ（MacroSession / DocumentReference / LayoutMerge / ArtifactCache）すべてをカバー。`AuthorityKey` 衝突検出と fallback。`DocumentPartitionPlanner` が document class と section outline から chapter / section 単位の stable `partitionId` を生成。partition-book / partition-article コーパスで `--jobs=1` と `--jobs=4` の出力等価性が確認済み |
-| Asset Bundle Runtime | 中〜高 | `AssetBundleManifest` / `AssetBundleIndex` の読み込み・検証。`format_version` / `min_ferritex_version` のバージョン互換チェック。read-only mmap 読み込み。tex input / package / opentype font / default font / TFM font の 5 種の indexed lookup。path traversal 防止。project root 優先の package 解決 |
+| Asset Bundle Runtime | 中〜高 | `AssetBundleManifest` / `AssetBundleIndex` の読み込み・検証。`format_version` / `min_ferritex_version` のバージョン互換チェック。read-only mmap 読み込み。tex input / package / opentype font / default font / TFM font の 5 種の indexed lookup。path traversal 防止。project root 優先の package 解決。Wave 3 で deterministic `FTX-ASSET-BUNDLE-001.tar.gz` 生成スクリプトと archive-based CI smoke proof を接続済み |
 | Parity Evidence | 中〜高 | `bench_full_profile` テストから 5 カテゴリ（layout-core / navigation / bibliography / embedded-assets / tikz）の parity 計測が実行可能。全カテゴリ pass 確認済み。`math_equations` regression 修正済み（document_diff_rate: 0.286 → 0.000） |
 
 ### Parity Evidence 現状（REQ-NF-007）
@@ -42,17 +42,15 @@
 |---|---|---|---|
 | A | Incremental compilation (REQ-FUNC-027-030) | 低 | 依存グラフ・persistent cache・corruption fallback・reverse propagation・subtree cache 再利用・TypesetterReusePlan による部分再 typeset まで実装済み。**Wave 1 完了**: `full_bench_warm_incremental_evidence` で 1.84× speedup を point-in-time 計測（full --no-cache 28.614s vs incremental 15.550s、`FTX-BENCH-001` 1000-section staged input）。`incremental_xref_convergence_after_page_shift` でページ番号ずれ後の TOC/相互参照収束を byte-identical で確認。**Wave 1 残差分なし**。ただし `REQ-NF-002`（差分コンパイル中央値 100ms 未満）は Wave 1 のスコープ外であり、別途最適化が必要 |
 | B | Parallel pipeline (REQ-FUNC-031-033) | 低〜中 | CommitBarrier 4 ステージ・AuthorityKey 衝突検出・DocumentPartitionPlanner・PaginationMergeCoordinator・partition bench corpus まで実装済み。bounded no-regression evidence に加え、multi-second no-cache benchmark で speedup 自体は実測済み（book 2.467x、article 2.752x）。**残差分**: `REQ-FUNC-032` の strict 条件を満たす full-compile determinism（multi-second no-cache では jobs=1/jobs=4 の PDF hash が不一致） |
-| C | tikz/pgf (REQ-FUNC-023) | 低 | graphics scene parsing 実装済み。tikz parity テストで match_ratio >= 0.80 を pass。**残差分**: long-tail な tikz パターンでの geometric parity 継続改善 |
-| D | Asset bundle distribution (REQ-FUNC-046) | 低〜中 | bundle runtime（manifest / index / mmap / version check / 5 種 lookup）は完成。bundle-bootstrap / bundle-package テストで article / book / report / letter の compile が pass。**残差分**: 公式 `FTX-ASSET-BUNDLE-001` archive の配布契約・CI パイプラインへの接続 |
-| E | Full LaTeX compatibility | 中 | long-tail package behavior、より厳密な layout parity は継続課題 |
+| C | Long-tail compatibility (Wave 4) | 中 | `tikz` / `pgf` の long-tail 幾何パターンと package compatibility 拡張が継続課題。機能面の残 Frontier はこの Wave 4 に集約された |
 
 ## 2. 到達点の評価
 
-Must 要件の大部分は動作しており、高難度領域（incremental / parallel / SyncTeX / asset bundle）もそれぞれ実装の核心部分を通過している。parity evidence 計測インフラ（layout-core / navigation / bibliography / embedded-assets / tikz の 5 カテゴリ）がテストに接続済みで、全カテゴリ pass が確認されている。`math_equations` regression も修正済み（0.286 → 0.000）。
+Must 要件の大部分は動作しており、高難度領域（incremental / parallel / SyncTeX / asset bundle）もそれぞれ実装の核心部分を通過している。parity evidence 計測インフラ（layout-core / navigation / bibliography / embedded-assets / tikz の 5 カテゴリ）がテストに接続済みで、全カテゴリ pass が確認されている。`math_equations` regression も修正済み（0.286 → 0.000）。Wave 3 では deterministic bundle archive 生成、artifact upload/download、archive-based smoke proof が CI に接続され、`REQ-FUNC-046` の配布面の残差分は解消された。
 
-Wave 1（Incremental Performance Evidence）が完了し、warm incremental compile の機構が動作することを point-in-time 計測で確認した（1.84× speedup、`FTX-BENCH-001` 1000-section staged input）。Cross-reference 収束の byte-identical 検証も確立された。ただし Wave 1 は incremental mechanism の初期実証であり、`REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成を意味するものではない。残差分は「`REQ-NF-002` 差分性能目標への最適化・性能実証の拡充（parallel speedup）・配布インフラの整備（bundle archive CI）・long-tail 互換性の改善」に整理される。
+Wave 1（Incremental Performance Evidence）が完了し、warm incremental compile の機構が動作することを point-in-time 計測で確認した（1.84× speedup、`FTX-BENCH-001` 1000-section staged input）。Cross-reference 収束の byte-identical 検証も確立された。Wave 3 も完了し、`FTX-ASSET-BUNDLE-001` の deterministic archive 生成と CI 上の archive-based smoke proof が定着した。ただし Wave 1 は incremental mechanism の初期実証であり、`REQ-NF-002`（差分コンパイル中央値 100ms 未満）の達成を意味するものではない。残差分は「`REQ-NF-002` 差分性能目標への最適化・strict `REQ-FUNC-032` を閉じる full-compile determinism・Wave 4 の long-tail 互換性改善」に整理される。
 
-現在の到達点は「incremental compile 機構の初期実証が完了した working product」であり、REQ-NF-007 の parity 5 カテゴリ全 pass に加え、REQ-FUNC-030 の収束要件が計測データで確認されている段階にある。性能面では Wave 1 の speedup evidence が確立されたが、`REQ-NF-002` の定量基準に到達するにはさらなる最適化が必要である。
+現在の到達点は「incremental compile 機構の初期実証、bundle archive 配布 CI 接続、parity 計測基盤が揃った working product」であり、REQ-NF-007 の parity 5 カテゴリ全 pass、REQ-FUNC-030 の収束要件、REQ-FUNC-046 の bundle archive smoke proof が確認されている段階にある。残る Frontier は `REQ-NF-002`、strict `REQ-FUNC-032` を閉じる full-compile determinism、Wave 4 の long-tail 互換性である。
 
 ## 3. 残 Frontier と推奨 Wave
 
@@ -65,6 +63,7 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 | Partition Parallel Bounded Evidence | 出力等価性・overhead bounded の計測 | **完了** — evidence 確立済み（§5 参照） |
 | Wave 1: Incremental Performance Evidence (REQ-FUNC-030) | warm incremental benchmark + cross-reference 収束検証 | **完了** — 1.84× speedup を point-in-time 計測（`FTX-BENCH-001` 固定構成）、xref convergence byte-identical 確認済み（§5 参照）。`REQ-NF-002` 達成とは別 |
 | Wave 2: Partition Parallel Speedup Evidence (REQ-FUNC-032) | multi-second partition benchmark の実測と strict proof blocker の文書化 | **完了（speedup evidence 取得済み、strict acceptance blocker: full-compile determinism）** — heavy partition corpus で speedup 自体は確認（book 35.399s → 14.352s, 2.467x / article 27.859s → 10.124s, 2.752x）。一方で no-cache full compile では jobs=1/jobs=4 の output identity が崩れ、strict proof は determinism blocker として記録（§5 参照） |
+| Wave 3: Bundle Distribution CI 接続 (REQ-FUNC-046) | deterministic archive 生成 + artifact upload/download + archive-based smoke proof | **完了** — `scripts/build_bundle_archive.sh` が `FTX-ASSET-BUNDLE-001.tar.gz` を再現可能に生成し、`bundle-ci.yml` が download した archive を `bundle_archive_smoke_proof` に渡して layout-core 4 クラスの `--reproducible` compile を検証 |
 
 ### Wave 1: Incremental Performance Evidence (REQ-FUNC-030) — 完了
 
@@ -73,12 +72,12 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 | 1 | 部分再コンパイルの end-to-end ベンチマーク | `full_bench_warm_incremental_evidence` で 1000 `\section` 入力に対し warm incremental compile 15.550s vs full `--no-cache` 28.614s（1.84× speedup）を実測。`bench_full_profile.rs` に組み込み済み |
 | 2 | cross-reference 収束パスの検証 | `incremental_xref_convergence_after_page_shift` で 3 章 report（TOC + `\ref` + `\pageref`）に `\newpage` 挿入後の incremental compile PDF が fresh full compile と byte-identical であることを確認。`e2e_compile.rs` に組み込み済み |
 
-### Wave 3: Bundle Distribution CI 接続 (REQ-FUNC-046)
+### Wave 3: Bundle Distribution CI 接続 (REQ-FUNC-046) — 完了
 
-| # | タスク | 受入基準 |
+| # | タスク | 結果 |
 |---|---|---|
-| 5 | `FTX-ASSET-BUNDLE-001` archive 作成と CI 接続 | 公式 bundle archive を CI で取得・展開し、bundle-bootstrap smoke テストが自動実行される |
-| 6 | bundle-only corpus 実証 | host fallback を無効化（`--reproducible`）した状態で layout-core subset が compile できる |
+| 5 | `FTX-ASSET-BUNDLE-001` archive 作成と CI 接続 | `scripts/build_bundle_archive.sh` を追加し、`manifest.json` / `asset-index.json` / `texmf/` のみを含む deterministic archive を生成。`bundle-ci.yml` が build artifact を upload/download し、smoke test に渡す |
+| 6 | bundle-only corpus 実証 | `bundle_archive_smoke_proof` が downloaded archive を tempdir に展開し、展開済み bundle root を `--asset-bundle` + `--reproducible` で使って layout-core 4 クラスを compile。全件 non-empty PDF を確認 |
 
 ### Wave 4: Long-tail 互換性改善
 
@@ -91,23 +90,24 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 
 - **Wave 1 完了**。incremental compile 機構の初期実証（point-in-time 計測で 1.84× speedup）と cross-reference 収束検証が確立された。`REQ-NF-002` の定量基準（100ms 未満）は別途最適化が必要
 - **Wave 2 完了**。multi-second no-cache partition benchmark で speedup 自体は確認できたが、strict proof を閉じるには full-compile determinism の改善が必要
-- **Wave 3 は次の主タスク**。bundle-only corpus の parity 判定は既存の計測基盤を再利用できる
-- **Wave 4 は単体で進められる**が、parallel の境界が固まってから入る方が安全
+- **Wave 3 完了**。bundle archive 生成、artifact upload/download、archive-based smoke proof まで CI に接続された
+- **残 Frontier は 3 つ**。`REQ-NF-002` 差分性能目標、strict `REQ-FUNC-032` の determinism blocker、Wave 4 の long-tail compatibility
 
 ```mermaid
 graph LR
     W1[Wave 1: Incremental Perf ✓] --> W2[Wave 2: Partition Speedup ✓]
-    W2 --> W3[Wave 3: Bundle CI]
+    W2 --> W3[Wave 3: Bundle CI ✓]
     W3 --> W4[Wave 4: Long-tail Compat]
     style W1 fill:#9f9,stroke:#333
     style W2 fill:#9f9,stroke:#333
+    style W3 fill:#9f9,stroke:#333
 ```
 
 ## 5. 妥当性判定
 
-- **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・配布整備フェーズ
-- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1 により incremental compile 機構の有効性と cross-reference 収束が point-in-time 計測で確認された。Wave 2 では multi-second no-cache partition benchmark により speedup 自体を確認した一方、strict `REQ-FUNC-032` を閉じるための full-compile determinism が未充足であることを定量化した。残りは `REQ-NF-002` 差分性能目標、parallel full-compile determinism、bundle 配布 CI 接続（Wave 3）、long-tail 互換性改善（Wave 4）
-- **直近の推奨**: parallel pipeline では speedup より determinism を優先して改善し、その後 Wave 3 の bundle 配布 CI 接続を進める
+- **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・bundle archive CI 接続完了
+- **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1 により incremental compile 機構の有効性と cross-reference 収束が point-in-time 計測で確認され、Wave 2 により multi-second no-cache partition benchmark の speedup 自体も確認された。Wave 3 では deterministic `FTX-ASSET-BUNDLE-001` archive の生成と archive-based smoke proof が CI に組み込まれ、`REQ-FUNC-046` の配布面は完了した。残りは `REQ-NF-002` 差分性能目標、strict `REQ-FUNC-032` を閉じる full-compile determinism、Wave 4 の long-tail 互換性改善のみ
+- **直近の推奨**: parallel pipeline では speedup ではなく determinism を優先して閉じ、並行して `REQ-NF-002` 最適化を継続しつつ、機能面では Wave 4 に集中する
 
 ### Warm Incremental Benchmark 実績 (REQ-FUNC-030) — Wave 1 完了
 
