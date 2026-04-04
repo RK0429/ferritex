@@ -10942,6 +10942,143 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "REQ-NF-002 stage breakdown: 5-run median profiling (~6 min)"]
+    fn incremental_stage_timing_5run_median() {
+        fn median_duration(values: &[Duration]) -> Duration {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted[2]
+        }
+
+        fn run_list_ms(values: &[Duration]) -> String {
+            values
+                .iter()
+                .map(|value| format!("{}ms", value.as_millis()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let mut body = String::new();
+        for index in 1..=1000 {
+            let stem = format!("section-{index:04}");
+            body.push_str(&format!("\\input{{{stem}}}\n"));
+            fs::write(
+                dir.path().join(format!("{stem}.tex")),
+                format!(
+                    "\\section{{Section {index:04}}}\\label{{sec:{index:04}}}\nAlpha paragraph {index:04}.\n\nBeta paragraph {index:04}.\n\nGamma paragraph {index:04}.\n"
+                ),
+            )
+            .expect("write section input");
+        }
+        fs::write(&input_file, document(&body)).expect("write main input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0, "{:?}", warmup.diagnostics);
+
+        let mut cache_load_runs = Vec::with_capacity(5);
+        let mut source_tree_load_runs = Vec::with_capacity(5);
+        let mut parse_runs = Vec::with_capacity(5);
+        let mut typeset_runs = Vec::with_capacity(5);
+        let mut pdf_render_runs = Vec::with_capacity(5);
+        let mut cache_store_runs = Vec::with_capacity(5);
+        let mut total_runs = Vec::with_capacity(5);
+
+        for i in 1..=5 {
+            fs::write(
+                dir.path().join("section-0900.tex"),
+                format!(
+                    "\\section{{Section 0900}}\\label{{sec:0900}}\nAlpha paragraph 0900.\n\nBeta paragraph 0900 after benchmark run {i} edit.\n\nGamma paragraph 0900.\n"
+                ),
+            )
+            .expect("update staged section");
+
+            let incremental = service(&FsTestFileAccessGate, &loader).compile(&options);
+            assert_eq!(incremental.exit_code, 0, "{:?}", incremental.diagnostics);
+
+            let timing = incremental.stage_timing;
+            cache_load_runs.push(timing.cache_load.unwrap_or(Duration::ZERO));
+            source_tree_load_runs.push(timing.source_tree_load.unwrap_or(Duration::ZERO));
+            parse_runs.push(timing.parse.unwrap_or(Duration::ZERO));
+            typeset_runs.push(timing.typeset.unwrap_or(Duration::ZERO));
+            pdf_render_runs.push(timing.pdf_render.unwrap_or(Duration::ZERO));
+            cache_store_runs.push(timing.cache_store.unwrap_or(Duration::ZERO));
+            total_runs.push(timing.total());
+        }
+
+        let cache_load_median = median_duration(&cache_load_runs);
+        let source_tree_load_median = median_duration(&source_tree_load_runs);
+        let parse_median = median_duration(&parse_runs);
+        let typeset_median = median_duration(&typeset_runs);
+        let pdf_render_median = median_duration(&pdf_render_runs);
+        let cache_store_median = median_duration(&cache_store_runs);
+        let total_median = median_duration(&total_runs);
+
+        let dominant_stage = [
+            ("cache_load", cache_load_median),
+            ("source_tree_load", source_tree_load_median),
+            ("parse", parse_median),
+            ("typeset", typeset_median),
+            ("pdf_render", pdf_render_median),
+            ("cache_store", cache_store_median),
+        ]
+        .into_iter()
+        .max_by_key(|(_, duration)| *duration)
+        .expect("stage medians should not be empty");
+        let dominant_percentage = if total_median.is_zero() {
+            0.0
+        } else {
+            dominant_stage.1.as_secs_f64() / total_median.as_secs_f64() * 100.0
+        };
+
+        println!("[REQ-NF-002 STAGE BREAKDOWN]");
+        println!(
+            "cache_load:       median {}ms  (runs: {})",
+            cache_load_median.as_millis(),
+            run_list_ms(&cache_load_runs)
+        );
+        println!(
+            "source_tree_load: median {}ms  (runs: {})",
+            source_tree_load_median.as_millis(),
+            run_list_ms(&source_tree_load_runs)
+        );
+        println!(
+            "parse:            median {}ms  (runs: {})",
+            parse_median.as_millis(),
+            run_list_ms(&parse_runs)
+        );
+        println!(
+            "typeset:          median {}ms  (runs: {})",
+            typeset_median.as_millis(),
+            run_list_ms(&typeset_runs)
+        );
+        println!(
+            "pdf_render:       median {}ms  (runs: {})",
+            pdf_render_median.as_millis(),
+            run_list_ms(&pdf_render_runs)
+        );
+        println!(
+            "cache_store:      median {}ms  (runs: {})",
+            cache_store_median.as_millis(),
+            run_list_ms(&cache_store_runs)
+        );
+        println!(
+            "total:            median {}ms  (runs: {})",
+            total_median.as_millis(),
+            run_list_ms(&total_runs)
+        );
+        println!(
+            "dominant_stage:   {} ({:.1}%)",
+            dominant_stage.0, dominant_percentage
+        );
+    }
+
+    #[test]
     fn parallel_partial_typeset_produces_same_output_as_sequential() {
         let loader = MockAssetBundleLoader::valid();
 
