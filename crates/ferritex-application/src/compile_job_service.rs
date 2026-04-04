@@ -791,6 +791,19 @@ impl<'a> CompileJobService<'a> {
     }
 
     pub fn compile(&self, options: &RuntimeOptions) -> CompileResult {
+        self.compile_with_changed_paths(options, &[])
+    }
+
+    /// Compile with an optional watcher-provided change hint.
+    ///
+    /// `changed_paths_hint` should contain canonical paths that match the
+    /// dependency graph node keys used by `CompileCache`. The current watcher
+    /// pipeline guarantees this for existing callers.
+    pub fn compile_with_changed_paths(
+        &self,
+        options: &RuntimeOptions,
+        changed_paths_hint: &[PathBuf],
+    ) -> CompileResult {
         let input_path = options.input_file.to_string_lossy().into_owned();
         let execution_policy = ExecutionPolicyFactory::create(options);
         let project_root = project_root_for_policy(&execution_policy, &options.input_file);
@@ -913,7 +926,7 @@ impl<'a> CompileJobService<'a> {
         let mut source_tree_reuse_plan = None;
         if !options.no_cache {
             let cache_load_start = std::time::Instant::now();
-            let lookup = compile_cache.lookup();
+            let lookup = compile_cache.lookup(changed_paths_hint);
             cached_cross_reference_seed = lookup
                 .baseline_state
                 .as_ref()

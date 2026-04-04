@@ -1,6 +1,6 @@
 use crate::graphics::api::{
-    ArrowSpec, Color, GraphicGroup, GraphicNode, GraphicText, GraphicsScene, PathSegment, Point,
-    Transform2D, VectorPrimitive,
+    ArrowSpec, Color, DashPattern, GraphicGroup, GraphicNode, GraphicText, GraphicsScene, LineCap,
+    LineJoin, PathSegment, Point, Transform2D, VectorPrimitive,
 };
 
 const CM_IN_PT: f64 = 28.3465;
@@ -37,6 +37,11 @@ struct ScopeState {
     default_stroke: Option<Color>,
     default_fill: Option<Color>,
     default_line_width: Option<f64>,
+    default_dash_pattern: DashPattern,
+    default_line_cap: LineCap,
+    default_line_join: LineJoin,
+    default_opacity: f64,
+    default_fill_opacity: f64,
     transform: Transform2D,
 }
 
@@ -46,6 +51,11 @@ impl Default for ScopeState {
             default_stroke: None,
             default_fill: None,
             default_line_width: Some(DEFAULT_LINE_WIDTH_PT),
+            default_dash_pattern: DashPattern::Solid,
+            default_line_cap: LineCap::Butt,
+            default_line_join: LineJoin::Miter,
+            default_opacity: 1.0,
+            default_fill_opacity: 1.0,
             transform: Transform2D::default(),
         }
     }
@@ -80,6 +90,11 @@ struct PathStyle {
     stroke: Option<Color>,
     fill: Option<Color>,
     line_width: f64,
+    dash_pattern: DashPattern,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    opacity: f64,
+    fill_opacity: f64,
     transform: Transform2D,
     arrows: ArrowSpec,
 }
@@ -179,6 +194,11 @@ fn parse_scope_block(
         default_stroke: scope_options.default_stroke,
         default_fill: scope_options.default_fill,
         default_line_width: scope_options.default_line_width,
+        default_dash_pattern: scope_options.default_dash_pattern,
+        default_line_cap: scope_options.default_line_cap,
+        default_line_join: scope_options.default_line_join,
+        default_opacity: scope_options.default_opacity,
+        default_fill_opacity: scope_options.default_fill_opacity,
         transform: parent_state.transform.compose(scope_options.transform),
     };
 
@@ -370,6 +390,11 @@ fn parse_path_statement(
             fill: style.fill,
             line_width: style.line_width,
             arrows: style.arrows,
+            dash_pattern: style.dash_pattern,
+            line_cap: style.line_cap,
+            line_join: style.line_join,
+            opacity: style.opacity,
+            fill_opacity: style.fill_opacity,
         }),
         state,
         style.transform,
@@ -516,7 +541,7 @@ fn parse_path_segments(
             let Some((start_deg, end_deg, radius)) = cursor.parse_arc_spec() else {
                 emit_parse_error(
                     diagnostics,
-                    "arc requires `(start angle:end angle:radius)`".to_string(),
+                    "arc requires `(start:end:radius)` or `(start angle=..., end angle=..., radius=...)`".to_string(),
                 );
                 return None;
             };
@@ -797,6 +822,43 @@ fn resolve_line_width_preset(name: &str) -> Option<f64> {
     }
 }
 
+fn resolve_dash_pattern_preset(name: &str) -> Option<DashPattern> {
+    match name.trim() {
+        "dashed" => Some(DashPattern::Dashed),
+        "dotted" => Some(DashPattern::Dotted),
+        "densely dashed" => Some(DashPattern::DenselyDashed),
+        "densely dotted" => Some(DashPattern::DenselyDotted),
+        "loosely dashed" => Some(DashPattern::LooselyDashed),
+        "loosely dotted" => Some(DashPattern::LooselyDotted),
+        "dash dot" => Some(DashPattern::DashDot),
+        "dash dot dot" => Some(DashPattern::DashDotDot),
+        _ => None,
+    }
+}
+
+fn parse_style_number(value: &str) -> Option<f64> {
+    let number = value.trim().parse::<f64>().ok()?;
+    number.is_finite().then_some(number)
+}
+
+fn parse_line_cap(value: &str) -> Option<LineCap> {
+    match value.trim() {
+        "butt" => Some(LineCap::Butt),
+        "round" => Some(LineCap::Round),
+        "rect" => Some(LineCap::Rect),
+        _ => None,
+    }
+}
+
+fn parse_line_join(value: &str) -> Option<LineJoin> {
+    match value.trim() {
+        "miter" => Some(LineJoin::Miter),
+        "round" => Some(LineJoin::Round),
+        "bevel" => Some(LineJoin::Bevel),
+        _ => None,
+    }
+}
+
 impl PathStyle {
     fn parse(
         options: Option<&str>,
@@ -814,6 +876,11 @@ impl PathStyle {
                 _ => state.default_fill,
             },
             line_width: state.default_line_width.unwrap_or(DEFAULT_LINE_WIDTH_PT),
+            dash_pattern: state.default_dash_pattern,
+            line_cap: state.default_line_cap,
+            line_join: state.default_line_join,
+            opacity: state.default_opacity,
+            fill_opacity: state.default_fill_opacity,
             transform: Transform2D::default(),
             arrows: ArrowSpec::None,
         };
@@ -836,6 +903,10 @@ impl PathStyle {
 
             if let Some(arrows) = parse_arrow_option(option) {
                 style.arrows = arrows;
+                continue;
+            }
+            if let Some(dash_pattern) = resolve_dash_pattern_preset(option) {
+                style.dash_pattern = dash_pattern;
                 continue;
             }
 
@@ -863,6 +934,34 @@ impl PathStyle {
                     };
                     style.line_width = line_width;
                 }
+                ("line cap", Some(value)) => match parse_line_cap(value) {
+                    Some(line_cap) => style.line_cap = line_cap,
+                    None => emit_parse_error(diagnostics, format!("invalid line cap `{value}`")),
+                },
+                ("line join", Some(value)) => match parse_line_join(value) {
+                    Some(line_join) => style.line_join = line_join,
+                    None => emit_parse_error(diagnostics, format!("invalid line join `{value}`")),
+                },
+                ("opacity", Some(value)) => match parse_style_number(value) {
+                    Some(opacity) => {
+                        let opacity = opacity.clamp(0.0, 1.0);
+                        style.opacity = opacity;
+                        style.fill_opacity = opacity;
+                    }
+                    None => emit_parse_error(diagnostics, format!("invalid opacity `{value}`")),
+                },
+                ("draw opacity", Some(value)) => match parse_style_number(value) {
+                    Some(opacity) => style.opacity = opacity.clamp(0.0, 1.0),
+                    None => {
+                        emit_parse_error(diagnostics, format!("invalid draw opacity `{value}`"))
+                    }
+                },
+                ("fill opacity", Some(value)) => match parse_style_number(value) {
+                    Some(opacity) => style.fill_opacity = opacity.clamp(0.0, 1.0),
+                    None => {
+                        emit_parse_error(diagnostics, format!("invalid fill opacity `{value}`"))
+                    }
+                },
                 ("xshift", Some(value)) => {
                     if let Some(length) = parse_length(value, false) {
                         style.transform.x_shift = length;
@@ -932,6 +1031,11 @@ struct ScopeOptions {
     default_stroke: Option<Color>,
     default_fill: Option<Color>,
     default_line_width: Option<f64>,
+    default_dash_pattern: DashPattern,
+    default_line_cap: LineCap,
+    default_line_join: LineJoin,
+    default_opacity: f64,
+    default_fill_opacity: f64,
     transform: Transform2D,
 }
 
@@ -945,6 +1049,11 @@ impl ScopeOptions {
             default_stroke: parent.default_stroke,
             default_fill: parent.default_fill,
             default_line_width: parent.default_line_width,
+            default_dash_pattern: parent.default_dash_pattern,
+            default_line_cap: parent.default_line_cap,
+            default_line_join: parent.default_line_join,
+            default_opacity: parent.default_opacity,
+            default_fill_opacity: parent.default_fill_opacity,
             transform: Transform2D::default(),
         };
 
@@ -954,6 +1063,10 @@ impl ScopeOptions {
 
         for option in split_options(options) {
             if option.is_empty() {
+                continue;
+            }
+            if let Some(dash_pattern) = resolve_dash_pattern_preset(option) {
+                parsed.default_dash_pattern = dash_pattern;
                 continue;
             }
 
@@ -977,6 +1090,34 @@ impl ScopeOptions {
                 ("line width", Some(value)) => match parse_length(value, false) {
                     Some(line_width) => parsed.default_line_width = Some(line_width),
                     None => emit_parse_error(diagnostics, format!("invalid line width `{value}`")),
+                },
+                ("line cap", Some(value)) => match parse_line_cap(value) {
+                    Some(line_cap) => parsed.default_line_cap = line_cap,
+                    None => emit_parse_error(diagnostics, format!("invalid line cap `{value}`")),
+                },
+                ("line join", Some(value)) => match parse_line_join(value) {
+                    Some(line_join) => parsed.default_line_join = line_join,
+                    None => emit_parse_error(diagnostics, format!("invalid line join `{value}`")),
+                },
+                ("opacity", Some(value)) => match parse_style_number(value) {
+                    Some(opacity) => {
+                        let opacity = opacity.clamp(0.0, 1.0);
+                        parsed.default_opacity = opacity;
+                        parsed.default_fill_opacity = opacity;
+                    }
+                    None => emit_parse_error(diagnostics, format!("invalid opacity `{value}`")),
+                },
+                ("draw opacity", Some(value)) => match parse_style_number(value) {
+                    Some(opacity) => parsed.default_opacity = opacity.clamp(0.0, 1.0),
+                    None => {
+                        emit_parse_error(diagnostics, format!("invalid draw opacity `{value}`"))
+                    }
+                },
+                ("fill opacity", Some(value)) => match parse_style_number(value) {
+                    Some(opacity) => parsed.default_fill_opacity = opacity.clamp(0.0, 1.0),
+                    None => {
+                        emit_parse_error(diagnostics, format!("invalid fill opacity `{value}`"))
+                    }
                 },
                 ("xshift", Some(value)) => match parse_length(value, false) {
                     Some(length) => parsed.transform.x_shift = length,
@@ -1171,9 +1312,17 @@ impl<'a> Cursor<'a> {
         Some((x_radius, y_radius))
     }
 
-    /// Parses the colon-separated arc spec `(start:end:radius)`.
-    /// The key-value form `[start angle=..., end angle=..., radius=...]` is not yet supported.
     fn parse_arc_spec(&mut self) -> Option<(f64, f64, f64)> {
+        let checkpoint = self.index;
+        if let Some(spec) = self.parse_arc_spec_colon() {
+            return Some(spec);
+        }
+        self.index = checkpoint;
+        self.parse_arc_spec_key_value()
+    }
+
+    /// Parses the colon-separated arc spec `(start:end:radius)`.
+    fn parse_arc_spec_colon(&mut self) -> Option<(f64, f64, f64)> {
         self.skip_whitespace();
         if !self.consume_prefix("(") {
             return None;
@@ -1203,6 +1352,38 @@ impl<'a> Cursor<'a> {
         Some((start_angle, end_angle, radius))
     }
 
+    fn parse_arc_spec_key_value(&mut self) -> Option<(f64, f64, f64)> {
+        self.skip_whitespace();
+        let spec = if let Some(group) = self.parse_parenthesized_group() {
+            group
+        } else {
+            match self.parse_optional_bracket_group()? {
+                Some(group) => group,
+                None => return None,
+            }
+        };
+
+        let mut start_angle = None;
+        let mut end_angle = None;
+        let mut radius = None;
+        for option in split_options(&spec) {
+            if option.is_empty() {
+                continue;
+            }
+
+            match split_option(option) {
+                ("start angle", Some(value)) => start_angle = parse_style_number(value),
+                ("end angle", Some(value)) => end_angle = parse_style_number(value),
+                ("radius", Some(value)) | ("x radius", Some(value)) => {
+                    radius = parse_length(value, true)
+                }
+                _ => return None,
+            }
+        }
+
+        Some((start_angle?, end_angle?, radius?))
+    }
+
     fn parse_braced_text(&mut self) -> Option<String> {
         self.skip_whitespace();
         if !self.consume_prefix("{") {
@@ -1226,6 +1407,33 @@ impl<'a> Cursor<'a> {
                 _ => {}
             }
         }
+        None
+    }
+
+    fn parse_parenthesized_group(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        if !self.consume_prefix("(") {
+            return None;
+        }
+
+        let start = self.index;
+        let mut depth = 1usize;
+        while self.index < self.input.len() {
+            let ch = self.remaining().chars().next()?;
+            self.index += ch.len_utf8();
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let end = self.index - 1;
+                        return Some(self.input[start..end].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
         None
     }
 
@@ -1301,6 +1509,10 @@ fn parse_length(token: &str, default_cm: bool) -> Option<f64> {
         (number, 72.0)
     } else if let Some(number) = token.strip_suffix("pt") {
         (number, 1.0)
+    } else if let Some(number) = token.strip_suffix("ex") {
+        (number, 4.3)
+    } else if let Some(number) = token.strip_suffix("em") {
+        (number, 10.0)
     } else {
         (token, if default_cm { CM_IN_PT } else { return None })
     };
@@ -1562,13 +1774,15 @@ fn emit_parse_error(diagnostics: &mut Vec<TikzDiagnostic>, message: String) {
 #[cfg(test)]
 mod tests {
     use crate::graphics::api::{
-        compile_graphics_scene, ArrowSpec, Color, GraphicGroup, GraphicNode, GraphicText,
-        GraphicsScene, PathSegment, Point, Transform2D, VectorPrimitive,
+        compile_graphics_scene, ArrowSpec, Color, DashPattern, GraphicGroup, GraphicNode,
+        GraphicText, GraphicsScene, LineCap, LineJoin, PathSegment, Point, Transform2D,
+        VectorPrimitive,
     };
 
     use super::{
         arc_segments, circle_path, ellipse_path, named_color, parse_length, parse_tikzpicture,
-        resolve_line_width_preset, resolve_named_color, TikzDiagnostic, CM_IN_PT, KAPPA,
+        resolve_dash_pattern_preset, resolve_line_width_preset, resolve_named_color,
+        TikzDiagnostic, CM_IN_PT, KAPPA,
     };
 
     fn assert_point_close(actual: Point, expected: Point) {
@@ -1776,6 +1990,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_length_ex_and_em_units() {
+        let ex = parse_length("1ex", false).expect("1ex should parse");
+        let em = parse_length("1em", false).expect("1em should parse");
+
+        assert!((ex - 4.3).abs() < 1e-9);
+        assert!((em - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn parses_draw_path_with_cycle() {
         let result = parse_tikzpicture(r"\draw (0,0) -- (1,0) -- (1,1) -- cycle;");
 
@@ -1798,7 +2021,7 @@ mod tests {
                 stroke: Some(named_color("black")),
                 fill: None,
                 line_width: 0.4,
-                arrows: ArrowSpec::None,
+                ..Default::default()
             })]
         );
     }
@@ -1830,7 +2053,7 @@ mod tests {
                 stroke: Some(named_color("black")),
                 fill: None,
                 line_width: 0.4,
-                arrows: ArrowSpec::None,
+                ..Default::default()
             })]
         );
     }
@@ -2267,7 +2490,7 @@ mod tests {
                     stroke: Some(named_color("black")),
                     fill: None,
                     line_width: 0.4,
-                    arrows: ArrowSpec::None,
+                    ..Default::default()
                 })],
                 default_stroke: None,
                 default_fill: None,
@@ -2444,6 +2667,43 @@ mod tests {
     }
 
     #[test]
+    fn resolves_dash_pattern_presets() {
+        assert_eq!(
+            resolve_dash_pattern_preset("dashed"),
+            Some(DashPattern::Dashed)
+        );
+        assert_eq!(
+            resolve_dash_pattern_preset("dotted"),
+            Some(DashPattern::Dotted)
+        );
+        assert_eq!(
+            resolve_dash_pattern_preset("densely dashed"),
+            Some(DashPattern::DenselyDashed)
+        );
+        assert_eq!(
+            resolve_dash_pattern_preset("densely dotted"),
+            Some(DashPattern::DenselyDotted)
+        );
+        assert_eq!(
+            resolve_dash_pattern_preset("loosely dashed"),
+            Some(DashPattern::LooselyDashed)
+        );
+        assert_eq!(
+            resolve_dash_pattern_preset("loosely dotted"),
+            Some(DashPattern::LooselyDotted)
+        );
+        assert_eq!(
+            resolve_dash_pattern_preset("dash dot"),
+            Some(DashPattern::DashDot)
+        );
+        assert_eq!(
+            resolve_dash_pattern_preset("dash dot dot"),
+            Some(DashPattern::DashDotDot)
+        );
+        assert_eq!(resolve_dash_pattern_preset("blue"), None);
+    }
+
+    #[test]
     fn parses_line_width_presets_in_scope_and_path_styles() {
         let result = parse_tikzpicture(
             r"\begin{scope}[very thick]
@@ -2464,6 +2724,155 @@ mod tests {
         };
         assert_eq!(default_line.line_width, 1.2);
         assert_eq!(thin_line.line_width, 0.4);
+    }
+
+    #[test]
+    fn parses_dash_pattern_presets_in_paths() {
+        let result = parse_tikzpicture(
+            r"\draw[dashed] (0,0) -- (1,0);
+               \draw[densely dotted] (0,1) -- (1,1);
+               \draw[dash dot dot] (0,2) -- (1,2);",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(dashed), GraphicNode::Vector(densely_dotted), GraphicNode::Vector(dash_dot_dot)] =
+            result.scene.nodes.as_slice()
+        else {
+            panic!("expected three vector nodes");
+        };
+        assert_eq!(dashed.dash_pattern, DashPattern::Dashed);
+        assert_eq!(densely_dotted.dash_pattern, DashPattern::DenselyDotted);
+        assert_eq!(dash_dot_dot.dash_pattern, DashPattern::DashDotDot);
+    }
+
+    #[test]
+    fn parses_line_cap_and_join_options() {
+        let result = parse_tikzpicture(r"\draw[line cap=round,line join=bevel] (0,0) -- (1,0);");
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.line_cap, LineCap::Round);
+        assert_eq!(primitive.line_join, LineJoin::Bevel);
+    }
+
+    #[test]
+    fn parses_opacity_variants() {
+        let result = parse_tikzpicture(
+            r"\draw[opacity=0.25] (0,0) -- (1,0);
+               \fill[draw opacity=0.4,fill opacity=0.7] (0,1) rectangle (1,2);",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(uniform), GraphicNode::Vector(split)] =
+            result.scene.nodes.as_slice()
+        else {
+            panic!("expected two vector nodes");
+        };
+        assert_eq!(uniform.opacity, 0.25);
+        assert_eq!(uniform.fill_opacity, 0.25);
+        assert_eq!(split.opacity, 0.4);
+        assert_eq!(split.fill_opacity, 0.7);
+    }
+
+    #[test]
+    fn parses_scope_inheritance_for_dash_cap_join_and_opacity() {
+        let result = parse_tikzpicture(
+            r"\begin{scope}[densely dashed,line cap=rect,line join=round,opacity=0.3]
+                \draw (0,0) -- (1,0);
+                \draw[dotted,draw opacity=0.8,fill opacity=0.6] (0,1) -- (1,1);
+            \end{scope}",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Group(scope)] = result.scene.nodes.as_slice() else {
+            panic!("expected scope group");
+        };
+        let [GraphicNode::Vector(inherited), GraphicNode::Vector(overridden)] =
+            scope.children.as_slice()
+        else {
+            panic!("expected two vector nodes");
+        };
+        assert_eq!(inherited.dash_pattern, DashPattern::DenselyDashed);
+        assert_eq!(inherited.line_cap, LineCap::Rect);
+        assert_eq!(inherited.line_join, LineJoin::Round);
+        assert_eq!(inherited.opacity, 0.3);
+        assert_eq!(inherited.fill_opacity, 0.3);
+        assert_eq!(overridden.dash_pattern, DashPattern::Dotted);
+        assert_eq!(overridden.line_cap, LineCap::Rect);
+        assert_eq!(overridden.line_join, LineJoin::Round);
+        assert_eq!(overridden.opacity, 0.8);
+        assert_eq!(overridden.fill_opacity, 0.6);
+    }
+
+    #[test]
+    fn clamps_opacity_values_to_pdf_range() {
+        let result = parse_tikzpicture(
+            r"\begin{scope}[opacity=1.5]
+                \draw (0,0) -- (1,0);
+                \fill[draw opacity=-0.2,fill opacity=4] (0,1) rectangle (1,2);
+            \end{scope}",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Group(scope)] = result.scene.nodes.as_slice() else {
+            panic!("expected scope group");
+        };
+        let [GraphicNode::Vector(inherited), GraphicNode::Vector(overridden)] =
+            scope.children.as_slice()
+        else {
+            panic!("expected two vector nodes");
+        };
+        assert_eq!(inherited.opacity, 1.0);
+        assert_eq!(inherited.fill_opacity, 1.0);
+        assert_eq!(overridden.opacity, 0.0);
+        assert_eq!(overridden.fill_opacity, 1.0);
+    }
+
+    #[test]
+    fn parses_parenthesized_key_value_arc_path() {
+        let result =
+            parse_tikzpicture(r"\draw (1,0) arc (start angle=0, end angle=90, radius=1) -- (2,0);");
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.path.len(), 3);
+        let PathSegment::CurveTo { end, .. } = primitive.path[1] else {
+            panic!("expected cubic bezier arc");
+        };
+        assert_point_close(
+            end,
+            Point {
+                x: 0.0,
+                y: CM_IN_PT,
+            },
+        );
+    }
+
+    #[test]
+    fn parses_bracketed_key_value_arc_path_with_x_radius() {
+        let result = parse_tikzpicture(
+            r"\draw (1,0) arc [start angle=0, end angle=90, x radius=1] -- (2,0);",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Vector(primitive)] = result.scene.nodes.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(primitive.path.len(), 3);
+        let PathSegment::CurveTo { end, .. } = primitive.path[1] else {
+            panic!("expected cubic bezier arc");
+        };
+        assert_point_close(
+            end,
+            Point {
+                x: 0.0,
+                y: CM_IN_PT,
+            },
+        );
     }
 
     #[test]

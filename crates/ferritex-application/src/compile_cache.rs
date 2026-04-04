@@ -106,7 +106,7 @@ impl<'a> CompileCache<'a> {
         }
     }
 
-    pub fn lookup(&self) -> CacheLookupResult {
+    pub fn lookup(&self, changed_paths_hint: &[PathBuf]) -> CacheLookupResult {
         let bytes = match self.file_access_gate.read_file(&self.metadata_path) {
             Ok(bytes) => bytes,
             Err(FileAccessError::Io { source })
@@ -201,7 +201,7 @@ impl<'a> CompileCache<'a> {
 
         let baseline_state = record.stable_compile_state.clone();
 
-        let change_summary = self.detect_changes(&record.dependency_graph);
+        let change_summary = self.detect_changes(&record.dependency_graph, changed_paths_hint);
         if !change_summary.changed_paths.is_empty() {
             return CacheLookupResult {
                 artifact: None,
@@ -325,20 +325,37 @@ impl<'a> CompileCache<'a> {
             })
     }
 
-    fn detect_changes(&self, dependency_graph: &DependencyGraph) -> ChangeSummary {
+    fn detect_changes(
+        &self,
+        dependency_graph: &DependencyGraph,
+        changed_paths_hint: &[PathBuf],
+    ) -> ChangeSummary {
         let mut changed_paths = Vec::new();
 
-        for (path, node) in &dependency_graph.nodes {
-            let current_hash = match self.file_access_gate.read_file(path) {
-                Ok(bytes) => fingerprint_bytes(&bytes),
-                Err(_) => {
+        if changed_paths_hint.is_empty() {
+            for (path, node) in &dependency_graph.nodes {
+                if self.path_has_changed(path, node.content_hash) {
                     changed_paths.push(path.clone());
+                }
+            }
+        } else {
+            // Fast path: trust the watcher hint to be a complete set of changed paths.
+            // If a file changes after poll_changes() but before this check, we can miss it
+            // for this cycle; that short race is acceptable because the next poll will
+            // observe it. Preserve the same assumption when migrating to inotify/kqueue.
+            let mut checked_paths = BTreeSet::new();
+            for path in changed_paths_hint {
+                if !checked_paths.insert(path.clone()) {
                     continue;
                 }
-            };
 
-            if current_hash != node.content_hash {
-                changed_paths.push(path.clone());
+                let Some(node) = dependency_graph.nodes.get(path) else {
+                    continue;
+                };
+
+                if self.path_has_changed(path, node.content_hash) {
+                    changed_paths.push(path.clone());
+                }
             }
         }
 
@@ -356,6 +373,15 @@ impl<'a> CompileCache<'a> {
             rebuild_paths,
             scope,
         }
+    }
+
+    fn path_has_changed(&self, path: &Path, expected_hash: u64) -> bool {
+        let current_hash = match self.file_access_gate.read_file(path) {
+            Ok(bytes) => fingerprint_bytes(&bytes),
+            Err(_) => return true,
+        };
+
+        current_hash != expected_hash
     }
 
     fn evict_excess_records(&self) -> std::io::Result<()> {
@@ -486,6 +512,8 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use ferritex_core::compilation::{CompilationSnapshot, DocumentState};
@@ -558,6 +586,90 @@ mod tests {
         }
     }
 
+    struct CountingFsGate {
+        read_counts: Mutex<BTreeMap<PathBuf, usize>>,
+    }
+
+    impl CountingFsGate {
+        fn new() -> Self {
+            Self {
+                read_counts: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn reset(&self) {
+            self.read_counts.lock().expect("lock read counts").clear();
+        }
+
+        fn read_count(&self, path: &Path) -> usize {
+            *self
+                .read_counts
+                .lock()
+                .expect("lock read counts")
+                .get(path)
+                .unwrap_or(&0)
+        }
+    }
+
+    impl ferritex_core::policy::FileAccessGate for CountingFsGate {
+        fn ensure_directory(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<(), ferritex_core::policy::FileAccessError> {
+            fs::create_dir_all(path).map_err(Into::into)
+        }
+
+        fn check_read(&self, _path: &std::path::Path) -> ferritex_core::policy::PathAccessDecision {
+            ferritex_core::policy::PathAccessDecision::Allowed
+        }
+
+        fn check_write(
+            &self,
+            _path: &std::path::Path,
+        ) -> ferritex_core::policy::PathAccessDecision {
+            ferritex_core::policy::PathAccessDecision::Allowed
+        }
+
+        fn check_readback(
+            &self,
+            _path: &std::path::Path,
+            _primary_input: &std::path::Path,
+            _jobname: &str,
+        ) -> ferritex_core::policy::PathAccessDecision {
+            ferritex_core::policy::PathAccessDecision::Allowed
+        }
+
+        fn read_file(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<Vec<u8>, ferritex_core::policy::FileAccessError> {
+            *self
+                .read_counts
+                .lock()
+                .expect("lock read counts")
+                .entry(path.to_path_buf())
+                .or_default() += 1;
+            fs::read(path).map_err(Into::into)
+        }
+
+        fn write_file(
+            &self,
+            path: &std::path::Path,
+            content: &[u8],
+        ) -> Result<(), ferritex_core::policy::FileAccessError> {
+            fs::write(path, content).map_err(Into::into)
+        }
+
+        fn read_readback(
+            &self,
+            path: &std::path::Path,
+            _primary_input: &std::path::Path,
+            _jobname: &str,
+        ) -> Result<Vec<u8>, ferritex_core::policy::FileAccessError> {
+            fs::read(path).map_err(Into::into)
+        }
+    }
+
     fn stable_state(input: &std::path::Path) -> StableCompileState {
         StableCompileState {
             snapshot: CompilationSnapshot {
@@ -603,7 +715,7 @@ mod tests {
 
         fs::write(&input, "after").expect("update input");
 
-        let lookup = cache.lookup();
+        let lookup = cache.lookup(&[]);
 
         assert!(lookup.artifact.is_none());
         assert_eq!(lookup.baseline_state, Some(stable_state(&input)));
@@ -642,7 +754,7 @@ mod tests {
             )
             .expect_none("cache stored");
 
-        let lookup = cache.lookup();
+        let lookup = cache.lookup(&[]);
 
         assert!(lookup.diagnostics.is_empty());
         assert_eq!(lookup.baseline_state, Some(expected_state.clone()));
@@ -692,7 +804,7 @@ mod tests {
 
         fs::write(&chapter, "after").expect("update chapter");
 
-        let lookup = cache.lookup();
+        let lookup = cache.lookup(&[]);
 
         assert_eq!(lookup.changed_paths, vec![chapter.clone()]);
         assert_eq!(
@@ -735,9 +847,177 @@ mod tests {
             )
             .expect_none("cache stored");
 
-        let lookup = cache.lookup();
+        let lookup = cache.lookup(&[]);
 
         assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn fast_path_detects_change_for_hinted_path() {
+        let gate = CountingFsGate::new();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let appendix = dir.path().join("appendix.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}\\input{appendix}").expect("write input");
+        fs::write(&chapter, "before").expect("write chapter");
+        fs::write(&appendix, "stable").expect("write appendix");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(
+            input.clone(),
+            fingerprint_bytes(b"\\input{chapter}\\input{appendix}"),
+        );
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"before"));
+        graph.record_node(appendix.clone(), fingerprint_bytes(b"stable"));
+        graph.record_edge(input.clone(), chapter.clone());
+        graph.record_edge(input.clone(), appendix.clone());
+
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .expect_none("cache stored");
+
+        fs::write(&chapter, "after").expect("update chapter");
+        gate.reset();
+
+        let lookup = cache.lookup(std::slice::from_ref(&chapter));
+
+        assert!(lookup.artifact.is_none());
+        assert_eq!(lookup.changed_paths, vec![chapter.clone()]);
+        assert_eq!(
+            lookup.rebuild_paths,
+            [input.clone(), chapter.clone()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(lookup.scope, Some(RecompilationScope::LocalRegion));
+        assert_eq!(gate.read_count(&input), 0);
+        assert_eq!(gate.read_count(&chapter), 1);
+        assert_eq!(gate.read_count(&appendix), 0);
+    }
+
+    #[test]
+    fn fast_path_with_empty_hint_falls_back_to_full_scan() {
+        let gate = CountingFsGate::new();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let appendix = dir.path().join("appendix.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}\\input{appendix}").expect("write input");
+        fs::write(&chapter, "before").expect("write chapter");
+        fs::write(&appendix, "stable").expect("write appendix");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(
+            input.clone(),
+            fingerprint_bytes(b"\\input{chapter}\\input{appendix}"),
+        );
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"before"));
+        graph.record_node(appendix.clone(), fingerprint_bytes(b"stable"));
+        graph.record_edge(input.clone(), chapter.clone());
+        graph.record_edge(input.clone(), appendix.clone());
+
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .expect_none("cache stored");
+
+        fs::write(&chapter, "after").expect("update chapter");
+        gate.reset();
+
+        let lookup = cache.lookup(&[]);
+
+        assert!(lookup.artifact.is_none());
+        assert_eq!(lookup.changed_paths, vec![chapter.clone()]);
+        assert_eq!(
+            lookup.rebuild_paths,
+            [input.clone(), chapter.clone()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(lookup.scope, Some(RecompilationScope::LocalRegion));
+        assert_eq!(gate.read_count(&input), 1);
+        assert_eq!(gate.read_count(&chapter), 1);
+        assert_eq!(gate.read_count(&appendix), 1);
+    }
+
+    #[test]
+    fn fast_path_ignores_hint_paths_not_in_dependency_graph() {
+        let gate = CountingFsGate::new();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let appendix = dir.path().join("appendix.tex");
+        let unrelated = dir.path().join("notes.txt");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}\\input{appendix}").expect("write input");
+        fs::write(&chapter, "before").expect("write chapter");
+        fs::write(&appendix, "stable").expect("write appendix");
+        fs::write(&unrelated, "updated").expect("write unrelated");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(
+            input.clone(),
+            fingerprint_bytes(b"\\input{chapter}\\input{appendix}"),
+        );
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"before"));
+        graph.record_node(appendix.clone(), fingerprint_bytes(b"stable"));
+        graph.record_edge(input.clone(), chapter.clone());
+        graph.record_edge(input.clone(), appendix.clone());
+
+        let expected_state = stable_state(&input);
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &expected_state,
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .expect_none("cache stored");
+
+        gate.reset();
+        let lookup = cache.lookup(std::slice::from_ref(&unrelated));
+
+        assert!(lookup.changed_paths.is_empty());
+        assert!(lookup.rebuild_paths.is_empty());
+        assert_eq!(lookup.scope, None);
+        assert_eq!(
+            lookup
+                .artifact
+                .expect("cached artifact")
+                .stable_compile_state,
+            expected_state
+        );
+        assert_eq!(gate.read_count(&input), 0);
+        assert_eq!(gate.read_count(&chapter), 0);
+        assert_eq!(gate.read_count(&appendix), 0);
+        assert_eq!(gate.read_count(&unrelated), 0);
     }
 
     #[test]

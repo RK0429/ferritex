@@ -1,8 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 
 use crate::compilation::{DocumentPartitionPlan, LinkStyle};
 use crate::graphics::api::{
-    ArrowSpec, Color, GraphicGroup, GraphicNode, GraphicsScene, ImageColorSpace, PathSegment, Point,
+    ArrowSpec, Color, DashPattern, GraphicGroup, GraphicNode, GraphicsScene, ImageColorSpace,
+    LineCap, LineJoin, PathSegment, Point,
 };
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
@@ -264,12 +266,17 @@ impl PdfRenderer {
             .collect::<Vec<_>>();
         let next_object_after_annotations =
             assign_annotation_object_ids(&mut page_annotations, annotation_object_start);
-        let named_destination_object_id =
-            (!document.named_destinations.is_empty()).then_some(next_object_after_annotations);
+        let opacity_graphics_state_object_ids =
+            assign_opacity_graphics_state_object_ids(&page_payloads, next_object_after_annotations);
+        let next_object_after_opacity_graphics_states =
+            next_object_after_annotations + opacity_graphics_state_object_ids.len();
+        let named_destination_object_id = (!document.named_destinations.is_empty())
+            .then_some(next_object_after_opacity_graphics_states);
         let outline_root_object_id = (!document.outlines.is_empty()).then_some(
-            next_object_after_annotations + usize::from(named_destination_object_id.is_some()),
+            next_object_after_opacity_graphics_states
+                + usize::from(named_destination_object_id.is_some()),
         );
-        let outline_item_object_start = next_object_after_annotations
+        let outline_item_object_start = next_object_after_opacity_graphics_states
             + usize::from(named_destination_object_id.is_some())
             + usize::from(outline_root_object_id.is_some());
         let outline_build =
@@ -343,15 +350,20 @@ impl PdfRenderer {
             };
             let xobject_resources =
                 page_xobject_resources(page_images, &image_objects, page_forms, &form_xobjects);
+            let opacity_resources = page_ext_gstate_resources(
+                &page_payloads[page_index].opacity_graphics_states,
+                &opacity_graphics_state_object_ids,
+            );
             append_object(
                 &mut pdf,
                 &mut offsets,
                 &format!(
-                    "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >>{} >>{annots_entry} >>\nendobj\n",
+                    "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >>{}{} >>{annots_entry} >>\nendobj\n",
                     points_to_pdf_number(page.page_box.width),
                     points_to_pdf_number(page.page_box.height),
                     page_font_resources,
                     xobject_resources,
+                    opacity_resources,
                 ),
             );
         }
@@ -403,6 +415,12 @@ impl PdfRenderer {
                 );
             }
         }
+
+        append_opacity_graphics_state_objects(
+            &mut pdf,
+            &mut offsets,
+            &opacity_graphics_state_object_ids,
+        );
 
         for image in &image_objects {
             append_image_xobject(&mut pdf, &mut offsets, image);
@@ -507,6 +525,7 @@ struct FontObjectSet {
 struct PageRenderPayload {
     page_index: usize,
     annotations: Vec<PdfLinkAnnotation>,
+    opacity_graphics_states: BTreeSet<OpacityGraphicsStateKey>,
     stream: String,
 }
 
@@ -520,6 +539,43 @@ struct PartitionRenderPayload {
 struct PageRenderWorkload {
     partition_id: String,
     page_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct OpacityGraphicsStateKey {
+    stroke_opacity_bits: u64,
+    fill_opacity_bits: u64,
+}
+
+impl OpacityGraphicsStateKey {
+    fn new(stroke_opacity: f64, fill_opacity: f64) -> Option<Self> {
+        if !stroke_opacity.is_finite() || !fill_opacity.is_finite() {
+            return None;
+        }
+        if stroke_opacity == 1.0 && fill_opacity == 1.0 {
+            return None;
+        }
+
+        Some(Self {
+            stroke_opacity_bits: stroke_opacity.to_bits(),
+            fill_opacity_bits: fill_opacity.to_bits(),
+        })
+    }
+
+    fn stroke_opacity(self) -> f64 {
+        f64::from_bits(self.stroke_opacity_bits)
+    }
+
+    fn fill_opacity(self) -> f64 {
+        f64::from_bits(self.fill_opacity_bits)
+    }
+}
+
+fn opacity_graphics_state_name(key: OpacityGraphicsStateKey) -> String {
+    format!(
+        "Gs{:016X}_{:016X}",
+        key.stroke_opacity_bits, key.fill_opacity_bits
+    )
 }
 
 fn default_font_resources() -> Vec<FontResource> {
@@ -779,6 +835,9 @@ fn render_page_payloads(
                     .map(|page_index| PageRenderPayload {
                         page_index,
                         annotations: page_link_annotations(&pages[page_index]),
+                        opacity_graphics_states: collect_page_opacity_graphics_states(
+                            &pages[page_index],
+                        ),
                         stream: render_page_stream(
                             &pages[page_index],
                             page_images
@@ -812,6 +871,7 @@ fn render_page_payloads(
                         PageRenderPayload {
                             page_index,
                             annotations: page_link_annotations(page),
+                            opacity_graphics_states: collect_page_opacity_graphics_states(page),
                             stream: render_page_stream(
                                 page,
                                 page_images
@@ -991,6 +1051,44 @@ fn render_page_stream(
     }
 
     stream
+}
+
+fn collect_page_opacity_graphics_states(page: &TypesetPage) -> BTreeSet<OpacityGraphicsStateKey> {
+    let mut opacity_graphics_states = BTreeSet::new();
+    for image in &page.images {
+        collect_scene_opacity_graphics_states(&image.scene, &mut opacity_graphics_states);
+    }
+    opacity_graphics_states
+}
+
+fn collect_scene_opacity_graphics_states(
+    scene: &GraphicsScene,
+    opacity_graphics_states: &mut BTreeSet<OpacityGraphicsStateKey>,
+) {
+    for node in &scene.nodes {
+        collect_graphic_node_opacity_graphics_states(node, opacity_graphics_states);
+    }
+}
+
+fn collect_graphic_node_opacity_graphics_states(
+    node: &GraphicNode,
+    opacity_graphics_states: &mut BTreeSet<OpacityGraphicsStateKey>,
+) {
+    match node {
+        GraphicNode::External(_) | GraphicNode::Pdf(_) | GraphicNode::Text(_) => {}
+        GraphicNode::Group(group) => {
+            for child in &group.children {
+                collect_graphic_node_opacity_graphics_states(child, opacity_graphics_states);
+            }
+        }
+        GraphicNode::Vector(primitive) => {
+            if let Some(key) =
+                OpacityGraphicsStateKey::new(primitive.opacity, primitive.fill_opacity)
+            {
+                opacity_graphics_states.insert(key);
+            }
+        }
+    }
 }
 
 fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
@@ -1388,6 +1486,30 @@ fn render_vector_primitive(primitive: &crate::graphics::api::VectorPrimitive) ->
 
     let mut stream = String::new();
     stream.push_str(&format!("{} w\n", pdf_real(primitive.line_width)));
+    match primitive.dash_pattern {
+        DashPattern::Solid => {}
+        DashPattern::Dashed => stream.push_str("[3 3] 0 d\n"),
+        DashPattern::Dotted => stream.push_str("[1 2] 0 d\n"),
+        DashPattern::DenselyDashed => stream.push_str("[3 2] 0 d\n"),
+        DashPattern::DenselyDotted => stream.push_str("[1 1] 0 d\n"),
+        DashPattern::LooselyDashed => stream.push_str("[3 6] 0 d\n"),
+        DashPattern::LooselyDotted => stream.push_str("[1 4] 0 d\n"),
+        DashPattern::DashDot => stream.push_str("[3 2 1 2] 0 d\n"),
+        DashPattern::DashDotDot => stream.push_str("[3 2 1 2 1 2] 0 d\n"),
+    }
+    match primitive.line_cap {
+        LineCap::Butt => {}
+        LineCap::Round => stream.push_str("1 J\n"),
+        LineCap::Rect => stream.push_str("2 J\n"),
+    }
+    match primitive.line_join {
+        LineJoin::Miter => {}
+        LineJoin::Round => stream.push_str("1 j\n"),
+        LineJoin::Bevel => stream.push_str("2 j\n"),
+    }
+    if let Some(key) = OpacityGraphicsStateKey::new(primitive.opacity, primitive.fill_opacity) {
+        stream.push_str(&format!("/{} gs\n", opacity_graphics_state_name(key)));
+    }
     if let Some(stroke) = primitive.stroke {
         stream.push_str(&pdf_stroke_rgb_operator(color_components(stroke)));
     }
@@ -1632,6 +1754,69 @@ fn page_xobject_resources(
             " /XObject << {} >>",
             resources.into_iter().collect::<Vec<_>>().join(" ")
         )
+    }
+}
+
+fn assign_opacity_graphics_state_object_ids(
+    page_payloads: &[PageRenderPayload],
+    start_object_id: usize,
+) -> BTreeMap<OpacityGraphicsStateKey, usize> {
+    let mut object_ids = BTreeMap::new();
+    let mut next_object_id = start_object_id;
+
+    for key in page_payloads
+        .iter()
+        .flat_map(|payload| payload.opacity_graphics_states.iter().copied())
+    {
+        object_ids.entry(key).or_insert_with(|| {
+            let object_id = next_object_id;
+            next_object_id += 1;
+            object_id
+        });
+    }
+
+    object_ids
+}
+
+fn page_ext_gstate_resources(
+    opacity_graphics_states: &BTreeSet<OpacityGraphicsStateKey>,
+    object_ids: &BTreeMap<OpacityGraphicsStateKey, usize>,
+) -> String {
+    if opacity_graphics_states.is_empty() {
+        return String::new();
+    }
+
+    let resources = opacity_graphics_states
+        .iter()
+        .filter_map(|key| {
+            object_ids.get(key).map(|object_id| {
+                format!("/{} {} 0 R", opacity_graphics_state_name(*key), object_id)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if resources.is_empty() {
+        String::new()
+    } else {
+        format!(" /ExtGState << {} >>", resources.join(" "))
+    }
+}
+
+fn append_opacity_graphics_state_objects(
+    buffer: &mut Vec<u8>,
+    offsets: &mut Vec<usize>,
+    object_ids: &BTreeMap<OpacityGraphicsStateKey, usize>,
+) {
+    for (key, object_id) in object_ids {
+        append_object(
+            buffer,
+            offsets,
+            &format!(
+                "{object_id} 0 obj\n<< /Type /ExtGState /CA {} /ca {} >>\nendobj\n",
+                pdf_real(key.stroke_opacity()),
+                pdf_real(key.fill_opacity()),
+            ),
+        );
     }
 }
 
@@ -1959,17 +2144,18 @@ fn escape_pdf_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_named_color, FontResource, ImageColorSpace, ImageFilter, PdfFormXObject,
-        PdfImageXObject, PdfRenderer, PlacedFormXObject, PlacedImage,
+        opacity_graphics_state_name, render_vector_primitive, resolve_named_color, FontResource,
+        ImageColorSpace, ImageFilter, OpacityGraphicsStateKey, PdfFormXObject, PdfImageXObject,
+        PdfRenderer, PlacedFormXObject, PlacedImage,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::compilation::{
         DocumentPartitionPlan, DocumentWorkUnit, LinkStyle, PartitionKind, PartitionLocator,
     };
     use crate::graphics::api::{
-        ArrowSpec, Color, ExternalGraphic, GraphicGroup, GraphicNode, GraphicText, GraphicsScene,
-        ImageMetadata, PathSegment, PdfGraphic, PdfGraphicMetadata, Point, Transform2D,
-        VectorPrimitive,
+        ArrowSpec, Color, DashPattern, ExternalGraphic, GraphicGroup, GraphicNode, GraphicText,
+        GraphicsScene, ImageMetadata, LineCap, LineJoin, PathSegment, PdfGraphic,
+        PdfGraphicMetadata, Point, Transform2D, VectorPrimitive,
     };
     use crate::kernel::api::{DimensionValue, StableId};
     use crate::typesetting::api::{
@@ -2079,7 +2265,7 @@ mod tests {
                     b: 1.0,
                 }),
                 line_width: 0.4,
-                arrows: ArrowSpec::None,
+                ..Default::default()
             })],
         }
     }
@@ -2099,7 +2285,7 @@ mod tests {
                     }),
                     fill: None,
                     line_width: 0.4,
-                    arrows: ArrowSpec::None,
+                    ..Default::default()
                 })],
                 default_stroke: Some(Color {
                     r: 0.0,
@@ -2139,6 +2325,7 @@ mod tests {
                 fill: None,
                 line_width: 0.4,
                 arrows,
+                ..Default::default()
             })],
         }
     }
@@ -2357,7 +2544,134 @@ mod tests {
         assert!(content.contains("20 0 l"));
         assert!(content.contains("20 20 l"));
         assert!(content.contains("h"));
+        assert!(!content.contains("0 J"));
+        assert!(!content.contains("0 j"));
         assert!(content.contains("B"));
+    }
+
+    #[test]
+    fn emits_tikz_standard_dash_arrays_for_vector_primitives() {
+        let expectations = [
+            (DashPattern::Dashed, "[3 3] 0 d"),
+            (DashPattern::LooselyDashed, "[3 6] 0 d"),
+            (DashPattern::DashDot, "[3 2 1 2] 0 d"),
+            (DashPattern::DashDotDot, "[3 2 1 2 1 2] 0 d"),
+        ];
+
+        for (dash_pattern, expected_operator) in expectations {
+            let content = render_vector_primitive(&VectorPrimitive {
+                path: vec![
+                    PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                    PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                ],
+                dash_pattern,
+                ..Default::default()
+            });
+
+            assert!(content.contains(expected_operator));
+        }
+    }
+
+    #[test]
+    fn emits_dash_cap_join_and_opacity_operators_for_vector_primitives() {
+        let key = OpacityGraphicsStateKey::new(0.25, 0.5).expect("non-default opacity key");
+        let resource_name = opacity_graphics_state_name(key);
+        let document = single_page_with_images(
+            &[],
+            vec![TypesetImage {
+                scene: GraphicsScene {
+                    nodes: vec![GraphicNode::Vector(VectorPrimitive {
+                        path: vec![
+                            PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                            PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                        ],
+                        stroke: Some(Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                        }),
+                        fill: Some(Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 1.0,
+                        }),
+                        line_width: 0.4,
+                        dash_pattern: DashPattern::DashDot,
+                        line_cap: LineCap::Round,
+                        line_join: LineJoin::Bevel,
+                        opacity: 0.25,
+                        fill_opacity: 0.5,
+                        ..Default::default()
+                    })],
+                },
+                x: points(72),
+                y: points(600),
+                display_width: points(20),
+                display_height: points(20),
+            }],
+        );
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("[3 2 1 2] 0 d"));
+        assert!(content.contains("1 J"));
+        assert!(content.contains("2 j"));
+        assert!(content.contains(&format!("/{resource_name} gs")));
+        assert!(content.contains(&format!("/ExtGState << /{resource_name}")));
+        assert!(content.contains("/Type /ExtGState /CA 0.25 /ca 0.5"));
+    }
+
+    #[test]
+    fn deduplicates_opacity_graphics_state_resources_per_page() {
+        let key = OpacityGraphicsStateKey::new(0.25, 0.5).expect("non-default opacity key");
+        let resource_name = opacity_graphics_state_name(key);
+        let scene = GraphicsScene {
+            nodes: vec![GraphicNode::Vector(VectorPrimitive {
+                path: vec![
+                    PathSegment::MoveTo(Point { x: 0.0, y: 0.0 }),
+                    PathSegment::LineTo(Point { x: 20.0, y: 0.0 }),
+                ],
+                stroke: Some(Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                }),
+                fill: None,
+                line_width: 0.4,
+                opacity: 0.25,
+                fill_opacity: 0.5,
+                ..Default::default()
+            })],
+        };
+        let document = single_page_with_images(
+            &[],
+            vec![
+                TypesetImage {
+                    scene: scene.clone(),
+                    x: points(72),
+                    y: points(600),
+                    display_width: points(20),
+                    display_height: points(20),
+                },
+                TypesetImage {
+                    scene,
+                    x: points(100),
+                    y: points(560),
+                    display_width: points(20),
+                    display_height: points(20),
+                },
+            ],
+        );
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains(&format!("/ExtGState << /{resource_name}")));
+        assert_eq!(
+            content.matches("/Type /ExtGState /CA 0.25 /ca 0.5").count(),
+            1
+        );
     }
 
     #[test]

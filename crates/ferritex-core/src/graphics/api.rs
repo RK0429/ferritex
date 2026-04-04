@@ -118,6 +118,51 @@ pub enum ArrowSpec {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum DashPattern {
+    #[default]
+    /// Solid stroke.
+    Solid,
+    /// TikZ `dashed`: on 3pt, off 3pt.
+    Dashed,
+    /// TikZ `dotted`: uses `\pgflinewidth` for dot length; approximated as fixed 1pt here.
+    Dotted,
+    /// TikZ `densely dashed`: on 3pt, off 2pt.
+    DenselyDashed,
+    /// TikZ `densely dotted`: approximated as fixed 1pt dots with 1pt gaps.
+    DenselyDotted,
+    /// TikZ `loosely dashed`: on 3pt, off 6pt.
+    LooselyDashed,
+    /// TikZ `loosely dotted`: approximated as fixed 1pt dots with 4pt gaps.
+    LooselyDotted,
+    /// TikZ `dash dot`: on 3pt, off 2pt, on 1pt, off 2pt.
+    DashDot,
+    /// TikZ `dash dot dot`: on 3pt, off 2pt, on 1pt, off 2pt, on 1pt, off 2pt.
+    DashDotDot,
+}
+
+impl Eq for DashPattern {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LineCap {
+    #[default]
+    Butt,
+    Round,
+    Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LineJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+fn default_opacity() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorPrimitive {
     pub path: Vec<PathSegment>,
@@ -126,9 +171,36 @@ pub struct VectorPrimitive {
     pub line_width: f64,
     #[serde(default)]
     pub arrows: ArrowSpec,
+    #[serde(default)]
+    pub dash_pattern: DashPattern,
+    #[serde(default)]
+    pub line_cap: LineCap,
+    #[serde(default)]
+    pub line_join: LineJoin,
+    #[serde(default = "default_opacity")]
+    pub opacity: f64,
+    #[serde(default = "default_opacity")]
+    pub fill_opacity: f64,
 }
 
 impl Eq for VectorPrimitive {}
+
+impl Default for VectorPrimitive {
+    fn default() -> Self {
+        Self {
+            path: Vec::new(),
+            stroke: None,
+            fill: None,
+            line_width: 0.0,
+            arrows: ArrowSpec::default(),
+            dash_pattern: DashPattern::default(),
+            line_cap: LineCap::default(),
+            line_join: LineJoin::default(),
+            opacity: default_opacity(),
+            fill_opacity: default_opacity(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphicGroup {
@@ -830,6 +902,11 @@ fn translate_graphic_node(node: GraphicNode, dx: f64, dy: f64) -> GraphicNode {
             fill: primitive.fill,
             line_width: primitive.line_width,
             arrows: primitive.arrows,
+            dash_pattern: primitive.dash_pattern,
+            line_cap: primitive.line_cap,
+            line_join: primitive.line_join,
+            opacity: primitive.opacity,
+            fill_opacity: primitive.fill_opacity,
         }),
         GraphicNode::Text(text) => GraphicNode::Text(GraphicText {
             position: translate_point(text.position, dx, dy),
@@ -958,10 +1035,10 @@ mod tests {
 
     use super::{
         compile_graphics_scene, compile_includegraphics, extract_png_image_data, is_pdf_signature,
-        parse_image_metadata, parse_jpeg_metadata, parse_pdf_metadata, parse_png_metadata,
-        ArrowSpec, Color, ExternalGraphic, GraphicAssetResolver, GraphicGroup, GraphicNode,
-        GraphicText, GraphicsScene, ImageColorSpace, ImageMetadata, PathSegment, PdfGraphic,
-        PdfGraphicMetadata, Point, ResolvedGraphic, Transform2D, VectorPrimitive,
+        parse_image_metadata, parse_jpeg_metadata, parse_pdf_metadata, parse_png_metadata, Color,
+        ExternalGraphic, GraphicAssetResolver, GraphicGroup, GraphicNode, GraphicText,
+        GraphicsScene, ImageColorSpace, ImageMetadata, PathSegment, PdfGraphic, PdfGraphicMetadata,
+        Point, ResolvedGraphic, Transform2D, VectorPrimitive,
     };
     use crate::kernel::api::DimensionValue;
     use crate::parser::api::IncludeGraphicsOptions;
@@ -1165,7 +1242,7 @@ mod tests {
                     }),
                     fill: None,
                     line_width: 0.4,
-                    arrows: ArrowSpec::None,
+                    ..Default::default()
                 }),
                 GraphicNode::Text(GraphicText {
                     position: Point { x: 12.0, y: 24.0 },
@@ -1192,7 +1269,7 @@ mod tests {
                         }),
                         fill: None,
                         line_width: 0.4,
-                        arrows: ArrowSpec::None,
+                        ..Default::default()
                     }),
                     GraphicNode::Text(GraphicText {
                         position: Point { x: 2.0, y: 4.0 },
@@ -1220,7 +1297,7 @@ mod tests {
                     }),
                     fill: None,
                     line_width: 0.4,
-                    arrows: ArrowSpec::None,
+                    ..Default::default()
                 })],
                 default_stroke: None,
                 default_fill: None,
@@ -1254,7 +1331,7 @@ mod tests {
                         }),
                         fill: None,
                         line_width: 0.4,
-                        arrows: ArrowSpec::None,
+                        ..Default::default()
                     })],
                     default_stroke: None,
                     default_fill: None,

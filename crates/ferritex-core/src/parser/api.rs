@@ -9942,7 +9942,7 @@ mod tests {
                     }),
                     fill: None,
                     line_width: 0.4,
-                    arrows: crate::graphics::api::ArrowSpec::None,
+                    ..Default::default()
                 })]
                 .as_slice()
             )

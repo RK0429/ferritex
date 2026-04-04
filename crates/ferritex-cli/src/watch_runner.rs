@@ -71,8 +71,11 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
         }
 
         recompile_scheduler.enqueue(changes);
-        while let Some(_coalesced_changes) = recompile_scheduler.start_next() {
-            let result = scheduler.run(workspace_root, || service.compile(&options));
+        while let Some(coalesced_changes) = recompile_scheduler.start_next() {
+            let hint = coalesced_changes;
+            let result = scheduler.run(workspace_root, || {
+                service.compile_with_changed_paths(&options, &hint)
+            });
             emit_diagnostics(&result.diagnostics);
             recompile_scheduler.finish_current();
 

@@ -28,7 +28,7 @@ Wave 1（Incremental Performance Evidence）では `FTX-BENCH-001` 1000-section 
 
 | Stage | 現状の問題 | 根拠 |
 |---|---|---|
-| **依存検出** | `CompileCache::detect_changes()` が依存グラフ上の全 node を走査し content hash を比較する。変更パスの caller 伝播がない | `compile_cache.rs:328` |
+| **依存検出** | Step 1 Slice 1 で watcher/scheduler からの `changed_paths` fast path は導入済み。ただし empty hint 時は依存グラフ上の全 node 走査に fallback し、cache split も未実装 | `compile_cache.rs:328` |
 | **Parse** | source subtree reuse は I/O 削減のみ。expanded 全文を毎回 parser に渡し直す | `compile_job_service.rs:2112` |
 | **Typeset** | `TypesetterReusePlan` の再利用単位が partition（chapter/section）粒度。1 段落変更でも section 全体を rebuild する。monolithic file は full fallback | `typesetting/api.rs:447`, `compile_job_service.rs:2285` |
 | **Cross-ref 収束** | `\pageref` 存在時は partial typeset 無効化。2〜3 pass 回り得る | `compile_job_service.rs:1026`, `compile_job_service.rs:1114` |
@@ -137,7 +137,7 @@ unchanged partition の parsed body も cache し、全文 parse を省略する
 
 ### Step 1: Fixed-cost 削減
 
-1. **依存検出の最適化**: `CompileCache::detect_changes()` に `changed_paths: &[PathBuf]` パラメータを追加し、watch/scheduler から変更ファイルパスを直接渡す。全 node 走査をスキップする fast path を実装
+1. **依存検出の最適化**: **完了（Step 1 Slice 1）**。`CompileCache::detect_changes()` に `changed_paths: &[PathBuf]` パラメータを追加し、watch/scheduler から変更ファイルパスを直接渡す。全 node 走査をスキップする fast path を実装
 2. **Cache 分割**: monolithic JSON を `index.json`（metadata のみ）+ per-partition blob ファイルに分割。変更 partition の blob のみ deserialize/serialize する
 3. **inotify/kqueue 連携**: `PollingFileWatcher` からのイベントに含まれる変更パスを `changed_paths` として `CompileCache` に渡すパイプラインを接続
 
