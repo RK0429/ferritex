@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,6 +67,7 @@ use serde_json::json;
 use crate::compile_cache::{
     fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CachedPagePayload,
     CachedSourceSubtree, CachedTypesetFragment, CompileCache, PendingFloat,
+    WarmPartitionCache,
 };
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
@@ -175,6 +177,7 @@ pub struct CompileJobService<'a> {
     parser: MinimalLatexParser,
     typesetter: MinimalTypesetter,
     pdf_renderer: PdfRenderer,
+    warm_partition_cache: Mutex<Option<WarmPartitionCache>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -713,6 +716,7 @@ impl<'a> CompileJobService<'a> {
             parser: MinimalLatexParser,
             typesetter: MinimalTypesetter,
             pdf_renderer: PdfRenderer::default(),
+            warm_partition_cache: Mutex::new(None),
         }
     }
 
@@ -975,7 +979,17 @@ impl<'a> CompileJobService<'a> {
         let mut source_tree_reuse_plan = None;
         if !options.no_cache {
             let cache_load_start = std::time::Instant::now();
-            let lookup = compile_cache.lookup(changed_paths_hint);
+            let warm_cache = self
+                .warm_partition_cache
+                .lock()
+                .expect("lock warm partition cache")
+                .take();
+            let lookup =
+                compile_cache.lookup_with_warm_cache(changed_paths_hint, warm_cache.as_ref());
+            *self
+                .warm_partition_cache
+                .lock()
+                .expect("lock warm partition cache") = Some(lookup.warm_cache());
             cached_cross_reference_seed = lookup
                 .baseline_state
                 .as_ref()
@@ -1658,6 +1672,24 @@ impl<'a> CompileJobService<'a> {
                 &partition_plan,
                 &pdf_document.page_payloads,
             );
+            let dirty_partition_ids: BTreeSet<String> = stage_timing
+                .typeset_partition_details
+                .as_ref()
+                .map(|details| {
+                    details
+                        .iter()
+                        .filter(|detail| detail.reuse_type != PartitionTypesetReuseType::Cached)
+                        .map(|detail| detail.partition_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let dirty_source_paths: &BTreeSet<PathBuf> = &changed_paths;
+            let (opt_dirty_partitions, opt_dirty_sources) =
+                if stage_timing.typeset_partition_details.is_some() {
+                    (Some(&dirty_partition_ids), Some(dirty_source_paths))
+                } else {
+                    (None, None)
+                };
             if let Some(diagnostic) = compile_cache.store_with_page_payloads(
                 &source_tree.dependency_graph,
                 &provisional_stable_state,
@@ -1665,6 +1697,8 @@ impl<'a> CompileJobService<'a> {
                 &source_tree.cached_source_subtrees,
                 &cached_typeset_fragments,
                 &cached_page_payloads,
+                opt_dirty_partitions,
+                opt_dirty_sources,
             ) {
                 diagnostics.push(diagnostic);
             }
