@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use crate::typesetting::DocumentLayoutFragment;
 
@@ -80,7 +80,7 @@ pub struct CommitEntry {
     pub payload: StageCommitPayload,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AuthorityKey {
     MacroRegister(String),
     Label(String),
@@ -219,7 +219,7 @@ pub fn commit_layout_fragment(
     });
 }
 
-fn authority_keys(payload: &StageCommitPayload) -> HashSet<AuthorityKey> {
+fn authority_keys(payload: &StageCommitPayload) -> BTreeSet<AuthorityKey> {
     match payload {
         StageCommitPayload::MacroSession(payload) => {
             payload

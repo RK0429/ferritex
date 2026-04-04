@@ -325,21 +325,17 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
     }
 }
 
-/// FTX-PARTITION-BENCH-001 supplementary multi-second speedup evidence for
+/// FTX-PARTITION-BENCH-001 canonical strict multi-second speedup assertion for
 /// REQ-FUNC-032 using the `heavy_` partition corpus.
 ///
 /// Canonical cache-enabled partition protocol remains covered by
-/// `partition_bench_docs_protocol_median_and_timing_proof`. In the current
-/// environment, cache-warm runs of even heavier partition fixtures remain
-/// sub-1s and show overhead domination, so this supplementary test forces
-/// `--no-cache` to capture full partition compilation. It uses `--reproducible`
-/// to reduce metadata jitter, prints per-case evidence, asserts a conservative
-/// speedup floor of 1.5x, and documents the remaining blocker when full
-/// no-cache output identity is not yet preserved.
-///
-/// TODO(REQ-FUNC-032): once full-compile determinism is fixed, upgrade this
-/// supplementary test to the canonical strict assertion:
-/// jobs=1/jobs=4 output identity + speedup > 1.0 for every heavy case.
+/// `partition_bench_docs_protocol_median_and_timing_proof`. Because cache-warm
+/// runs of these fixtures remain sub-1s and overhead-dominated, this canonical
+/// strict proof forces `--no-cache` to capture full partition compilation.
+/// It uses `--reproducible` to reduce metadata jitter, prints per-case
+/// evidence, and hard-fails unless every heavy case preserves output identity
+/// while still achieving a measurable speedup for both the book and article
+/// partition corpora.
 #[test]
 fn partition_bench_multisecond_speedup_evidence() {
     let has_benchmark_precondition =
@@ -438,22 +434,17 @@ fn partition_bench_multisecond_speedup_evidence() {
 
     assert!(
         speedup_floor_achieved,
-        "[REQ-FUNC-032] supplementary multi-second evidence regressed below 1.5x speedup floor"
+        "[REQ-FUNC-032] multi-second evidence regressed below the 1.5x speedup floor"
     );
 
-    if !output_identity_preserved {
-        eprintln!(
-            "[REQ-FUNC-032 LIMITATION] no-cache multi-second partition corpus still produces jobs=1/jobs=4 output divergence; strict speedup proof remains blocked by full-compile determinism"
-        );
-        return;
-    }
-
-    if !strict_speedup_achieved {
-        eprintln!(
-            "[REQ-FUNC-032 LIMITATION] no-cache multi-second partition corpus preserved output identity but did not achieve strict speedup > 1.0 for every case"
-        );
-        return;
-    }
+    assert!(
+        output_identity_preserved,
+        "[REQ-FUNC-032] no-cache multi-second partition corpus must preserve jobs=1/jobs=4 output identity for every heavy case"
+    );
+    assert!(
+        strict_speedup_achieved,
+        "[REQ-FUNC-032] no-cache multi-second partition corpus must achieve strict speedup > 1.0 for every heavy case"
+    );
 }
 
 /// FTX-PARTITION-BENCH-001 bounded no-regression proof for REQ-FUNC-032

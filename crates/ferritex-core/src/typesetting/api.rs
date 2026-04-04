@@ -42,7 +42,7 @@ pub const FOOTNOTE_MARKER_START: char = '\u{e210}';
 pub const FOOTNOTE_MARKER_END: char = '\u{e211}';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ClassLayout {
+pub struct ClassLayout {
     top_margin_pt: i64,
     bottom_margin_pt: i64,
     baselineskip_pt: i64,
@@ -312,6 +312,21 @@ pub struct TypesetDocument {
     pub has_unresolved_index: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionVListResult {
+    pub vlist: Vec<VListItem>,
+    pub footnotes: Vec<FootnoteEntry>,
+    pub layout: ClassLayout,
+    pub page_box: PageBox,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaginatedVListContinuation {
+    pub pages: Vec<TypesetPage>,
+    pub final_content_used: DimensionValue,
+    pub continued_on_initial_page: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypesetOutline {
     pub level: u8,
@@ -378,7 +393,7 @@ impl PlacementSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FootnoteEntry {
+pub struct FootnoteEntry {
     text: String,
     source_span: Option<SourceSpan>,
 }
@@ -509,7 +524,9 @@ impl PaginationMergeCoordinator {
                         .unwrap_or(destination.page_index + page_offset),
                     y: destination.y,
                 };
-                named_destinations.insert(destination.name.clone(), adjusted_destination);
+                named_destinations
+                    .entry(destination.name.clone())
+                    .or_insert(adjusted_destination);
             }
 
             page_offset += fragment.pages.len();
@@ -593,7 +610,9 @@ impl PaginationMergeCoordinator {
                     .get(&destination.name)
                     .copied()
                     .unwrap_or(destination.page_index + page_offset);
-                named_destinations.insert(destination.name.clone(), destination);
+                named_destinations
+                    .entry(destination.name.clone())
+                    .or_insert(destination);
             }
 
             page_offset += page_count;
@@ -671,6 +690,7 @@ fn renumber_merged_page_numbers(pages: &mut [TypesetPage]) {
             // This merged page number is generated during pagination, so it has no source origin.
             source_span: None,
         });
+        page.lines.sort_by(|left, right| right.y.cmp(&left.y));
     }
 }
 
@@ -1087,6 +1107,41 @@ impl MinimalTypesetter {
         provider: &dyn CharWidthProvider,
         graphics_resolver: Option<&dyn GraphicAssetResolver>,
     ) -> TypesetDocument {
+        let PartitionVListResult {
+            vlist,
+            footnotes,
+            layout,
+            page_box,
+        } = self.build_vlist_for_partition(document, body_nodes, provider, graphics_resolver);
+        let mut pages = paginate_vlist_with_layout(&vlist, &page_box, layout);
+        append_footnotes_to_pages(&mut pages, &footnotes, layout);
+        assemble_typeset_document(document, pages)
+    }
+
+    pub fn build_vlist_for_partition(
+        &self,
+        document: &ParsedDocument,
+        body_nodes: Vec<DocumentNode>,
+        provider: &dyn CharWidthProvider,
+        graphics_resolver: Option<&dyn GraphicAssetResolver>,
+    ) -> PartitionVListResult {
+        self.build_vlist_for_partition_continuing(
+            document,
+            body_nodes,
+            provider,
+            graphics_resolver,
+            false,
+        )
+    }
+
+    pub fn build_vlist_for_partition_continuing(
+        &self,
+        document: &ParsedDocument,
+        body_nodes: Vec<DocumentNode>,
+        provider: &dyn CharWidthProvider,
+        graphics_resolver: Option<&dyn GraphicAssetResolver>,
+        continues_from_previous_block: bool,
+    ) -> PartitionVListResult {
         let page_box = page_box_for_class(&document.document_class);
         let (body_nodes, footnotes) = extract_footnotes_from_nodes(body_nodes);
         let mut layout = class_layout_for(&document.document_class);
@@ -1107,22 +1162,14 @@ impl MinimalTypesetter {
             &params,
             layout,
             graphics_resolver,
+            continues_from_previous_block,
         );
-        let mut pages = paginate_vlist_with_layout(&vlist, &page_box, layout);
-        append_footnotes_to_pages(&mut pages, &footnotes, layout);
-        let outlines = collect_outlines(document, &pages);
-        let named_destinations = collect_named_destinations(document, &pages);
-        let index_entries = resolve_index_entries(&pages);
 
-        TypesetDocument {
-            pages,
-            outlines,
-            named_destinations,
-            title: document.title.clone(),
-            author: document.author.clone(),
-            navigation: build_navigation_state(document),
-            index_entries,
-            has_unresolved_index: document.has_unresolved_index,
+        PartitionVListResult {
+            vlist,
+            footnotes,
+            layout,
+            page_box,
         }
     }
 }
@@ -1223,7 +1270,7 @@ fn split_inline_footnote(text: &str) -> Option<(String, String)> {
     Some((sanitized, suffix))
 }
 
-fn append_footnotes_to_pages(
+pub fn append_footnotes_to_pages(
     pages: &mut [TypesetPage],
     footnotes: &[FootnoteEntry],
     layout: ClassLayout,
@@ -1259,6 +1306,42 @@ fn append_footnotes_to_pages(
         });
     }
     page.lines.sort_by(|left, right| right.y.cmp(&left.y));
+}
+
+pub fn assemble_typeset_document(
+    document: &ParsedDocument,
+    pages: Vec<TypesetPage>,
+) -> TypesetDocument {
+    let outlines = collect_outlines(document, &pages);
+    let named_destinations = collect_named_destinations(document, &pages);
+    let index_entries = resolve_index_entries(&pages);
+
+    TypesetDocument {
+        pages,
+        outlines,
+        named_destinations,
+        title: document.title.clone(),
+        author: document.author.clone(),
+        navigation: build_navigation_state(document),
+        index_entries,
+        has_unresolved_index: document.has_unresolved_index,
+    }
+}
+
+pub fn finalize_partitioned_typeset_document(
+    document: &ParsedDocument,
+    mut pages: Vec<TypesetPage>,
+) -> TypesetDocument {
+    #[cfg(not(test))]
+    let layout = class_layout_for(&document.document_class);
+    #[cfg(test)]
+    let mut layout = class_layout_for(&document.document_class);
+    #[cfg(test)]
+    adjust_layout_for_core_tests(&mut layout);
+    for (page_index, page) in pages.iter_mut().enumerate() {
+        *page = finalize_page_furniture(page.clone(), layout, page_index + 1);
+    }
+    assemble_typeset_document(document, pages)
 }
 
 fn build_navigation_state(document: &ParsedDocument) -> NavigationState {
@@ -1715,9 +1798,11 @@ fn document_nodes_to_vlist_with_config(
         params,
         layout,
         graphics_resolver,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn document_nodes_to_vlist_with_document(
     document: &ParsedDocument,
     nodes: &[DocumentNode],
@@ -1726,6 +1811,7 @@ fn document_nodes_to_vlist_with_document(
     params: &BreakParams,
     layout: ClassLayout,
     graphics_resolver: Option<&dyn GraphicAssetResolver>,
+    continues_from_previous_block: bool,
 ) -> Vec<VListItem> {
     let mut float_counters = FloatCounters::default();
     document_nodes_to_vlist_with_state(
@@ -1736,6 +1822,7 @@ fn document_nodes_to_vlist_with_document(
         params,
         layout,
         graphics_resolver,
+        continues_from_previous_block.then_some(SegmentBlockKind::Paragraph),
         &mut float_counters,
     )
 }
@@ -1781,11 +1868,12 @@ fn document_nodes_to_vlist_with_state(
     params: &BreakParams,
     layout: ClassLayout,
     graphics_resolver: Option<&dyn GraphicAssetResolver>,
+    initial_previous_block: Option<SegmentBlockKind>,
     float_counters: &mut FloatCounters,
 ) -> Vec<VListItem> {
     let mut vlist = Vec::new();
     let mut segment_start = 0;
-    let mut previous_block = None;
+    let mut previous_block = initial_previous_block;
 
     for (index, node) in nodes.iter().enumerate() {
         match node {
@@ -1937,6 +2025,7 @@ fn document_nodes_to_vlist_with_state(
                     params,
                     float_layout,
                     graphics_resolver,
+                    None,
                     float_counters,
                 );
 
@@ -2912,9 +3001,12 @@ fn paginate_vlist_with_layout(
     page_box: &PageBox,
     layout: ClassLayout,
 ) -> Vec<TypesetPage> {
-    let content_height = page_content_height(page_box, layout);
-
-    if vlist.is_empty() {
+    let mut result =
+        paginate_vlist_continuing_detailed(vlist, page_box, layout, DimensionValue::zero());
+    for (page_index, page) in result.pages.iter_mut().enumerate() {
+        *page = finalize_page_furniture(page.clone(), layout, page_index + 1);
+    }
+    if result.pages.is_empty() {
         return vec![finalize_page_furniture(
             TypesetPage {
                 lines: Vec::new(),
@@ -2927,12 +3019,43 @@ fn paginate_vlist_with_layout(
             1,
         )];
     }
+    result.pages
+}
+
+pub fn paginate_vlist_continuing(
+    vlist: &[VListItem],
+    page_box: &PageBox,
+    layout: ClassLayout,
+    initial_content_used: DimensionValue,
+) -> (Vec<TypesetPage>, DimensionValue) {
+    let result = paginate_vlist_continuing_detailed(vlist, page_box, layout, initial_content_used);
+    (result.pages, result.final_content_used)
+}
+
+pub fn paginate_vlist_continuing_detailed(
+    vlist: &[VListItem],
+    page_box: &PageBox,
+    layout: ClassLayout,
+    initial_content_used: DimensionValue,
+) -> PaginatedVListContinuation {
+    let content_height = page_content_height(page_box, layout);
+
+    if vlist.is_empty() {
+        return PaginatedVListContinuation {
+            pages: Vec::new(),
+            final_content_used: initial_content_used,
+            continued_on_initial_page: false,
+        };
+    }
 
     let mut pages = Vec::new();
     let mut current_page = Vec::new();
-    let mut current_height = DimensionValue::zero();
+    let mut current_height = initial_content_used;
+    let mut page_start_height = initial_content_used;
+    let mut last_page_content_used = initial_content_used;
     let mut best_break_candidate: Option<VListBreakCandidate> = None;
     let mut float_queue = FloatQueue::new();
+    let mut continued_on_initial_page = false;
 
     for item in vlist {
         match item {
@@ -2959,20 +3082,29 @@ fn paginate_vlist_with_layout(
                     FloatRegion::Bottom,
                     content_height,
                 );
-                if page_has_renderable_content(&current_page)
-                    || (pages.is_empty() && float_queue.is_empty())
-                {
-                    pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
-                }
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    float_queue.is_empty(),
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
 
                 current_page.clear();
                 current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
                 best_break_candidate = None;
-                pages.extend(flush_pending_float_pages(
+                append_flushed_float_pages(
+                    &mut pages,
+                    &mut last_page_content_used,
                     &mut float_queue,
                     page_box,
                     layout,
-                ));
+                );
                 continue;
             }
             VListItem::Penalty { value } if *value <= PENALTY_FORCED => {
@@ -2983,15 +3115,25 @@ fn paginate_vlist_with_layout(
                     FloatRegion::Bottom,
                     content_height,
                 );
-                if page_has_renderable_content(&current_page) || pages.is_empty() {
-                    pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
-                }
+                let allow_leading_blank_page = pages.is_empty();
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    allow_leading_blank_page,
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
                 }
 
                 current_page.clear();
                 current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
                 best_break_candidate = None;
                 place_pending_floats_in_region(
                     &mut current_page,
@@ -3005,6 +3147,7 @@ fn paginate_vlist_with_layout(
             VListItem::OpenRightBreak => {
                 if pages.len() % 2 == 1 {
                     pages.push(typeset_page_from_vlist(&[], page_box, layout));
+                    last_page_content_used = DimensionValue::zero();
                 }
                 continue;
             }
@@ -3021,10 +3164,12 @@ fn paginate_vlist_with_layout(
                 content_height,
             );
         }
-        if !current_page.is_empty() && current_height + item_height > content_height {
+        if current_height + item_height > content_height
+            && (!current_page.is_empty() || page_start_height > DimensionValue::zero())
+        {
             if let Some(candidate) = best_break_candidate {
                 let trailing_items = current_page.split_off(candidate.split_after);
-                current_height = vlist_total_height(&current_page);
+                current_height = page_start_height + vlist_total_height(&current_page);
                 place_pending_floats_in_region(
                     &mut current_page,
                     &mut current_height,
@@ -3032,13 +3177,24 @@ fn paginate_vlist_with_layout(
                     FloatRegion::Bottom,
                     content_height,
                 );
-                pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    false,
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
                 }
 
                 current_page.clear();
                 current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
                 place_pending_floats_in_region(
                     &mut current_page,
                     &mut current_height,
@@ -3047,7 +3203,7 @@ fn paginate_vlist_with_layout(
                     content_height,
                 );
                 current_page.extend(trailing_items);
-                current_height = vlist_total_height(&current_page);
+                current_height = page_start_height + vlist_total_height(&current_page);
                 best_break_candidate = find_best_break_candidate(&current_page);
             } else {
                 place_pending_floats_in_region(
@@ -3057,13 +3213,24 @@ fn paginate_vlist_with_layout(
                     FloatRegion::Bottom,
                     content_height,
                 );
-                pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    false,
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
                 }
 
                 current_page.clear();
                 current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
                 place_pending_floats_in_region(
                     &mut current_page,
                     &mut current_height,
@@ -3081,13 +3248,24 @@ fn paginate_vlist_with_layout(
                     FloatRegion::Bottom,
                     content_height,
                 );
-                pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
+                emit_current_page(
+                    &mut pages,
+                    &current_page,
+                    current_height,
+                    page_start_height,
+                    page_box,
+                    layout,
+                    false,
+                    &mut last_page_content_used,
+                    &mut continued_on_initial_page,
+                );
                 if !float_queue.is_empty() {
                     float_queue.increment_defer_counts();
                 }
 
                 current_page.clear();
                 current_height = DimensionValue::zero();
+                page_start_height = DimensionValue::zero();
                 best_break_candidate = None;
                 place_pending_floats_in_region(
                     &mut current_page,
@@ -3107,7 +3285,11 @@ fn paginate_vlist_with_layout(
     }
 
     if current_page.is_empty() && !pages.is_empty() && float_queue.is_empty() {
-        return pages;
+        return PaginatedVListContinuation {
+            pages,
+            final_content_used: last_page_content_used,
+            continued_on_initial_page,
+        };
     }
 
     place_pending_top_floats_before_content(
@@ -3123,21 +3305,30 @@ fn paginate_vlist_with_layout(
         FloatRegion::Bottom,
         content_height,
     );
-    if page_has_renderable_content(&current_page) || (pages.is_empty() && float_queue.is_empty()) {
-        pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
-    }
-    pages.extend(flush_pending_float_pages(
+    emit_current_page(
+        &mut pages,
+        &current_page,
+        current_height,
+        page_start_height,
+        page_box,
+        layout,
+        float_queue.is_empty(),
+        &mut last_page_content_used,
+        &mut continued_on_initial_page,
+    );
+    append_flushed_float_pages(
+        &mut pages,
+        &mut last_page_content_used,
         &mut float_queue,
         page_box,
         layout,
-    ));
-    if pages.is_empty() {
-        pages.push(typeset_page_from_vlist(&[], page_box, layout));
+    );
+
+    PaginatedVListContinuation {
+        pages,
+        final_content_used: last_page_content_used,
+        continued_on_initial_page,
     }
-    for (page_index, page) in pages.iter_mut().enumerate() {
-        *page = finalize_page_furniture(page.clone(), layout, page_index + 1);
-    }
-    pages
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3201,6 +3392,25 @@ fn page_has_renderable_content(items: &[VListItem]) -> bool {
     })
 }
 
+fn page_has_any_content(page: &TypesetPage) -> bool {
+    !page.lines.is_empty()
+        || !page.images.is_empty()
+        || !page.float_placements.is_empty()
+        || !page.index_entries.is_empty()
+}
+
+fn should_emit_paginated_page(
+    current_page: &[VListItem],
+    no_pages_emitted_yet: bool,
+    page_start_height: DimensionValue,
+    allow_leading_blank_page: bool,
+) -> bool {
+    page_has_renderable_content(current_page)
+        || (allow_leading_blank_page
+            && no_pages_emitted_yet
+            && page_start_height == DimensionValue::zero())
+}
+
 fn push_placed_float(items: &mut Vec<VListItem>, region: FloatRegion, content: FloatContent) {
     let height = content.height;
     items.push(VListItem::PlacedFloat { region, content });
@@ -3251,11 +3461,11 @@ fn place_pending_top_floats_before_content(
     *items = prepended;
 }
 
-fn flush_pending_float_pages(
+fn flush_pending_float_pages_with_heights(
     float_queue: &mut FloatQueue,
     page_box: &PageBox,
     layout: ClassLayout,
-) -> Vec<TypesetPage> {
+) -> Vec<(TypesetPage, DimensionValue)> {
     let mut pages = Vec::new();
     let mut current_page = Vec::new();
     let mut current_height = DimensionValue::zero();
@@ -3264,7 +3474,10 @@ fn flush_pending_float_pages(
     for placement in float_queue.force_flush() {
         let height = placement.content.height;
         if !current_page.is_empty() && current_height + height > content_height {
-            pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
+            pages.push((
+                typeset_page_from_vlist(&current_page, page_box, layout),
+                current_height,
+            ));
             current_page.clear();
             current_height = DimensionValue::zero();
         }
@@ -3274,7 +3487,10 @@ fn flush_pending_float_pages(
     }
 
     if page_has_renderable_content(&current_page) {
-        pages.push(typeset_page_from_vlist(&current_page, page_box, layout));
+        pages.push((
+            typeset_page_from_vlist(&current_page, page_box, layout),
+            current_height,
+        ));
     }
 
     pages
@@ -3299,11 +3515,20 @@ fn typeset_page_from_vlist(
     page_box: &PageBox,
     layout: ClassLayout,
 ) -> TypesetPage {
+    typeset_page_from_vlist_with_offset(items, page_box, layout, DimensionValue::zero())
+}
+
+fn typeset_page_from_vlist_with_offset(
+    items: &[VListItem],
+    page_box: &PageBox,
+    layout: ClassLayout,
+    initial_consumed_height: DimensionValue,
+) -> TypesetPage {
     let mut lines = Vec::new();
     let mut images = Vec::new();
     let mut float_placements = Vec::new();
     let mut index_entries = Vec::new();
-    let mut consumed_height = DimensionValue::zero();
+    let mut consumed_height = initial_consumed_height;
 
     for item in items {
         match item {
@@ -3382,6 +3607,51 @@ fn typeset_page_from_vlist(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_current_page(
+    pages: &mut Vec<TypesetPage>,
+    current_page: &[VListItem],
+    current_height: DimensionValue,
+    page_start_height: DimensionValue,
+    page_box: &PageBox,
+    layout: ClassLayout,
+    allow_leading_blank_page: bool,
+    last_page_content_used: &mut DimensionValue,
+    continued_on_initial_page: &mut bool,
+) {
+    if !should_emit_paginated_page(
+        current_page,
+        pages.is_empty(),
+        page_start_height,
+        allow_leading_blank_page,
+    ) {
+        return;
+    }
+
+    let page =
+        typeset_page_from_vlist_with_offset(current_page, page_box, layout, page_start_height);
+    if page_start_height > DimensionValue::zero() && page_has_any_content(&page) {
+        *continued_on_initial_page = true;
+    }
+    *last_page_content_used = current_height;
+    pages.push(page);
+}
+
+fn append_flushed_float_pages(
+    pages: &mut Vec<TypesetPage>,
+    last_page_content_used: &mut DimensionValue,
+    float_queue: &mut FloatQueue,
+    page_box: &PageBox,
+    layout: ClassLayout,
+) {
+    for (page, content_used) in
+        flush_pending_float_pages_with_heights(float_queue, page_box, layout)
+    {
+        *last_page_content_used = content_used;
+        pages.push(page);
+    }
+}
+
 fn finalize_page_furniture(
     mut page: TypesetPage,
     layout: ClassLayout,
@@ -3397,8 +3667,8 @@ fn finalize_page_furniture(
             // Page furniture is synthesized during final page assembly, so it has no source origin.
             source_span: None,
         });
+        page.lines.sort_by(|left, right| right.y.cmp(&left.y));
     }
-    page.lines.sort_by(|left, right| right.y.cmp(&left.y));
     page
 }
 
@@ -4068,6 +4338,66 @@ mod tests {
 
         assert_eq!(pages.len(), 1);
         assert!(pages[0].lines.is_empty());
+    }
+
+    #[test]
+    fn paginate_vlist_continuing_offsets_first_page_content() {
+        let layout = class_layout_for("article");
+        let page_box = page_box_for_class("article");
+        let initial_content_used = points(24);
+        let vlist = vec![VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: "Continued".to_string(),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+            source_span: None,
+        }];
+
+        let result = super::paginate_vlist_continuing_detailed(
+            &vlist,
+            &page_box,
+            layout,
+            initial_content_used,
+        );
+
+        assert!(result.continued_on_initial_page);
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(
+            result.pages[0].lines[0].y,
+            page_box.height - points(layout.top_margin_pt) - initial_content_used
+        );
+        assert_eq!(
+            result.final_content_used,
+            initial_content_used + points(LINE_HEIGHT_PT)
+        );
+    }
+
+    #[test]
+    fn paginate_vlist_continuing_starts_new_page_when_remaining_space_is_exhausted() {
+        let layout = class_layout_for("article");
+        let page_box = page_box_for_class("article");
+        let content_height =
+            page_box.height - points(layout.top_margin_pt) - points(layout.bottom_margin_pt);
+        let vlist = vec![VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: "Next page".to_string(),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+            source_span: None,
+        }];
+
+        let result =
+            super::paginate_vlist_continuing_detailed(&vlist, &page_box, layout, content_height);
+
+        assert!(!result.continued_on_initial_page);
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(
+            result.pages[0].lines[0].y,
+            page_box.height - points(layout.top_margin_pt)
+        );
+        assert_eq!(result.final_content_used, points(LINE_HEIGHT_PT));
     }
 
     #[test]
@@ -5470,6 +5800,46 @@ mod tests {
     }
 
     #[test]
+    fn renumber_merged_page_numbers_sorts_page_number_by_y_descending() {
+        let mut pages = vec![TypesetPage {
+            lines: vec![
+                TextLine {
+                    text: "Top".to_string(),
+                    y: points(700),
+                    links: Vec::new(),
+                    font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+                    source_span: None,
+                },
+                TextLine {
+                    text: "9".to_string(),
+                    y: points(145),
+                    links: Vec::new(),
+                    font_index: 0,
+                    font_size: points(10),
+                    source_span: None,
+                },
+                TextLine {
+                    text: "Bottom".to_string(),
+                    y: points(100),
+                    links: Vec::new(),
+                    font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+                    source_span: None,
+                },
+            ],
+            images: Vec::new(),
+            page_box: page_box_for_class("book"),
+            float_placements: Vec::new(),
+            index_entries: Vec::new(),
+        }];
+
+        renumber_merged_page_numbers(&mut pages);
+
+        assert_eq!(visible_line_texts(&pages[0]), vec!["Top", "1", "Bottom"]);
+    }
+
+    #[test]
     fn finalize_page_furniture_skips_page_number_on_blank_page() {
         let page = TypesetPage {
             lines: Vec::new(),
@@ -5482,6 +5852,38 @@ mod tests {
         let finalized = finalize_page_furniture(page, class_layout_for("book"), 2);
 
         assert!(finalized.lines.is_empty());
+    }
+
+    #[test]
+    fn finalize_page_furniture_sorts_page_number_by_y_descending() {
+        let page = TypesetPage {
+            lines: vec![
+                TextLine {
+                    text: "Top".to_string(),
+                    y: points(700),
+                    links: Vec::new(),
+                    font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+                    source_span: None,
+                },
+                TextLine {
+                    text: "Bottom".to_string(),
+                    y: points(100),
+                    links: Vec::new(),
+                    font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+                    source_span: None,
+                },
+            ],
+            images: Vec::new(),
+            page_box: page_box_for_class("book"),
+            float_placements: Vec::new(),
+            index_entries: Vec::new(),
+        };
+
+        let finalized = finalize_page_furniture(page, class_layout_for("book"), 7);
+
+        assert_eq!(visible_line_texts(&finalized), vec!["Top", "7", "Bottom"]);
     }
 
     #[test]

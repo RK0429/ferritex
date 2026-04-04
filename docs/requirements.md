@@ -733,7 +733,7 @@
 - **優先度**: Should
 - **出典**: ユーザー明示
 - **関連要件**: REQ-FUNC-031
-- **実装メモ（2026-04-04）**: `heavy_chapters_independent.tex` / `heavy_sections_independent.tex` を `FTX-PARTITION-BENCH-001` の multi-second evidence 用 fixture として追加し、既存 independent corpus の `\@for` リストを 2x に増やした additive corpus として運用している。canonical cache-enabled protocol を同一入力の warm compile で確認したところ、book 0.92s / 0.92s、article 0.77s / 0.77s（jobs=1 / jobs=4）で依然 sub-1s かつ overhead domination が残ったため、`partition_bench_multisecond_speedup_evidence` は supplementary no-cache evidence として 1 warmup + 5 measured runs、`--no-cache` + `--reproducible`、`--jobs=1` vs `--jobs=4` を比較する。no-cache 計測結果は book 35.399s → 14.352s（2.467x）、article 27.859s → 10.124s（2.752x）であり、multi-second full compile における speedup 自体は確認できた。一方で同条件では jobs=1/jobs=4 の PDF hash が一致せず、strict acceptance 条件の blocker は speedup 不足ではなく full-compile determinism である。cache-enabled の既存 evidence（`partition_bench_output_identity_across_jobs_1_and_jobs_4`、`partition_bench_docs_protocol_median_and_timing_proof`）は引き続き pass。適用済み最適化: balanced coalescing / worker-thread document construction / fragment move semantics / inline group execution / merge_owned
+- **実装メモ（2026-04-04）**: `heavy_chapters_independent.tex` / `heavy_sections_independent.tex` を `FTX-PARTITION-BENCH-001` の multi-second evidence 用 fixture として追加し、既存 independent corpus の `\@for` リストを 2x に増やした additive corpus として運用している。`partition_bench_multisecond_speedup_evidence` は canonical strict no-cache proof として 1 warmup + 5 measured runs、`--no-cache` + `--reproducible`、`--jobs=1` vs `--jobs=4` を比較する。full-compile determinism 修正では (1) `HashMap` → `BTreeMap` による iteration order 決定性確保（`RegisterBankView`）、(2) `PaginationMergeCoordinator` の `named_destinations` merge を first-wins semantics に統一、(3) `finalize_page_furniture` / `renumber_merged_page_numbers` でページ番号 `TextLine` 追加後に `page.lines` を y 降順ソートして content stream のバイト順序を正規化、に加えて、section-level パーティション（article class）では「VList 構築のみを並列化し、pagination は content offset を引き継ぎつつ逐次実行する」pipelined path を採用する。これにより chapter-level の独立ページ分割と、article の連続フローの両方で同一の strict proof 条件（output identity + speedup assertions）を維持する。適用済み最適化: balanced coalescing / worker-thread document construction / fragment move semantics / inline group execution / merge_owned / page-lines y-sort normalization / pipelined VList build + sequential pagination
 
 #### REQ-FUNC-033: フォント処理並列化
 
@@ -1151,7 +1151,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
-| 0.1.43 | 2026-04-04 | `REQ-FUNC-032` に multi-second no-cache evidence を追記し、heavy partition fixture / speedup 実測値 / full-compile determinism blocker を記録 | Codex |
+| 0.1.43 | 2026-04-04 | `REQ-FUNC-032` に multi-second no-cache evidence と pipelined VList build + sequential pagination の strict-proof 対応方針を追記 | Codex |
 | 0.1.42 | 2026-04-04 | `REQ-FUNC-032` に実装メモを追加。出力等価性確認済み・bounded no-regression evidence 確立済み・strict speedup 条件の sub-1s 構造的限界と適用済み最適化を記録 | Claude Opus 4.6 |
 | 0.1.41 | 2026-03-18 | `REQ-FUNC-046` の baseline 文書群成功条件を `--asset-bundle <展開先>` 明示指定へ統一し、`REQ-NF-009` / architecture の bootstrap 契約と整合させた | Codex |
 | 0.1.40 | 2026-03-18 | `REQ-NF-009` と `REQ-FUNC-046` に公式 Asset Bundle archive を `--asset-bundle <展開先>` で指定する初回導入フローを明記し、未確定事項から初回取得戦略を削除 | Codex |

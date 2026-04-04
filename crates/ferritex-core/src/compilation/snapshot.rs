@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -7,23 +7,23 @@ use crate::parser::{CompatIntRegister, RegisterStore, Token};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RegisterBankView {
-    pub counts: HashMap<u16, i32>,
-    pub dimens: HashMap<u16, i32>,
-    pub skips: HashMap<u16, i32>,
-    pub muskips: HashMap<u16, i32>,
-    pub toks: HashMap<u16, Vec<Token>>,
-    pub compat_ints: HashMap<CompatIntRegister, i32>,
+    pub counts: BTreeMap<u16, i32>,
+    pub dimens: BTreeMap<u16, i32>,
+    pub skips: BTreeMap<u16, i32>,
+    pub muskips: BTreeMap<u16, i32>,
+    pub toks: BTreeMap<u16, Vec<Token>>,
+    pub compat_ints: BTreeMap<CompatIntRegister, i32>,
 }
 
 impl RegisterBankView {
     pub fn from_register_store(registers: &RegisterStore) -> Self {
         Self {
-            counts: registers.counts_snapshot(),
-            dimens: registers.dimens_snapshot(),
-            skips: registers.skips_snapshot(),
-            muskips: registers.muskips_snapshot(),
-            toks: registers.toks_snapshot(),
-            compat_ints: registers.compat_ints_snapshot(),
+            counts: registers.counts_snapshot().into_iter().collect(),
+            dimens: registers.dimens_snapshot().into_iter().collect(),
+            skips: registers.skips_snapshot().into_iter().collect(),
+            muskips: registers.muskips_snapshot().into_iter().collect(),
+            toks: registers.toks_snapshot().into_iter().collect(),
+            compat_ints: registers.compat_ints_snapshot().into_iter().collect(),
         }
     }
 }

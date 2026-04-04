@@ -20,8 +20,8 @@ use ferritex_core::bibliography::api::{
 };
 use ferritex_core::compilation::{
     CompilationJob, CompilationSnapshot, DestinationAnchor, DocumentPartitionPlan, DocumentState,
-    DocumentWorkUnit, IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PdfMetadataDraft,
-    SectionOutlineEntry, SymbolLocation,
+    DocumentWorkUnit, IndexEntry, LinkStyle, NavigationState, OutlineDraftEntry, PartitionKind,
+    PdfMetadataDraft, SectionOutlineEntry, SymbolLocation,
 };
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::font::api::OpenTypeWidthProvider;
@@ -53,8 +53,10 @@ use ferritex_core::synctex::{
     PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace, SyncTexData,
 };
 use ferritex_core::typesetting::{
-    resolve_page_labels, DocumentLayoutFragment, FixedWidthProvider, MinimalTypesetter,
-    PaginationMergeCoordinator, TextLine, TfmWidthProvider, TypesetDocument, TypesetterReusePlan,
+    append_footnotes_to_pages, finalize_partitioned_typeset_document,
+    paginate_vlist_continuing_detailed, resolve_page_labels, DocumentLayoutFragment,
+    FixedWidthProvider, MinimalTypesetter, PaginationMergeCoordinator, PartitionVListResult,
+    TextLine, TfmWidthProvider, TypesetDocument, TypesetPage, TypesetterReusePlan,
 };
 use serde_json::json;
 
@@ -1865,6 +1867,108 @@ impl<'a> CompileJobService<'a> {
         }
     }
 
+    fn build_partition_vlist_with_selection(
+        &self,
+        context_document: &ParsedDocument,
+        body_document: &ParsedDocument,
+        source_lines: Option<&[SourceLineTrace]>,
+        selection: &CompileFontSelection,
+        graphics_resolver: &CompileGraphicAssetResolver<'_>,
+        continues_from_previous_block: bool,
+    ) -> PartitionVListResult {
+        let mut annotated_document = body_document.clone();
+        let body_nodes = source_lines.map(|source_lines| {
+            annotated_document.annotate_structure_source_spans(source_lines);
+            annotated_document.body_nodes_with_source_spans(source_lines)
+        });
+        let body_document = if source_lines.is_some() {
+            &annotated_document
+        } else {
+            body_document
+        };
+
+        match (selection, body_nodes) {
+            (CompileFontSelection::OpenType(loaded_font), Some(body_nodes)) => {
+                let provider = OpenTypeWidthProvider {
+                    font: &loaded_font.font,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.build_vlist_for_partition_continuing(
+                    context_document,
+                    body_nodes,
+                    &provider,
+                    Some(graphics_resolver),
+                    continues_from_previous_block,
+                )
+            }
+            (CompileFontSelection::OpenType(loaded_font), None) => {
+                let provider = OpenTypeWidthProvider {
+                    font: &loaded_font.font,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.build_vlist_for_partition_continuing(
+                    context_document,
+                    body_document.body_nodes(),
+                    &provider,
+                    Some(graphics_resolver),
+                    continues_from_previous_block,
+                )
+            }
+            (CompileFontSelection::Tfm { main, .. }, Some(body_nodes)) => {
+                let provider = TfmWidthProvider {
+                    metrics: &main.metrics,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.build_vlist_for_partition_continuing(
+                    context_document,
+                    body_nodes,
+                    &provider,
+                    Some(graphics_resolver),
+                    continues_from_previous_block,
+                )
+            }
+            (CompileFontSelection::Tfm { main, .. }, None) => {
+                let provider = TfmWidthProvider {
+                    metrics: &main.metrics,
+                    fallback_width: DEFAULT_TFM_FALLBACK_WIDTH,
+                };
+                self.typesetter.build_vlist_for_partition_continuing(
+                    context_document,
+                    body_document.body_nodes(),
+                    &provider,
+                    Some(graphics_resolver),
+                    continues_from_previous_block,
+                )
+            }
+            (CompileFontSelection::Basic, Some(body_nodes)) => {
+                let provider = FixedWidthProvider {
+                    char_width: DimensionValue(65_536),
+                    space_width: DimensionValue(65_536),
+                };
+                self.typesetter.build_vlist_for_partition_continuing(
+                    context_document,
+                    body_nodes,
+                    &provider,
+                    Some(graphics_resolver),
+                    continues_from_previous_block,
+                )
+            }
+            (CompileFontSelection::Basic, None) => {
+                let provider = FixedWidthProvider {
+                    char_width: DimensionValue(65_536),
+                    space_width: DimensionValue(65_536),
+                };
+                self.typesetter.build_vlist_for_partition_continuing(
+                    context_document,
+                    body_document.body_nodes(),
+                    &provider,
+                    Some(graphics_resolver),
+                    continues_from_previous_block,
+                )
+            }
+        }
+    }
+
     fn load_source_tree_with_root_source(
         &self,
         input_file: &Path,
@@ -2413,6 +2517,29 @@ fn try_parallel_full_typeset(
         "full typeset executing in parallel with coalesced partitions"
     );
 
+    let is_chapter_level = partition_plan
+        .work_units
+        .iter()
+        .all(|unit| unit.kind == PartitionKind::Chapter);
+
+    if !is_chapter_level {
+        return run_parallel_pipelined_full_typeset(
+            service,
+            document,
+            source_lines,
+            selection,
+            graphics_resolver,
+            parallelism,
+            &coalesced_plan,
+            work_items,
+            file_access_gate,
+            input_dir,
+            project_root,
+            overlay_roots,
+            asset_bundle_path,
+        );
+    }
+
     let parallel_results = run_parallel_full_typeset(
         service,
         document,
@@ -2461,6 +2588,96 @@ fn try_parallel_full_typeset(
     ))
 }
 
+fn run_parallel_pipelined_full_typeset(
+    service: &CompileJobService<'_>,
+    document: &ParsedDocument,
+    source_lines: &[SourceLineTrace],
+    selection: &CompileFontSelection,
+    graphics_resolver: &CompileGraphicAssetResolver<'_>,
+    parallelism: usize,
+    coalesced_plan: &DocumentPartitionPlan,
+    work_items: Vec<FullTypesetWorkItem>,
+    file_access_gate: &dyn FileAccessGate,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+) -> Result<TypesetDocument, &'static str> {
+    let built_vlists = run_parallel_vlist_build(
+        service,
+        document,
+        source_lines,
+        selection,
+        parallelism,
+        work_items,
+        file_access_gate,
+        input_dir,
+        project_root,
+        overlay_roots,
+        asset_bundle_path,
+    )?;
+
+    let mut vlist_results = BTreeMap::new();
+    for built in built_vlists {
+        for diagnostic in built.diagnostics {
+            graphics_resolver.push_diagnostic(diagnostic);
+        }
+        vlist_results.insert(built.partition_id, built.vlist_result);
+    }
+    if vlist_results.len() < coalesced_plan.work_units.len() {
+        return Err("parallel full typeset produced incomplete vlist results");
+    }
+
+    let mut all_pages = Vec::new();
+    let mut content_offset = DimensionValue::zero();
+
+    for work_unit in &coalesced_plan.work_units {
+        let vlist_result = vlist_results
+            .remove(&work_unit.partition_id)
+            .ok_or("missing pipelined vlist result for coalesced partition")?;
+        let pagination = paginate_vlist_continuing_detailed(
+            &vlist_result.vlist,
+            &vlist_result.page_box,
+            vlist_result.layout,
+            content_offset,
+        );
+        let mut pages = pagination.pages;
+
+        if pagination.continued_on_initial_page {
+            let first_page = pages
+                .first_mut()
+                .ok_or("continued partition must produce at least one page")?;
+            append_footnotes_to_pages(
+                std::slice::from_mut(first_page),
+                &vlist_result.footnotes,
+                vlist_result.layout,
+            );
+            let continued_page = pages.remove(0);
+            let previous_page = all_pages
+                .last_mut()
+                .ok_or("continued partition requires an existing page")?;
+            merge_continued_page(previous_page, continued_page);
+        } else {
+            append_footnotes_to_pages(&mut pages, &vlist_result.footnotes, vlist_result.layout);
+        }
+
+        all_pages.extend(pages);
+        content_offset = pagination.final_content_used;
+    }
+
+    Ok(finalize_partitioned_typeset_document(document, all_pages))
+}
+
+fn merge_continued_page(target: &mut TypesetPage, mut continued: TypesetPage) {
+    target.lines.append(&mut continued.lines);
+    target.lines.sort_by(|left, right| right.y.cmp(&left.y));
+    target.images.append(&mut continued.images);
+    target
+        .float_placements
+        .append(&mut continued.float_placements);
+    target.index_entries.append(&mut continued.index_entries);
+}
+
 #[derive(Debug)]
 struct PartialTypesetWorkItem {
     work_unit: DocumentWorkUnit,
@@ -2473,6 +2690,13 @@ struct FullTypesetWorkItem {
     work_unit: DocumentWorkUnit,
     body_range: (usize, usize),
     section_range: (usize, usize),
+}
+
+#[derive(Debug)]
+struct BuiltPartitionVList {
+    partition_id: String,
+    vlist_result: PartitionVListResult,
+    diagnostics: Vec<Diagnostic>,
 }
 
 fn distribute_round_robin<T>(items: Vec<T>, concurrency: usize) -> Vec<Vec<T>> {
@@ -2733,6 +2957,68 @@ fn run_parallel_full_typeset(
     Ok(results)
 }
 
+fn run_parallel_vlist_build(
+    service: &CompileJobService<'_>,
+    document: &ParsedDocument,
+    source_lines: &[SourceLineTrace],
+    selection: &CompileFontSelection,
+    parallelism: usize,
+    work_items: Vec<FullTypesetWorkItem>,
+    file_access_gate: &dyn FileAccessGate,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+) -> Result<Vec<BuiltPartitionVList>, &'static str> {
+    let concurrency = parallelism.max(1);
+    let work_item_count = work_items.len();
+    let mut groups = distribute_round_robin(work_items, concurrency);
+    let inline_group = groups.pop().unwrap_or_default();
+
+    let results = thread::scope(|scope| -> Result<Vec<_>, &'static str> {
+        let handles = groups
+            .into_iter()
+            .map(|group| {
+                scope.spawn(move || {
+                    execute_vlist_build_group(
+                        service,
+                        document,
+                        source_lines,
+                        selection,
+                        group,
+                        file_access_gate,
+                        input_dir,
+                        project_root,
+                        overlay_roots,
+                        asset_bundle_path,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut results = Vec::with_capacity(work_item_count);
+        results.extend(execute_vlist_build_group(
+            service,
+            document,
+            source_lines,
+            selection,
+            inline_group,
+            file_access_gate,
+            input_dir,
+            project_root,
+            overlay_roots,
+            asset_bundle_path,
+        )?);
+        for handle in handles {
+            let worker_results = handle.join().expect("vlist build thread panicked")?;
+            results.extend(worker_results);
+        }
+        Ok(results)
+    })?;
+
+    Ok(results)
+}
+
 fn execute_partial_typeset_group(
     service: &CompileJobService<'_>,
     document: &ParsedDocument,
@@ -2819,6 +3105,55 @@ fn execute_full_typeset_group(
             fragment,
             thread_resolver.take_diagnostics(),
         ));
+    }
+    Ok(worker_results)
+}
+
+fn execute_vlist_build_group(
+    service: &CompileJobService<'_>,
+    document: &ParsedDocument,
+    source_lines: &[SourceLineTrace],
+    selection: &CompileFontSelection,
+    group: Vec<FullTypesetWorkItem>,
+    file_access_gate: &dyn FileAccessGate,
+    input_dir: &Path,
+    project_root: &Path,
+    overlay_roots: &[PathBuf],
+    asset_bundle_path: Option<&Path>,
+) -> Result<Vec<BuiltPartitionVList>, &'static str> {
+    let thread_resolver = CompileGraphicAssetResolver {
+        file_access_gate,
+        input_dir,
+        project_root,
+        overlay_roots,
+        asset_bundle_path,
+        diagnostics: RefCell::new(Vec::new()),
+    };
+    let mut worker_results = Vec::with_capacity(group.len());
+    for work_item in group {
+        let partition_document = partition_document_for_work_unit(
+            document,
+            &work_item.work_unit,
+            work_item.body_range,
+            work_item.section_range,
+        )
+        .ok_or("failed to build partition-scoped parsed document")?;
+        let continues_from_previous_block =
+            matches!(work_item.work_unit.kind, PartitionKind::Section)
+                && work_item.work_unit.locator.ordinal > 0;
+        let vlist_result = service.build_partition_vlist_with_selection(
+            document,
+            &partition_document,
+            Some(source_lines),
+            selection,
+            &thread_resolver,
+            continues_from_previous_block,
+        );
+        worker_results.push(BuiltPartitionVList {
+            partition_id: work_item.work_unit.partition_id,
+            vlist_result,
+            diagnostics: thread_resolver.take_diagnostics(),
+        });
     }
     Ok(worker_results)
 }
@@ -6477,6 +6812,26 @@ mod tests {
         input_file
     }
 
+    fn write_partitioned_article_project(root: &Path, sections: &[(&str, &str)]) -> PathBuf {
+        let body = sections
+            .iter()
+            .map(|(file_name, _)| {
+                let stem = Path::new(file_name)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .expect("utf-8 section file stem");
+                format!("\\input{{{stem}}}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input_file = root.join("main.tex");
+        fs::write(&input_file, document(&body)).expect("write main input");
+        for (file_name, content) in sections {
+            fs::write(root.join(file_name), content).expect("write section input");
+        }
+        input_file
+    }
+
     fn read_pdf(path: &Path) -> String {
         String::from_utf8_lossy(&fs::read(path).expect("read output pdf")).into_owned()
     }
@@ -7842,10 +8197,7 @@ mod tests {
         let parallel_pdf =
             fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
 
-        assert_eq!(
-            pdf_text_operators(&String::from_utf8_lossy(&sequential_pdf)),
-            pdf_text_operators(&String::from_utf8_lossy(&parallel_pdf))
-        );
+        assert_eq!(sequential_pdf, parallel_pdf);
     }
 
     #[test]
@@ -7991,10 +8343,73 @@ mod tests {
         let parallel_pdf =
             fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
 
-        assert_eq!(
-            pdf_text_operators(&String::from_utf8_lossy(&sequential_pdf)),
-            pdf_text_operators(&String::from_utf8_lossy(&parallel_pdf))
+        assert_eq!(sequential_pdf, parallel_pdf);
+    }
+
+    #[test]
+    fn parallel_full_typeset_produces_same_output_as_sequential_for_section_partitions() {
+        let loader = MockAssetBundleLoader::valid();
+
+        let sequential_dir = tempdir().expect("create sequential tempdir");
+        let sequential_input = write_partitioned_article_project(
+            sequential_dir.path(),
+            &[
+                (
+                    "section-one.tex",
+                    "\\section{One}\\label{sec:one}\nSection one body stays on the first page.\n",
+                ),
+                (
+                    "section-two.tex",
+                    "\\section{Two}\\label{sec:two}\nSection two should continue on the same page without an injected page break.\n",
+                ),
+                (
+                    "section-three.tex",
+                    "\\section{Three}\\label{sec:three}\nSection three keeps the article flow continuous.\n",
+                ),
+            ],
         );
+        let mut sequential_options =
+            runtime_options(sequential_input, sequential_dir.path().join("out"));
+        sequential_options.no_cache = true;
+        sequential_options.parallelism = 1;
+
+        let sequential = service(&FsTestFileAccessGate, &loader).compile(&sequential_options);
+        assert_eq!(sequential.exit_code, 0);
+        let sequential_pdf =
+            fs::read(sequential_options.output_dir.join("main.pdf")).expect("read sequential pdf");
+
+        let parallel_dir = tempdir().expect("create parallel tempdir");
+        let parallel_input = write_partitioned_article_project(
+            parallel_dir.path(),
+            &[
+                (
+                    "section-one.tex",
+                    "\\section{One}\\label{sec:one}\nSection one body stays on the first page.\n",
+                ),
+                (
+                    "section-two.tex",
+                    "\\section{Two}\\label{sec:two}\nSection two should continue on the same page without an injected page break.\n",
+                ),
+                (
+                    "section-three.tex",
+                    "\\section{Three}\\label{sec:three}\nSection three keeps the article flow continuous.\n",
+                ),
+            ],
+        );
+        let mut parallel_options = runtime_options(parallel_input, parallel_dir.path().join("out"));
+        parallel_options.no_cache = true;
+        parallel_options.parallelism = 4;
+
+        let (parallel, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &parallel_options);
+        assert_eq!(parallel.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("full typeset executing in parallel")));
+        let parallel_pdf =
+            fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
+
+        assert_eq!(sequential_pdf, parallel_pdf);
     }
 
     #[test]
