@@ -1,0 +1,40 @@
+\documentclass{article}
+\usepackage{multicol}
+\title{Multicolumn with Column Breaks}
+\author{Ferritex Test}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\section{Two Columns with Manual Break}
+
+\begin{multicols}{2}
+This text appears in the left column. It contains enough words to
+demonstrate that the column break directive forces a transition to the
+next column regardless of how much vertical space remains.
+
+\columnbreak
+
+This text appears in the right column after the explicit column break.
+The break ensures predictable placement without relying on automatic
+balancing.
+\end{multicols}
+
+\section{Three Columns}
+
+\begin{multicols}{3}
+First column content that fills the narrow measure of a three-column
+layout.
+
+\columnbreak
+
+Second column with a moderate amount of text to show the middle
+position.
+
+\columnbreak
+
+Third and final column wrapping up the three-column demonstration.
+\end{multicols}
+
+\end{document}

@@ -56,17 +56,16 @@ use ferritex_core::synctex::{
 use ferritex_core::typesetting::{
     append_footnotes_to_pages, append_footnotes_to_pages_starting_at,
     finalize_partitioned_typeset_document, paginate_vlist_continuing_detailed,
-    paginate_vlist_continuing_with_state, resolve_page_labels,
-    snapshot_paginated_vlist_state, DocumentLayoutFragment,
-    FixedWidthProvider, FloatCounters, FloatItem, FloatQueue, MinimalTypesetter,
-    PaginationMergeCoordinator, PartitionVListResult, RawBlockCheckpoint, TextLine,
-    TfmWidthProvider, TypesetDocument, TypesetPage, TypesetterReusePlan,
+    paginate_vlist_continuing_with_state, resolve_page_labels, snapshot_paginated_vlist_state,
+    DocumentLayoutFragment, FixedWidthProvider, FloatCounters, FloatItem, FloatQueue,
+    MinimalTypesetter, PaginationMergeCoordinator, PartitionVListResult, RawBlockCheckpoint,
+    TextLine, TfmWidthProvider, TypesetDocument, TypesetPage, TypesetterReusePlan,
 };
 use serde_json::json;
 
 use crate::compile_cache::{
-    fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState,
-    CachedSourceSubtree, CachedTypesetFragment, CompileCache, PendingFloat,
+    fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CachedSourceSubtree,
+    CachedTypesetFragment, CompileCache, PendingFloat,
 };
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
@@ -1188,9 +1187,11 @@ impl<'a> CompileJobService<'a> {
                         }
                     };
 
-                    let partial_typeset_available = cached_recompilation_scope
-                        == Some(RecompilationScope::LocalRegion)
-                        && !cached_typeset_fragments.is_empty()
+                    let partial_typeset_available = matches!(
+                        cached_recompilation_scope,
+                        Some(RecompilationScope::LocalRegion)
+                            | Some(RecompilationScope::BlockLevel { .. })
+                    ) && !cached_typeset_fragments.is_empty()
                         && !document.has_pageref_markers();
                     if partial_typeset_available && typeset_callback_count > 1 {
                         tracing::info!(
@@ -1209,11 +1210,20 @@ impl<'a> CompileJobService<'a> {
                             &source_tree,
                             &cached_typeset_fragments,
                         );
+                        let is_block_level = matches!(
+                            cached_recompilation_scope,
+                            Some(RecompilationScope::BlockLevel { .. })
+                        );
                         let typesetter_reuse_plan = TypesetterReusePlan::create(
                             &partition_plan,
                             &reuse_plan.rebuild_paths,
                             &usable_cached_fragments,
-                            changed_paths.contains(&normalized_input_file),
+                            if is_block_level {
+                                false
+                            } else {
+                                changed_paths.contains(&normalized_input_file)
+                            },
+                            is_block_level,
                         );
 
                         if typesetter_reuse_plan.requires_full_typeset {
@@ -1989,10 +1999,8 @@ impl<'a> CompileJobService<'a> {
         graphics_resolver: &CompileGraphicAssetResolver<'_>,
         continues_from_previous_block: bool,
     ) -> PartitionVListResult {
-        let (_annotated_document, body_nodes) =
-            annotated_body_nodes(body_document, source_lines).unwrap_or_else(|| {
-                (body_document.clone(), body_document.body_nodes())
-            });
+        let (_annotated_document, body_nodes) = annotated_body_nodes(body_document, source_lines)
+            .unwrap_or_else(|| (body_document.clone(), body_document.body_nodes()));
         self.build_vlist_from_body_nodes_with_selection(
             context_document,
             body_nodes,
@@ -2530,7 +2538,11 @@ fn normalize_block_text(text: &str) -> String {
 }
 
 fn block_signature(nodes: &[DocumentNode], source_lines: &[SourceLineTrace]) -> String {
-    fn collect_parts(nodes: &[DocumentNode], source_lines: &[SourceLineTrace], parts: &mut Vec<String>) {
+    fn collect_parts(
+        nodes: &[DocumentNode],
+        source_lines: &[SourceLineTrace],
+        parts: &mut Vec<String>,
+    ) {
         for node in nodes {
             match node {
                 DocumentNode::Text(text, _) => parts.push(normalize_block_text(text)),
@@ -2575,6 +2587,15 @@ fn block_signature(nodes: &[DocumentNode], source_lines: &[SourceLineTrace]) -> 
                 DocumentNode::ClearDoublePage => parts.push("<cleardoublepage>".to_string()),
                 DocumentNode::IndexMarker(entry) => parts.push(format!("<index:{entry:?}>")),
                 DocumentNode::InlineMath(nodes) => parts.push(format!("<inline-math:{nodes:?}>")),
+                DocumentNode::Multicols {
+                    children,
+                    column_count,
+                    ..
+                } => {
+                    parts.push(format!("<multicols:{column_count}>"));
+                    collect_parts(children, source_lines, parts);
+                }
+                DocumentNode::ColumnBreak => parts.push("<columnbreak>".to_string()),
             }
         }
     }
@@ -2624,7 +2645,10 @@ fn find_affected_block_index(
     for index in 0..cached_checkpoints.len() {
         let cached_checkpoint = &cached_checkpoints[index];
         let current_checkpoint = &current_checkpoints[index];
-        match (cached_checkpoint.source_span, current_checkpoint.source_span) {
+        match (
+            cached_checkpoint.source_span,
+            current_checkpoint.source_span,
+        ) {
             (Some(cached_span), Some(current_span)) => {
                 let cached_text = extract_text_for_span(cached_source_lines, cached_span);
                 let current_text = extract_text_for_span(current_source_lines, current_span);
@@ -2633,22 +2657,26 @@ fn find_affected_block_index(
                 }
             }
             (None, None) => {
-                let Some(cached_range) =
-                    checkpoint_suffix_range(cached_checkpoints, index, cached_nodes.len(), |item| {
-                        item.node_index
-                    })
-                else {
+                let Some(cached_range) = checkpoint_suffix_range(
+                    cached_checkpoints,
+                    index,
+                    cached_nodes.len(),
+                    |item| item.node_index,
+                ) else {
                     return Some(0);
                 };
-                let Some(current_range) =
-                    checkpoint_suffix_range(current_checkpoints, index, current_nodes.len(), |item| {
-                        item.node_index
-                    })
-                else {
+                let Some(current_range) = checkpoint_suffix_range(
+                    current_checkpoints,
+                    index,
+                    current_nodes.len(),
+                    |item| item.node_index,
+                ) else {
                     return Some(0);
                 };
-                let cached_signature =
-                    block_signature(&cached_nodes[cached_range.0..cached_range.1], cached_source_lines);
+                let cached_signature = block_signature(
+                    &cached_nodes[cached_range.0..cached_range.1],
+                    cached_source_lines,
+                );
                 let current_signature = block_signature(
                     &current_nodes[current_range.0..current_range.1],
                     current_source_lines,
@@ -2820,6 +2848,7 @@ fn raw_checkpoints_to_block_checkpoint_data(
     body_nodes: &[DocumentNode],
     vlist_result: &PartitionVListResult,
     source_hash: u64,
+    partition_body: String,
 ) -> BlockCheckpointData {
     let checkpoints = raw_checkpoints
         .iter()
@@ -2859,6 +2888,7 @@ fn raw_checkpoints_to_block_checkpoint_data(
     BlockCheckpointData {
         checkpoints,
         source_hash,
+        partition_body,
     }
 }
 
@@ -3095,89 +3125,107 @@ fn try_partial_typeset_document(
             let current_subtree = current_source_subtrees.get(&work_unit.locator.entry_file);
             let cached_subtree = cached_source_subtrees.get(&work_unit.locator.entry_file);
 
-            let fragment = if let (Some(checkpoint_data), Some(current_subtree), Some(cached_subtree)) = (
-                cached_fragment.block_checkpoints.as_ref(),
-                current_subtree,
-                cached_subtree,
-            ) {
-                let (_annotated_current_document, current_nodes) = annotated_body_nodes(
-                    &partition_document,
-                    Some(&current_subtree.source_lines),
-                )
-                .ok_or("failed to annotate current partition body nodes")?;
-                let mut current_raw_checkpoints = Vec::new();
-                let _ = service.build_vlist_from_body_nodes_with_selection(
-                    &partition_document,
-                    current_nodes.clone(),
-                    selection,
-                    graphics_resolver,
-                    false,
-                    FloatCounters::default(),
-                    Some(&mut current_raw_checkpoints),
-                );
-
-                let cached_partition_document = parse_partition_body_document(
-                    service,
-                    &document.document_class,
-                    &cached_subtree.text,
-                )
-                .ok_or("failed to parse cached partition body")?;
-                let (_annotated_cached_document, cached_nodes) = annotated_body_nodes(
-                    &cached_partition_document,
-                    Some(&cached_subtree.source_lines),
-                )
-                .ok_or("failed to annotate cached partition body nodes")?;
-
-                match find_affected_block_index(
-                    &checkpoint_data.checkpoints,
-                    &cached_nodes,
-                    &cached_subtree.source_lines,
-                    &current_raw_checkpoints,
-                    &current_nodes,
-                    &current_subtree.source_lines,
-                    &cached_subtree.text,
-                    &current_subtree.text,
+            let fragment =
+                if let (Some(checkpoint_data), Some(current_subtree), Some(cached_subtree)) = (
+                    cached_fragment.block_checkpoints.as_ref(),
+                    current_subtree,
+                    cached_subtree,
                 ) {
-                    None => cached_fragment.fragment.clone(),
-                    Some(0) => {
-                        let partition_typeset = service.typeset_document_with_selection(
-                            &partition_document,
-                            Some(source_lines),
-                            selection,
-                            graphics_resolver,
-                        );
-                        extract_rebuilt_fragment(partition_typeset, work_unit)?
-                    }
-                    Some(affected_block_index) => suffix_rebuild(
-                        service,
+                    let (_annotated_current_document, current_nodes) = annotated_body_nodes(
                         &partition_document,
-                        &current_nodes,
+                        Some(&current_subtree.source_lines),
+                    )
+                    .ok_or("failed to annotate current partition body nodes")?;
+                    let mut current_raw_checkpoints = Vec::new();
+                    let _ = service.build_vlist_from_body_nodes_with_selection(
+                        &partition_document,
+                        current_nodes.clone(),
                         selection,
                         graphics_resolver,
-                        cached_fragment,
-                        checkpoint_data,
-                        affected_block_index,
+                        false,
+                        FloatCounters::default(),
+                        Some(&mut current_raw_checkpoints),
+                    );
+
+                    let cached_partition_document = if checkpoint_data.partition_body.is_empty() {
+                        parse_partition_body_document(
+                            service,
+                            &document.document_class,
+                            &cached_subtree.text,
+                        )
+                        .ok_or("failed to parse cached partition body")?
+                    } else {
+                        ParsedDocument {
+                            document_class: document.document_class.clone(),
+                            class_options: document.class_options.clone(),
+                            loaded_packages: document.loaded_packages.clone(),
+                            package_count: document.package_count,
+                            main_font_name: document.main_font_name.clone(),
+                            sans_font_name: document.sans_font_name.clone(),
+                            mono_font_name: document.mono_font_name.clone(),
+                            body: checkpoint_data.partition_body.clone(),
+                            labels: document.labels.clone(),
+                            bibliography_state: document.bibliography_state.clone(),
+                            has_maketitle: document.has_maketitle,
+                            has_unresolved_refs: document.has_unresolved_refs,
+                        }
+                    };
+                    let (_annotated_cached_document, cached_nodes) = annotated_body_nodes(
+                        &cached_partition_document,
+                        Some(&cached_subtree.source_lines),
                     )
-                    .unwrap_or_else(|| {
-                        let partition_typeset = service.typeset_document_with_selection(
+                    .ok_or("failed to annotate cached partition body nodes")?;
+
+                    match find_affected_block_index(
+                        &checkpoint_data.checkpoints,
+                        &cached_nodes,
+                        &cached_subtree.source_lines,
+                        &current_raw_checkpoints,
+                        &current_nodes,
+                        &current_subtree.source_lines,
+                        &cached_subtree.text,
+                        &current_subtree.text,
+                    ) {
+                        None => cached_fragment.fragment.clone(),
+                        Some(0) => {
+                            let partition_typeset = service.typeset_document_with_selection(
+                                &partition_document,
+                                Some(source_lines),
+                                selection,
+                                graphics_resolver,
+                            );
+                            extract_rebuilt_fragment(partition_typeset, work_unit)?
+                        }
+                        Some(affected_block_index) => suffix_rebuild(
+                            service,
                             &partition_document,
-                            Some(source_lines),
+                            &current_nodes,
                             selection,
                             graphics_resolver,
-                        );
-                        extract_rebuilt_fragment(partition_typeset, work_unit)
-                            .expect("fallback partition rebuild should succeed")
-                    }),
-                }
-            } else {
-                let partition_typeset = service.typeset_document_with_selection(
-                    &partition_document,
-                    Some(source_lines),
-                    selection,
-                    graphics_resolver,
-                );
-                extract_rebuilt_fragment(partition_typeset, work_unit)?
-            };
+                            cached_fragment,
+                            checkpoint_data,
+                            affected_block_index,
+                        )
+                        .unwrap_or_else(|| {
+                            let partition_typeset = service.typeset_document_with_selection(
+                                &partition_document,
+                                Some(source_lines),
+                                selection,
+                                graphics_resolver,
+                            );
+                            extract_rebuilt_fragment(partition_typeset, work_unit)
+                                .expect("fallback partition rebuild should succeed")
+                        }),
+                    }
+                } else {
+                    let partition_typeset = service.typeset_document_with_selection(
+                        &partition_document,
+                        Some(source_lines),
+                        selection,
+                        graphics_resolver,
+                    );
+                    extract_rebuilt_fragment(partition_typeset, work_unit)?
+                };
             fragments.insert(work_unit.partition_id.clone(), fragment);
         }
     }
@@ -4186,8 +4234,10 @@ fn cached_typeset_fragments_for(
                                 body_range,
                                 section_range,
                             )?;
-                            let (_annotated_document, body_nodes) =
-                                annotated_body_nodes(&partition_document, Some(&subtree.source_lines))?;
+                            let (_annotated_document, body_nodes) = annotated_body_nodes(
+                                &partition_document,
+                                Some(&subtree.source_lines),
+                            )?;
                             let mut raw_checkpoints = Vec::new();
                             let vlist_result = service.build_vlist_from_body_nodes_with_selection(
                                 &partition_document,
@@ -4203,6 +4253,7 @@ fn cached_typeset_fragments_for(
                                 &body_nodes,
                                 &vlist_result,
                                 source_hash,
+                                partition_document.body.clone(),
                             ))
                         });
                     (source_hash, block_checkpoints)
@@ -7892,6 +7943,7 @@ mod tests {
                 &cached_nodes,
                 &cached_vlist,
                 1,
+                cached_document.body.clone(),
             )),
         };
         let mut current_raw_checkpoints = Vec::new();
@@ -8006,6 +8058,7 @@ mod tests {
                 &cached_nodes,
                 &cached_vlist,
                 1,
+                cached_document.body.clone(),
             )),
         };
         let mut current_raw_checkpoints = Vec::new();
@@ -8121,6 +8174,7 @@ mod tests {
                 &cached_nodes,
                 &cached_vlist,
                 1,
+                cached_document.body.clone(),
             )),
         };
         let mut current_raw_checkpoints = Vec::new();
@@ -9054,6 +9108,7 @@ mod tests {
         let document = test_typeset_document(vec![
             TextLine {
                 text: "Annotated text".to_string(),
+                x: DimensionValue::zero(),
                 y: points(720),
                 links: Vec::new(),
                 font_index: 0,
@@ -9062,6 +9117,7 @@ mod tests {
             },
             TextLine {
                 text: "Rendered".to_string(),
+                x: DimensionValue::zero(),
                 y: points(702),
                 links: Vec::new(),
                 font_index: 0,
@@ -9132,6 +9188,7 @@ mod tests {
             content: FloatContent {
                 lines: vec![TextLine {
                     text: "Float caption coverage".to_string(),
+                    x: DimensionValue::zero(),
                     y: DimensionValue::zero(),
                     links: Vec::new(),
                     font_index: 0,
@@ -9172,6 +9229,7 @@ mod tests {
         let document = test_typeset_document(vec![
             TextLine {
                 text: "Body".to_string(),
+                x: DimensionValue::zero(),
                 y: points(720),
                 links: Vec::new(),
                 font_index: 0,
@@ -9180,6 +9238,7 @@ mod tests {
             },
             TextLine {
                 text: "1".to_string(),
+                x: DimensionValue::zero(),
                 y: points(139),
                 links: Vec::new(),
                 font_index: 0,
@@ -9220,6 +9279,7 @@ mod tests {
         let mut document = test_typeset_document(vec![
             TextLine {
                 text: "Hello".to_string(),
+                x: DimensionValue::zero(),
                 y: points(720),
                 links: Vec::new(),
                 font_index: 0,
@@ -9228,6 +9288,7 @@ mod tests {
             },
             TextLine {
                 text: "world".to_string(),
+                x: DimensionValue::zero(),
                 y: points(702),
                 links: Vec::new(),
                 font_index: 0,
@@ -9503,6 +9564,97 @@ mod tests {
             "\\chapter{Two}\\label{chap:two}\nAlpha paragraph.\n\nBeta paragraph after block reuse.\n\nGamma paragraph.\n",
         )
         .expect("update chapter two");
+
+        let (incremental, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);
+        assert_eq!(incremental.exit_code, 0);
+        assert!(
+            trace_messages
+                .iter()
+                .any(|message| message.contains("partial typeset reuse applied")),
+            "{trace_messages:?}"
+        );
+        assert!(
+            trace_messages
+                .iter()
+                .all(|message| !message.contains("partial typeset fallback to full typeset")),
+            "{trace_messages:?}"
+        );
+
+        let incremental_pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(incremental_pdf.contains("Beta paragraph after block reuse."));
+
+        let mut full_options = runtime_options(input_file, dir.path().join("out-full"));
+        full_options.no_cache = true;
+        let full = service(&FsTestFileAccessGate, &loader).compile(&full_options);
+        assert_eq!(full.exit_code, 0);
+
+        let full_pdf = read_pdf(&full_options.output_dir.join("main.pdf"));
+        assert_eq!(incremental_pdf, full_pdf);
+    }
+
+    #[test]
+    fn block_checkpoint_single_paragraph_edit_with_packages() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        let chapter_one = dir.path().join("chapter-one.tex");
+        let chapter_two = dir.path().join("chapter-two.tex");
+        fs::write(
+            &input_file,
+            concat!(
+                "\\documentclass{report}\n",
+                "\\usepackage{amsmath}\n",
+                "\\def\\mymacro{Custom macro text.}\n",
+                "\\begin{document}\n",
+                "\\input{chapter-one}\n",
+                "\\newpage\n",
+                "\\input{chapter-two}\n",
+                "\\end{document}\n",
+            ),
+        )
+        .expect("write main input");
+        fs::write(
+            &chapter_one,
+            concat!(
+                "\\chapter{One}\\label{chap:one}\n",
+                "Stable opening chapter.\n",
+            ),
+        )
+        .expect("write chapter one input");
+        fs::write(
+            &chapter_two,
+            concat!(
+                "\\chapter{Two}\\label{chap:two}\n",
+                "Alpha paragraph.\n\n",
+                "\\mymacro\n\n",
+                "\\begin{align}\n",
+                "E &= mc^2\n",
+                "\\end{align}\n\n",
+                "Beta paragraph.\n",
+            ),
+        )
+        .expect("write chapter two input");
+
+        let mut options = runtime_options(input_file.clone(), dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(warmup.exit_code, 0);
+
+        fs::write(
+            &chapter_two,
+            concat!(
+                "\\chapter{Two}\\label{chap:two}\n",
+                "Alpha paragraph.\n\n",
+                "\\mymacro\n\n",
+                "\\begin{align}\n",
+                "E &= mc^2\n",
+                "\\end{align}\n\n",
+                "Beta paragraph after block reuse.\n",
+            ),
+        )
+        .expect("update chapter two input");
 
         let (incremental, trace_messages) =
             compile_with_trace_messages(&FsTestFileAccessGate, &loader, &options);

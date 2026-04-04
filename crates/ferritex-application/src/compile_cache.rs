@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::stable_compile_state::StableCompileState;
 
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 const LEGACY_CACHE_VERSION: u32 = 4;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
 const CACHE_INDEX_FILENAME: &str = "index.json";
@@ -90,6 +90,8 @@ pub struct PendingFloat {
 pub struct BlockCheckpointData {
     pub checkpoints: Vec<BlockCheckpoint>,
     pub source_hash: u64,
+    #[serde(default)]
+    pub partition_body: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +202,24 @@ impl<'a> CompileCache<'a> {
 
         let change_summary = self.detect_changes(&record.dependency_graph, changed_paths_hint);
         if !change_summary.changed_paths.is_empty() {
+            let scope = if change_summary.scope == RecompilationScope::LocalRegion
+                && record.cached_typeset_fragments.values().any(|fragment| {
+                    fragment
+                        .block_checkpoints
+                        .as_ref()
+                        .map(|data| !data.partition_body.is_empty())
+                        .unwrap_or(false)
+                }) {
+                // TODO: Thread partition ids through detect_changes so this promotion can
+                // populate affected_partitions instead of falling back to an empty list.
+                RecompilationScope::BlockLevel {
+                    affected_partitions: Vec::new(),
+                    references_affected: false,
+                    pagination_affected: false,
+                }
+            } else {
+                change_summary.scope
+            };
             return CacheLookupResult {
                 artifact: None,
                 baseline_state: Some(baseline_state),
@@ -209,7 +229,7 @@ impl<'a> CompileCache<'a> {
                 cached_dependency_graph: Some(record.dependency_graph),
                 cached_source_subtrees: record.cached_source_subtrees,
                 cached_typeset_fragments: record.cached_typeset_fragments,
-                scope: Some(change_summary.scope),
+                scope: Some(scope),
             };
         }
 
@@ -1123,6 +1143,7 @@ mod tests {
                         content: FloatContent {
                             lines: vec![TextLine {
                                 text: "pending float".to_string(),
+                                x: DimensionValue::zero(),
                                 y: DimensionValue(0),
                                 links: Vec::new(),
                                 font_index: 0,
@@ -1140,6 +1161,7 @@ mod tests {
                 },
             }],
             source_hash: 99,
+            partition_body: "Body paragraph.\n\nSecond paragraph.".to_string(),
         }
     }
 
@@ -1152,6 +1174,21 @@ mod tests {
             serde_json::from_str(&serialized).expect("deserialize checkpoint data");
 
         assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn block_checkpoint_data_without_partition_body_defaults_empty() {
+        let payload = serde_json::json!({
+            "checkpoints": [],
+            "source_hash": 77_u64,
+        });
+
+        let restored: BlockCheckpointData =
+            serde_json::from_value(payload).expect("deserialize legacy checkpoint data");
+
+        assert!(restored.checkpoints.is_empty());
+        assert_eq!(restored.source_hash, 77);
+        assert!(restored.partition_body.is_empty());
     }
 
     #[test]
@@ -1294,6 +1331,58 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
         );
         assert_eq!(lookup.scope, Some(RecompilationScope::LocalRegion));
+    }
+
+    #[test]
+    fn lookup_promotes_local_region_to_block_level_when_partition_bodies_are_cached() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let chapter = dir.path().join("chapter.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "\\input{chapter}").expect("write input");
+        fs::write(&chapter, "before").expect("write chapter");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let mut graph = ferritex_core::incremental::DependencyGraph::default();
+        graph.record_node(input.clone(), fingerprint_bytes(b"\\input{chapter}"));
+        graph.record_node(chapter.clone(), fingerprint_bytes(b"before"));
+        graph.record_edge(input.clone(), chapter.clone());
+
+        let cached_typeset_fragments = BTreeMap::from([(
+            "chapter:0001:intro".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("chapter:0001:intro"),
+                source_hash: 42,
+                block_checkpoints: Some(test_block_checkpoint_data()),
+            },
+        )]);
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+            )
+            .expect_none("cache stored");
+
+        fs::write(&chapter, "after").expect("update chapter");
+
+        let lookup = cache.lookup(&[]);
+
+        assert_eq!(lookup.changed_paths, vec![chapter.clone()]);
+        assert_eq!(
+            lookup.scope,
+            Some(RecompilationScope::BlockLevel {
+                affected_partitions: Vec::new(),
+                references_affected: false,
+                pagination_affected: false,
+            })
+        );
     }
 
     #[test]
@@ -2225,6 +2314,7 @@ mod tests {
             pages: vec![TypesetPage {
                 lines: vec![TextLine {
                     text: "cached".to_string(),
+                    x: DimensionValue::zero(),
                     y: DimensionValue(0),
                     links: Vec::new(),
                     font_index: 0,

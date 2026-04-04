@@ -1103,17 +1103,21 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
     );
     let mut current_font = first_line.font_index;
     let mut current_font_size = first_line.font_size;
+    let first_x = LEFT_MARGIN_PT as i64 * SCALED_POINTS_PER_POINT + first_line.x.0;
     stream.push_str(&format!(
         "{} {} Td\n",
-        LEFT_MARGIN_PT,
+        points_to_pdf_number(DimensionValue(first_x)),
         points_to_pdf_number(first_line.y)
     ));
     render_text_line(&mut stream, first_line, link_style);
 
+    let mut previous_x = first_line.x;
     let mut previous_y = first_line.y;
     for line in &lines[1..] {
+        let dx = line.x.0 - previous_x.0;
         stream.push_str(&format!(
-            "0 {} Td\n",
+            "{} {} Td\n",
+            points_to_pdf_number(DimensionValue(dx)),
             points_to_pdf_number(line.y - previous_y)
         ));
         if line.font_index != current_font || line.font_size != current_font_size {
@@ -1126,6 +1130,7 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
             current_font_size = line.font_size;
         }
         render_text_line(&mut stream, line, link_style);
+        previous_x = line.x;
         previous_y = line.y;
     }
     stream.push_str("ET\n");
@@ -1339,6 +1344,7 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
         .iter()
         .map(|line| TextLine {
             text: line.text.clone(),
+            x: line.x,
             y: placement.y_position - line.y,
             links: line.links.clone(),
             font_index: line.font_index,
@@ -2180,6 +2186,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, text)| TextLine {
                     text: (*text).to_string(),
+                    x: DimensionValue::zero(),
                     y: points(720 - (index as i64 * 18)),
                     links: Vec::new(),
                     font_index: 0,
@@ -2342,6 +2349,7 @@ mod tests {
     fn linked_line(text: &str, start_char: usize, end_char: usize, url: &str) -> TextLine {
         TextLine {
             text: text.to_string(),
+            x: DimensionValue::zero(),
             y: points(720),
             links: vec![TextLineLink {
                 url: url.to_string(),
@@ -2378,6 +2386,7 @@ mod tests {
             content: crate::typesetting::api::FloatContent {
                 lines: vec![TextLine {
                     text: "Float text".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(0),
                     links: Vec::new(),
                     font_index: 0,
@@ -3074,6 +3083,7 @@ mod tests {
         let mut document = single_page(&[]);
         document.pages[0].lines = vec![TextLine {
             text: "aaa bbb ccc".to_string(),
+            x: DimensionValue::zero(),
             y: points(720),
             links: vec![
                 TextLineLink {
@@ -3180,6 +3190,7 @@ mod tests {
         document.pages[0].lines = vec![
             TextLine {
                 text: "Main".to_string(),
+                x: DimensionValue::zero(),
                 y: points(720),
                 links: Vec::new(),
                 font_index: 0,
@@ -3188,6 +3199,7 @@ mod tests {
             },
             TextLine {
                 text: "Sans".to_string(),
+                x: DimensionValue::zero(),
                 y: points(702),
                 links: Vec::new(),
                 font_index: 1,
@@ -3196,6 +3208,7 @@ mod tests {
             },
             TextLine {
                 text: "Mono".to_string(),
+                x: DimensionValue::zero(),
                 y: points(684),
                 links: Vec::new(),
                 font_index: 2,

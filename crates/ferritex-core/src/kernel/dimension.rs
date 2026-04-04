@@ -12,6 +12,12 @@ impl DimensionValue {
     }
 }
 
+impl Default for DimensionValue {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
 impl Add for DimensionValue {
     type Output = Self;
 

@@ -284,6 +284,8 @@ pub struct TextLineLink {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextLine {
     pub text: String,
+    #[serde(default)]
+    pub x: DimensionValue,
     pub y: DimensionValue,
     pub links: Vec<TextLineLink>,
     pub font_index: u8,
@@ -458,8 +460,11 @@ impl TypesetterReusePlan {
         rebuild_paths: &BTreeSet<PathBuf>,
         cached_fragments: &BTreeMap<String, DocumentLayoutFragment>,
         preamble_changed: bool,
+        block_level_reuse: bool,
     ) -> Self {
-        if preamble_changed || primary_input_changed(partition_plan, rebuild_paths) {
+        if preamble_changed
+            || (!block_level_reuse && primary_input_changed(partition_plan, rebuild_paths))
+        {
             return Self {
                 rebuild_partition_ids: BTreeSet::new(),
                 reuse_fragments: BTreeMap::new(),
@@ -691,6 +696,7 @@ fn renumber_merged_page_numbers(pages: &mut [TypesetPage]) {
         }
         page.lines.push(TextLine {
             text: (page_index + 1).to_string(),
+            x: DimensionValue::zero(),
             y: style.y,
             links: Vec::new(),
             font_index: style.font_index,
@@ -992,6 +998,11 @@ pub enum VListItem {
         content: FloatContent,
     },
     ClearPage,
+    MulticolRegion {
+        columns: Vec<FloatContent>,
+        column_width: DimensionValue,
+        column_sep: DimensionValue,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1280,6 +1291,13 @@ fn extract_footnotes_from_node(
             caption_span,
             label,
         }),
+        DocumentNode::Multicols {
+            column_count,
+            children,
+        } => Some(DocumentNode::Multicols {
+            column_count,
+            children: extract_footnotes_from_children(children, footnotes),
+        }),
         other => Some(other),
     }
 }
@@ -1343,6 +1361,7 @@ pub fn append_footnotes_to_pages_starting_at(
 
         page.lines.push(TextLine {
             text: footnote_number.to_string(),
+            x: DimensionValue::zero(),
             y: points(layout.footnote_marker_y_pt - offset_pt),
             links: Vec::new(),
             font_index: 0,
@@ -1352,6 +1371,7 @@ pub fn append_footnotes_to_pages_starting_at(
         });
         page.lines.push(TextLine {
             text: footnote.text.clone(),
+            x: DimensionValue::zero(),
             y: points(layout.footnote_text_y_pt - offset_pt),
             links: Vec::new(),
             font_index: 0,
@@ -1801,7 +1821,9 @@ fn document_nodes_to_hlist_with_font_config(
                     current_font_index,
                 );
             }
-            DocumentNode::Float { .. } => {
+            DocumentNode::Float { .. }
+            | DocumentNode::Multicols { .. }
+            | DocumentNode::ColumnBreak => {
                 flush_word(
                     &mut hlist,
                     &mut current_word,
@@ -2189,6 +2211,57 @@ fn document_nodes_to_vlist_with_state(
                 previous_block = None;
                 segment_start = index + 1;
             }
+            DocumentNode::Multicols {
+                column_count,
+                children,
+            } => {
+                let _ = append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    document,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                    layout,
+                    &mut previous_block,
+                );
+
+                let multicol_vlist = typeset_multicols(
+                    document,
+                    children,
+                    *column_count,
+                    provider,
+                    hyphenator,
+                    params,
+                    layout,
+                    graphics_resolver,
+                    float_counters,
+                );
+                vlist.extend(multicol_vlist);
+
+                collect_raw_block_checkpoint(
+                    &mut checkpoint_collector,
+                    index + 1,
+                    node_source_span(node),
+                    vlist.len(),
+                );
+                previous_block = None;
+                segment_start = index + 1;
+            }
+            DocumentNode::ColumnBreak => {
+                // ColumnBreak outside multicols is ignored
+                let _ = append_nodes_segment_to_vlist(
+                    &mut vlist,
+                    document,
+                    &nodes[segment_start..index],
+                    provider,
+                    hyphenator,
+                    params,
+                    layout,
+                    &mut previous_block,
+                );
+                segment_start = index + 1;
+            }
             _ => {}
         }
     }
@@ -2229,6 +2302,116 @@ fn collect_raw_block_checkpoint(
         source_span,
         vlist_position,
     });
+}
+
+/// Default column separator width in points (matches LaTeX multicol's \columnsep = 10pt)
+const MULTICOL_COLUMN_SEP_PT: i64 = 10;
+
+/// Typeset a multicols environment by pre-splitting children at ColumnBreak boundaries,
+/// typesetting each group at the narrower column width, and emitting a single
+/// `VListItem::MulticolRegion` that places columns side-by-side during page rendering.
+#[allow(clippy::too_many_arguments)]
+fn typeset_multicols(
+    document: &ParsedDocument,
+    children: &[DocumentNode],
+    column_count: u32,
+    provider: &dyn CharWidthProvider,
+    hyphenator: Option<&dyn Hyphenator>,
+    params: &BreakParams,
+    layout: ClassLayout,
+    graphics_resolver: Option<&dyn GraphicAssetResolver>,
+    float_counters: &mut FloatCounters,
+) -> Vec<VListItem> {
+    let ncols = (column_count as usize).max(1);
+    let column_sep = DimensionValue(MULTICOL_COLUMN_SEP_PT * SCALED_POINTS_PER_POINT);
+    let total_sep = column_sep.0 * (ncols as i64 - 1);
+    let column_width = DimensionValue(
+        (params.line_width.0 - total_sep).max(SCALED_POINTS_PER_POINT) / ncols as i64,
+    );
+
+    let mut column_params = *params;
+    column_params.line_width = column_width;
+
+    // Pre-split children at ColumnBreak boundaries
+    let groups = split_children_at_column_breaks(children);
+
+    // Typeset each group into a FloatContent (provides TextLines with y positions)
+    let mut columns = Vec::with_capacity(ncols);
+    for group in groups.iter().take(ncols) {
+        let vlist = document_nodes_to_vlist_with_state(
+            document,
+            group,
+            provider,
+            hyphenator,
+            &column_params,
+            layout,
+            graphics_resolver,
+            None,
+            float_counters,
+            None,
+        );
+        columns.push(float_content_from_vlist(&vlist));
+    }
+    // If fewer groups than columns (no explicit breaks or fewer breaks), pad with empties
+    while columns.len() < ncols {
+        columns.push(FloatContent {
+            lines: Vec::new(),
+            images: Vec::new(),
+            height: DimensionValue::zero(),
+        });
+    }
+    // If more groups than columns, typeset remaining into the last column
+    if groups.len() > ncols {
+        for group in &groups[ncols..] {
+            let vlist = document_nodes_to_vlist_with_state(
+                document,
+                group,
+                provider,
+                hyphenator,
+                &column_params,
+                layout,
+                graphics_resolver,
+                None,
+                float_counters,
+                None,
+            );
+            let extra = float_content_from_vlist(&vlist);
+            let last = columns.last_mut().expect("columns is never empty");
+            let base_y = last.height;
+            for mut line in extra.lines {
+                line.y = line.y + base_y;
+                last.lines.push(line);
+            }
+            for mut image in extra.images {
+                image.y = image.y + base_y;
+                last.images.push(image);
+            }
+            last.height = last.height + extra.height;
+        }
+    }
+
+    vec![VListItem::MulticolRegion {
+        columns,
+        column_width,
+        column_sep,
+    }]
+}
+
+/// Split a slice of DocumentNodes into groups separated by ColumnBreak nodes.
+/// ColumnBreak nodes themselves are excluded from the output groups.
+fn split_children_at_column_breaks(children: &[DocumentNode]) -> Vec<Vec<DocumentNode>> {
+    let mut groups: Vec<Vec<DocumentNode>> = vec![Vec::new()];
+    for node in children {
+        if matches!(node, DocumentNode::ColumnBreak) {
+            groups.push(Vec::new());
+        } else {
+            groups
+                .last_mut()
+                .expect("groups is never empty")
+                .push(node.clone());
+        }
+    }
+    groups
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2627,6 +2810,11 @@ fn push_visible_text_from_node(text: &mut String, node: &DocumentNode) {
                 push_visible_text_from_node(text, child);
             }
         }
+        DocumentNode::Multicols { children, .. } => {
+            for child in children {
+                push_visible_text_from_node(text, child);
+            }
+        }
         DocumentNode::InlineMath(_)
         | DocumentNode::DisplayMath(_, _)
         | DocumentNode::EquationEnv { .. }
@@ -2637,7 +2825,8 @@ fn push_visible_text_from_node(text: &mut String, node: &DocumentNode) {
         | DocumentNode::ClearDoublePage
         | DocumentNode::IncludeGraphics { .. }
         | DocumentNode::TikzPicture { .. }
-        | DocumentNode::Float { .. } => {}
+        | DocumentNode::Float { .. }
+        | DocumentNode::ColumnBreak => {}
     }
 }
 
@@ -2662,7 +2851,9 @@ fn node_source_span(node: &DocumentNode) -> Option<SourceSpan> {
         | DocumentNode::ClearDoublePage
         | DocumentNode::IncludeGraphics { .. }
         | DocumentNode::TikzPicture { .. }
-        | DocumentNode::Float { .. } => None,
+        | DocumentNode::Float { .. }
+        | DocumentNode::ColumnBreak => None,
+        DocumentNode::Multicols { children, .. } => direct_source_span_from_nodes(children),
     }
 }
 
@@ -2823,6 +3014,7 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
+                    x: DimensionValue::zero(),
                     y: consumed_height,
                     links: links.clone(),
                     font_index: *font_index,
@@ -2845,6 +3037,34 @@ fn float_content_from_vlist(items: &[VListItem]) -> FloatContent {
             }
             VListItem::Glue { height } => {
                 consumed_height = consumed_height + *height;
+            }
+            VListItem::MulticolRegion {
+                columns,
+                column_width,
+                column_sep,
+            } => {
+                // Flatten nested multicol into float content (rare edge case)
+                for (col_index, col) in columns.iter().enumerate() {
+                    let x_offset =
+                        DimensionValue(col_index as i64 * (column_width.0 + column_sep.0));
+                    for line in &col.lines {
+                        lines.push(TextLine {
+                            text: line.text.clone(),
+                            x: x_offset,
+                            y: consumed_height + line.y,
+                            links: line.links.clone(),
+                            font_index: line.font_index,
+                            font_size: line.font_size,
+                            source_span: line.source_span,
+                        });
+                    }
+                }
+                let max_col_height = columns
+                    .iter()
+                    .map(|col| col.height)
+                    .max()
+                    .unwrap_or(DimensionValue::zero());
+                consumed_height = consumed_height + max_col_height;
             }
             VListItem::Penalty { .. }
             | VListItem::OpenRightBreak
@@ -3137,6 +3357,7 @@ fn resolve_float_lines(placement: &FloatPlacement) -> Vec<TextLine> {
         .iter()
         .map(|line| TextLine {
             text: line.text.clone(),
+            x: line.x,
             y: placement.y_position - line.y,
             links: line.links.clone(),
             font_index: line.font_index,
@@ -3662,43 +3883,43 @@ pub fn snapshot_paginated_vlist_state(
                     let overflow_height = vlist_total_height(&overflow_items);
                     current_height = current_height - overflow_height;
                     place_pending_floats_in_region(
-                    &mut current_page,
-                    &mut current_height,
-                    &mut float_queue,
-                    FloatRegion::Bottom,
-                    content_height,
-                );
-                emit_current_page(
-                    &mut pages,
-                    &current_page,
-                    current_height,
-                    page_start_height,
-                    page_box,
-                    layout,
-                    false,
-                    &mut last_page_content_used,
-                    &mut continued_on_initial_page,
-                );
-                if !float_queue.is_empty() {
-                    float_queue.increment_defer_counts();
-                }
+                        &mut current_page,
+                        &mut current_height,
+                        &mut float_queue,
+                        FloatRegion::Bottom,
+                        content_height,
+                    );
+                    emit_current_page(
+                        &mut pages,
+                        &current_page,
+                        current_height,
+                        page_start_height,
+                        page_box,
+                        layout,
+                        false,
+                        &mut last_page_content_used,
+                        &mut continued_on_initial_page,
+                    );
+                    if !float_queue.is_empty() {
+                        float_queue.increment_defer_counts();
+                    }
 
-                current_page.clear();
-                current_height = DimensionValue::zero();
-                page_start_height = DimensionValue::zero();
-                best_break_candidate = find_best_break_candidate(&overflow_items);
-                place_pending_floats_in_region(
-                    &mut current_page,
-                    &mut current_height,
-                    &mut float_queue,
-                    FloatRegion::Top,
-                    content_height,
-                );
-                for overflow_item in overflow_items {
-                    current_height = current_height + vlist_item_height(&overflow_item);
-                    current_page.push(overflow_item);
+                    current_page.clear();
+                    current_height = DimensionValue::zero();
+                    page_start_height = DimensionValue::zero();
+                    best_break_candidate = find_best_break_candidate(&overflow_items);
+                    place_pending_floats_in_region(
+                        &mut current_page,
+                        &mut current_height,
+                        &mut float_queue,
+                        FloatRegion::Top,
+                        content_height,
+                    );
+                    for overflow_item in overflow_items {
+                        current_height = current_height + vlist_item_height(&overflow_item);
+                        current_page.push(overflow_item);
+                    }
                 }
-            }
             }
 
             if !current_page.is_empty() && current_height + item_height > content_height {
@@ -3745,8 +3966,15 @@ pub fn snapshot_paginated_vlist_state(
         }
     }
 
-    let current_page = should_emit_paginated_page(&current_page, pages.is_empty(), page_start_height, false)
-        .then(|| typeset_page_from_vlist_with_offset(&current_page, page_box, layout, page_start_height));
+    let current_page = should_emit_paginated_page(
+        &current_page,
+        pages.is_empty(),
+        page_start_height,
+        false,
+    )
+    .then(|| {
+        typeset_page_from_vlist_with_offset(&current_page, page_box, layout, page_start_height)
+    });
 
     PaginationStateSnapshot {
         content_used: current_height,
@@ -3812,7 +4040,10 @@ fn page_has_renderable_content(items: &[VListItem]) -> bool {
     items.iter().any(|item| {
         matches!(
             item,
-            VListItem::Box { .. } | VListItem::Image { .. } | VListItem::PlacedFloat { .. }
+            VListItem::Box { .. }
+                | VListItem::Image { .. }
+                | VListItem::PlacedFloat { .. }
+                | VListItem::MulticolRegion { .. }
         )
     })
 }
@@ -3926,6 +4157,11 @@ fn vlist_item_height(item: &VListItem) -> DimensionValue {
         VListItem::Box { tex_box, .. } => tex_box.height + tex_box.depth,
         VListItem::Image { graphics_box } => graphics_box.height,
         VListItem::Glue { height } => *height,
+        VListItem::MulticolRegion { columns, .. } => columns
+            .iter()
+            .map(|col| col.height)
+            .max()
+            .unwrap_or(DimensionValue::zero()),
         VListItem::Penalty { .. }
         | VListItem::OpenRightBreak
         | VListItem::IndexMarker { .. }
@@ -3967,6 +4203,7 @@ fn typeset_page_from_vlist_with_offset(
             } => {
                 lines.push(TextLine {
                     text: content.clone(),
+                    x: DimensionValue::zero(),
                     y: page_content_top(page_box, layout) - consumed_height,
                     links: links.clone(),
                     font_index: *font_index,
@@ -4015,6 +4252,42 @@ fn typeset_page_from_vlist_with_offset(
             }
             VListItem::Glue { height } => {
                 consumed_height = consumed_height + *height;
+            }
+            VListItem::MulticolRegion {
+                columns,
+                column_width,
+                column_sep,
+            } => {
+                let page_top = page_content_top(page_box, layout);
+                let mut max_col_height = DimensionValue::zero();
+                for (col_index, col) in columns.iter().enumerate() {
+                    let x_offset =
+                        DimensionValue(col_index as i64 * (column_width.0 + column_sep.0));
+                    for line in &col.lines {
+                        lines.push(TextLine {
+                            text: line.text.clone(),
+                            x: x_offset,
+                            y: page_top - consumed_height - line.y,
+                            links: line.links.clone(),
+                            font_index: line.font_index,
+                            font_size: line.font_size,
+                            source_span: line.source_span,
+                        });
+                    }
+                    for image in &col.images {
+                        images.push(TypesetImage {
+                            scene: image.scene.clone(),
+                            x: image.x + x_offset,
+                            y: page_top - consumed_height - image.y - image.display_height,
+                            display_width: image.display_width,
+                            display_height: image.display_height,
+                        });
+                    }
+                    if col.height > max_col_height {
+                        max_col_height = col.height;
+                    }
+                }
+                consumed_height = consumed_height + max_col_height;
             }
             VListItem::Penalty { .. }
             | VListItem::OpenRightBreak
@@ -4085,6 +4358,7 @@ fn finalize_page_furniture(
     if layout.has_page_number && (!page.lines.is_empty() || !page.images.is_empty()) {
         page.lines.push(TextLine {
             text: page_number.to_string(),
+            x: DimensionValue::zero(),
             y: points(layout.page_number_y_pt),
             links: Vec::new(),
             font_index: 0,
@@ -4536,6 +4810,7 @@ mod tests {
         FloatContent {
             lines: vec![TextLine {
                 text: text.to_string(),
+                x: DimensionValue::zero(),
                 y: DimensionValue::zero(),
                 links: Vec::new(),
                 font_index: 0,
@@ -4565,6 +4840,7 @@ mod tests {
             vec![
                 TextLine {
                     text: "Hello".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
@@ -4573,6 +4849,7 @@ mod tests {
                 },
                 TextLine {
                     text: "Ferritex".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
                     links: Vec::new(),
                     font_index: 0,
@@ -4627,6 +4904,7 @@ mod tests {
             TypesetPage {
                 lines: vec![TextLine {
                     text: "Line 1".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
@@ -4641,6 +4919,7 @@ mod tests {
             TypesetPage {
                 lines: vec![TextLine {
                     text: "1 Later".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
@@ -4683,6 +4962,7 @@ mod tests {
             lines: vec![
                 TextLine {
                     text: "1 Intro".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
                     links: Vec::new(),
                     font_index: 0,
@@ -4691,6 +4971,7 @@ mod tests {
                 },
                 TextLine {
                     text: "[1] Donald Knuth".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
                     links: Vec::new(),
                     font_index: 0,
@@ -4999,6 +5280,7 @@ mod tests {
                     lines: vec![
                         TextLine {
                             text: "Body".to_string(),
+                            x: DimensionValue::zero(),
                             y: DimensionValue::zero(),
                             links: Vec::new(),
                             font_index: 0,
@@ -5007,6 +5289,7 @@ mod tests {
                         },
                         TextLine {
                             text: "Figure 1: A caption".to_string(),
+                            x: DimensionValue::zero(),
                             y: points(LINE_HEIGHT_PT),
                             links: Vec::new(),
                             font_index: 0,
@@ -5655,6 +5938,23 @@ mod tests {
             serde_json::from_str(&serialized).expect("deserialize vlist item");
 
         assert_eq!(restored, item);
+    }
+
+    #[test]
+    fn text_line_deserializes_without_x_using_zero_default() {
+        let restored: TextLine = serde_json::from_value(serde_json::json!({
+            "text": "legacy line",
+            "y": 720896,
+            "links": [],
+            "font_index": 3,
+            "font_size": 655360,
+            "source_span": null
+        }))
+        .expect("deserialize legacy text line");
+
+        assert_eq!(restored.x, DimensionValue::zero());
+        assert_eq!(restored.text, "legacy line");
+        assert_eq!(restored.y, DimensionValue(720896));
     }
 
     #[test]
@@ -6612,6 +6912,7 @@ mod tests {
                 lines: vec![
                     TextLine {
                         text: "Body".to_string(),
+                        x: DimensionValue::zero(),
                         y: points(700),
                         links: Vec::new(),
                         font_index: 0,
@@ -6620,6 +6921,7 @@ mod tests {
                     },
                     TextLine {
                         text: "9".to_string(),
+                        x: DimensionValue::zero(),
                         y: points(145),
                         links: Vec::new(),
                         font_index: 0,
@@ -6635,6 +6937,7 @@ mod tests {
             TypesetPage {
                 lines: vec![TextLine {
                     text: "10".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(145),
                     links: Vec::new(),
                     font_index: 0,
@@ -6650,6 +6953,7 @@ mod tests {
                 lines: vec![
                     TextLine {
                         text: "Tail".to_string(),
+                        x: DimensionValue::zero(),
                         y: points(700),
                         links: Vec::new(),
                         font_index: 0,
@@ -6658,6 +6962,7 @@ mod tests {
                     },
                     TextLine {
                         text: "11".to_string(),
+                        x: DimensionValue::zero(),
                         y: points(145),
                         links: Vec::new(),
                         font_index: 0,
@@ -6685,6 +6990,7 @@ mod tests {
             lines: vec![
                 TextLine {
                     text: "Top".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(700),
                     links: Vec::new(),
                     font_index: 0,
@@ -6693,6 +6999,7 @@ mod tests {
                 },
                 TextLine {
                     text: "9".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(145),
                     links: Vec::new(),
                     font_index: 0,
@@ -6701,6 +7008,7 @@ mod tests {
                 },
                 TextLine {
                     text: "Bottom".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(100),
                     links: Vec::new(),
                     font_index: 0,
@@ -6740,6 +7048,7 @@ mod tests {
             lines: vec![
                 TextLine {
                     text: "Top".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(700),
                     links: Vec::new(),
                     font_index: 0,
@@ -6748,6 +7057,7 @@ mod tests {
                 },
                 TextLine {
                     text: "Bottom".to_string(),
+                    x: DimensionValue::zero(),
                     y: points(100),
                     links: Vec::new(),
                     font_index: 0,
@@ -7399,11 +7709,41 @@ mod tests {
     fn typesetter_reuse_plan_requires_full_when_preamble_changes() {
         let plan = partition_plan();
         let reuse_plan =
-            TypesetterReusePlan::create(&plan, &BTreeSet::new(), &BTreeMap::new(), true);
+            TypesetterReusePlan::create(&plan, &BTreeSet::new(), &BTreeMap::new(), true, false);
 
         assert!(reuse_plan.requires_full_typeset);
         assert!(reuse_plan.rebuild_partition_ids.is_empty());
         assert!(reuse_plan.reuse_fragments.is_empty());
+    }
+
+    #[test]
+    fn typesetter_reuse_plan_skips_primary_input_guard_for_block_level_reuse() {
+        let plan = single_file_partition_plan();
+        let rebuild_paths = BTreeSet::from([PathBuf::from("main.tex")]);
+        let cached_fragments = BTreeMap::from([(
+            "section:0002:results".to_string(),
+            fragment(
+                "section:0002:results",
+                1,
+                BTreeMap::from([("results".to_string(), 0)]),
+            ),
+        )]);
+
+        let full_reuse_plan =
+            TypesetterReusePlan::create(&plan, &rebuild_paths, &cached_fragments, false, false);
+        assert!(full_reuse_plan.requires_full_typeset);
+
+        let block_reuse_plan =
+            TypesetterReusePlan::create(&plan, &rebuild_paths, &cached_fragments, false, true);
+        assert!(!block_reuse_plan.requires_full_typeset);
+        assert_eq!(
+            block_reuse_plan.rebuild_partition_ids,
+            BTreeSet::from([
+                "section:0001:intro".to_string(),
+                "section:0002:results".to_string()
+            ])
+        );
+        assert!(block_reuse_plan.reuse_fragments.is_empty());
     }
 
     #[test]
@@ -7420,7 +7760,7 @@ mod tests {
         )]);
 
         let reuse_plan =
-            TypesetterReusePlan::create(&plan, &rebuild_paths, &cached_fragments, false);
+            TypesetterReusePlan::create(&plan, &rebuild_paths, &cached_fragments, false, false);
 
         assert!(!reuse_plan.requires_full_typeset);
         assert_eq!(
@@ -7436,7 +7776,7 @@ mod tests {
         let rebuild_paths = BTreeSet::from([PathBuf::from("chapter-1.tex")]);
 
         let reuse_plan =
-            TypesetterReusePlan::create(&plan, &rebuild_paths, &BTreeMap::new(), false);
+            TypesetterReusePlan::create(&plan, &rebuild_paths, &BTreeMap::new(), false, false);
 
         assert!(reuse_plan.requires_full_typeset);
     }
@@ -7602,6 +7942,36 @@ mod tests {
         }
     }
 
+    fn single_file_partition_plan() -> DocumentPartitionPlan {
+        DocumentPartitionPlan {
+            fallback_partition_id: "document:0000:main".to_string(),
+            work_units: vec![
+                DocumentWorkUnit {
+                    partition_id: "section:0001:intro".to_string(),
+                    kind: PartitionKind::Section,
+                    locator: PartitionLocator {
+                        entry_file: PathBuf::from("main.tex"),
+                        level: 0,
+                        ordinal: 0,
+                        title: "Intro".to_string(),
+                    },
+                    title: "Intro".to_string(),
+                },
+                DocumentWorkUnit {
+                    partition_id: "section:0002:results".to_string(),
+                    kind: PartitionKind::Section,
+                    locator: PartitionLocator {
+                        entry_file: PathBuf::from("main.tex"),
+                        level: 0,
+                        ordinal: 1,
+                        title: "Results".to_string(),
+                    },
+                    title: "Results".to_string(),
+                },
+            ],
+        }
+    }
+
     fn fragment(
         partition_id: &str,
         page_count: usize,
@@ -7640,6 +8010,7 @@ mod tests {
         TypesetPage {
             lines: vec![TextLine {
                 text: text.to_string(),
+                x: DimensionValue::zero(),
                 y: points(700),
                 links: Vec::new(),
                 font_index: 0,
@@ -7674,5 +8045,146 @@ mod tests {
         data.extend_from_slice(&0i32.to_be_bytes());
 
         data
+    }
+
+    #[test]
+    fn typeset_multicols_produces_vlist_items() {
+        use crate::parser::api::{DocumentNode, ParsedDocument};
+
+        let _document = ParsedDocument {
+            document_class: "article".to_string(),
+            ..Default::default()
+        };
+        let nodes = vec![DocumentNode::Multicols {
+            column_count: 2,
+            children: vec![
+                DocumentNode::Text("Column one text.".to_string(), None),
+                DocumentNode::ParBreak,
+                DocumentNode::Text("Column two text.".to_string(), None),
+            ],
+        }];
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
+        assert!(!vlist.is_empty(), "multicols should produce vlist items");
+    }
+
+    #[test]
+    fn typeset_multicols_with_columnbreak() {
+        use crate::parser::api::{DocumentNode, ParsedDocument};
+
+        let _document = ParsedDocument {
+            document_class: "article".to_string(),
+            ..Default::default()
+        };
+        let nodes = vec![DocumentNode::Multicols {
+            column_count: 2,
+            children: vec![
+                DocumentNode::Text("Left column.".to_string(), None),
+                DocumentNode::ColumnBreak,
+                DocumentNode::Text("Right column.".to_string(), None),
+            ],
+        }];
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
+        assert!(
+            !vlist.is_empty(),
+            "multicols with columnbreak should produce vlist items"
+        );
+    }
+
+    #[test]
+    fn typeset_multicols_single_column() {
+        use crate::parser::api::{DocumentNode, ParsedDocument};
+
+        let _document = ParsedDocument {
+            document_class: "article".to_string(),
+            ..Default::default()
+        };
+        let nodes = vec![DocumentNode::Multicols {
+            column_count: 1,
+            children: vec![DocumentNode::Text("Single column.".to_string(), None)],
+        }];
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
+        assert!(
+            !vlist.is_empty(),
+            "single-column multicols should produce vlist items"
+        );
+    }
+
+    #[test]
+    fn typeset_multicols_empty_children() {
+        use crate::parser::api::{DocumentNode, ParsedDocument};
+
+        let _document = ParsedDocument {
+            document_class: "article".to_string(),
+            ..Default::default()
+        };
+        let nodes = vec![DocumentNode::Multicols {
+            column_count: 2,
+            children: vec![],
+        }];
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
+        // A MulticolRegion VListItem is emitted even for empty content,
+        // but it has zero height and produces no rendered output.
+        assert_eq!(vlist.len(), 1, "empty multicols emits one MulticolRegion");
+        assert_eq!(
+            super::vlist_item_height(&vlist[0]),
+            DimensionValue::zero(),
+            "empty multicols region has zero height"
+        );
+    }
+
+    #[test]
+    fn typeset_multicols_produces_side_by_side_columns() {
+        use crate::parser::api::DocumentNode;
+
+        let nodes = vec![DocumentNode::Multicols {
+            column_count: 2,
+            children: vec![
+                DocumentNode::Text("Left.".to_string(), None),
+                DocumentNode::ColumnBreak,
+                DocumentNode::Text("Right.".to_string(), None),
+            ],
+        }];
+        let provider = default_fixed_width_provider();
+        let params = super::break_params_for_provider(&provider);
+        let vlist = document_nodes_to_vlist_with_config(&nodes, &provider, None, &params, None);
+
+        // Should produce exactly one MulticolRegion
+        assert_eq!(vlist.len(), 1);
+        match &vlist[0] {
+            VListItem::MulticolRegion { columns, .. } => {
+                assert_eq!(columns.len(), 2, "should have 2 columns");
+                assert!(
+                    !columns[0].lines.is_empty(),
+                    "left column should have content"
+                );
+                assert!(
+                    !columns[1].lines.is_empty(),
+                    "right column should have content"
+                );
+            }
+            other => panic!("expected MulticolRegion, got {:?}", other),
+        }
+
+        // Paginate and verify TextLines have different x positions
+        let page_box = page_box_for_class("article");
+        let pages = paginate_vlist(&vlist, &page_box);
+        assert!(!pages.is_empty());
+        let page = &pages[0];
+
+        let x_positions: Vec<_> = page.lines.iter().map(|line| line.x).collect();
+        let distinct_x: std::collections::BTreeSet<_> = x_positions.iter().collect();
+        assert!(
+            distinct_x.len() >= 2,
+            "multicol should produce lines at >= 2 distinct x positions, got {:?}",
+            x_positions
+        );
     }
 }

@@ -149,6 +149,9 @@ pub struct GeometryExtension;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FontspecExtension;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MulticolExtension;
+
 pub struct StyInterpreter<'a, 'resolver> {
     source: &'a str,
     options: &'a [String],
@@ -250,6 +253,16 @@ impl PackageExtension for FontspecExtension {
         register_noop_command(engine, "setmainfont", 1);
         register_noop_command(engine, "setsansfont", 1);
         register_noop_command(engine, "setmonofont", 1);
+    }
+}
+
+impl PackageExtension for MulticolExtension {
+    fn name(&self) -> &str {
+        "multicol"
+    }
+
+    fn register(&self, _engine: &mut MacroEngine) {
+        // multicols environment and \columnbreak are handled directly by the parser
     }
 }
 
@@ -397,6 +410,7 @@ fn get_native_extension(name: &str) -> Option<&'static dyn PackageExtension> {
     static GEOMETRY_EXTENSION: GeometryExtension = GeometryExtension;
     static GRAPHICX_EXTENSION: GraphicxExtension = GraphicxExtension;
     static XCOLOR_EXTENSION: XcolorExtension = XcolorExtension;
+    static MULTICOL_EXTENSION: MulticolExtension = MulticolExtension;
 
     match name {
         "amsmath" => Some(&AMSMATH_EXTENSION),
@@ -404,6 +418,7 @@ fn get_native_extension(name: &str) -> Option<&'static dyn PackageExtension> {
         "geometry" => Some(&GEOMETRY_EXTENSION),
         "graphicx" => Some(&GRAPHICX_EXTENSION),
         "xcolor" => Some(&XCOLOR_EXTENSION),
+        "multicol" => Some(&MULTICOL_EXTENSION),
         _ => None,
     }
 }

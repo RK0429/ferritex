@@ -72,6 +72,10 @@ const BODY_INDEX_ENTRY_START: char = '\u{E01D}';
 const BODY_INDEX_ENTRY_END: char = '\u{E01E}';
 const BODY_INDEX_ENTRY_FIELD_SEP: char = '\u{E01F}';
 const BODY_TRAILING_SPACE_SENTINEL: char = '\u{E029}';
+const BODY_MULTICOL_START: char = '\u{E02B}';
+const BODY_MULTICOL_END: char = '\u{E02C}';
+const BODY_MULTICOL_COL_SEP: char = '\u{E02D}';
+const BODY_COLUMNBREAK: char = '\u{E02E}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -471,6 +475,11 @@ pub enum DocumentNode {
         caption_span: Option<SourceSpan>,
         label: Option<String>,
     },
+    Multicols {
+        column_count: u32,
+        children: Vec<DocumentNode>,
+    },
+    ColumnBreak,
 }
 
 impl ParsedDocument {
@@ -1232,6 +1241,7 @@ enum OpenEnvironmentKind {
     UserDefined { end_tokens: Vec<Token> },
     List(ListEnvironmentState),
     Float(FloatEnvironmentState),
+    Multicols,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1945,6 +1955,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     "cleardoublepage" | "frontmatter" | "mainmatter" | "backmatter" => {
                         let _ = self.take_global_prefix();
                         self.body.push(BODY_CLEAR_DOUBLE_PAGE_MARKER);
+                    }
+                    "columnbreak" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push(BODY_COLUMNBREAK);
                     }
                     "cite" => {
                         let _ = self.take_global_prefix();
@@ -2936,6 +2950,23 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return Ok(());
         }
 
+        if name == "multicols" {
+            let column_count = self
+                .read_required_braced_tokens()?
+                .map(|tokens| tokens_to_text(&tokens).trim().parse::<u32>().unwrap_or(2))
+                .unwrap_or(2);
+            self.emit_paragraph_break_before_block();
+            self.body.push(BODY_MULTICOL_START);
+            self.body.push_str(&column_count.to_string());
+            self.body.push(BODY_MULTICOL_COL_SEP);
+            self.environment_stack.push(OpenEnvironment {
+                name,
+                line,
+                kind: OpenEnvironmentKind::Multicols,
+            });
+            return Ok(());
+        }
+
         if name == "tikzpicture" {
             let _ = self.read_optional_bracket_tokens()?;
             let content = self.read_raw_environment_body(&name, line)?;
@@ -3054,6 +3085,24 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return Ok(false);
         }
 
+        if name == "multicols" {
+            if matches!(
+                self.environment_stack.last(),
+                Some(OpenEnvironment {
+                    name: open_name,
+                    kind: OpenEnvironmentKind::Multicols,
+                    ..
+                }) if open_name == &name
+            ) {
+                let _ = self.environment_stack.pop();
+                self.body.push(BODY_MULTICOL_END);
+                self.emit_paragraph_break_before_block();
+            } else {
+                self.body.push_str(&name);
+            }
+            return Ok(false);
+        }
+
         if list_environment_kind(&name).is_some() {
             if matches!(
                 self.environment_stack.last(),
@@ -3092,7 +3141,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             OpenEnvironmentKind::List(_) => {
                 self.body.push_str(&name);
             }
-            OpenEnvironmentKind::Float(_) => {
+            OpenEnvironmentKind::Float(_) | OpenEnvironmentKind::Multicols => {
                 self.body.push_str(&name);
             }
         }
@@ -3120,7 +3169,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         }
                         ListEnvironmentKind::Description => Marker::Description,
                     }),
-                    OpenEnvironmentKind::UserDefined { .. } | OpenEnvironmentKind::Float(_) => None,
+                    OpenEnvironmentKind::UserDefined { .. }
+                    | OpenEnvironmentKind::Float(_)
+                    | OpenEnvironmentKind::Multicols => None,
                 })
         }) else {
             self.body.push_str("item");
@@ -3732,7 +3783,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             .last_mut()
             .and_then(|environment| match &mut environment.kind {
                 OpenEnvironmentKind::Float(state) => Some(state),
-                OpenEnvironmentKind::UserDefined { .. } | OpenEnvironmentKind::List(_) => None,
+                OpenEnvironmentKind::UserDefined { .. }
+                | OpenEnvironmentKind::List(_)
+                | OpenEnvironmentKind::Multicols => None,
             })
     }
 
@@ -7175,6 +7228,7 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
         *ch == BODY_PAGE_BREAK_MARKER
             || *ch == BODY_CLEAR_PAGE_MARKER
             || *ch == BODY_CLEAR_DOUBLE_PAGE_MARKER
+            || *ch == BODY_COLUMNBREAK
     }) {
         nodes.extend(body_text_nodes(
             &body_with_placeholders[segment_start..index],
@@ -7184,7 +7238,8 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
             BODY_PAGE_BREAK_MARKER => DocumentNode::PageBreak,
             BODY_CLEAR_PAGE_MARKER => DocumentNode::ClearPage,
             BODY_CLEAR_DOUBLE_PAGE_MARKER => DocumentNode::ClearDoublePage,
-            _ => unreachable!("filtered markers should only include page break markers"),
+            BODY_COLUMNBREAK => DocumentNode::ColumnBreak,
+            _ => unreachable!("filtered markers should only include break markers"),
         });
         segment_start = index + marker.len_utf8();
     }
@@ -7321,6 +7376,13 @@ impl BodySourceSpanAnnotator {
                     label,
                 }
             }
+            DocumentNode::Multicols {
+                column_count,
+                children,
+            } => DocumentNode::Multicols {
+                column_count,
+                children: self.annotate_nodes(children),
+            },
             other => other,
         }
     }
@@ -7657,6 +7719,14 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_MULTICOL_START => {
+                let (content, next_index) =
+                    extract_single_marker_content(body, index, BODY_MULTICOL_END);
+                let placeholder = next_box_placeholder(placeholders.len());
+                placeholders.push(deserialize_multicol_marker(content));
+                text.push(placeholder);
+                index = next_index;
+            }
             _ => {
                 text.push(ch);
                 index += ch.len_utf8();
@@ -7665,6 +7735,18 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
     }
 
     (text, placeholders)
+}
+
+fn deserialize_multicol_marker(content: &str) -> DocumentNode {
+    let (col_count_str, body_content) = content
+        .split_once(BODY_MULTICOL_COL_SEP)
+        .unwrap_or(("2", content));
+    let column_count = col_count_str.trim().parse::<u32>().unwrap_or(2).max(1);
+    let children = body_nodes_from_text(body_content);
+    DocumentNode::Multicols {
+        column_count,
+        children,
+    }
 }
 
 fn extract_box_marker_content(body: &str, start_index: usize) -> (&str, usize) {
@@ -8391,6 +8473,10 @@ fn encode_body_markers_in_text(text: &str) -> String {
             }
             "cleardoublepage" | "frontmatter" | "mainmatter" | "backmatter" => {
                 encoded.push(BODY_CLEAR_DOUBLE_PAGE_MARKER);
+                index = command_end;
+            }
+            "columnbreak" => {
+                encoded.push(BODY_COLUMNBREAK);
                 index = command_end;
             }
             "href" => {
@@ -12640,5 +12726,46 @@ mod tests {
             .expect("parse document");
 
         assert_eq!(document.body, "BA");
+    }
+
+    #[test]
+    fn parse_multicols_environment_produces_multicols_node() {
+        let document = parse_document(
+            "\\usepackage{multicol}\n\\begin{multicols}{2}\nLeft column.\n\nRight column.\n\\end{multicols}",
+        );
+        let nodes = document.body_nodes();
+        let multicol_node = nodes.iter().find(|node| matches!(node, DocumentNode::Multicols { .. }));
+        assert!(multicol_node.is_some(), "should produce a Multicols node");
+        if let Some(DocumentNode::Multicols { column_count, children }) = multicol_node {
+            assert_eq!(*column_count, 2);
+            assert!(!children.is_empty(), "children should not be empty");
+        }
+    }
+
+    #[test]
+    fn parse_multicols_with_three_columns() {
+        let document = parse_document(
+            "\\usepackage{multicol}\n\\begin{multicols}{3}\nA\n\nB\n\nC\n\\end{multicols}",
+        );
+        let nodes = document.body_nodes();
+        let multicol_node = nodes.iter().find(|node| matches!(node, DocumentNode::Multicols { .. }));
+        assert!(multicol_node.is_some());
+        if let Some(DocumentNode::Multicols { column_count, .. }) = multicol_node {
+            assert_eq!(*column_count, 3);
+        }
+    }
+
+    #[test]
+    fn parse_columnbreak_produces_columnbreak_node() {
+        let document = parse_document(
+            "\\usepackage{multicol}\n\\begin{multicols}{2}\nLeft.\n\\columnbreak\nRight.\n\\end{multicols}",
+        );
+        let nodes = document.body_nodes();
+        let multicol_node = nodes.iter().find(|node| matches!(node, DocumentNode::Multicols { .. }));
+        assert!(multicol_node.is_some());
+        if let Some(DocumentNode::Multicols { children, .. }) = multicol_node {
+            let has_break = children.iter().any(|n| matches!(n, DocumentNode::ColumnBreak));
+            assert!(has_break, "should contain a ColumnBreak node");
+        }
     }
 }
