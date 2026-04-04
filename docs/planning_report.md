@@ -98,7 +98,7 @@ Wave 1（Incremental Performance Evidence）が完了し、warm incremental comp
 - **Wave 1 完了**。incremental compile 機構の初期実証（point-in-time 計測で 1.84× speedup）と cross-reference 収束検証が確立された。`REQ-NF-002` の定量基準（100ms 未満）は別途最適化が必要
 - **Wave 2 完了**。pipelined VList build + sequential pagination を section-level path に適用し、book/article 両 heavy corpus で output identity と speedup > 1.0 の strict proof を確立
 - **Wave 3 完了**。bundle archive 生成、artifact upload/download、archive-based smoke proof まで CI に接続された
-- **残 Frontier は 2 つ**。`REQ-NF-002` 差分性能目標と Wave 4 の long-tail compatibility
+- **残 Frontier は 2 つ**。`REQ-NF-002` 差分性能目標（設計文書: [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)）と Wave 4 の long-tail compatibility
 
 ```mermaid
 graph LR
@@ -114,7 +114,7 @@ graph LR
 
 - **結果**: incremental 機構実証済み・parallel speedup evidence 取得済み・bundle archive CI 接続完了
 - **判断**: 実装の核心部分と parity evidence 接続が完了。REQ-NF-007 の 5 カテゴリ parity は全 pass。Wave 1 により incremental compile 機構の有効性と cross-reference 収束が point-in-time 計測で確認され、Wave 2 では book/article 両 heavy corpus で output identity と speedup > 1.0 の strict proof が確立された。Wave 3 では deterministic `FTX-ASSET-BUNDLE-001` archive の生成と archive-based smoke proof が CI に組み込まれ、`REQ-FUNC-046` の配布面は完了した。残りは `REQ-NF-002` 差分性能目標と Wave 4 の long-tail 互換性改善のみ
-- **直近の推奨**: `REQ-NF-002` の差分性能最適化（cache 粒度の細分化・再 typeset スコープの縮小）と Wave 4 の long-tail 互換性改善を継続する
+- **直近の推奨**: `REQ-NF-002` の差分性能最適化（cache 粒度の細分化・再 typeset スコープの縮小、詳細は [design-incremental-100ms-optimization.md](design-incremental-100ms-optimization.md)）と Wave 4 の long-tail 互換性改善を継続する
 
 ### Warm Incremental Benchmark 実績 (REQ-FUNC-030) — Wave 1 完了
 

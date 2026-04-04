@@ -12,7 +12,7 @@ Warm incremental recompilation is functional: on the current test configuration 
 
 Bundle distribution Wave 3 is now wired into CI: `scripts/build_bundle_archive.sh` reproducibly emits `FTX-ASSET-BUNDLE-001.tar.gz`, and `bundle-ci.yml` uploads the archive artifact, downloads it in a dependent job, and runs `bundle_archive_smoke_proof` against the downloaded archive under `--reproducible`.
 
-The largest remaining gaps against `docs/requirements.md` are the `REQ-NF-002` differential compile target, strict full-compile determinism for the multi-second partition parallel proof, and long-tail `tikz`/`pgf` plus package compatibility work.
+The largest remaining gaps against `docs/requirements.md` are the `REQ-NF-002` differential compile target (median differential compile < 100ms) and long-tail `tikz`/`pgf` plus package compatibility work (Wave 4).
 
 ## Quick start
 
