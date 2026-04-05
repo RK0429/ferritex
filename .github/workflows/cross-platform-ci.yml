@@ -1,0 +1,143 @@
+name: Cross Platform CI
+
+on:
+  push:
+    paths:
+      - .github/workflows/cross-platform-ci.yml
+      - scripts/**
+      - crates/ferritex-cli/**
+      - crates/ferritex-core/**
+      - crates/ferritex-bench/fixtures/**
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-archive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build bundle archive
+        run: |
+          set -euo pipefail
+          bash scripts/build_bundle_archive.sh "${RUNNER_TEMP}/FTX-ASSET-BUNDLE-001.tar.gz"
+          tar -tzf "${RUNNER_TEMP}/FTX-ASSET-BUNDLE-001.tar.gz" > /dev/null
+
+      - name: Upload bundle archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferritex-bundle-archive
+          path: ${{ runner.temp }}/FTX-ASSET-BUNDLE-001.tar.gz
+          if-no-files-found: error
+
+  compile-and-hash:
+    runs-on: ${{ matrix.runner }}
+    needs: build-archive
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+          - runner: macos-latest
+            os: macos
+          - runner: windows-latest
+            os: windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Download bundle archive
+        uses: actions/download-artifact@v4
+        with:
+          name: ferritex-bundle-archive
+          path: ${{ runner.temp }}/bundle-archive
+
+      - name: Expand archive artifact
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bundle-expanded" "${RUNNER_TEMP}/compile-out"
+          tar -xzf "${RUNNER_TEMP}/bundle-archive/FTX-ASSET-BUNDLE-001.tar.gz" -C "${RUNNER_TEMP}/bundle-expanded"
+          test -f "${RUNNER_TEMP}/bundle-expanded/FTX-ASSET-BUNDLE-001/manifest.json"
+          echo "FERRITEX_ASSET_BUNDLE=${RUNNER_TEMP}/bundle-expanded/FTX-ASSET-BUNDLE-001" >> "$GITHUB_ENV"
+          echo "FERRITEX_OUTPUT_DIR=${RUNNER_TEMP}/compile-out" >> "$GITHUB_ENV"
+
+      - name: Build ferritex CLI
+        run: cargo build -p ferritex-cli --release
+
+      - name: Compile layout-core fixtures and hash outputs
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ferritex_bin="target/release/ferritex.exe"
+          else
+            ferritex_bin="target/release/ferritex"
+          fi
+
+          hash_file="hashes-${{ matrix.os }}.txt"
+          : > "$hash_file"
+          for fixture in article book report letter; do
+            input="crates/ferritex-bench/fixtures/layout-core/${fixture}.tex"
+            pdf="${FERRITEX_OUTPUT_DIR}/${fixture}.pdf"
+            rm -f "$pdf"
+            "$ferritex_bin" compile "$input" \
+              --reproducible \
+              --asset-bundle "$FERRITEX_ASSET_BUNDLE" \
+              --output-dir "$FERRITEX_OUTPUT_DIR"
+            test -s "$pdf"
+
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              sha256=$(shasum -a 256 "$pdf" | awk '{print $1}')
+            else
+              sha256=$(sha256sum "$pdf" | awk '{print $1}')
+            fi
+            printf '%s %s\n' "$fixture" "$sha256" >> "$hash_file"
+          done
+
+      - name: Upload hash artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashes-${{ matrix.os }}
+          path: hashes-${{ matrix.os }}.txt
+          if-no-files-found: error
+
+  compare-hashes:
+    runs-on: ubuntu-latest
+    needs: compile-and-hash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download hash artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hashes-*
+          path: ${{ runner.temp }}/hashes
+          merge-multiple: true
+
+      - name: Compare cross-platform hashes
+        run: |
+          set -euo pipefail
+          bash scripts/compare_cross_platform_hashes.sh "${RUNNER_TEMP}/hashes"
