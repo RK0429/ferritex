@@ -15,7 +15,7 @@
 
 ### 1.1 Step 1 完了後のボトルネック
 
-Step 0 profiling により、`FTX-BENCH-001` 1000-section staged input の warm incremental compile で typeset が全体の 91.1%（14.678s / 16.106s）を占めることが判明している。現在の `TypesetterReusePlan` は **partition 粒度**で reuse/rebuild を判定するため、1 段落変更でもその partition（section）全体を rebuild する。
+Step 0 profiling により、`FTX-STRESS-2000` stress benchmark（1000-section / 2000-cycle staged input）の warm incremental compile で typeset が全体の 91.1%（14.678s / 16.106s）を占めることが判明している。現在の `TypesetterReusePlan` は **partition 粒度**で reuse/rebuild を判定するため、1 段落変更でもその partition（section）全体を rebuild する。
 
 Step 2 の目的は、partition 内の **block 粒度**で checkpoint を取り、変更 block 以降の suffix のみ rebuild することで、typeset stage のコストを partition サイズではなく「変更 block + suffix」のサイズに比例させることである。
 
@@ -364,7 +364,7 @@ Suffix rebuild の結果を検証し、以下の場合は partition 全体 rebui
 
 | 計測 | 方法 | 基準 |
 |---|---|---|
-| Typeset stage timing | `FTX-BENCH-001` 1 段落変更、5-run median | Step 1 比 80%+ 削減 |
+| Typeset stage timing | `FTX-STRESS-2000` stress benchmark の 1 段落変更、5-run median | Step 1 比 80%+ 削減 |
 | Full vs block reuse parity | byte-identical PDF 比較 | 一致 |
 | Checkpoint generation overhead | full compile with/without checkpoint collection | < 5% overhead |
 

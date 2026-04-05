@@ -10,9 +10,9 @@ use ferritex_bench::{
     corpus_navigation_cases, corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases,
     format_bibliography_parity_summary, format_embedded_assets_parity_summary,
     format_navigation_parity_summary, format_parity_summary, format_tikz_parity_summary,
-    full_bench_cases, BenchCase, BenchHarness, BenchProfile, BenchRunConfig,
-    BibliographyParityResult, CliCompileBackend, EmbeddedAssetsParityResult,
-    NavigationParityResult, ParityResult, TikzParityResult,
+    full_bench_cases, full_bench_strict_cases, stress_bench_cases, BenchCase, BenchHarness,
+    BenchProfile, BenchRunConfig, BibliographyParityResult, CliCompileBackend,
+    EmbeddedAssetsParityResult, NavigationParityResult, ParityResult, TikzParityResult,
 };
 
 fn ferritex_bin() -> PathBuf {
@@ -29,31 +29,48 @@ fn extract_pdf_text(pdf: &str) -> String {
         .collect()
 }
 
-fn stage_full_bench_cases() -> (tempfile::TempDir, Vec<BenchCase>) {
-    let bench_fixtures = bench_fixtures_root();
-    let base_cases = full_bench_cases(&bench_fixtures);
-    let bench_dir = bench_fixtures.join("bench");
+fn stage_bench_cases(base_cases: Vec<BenchCase>) -> (tempfile::TempDir, Vec<BenchCase>) {
     let temp_dir = tempfile::tempdir().expect("create tempdir");
 
-    std::fs::copy(
-        bench_dir.join("pixel.png"),
-        temp_dir.path().join("pixel.png"),
-    )
-    .expect("copy pixel asset to temp dir");
-
     let mut cases = Vec::with_capacity(base_cases.len());
-    for case in &base_cases {
+    for case in base_cases {
+        if let Some(bench_dir) = case.input_fixture.parent() {
+            let pixel_src = bench_dir.join("pixel.png");
+            let pixel_dst = temp_dir.path().join("pixel.png");
+            if pixel_src.exists() && !pixel_dst.exists() {
+                std::fs::copy(&pixel_src, &pixel_dst).unwrap_or_else(|error| {
+                    panic!(
+                        "copy pixel asset {} -> {}: {error}",
+                        pixel_src.display(),
+                        pixel_dst.display()
+                    )
+                });
+            }
+        }
+
         let fixture_name = case
             .input_fixture
             .file_name()
             .expect("fixture should have filename");
         let temp_input = temp_dir.path().join(fixture_name);
         std::fs::copy(&case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+
+        let staged_bundle = case.asset_bundle.as_ref().map(|bundle_src| {
+            let bundle_name = bundle_src
+                .file_name()
+                .expect("asset bundle should have a directory name");
+            let bundle_dst = temp_dir.path().join(bundle_name);
+            if !bundle_dst.exists() {
+                copy_dir_all(bundle_src, &bundle_dst);
+            }
+            bundle_dst
+        });
+
         cases.push(BenchCase {
-            name: case.name.clone(),
-            profile: case.profile.clone(),
+            name: case.name,
+            profile: case.profile,
             input_fixture: temp_input,
-            asset_bundle: case.asset_bundle.clone(),
+            asset_bundle: staged_bundle,
             jobs: case.jobs,
             reproducible: case.reproducible,
             no_cache: case.no_cache,
@@ -61,6 +78,21 @@ fn stage_full_bench_cases() -> (tempfile::TempDir, Vec<BenchCase>) {
     }
 
     (temp_dir, cases)
+}
+
+fn stage_full_bench_cases() -> (tempfile::TempDir, Vec<BenchCase>) {
+    let bench_fixtures = bench_fixtures_root();
+    stage_bench_cases(full_bench_cases(&bench_fixtures))
+}
+
+fn stage_full_bench_strict_cases() -> (tempfile::TempDir, Vec<BenchCase>) {
+    let bench_fixtures = bench_fixtures_root();
+    stage_bench_cases(full_bench_strict_cases(&bench_fixtures))
+}
+
+fn stage_stress_bench_cases() -> (tempfile::TempDir, Vec<BenchCase>) {
+    let bench_fixtures = bench_fixtures_root();
+    stage_bench_cases(stress_bench_cases(&bench_fixtures))
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) {
@@ -185,6 +217,71 @@ fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
 fn count_pdf_pages(pdf_bytes: &[u8]) -> usize {
     count_occurrences(pdf_bytes, b"/Type /Page")
         .saturating_sub(count_occurrences(pdf_bytes, b"/Type /Pages"))
+}
+
+fn run_full_bench_protocol(
+    cases: Vec<BenchCase>,
+    label: &str,
+) -> (std::time::Duration, std::time::Duration) {
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases,
+        BenchRunConfig {
+            warmup_runs: 1,
+            measured_runs: 5,
+            compare_output_identity: true,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "{label} failed: {:?}",
+        report.failures
+    );
+    assert_eq!(report.results.len(), 2);
+
+    let seq = report
+        .results
+        .iter()
+        .find(|r| r.case.jobs == 1)
+        .expect("jobs=1 result");
+    let par = report
+        .results
+        .iter()
+        .find(|r| r.case.jobs == 4)
+        .expect("jobs=4 result");
+    assert_eq!(seq.timings.len(), 5);
+    assert_eq!(par.timings.len(), 5);
+    assert_eq!(
+        seq.timings[0].output_hash, par.timings[0].output_hash,
+        "output should be identical across jobs=1 and jobs=4"
+    );
+
+    let seq_median = report
+        .median_duration_for(&seq.case.name)
+        .expect("jobs=1 median should exist");
+    let par_median = report
+        .median_duration_for(&par.case.name)
+        .expect("jobs=4 median should exist");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&report.to_json()).expect("JSON should parse");
+    let results = json["results"].as_array().expect("results array");
+    for result in results {
+        assert!(
+            result.get("median_duration_ms").is_some(),
+            "each result should have median_duration_ms in JSON"
+        );
+        let median_ms = result["median_duration_ms"]
+            .as_f64()
+            .expect("median_duration_ms should be numeric");
+        assert!(median_ms > 0.0, "median should be positive");
+    }
+
+    (seq_median, par_median)
 }
 
 #[test]
@@ -379,65 +476,8 @@ fn full_bench_report_captures_timing_in_json() {
 
 #[test]
 fn full_bench_docs_protocol_median_and_timing_proof() {
-    let (_temp_dir, cases) = stage_full_bench_cases();
-
-    let backend = CliCompileBackend::new(ferritex_bin());
-    let harness = BenchHarness::new(
-        cases,
-        BenchRunConfig {
-            warmup_runs: 1,
-            measured_runs: 5,
-            compare_output_identity: true,
-        },
-    )
-    .with_backend(backend);
-
-    let report = harness.run();
-
-    assert!(
-        report.failures.is_empty(),
-        "full bench docs protocol failed: {:?}",
-        report.failures
-    );
-    assert_eq!(report.results.len(), 2);
-
-    let seq = report
-        .results
-        .iter()
-        .find(|r| r.case.jobs == 1)
-        .expect("jobs=1 result");
-    let par = report
-        .results
-        .iter()
-        .find(|r| r.case.jobs == 4)
-        .expect("jobs=4 result");
-    assert_eq!(seq.timings.len(), 5);
-    assert_eq!(par.timings.len(), 5);
-    assert_eq!(
-        seq.timings[0].output_hash, par.timings[0].output_hash,
-        "output should be identical across jobs=1 and jobs=4"
-    );
-
-    let seq_median = report
-        .median_duration_for(&seq.case.name)
-        .expect("jobs=1 median should exist");
-    let par_median = report
-        .median_duration_for(&par.case.name)
-        .expect("jobs=4 median should exist");
-
-    let json: serde_json::Value =
-        serde_json::from_str(&report.to_json()).expect("JSON should parse");
-    let results = json["results"].as_array().expect("results array");
-    for result in results {
-        assert!(
-            result.get("median_duration_ms").is_some(),
-            "each result should have median_duration_ms in JSON"
-        );
-        let median_ms = result["median_duration_ms"]
-            .as_f64()
-            .expect("median_duration_ms should be numeric");
-        assert!(median_ms > 0.0, "median should be positive");
-    }
+    let (_temp_dir, cases) = stage_full_bench_strict_cases();
+    let (seq_median, par_median) = run_full_bench_protocol(cases, "full bench docs protocol");
 
     let has_benchmark_precondition =
         std::thread::available_parallelism().map_or(false, |n| n.get() >= 4);
@@ -483,8 +523,20 @@ fn full_bench_docs_protocol_median_and_timing_proof() {
 }
 
 #[test]
-fn full_bench_warm_incremental_evidence() {
+fn full_bench_warm_cache_probe() {
     let (_temp_dir, cases) = stage_full_bench_cases();
+    let (seq_median, par_median) = run_full_bench_protocol(cases, "full bench warm cache probe");
+
+    eprintln!(
+        "[FTX-BENCH-001 WARM CACHE PROBE] jobs=1 median {:.3}s, jobs=4 median {:.3}s",
+        seq_median.as_secs_f64(),
+        par_median.as_secs_f64()
+    );
+}
+
+#[test]
+fn stress_bench_warm_incremental_evidence() {
+    let (_temp_dir, cases) = stage_stress_bench_cases();
     let staged_case = cases
         .into_iter()
         .find(|case| case.jobs == 1)
@@ -493,14 +545,14 @@ fn full_bench_warm_incremental_evidence() {
     let staged_source =
         std::fs::read_to_string(&staged_case.input_fixture).unwrap_or_else(|error| {
             panic!(
-                "read staged full bench fixture {}: {error}",
+                "read staged stress bench fixture {}: {error}",
                 staged_case.input_fixture.display()
             )
         });
     let loop_marker = "\\@for\\benchitem:=001,002,003,004,005";
     let (prefix, _) = staged_source
         .split_once(loop_marker)
-        .expect("FTX-BENCH-001 loop marker should exist");
+        .expect("stress bench loop marker should exist");
 
     let cycle_dir = staged_case.input_fixture.with_file_name("ftx_bench_cycles");
     std::fs::create_dir_all(&cycle_dir).unwrap_or_else(|error| {
@@ -555,7 +607,7 @@ b_n &= a_n + n\n\
     )
     .unwrap_or_else(|error| {
         panic!(
-            "write staged full bench fixture {}: {error}",
+            "write staged stress bench fixture {}: {error}",
             staged_case.input_fixture.display()
         )
     });

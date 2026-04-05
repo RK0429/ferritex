@@ -326,6 +326,7 @@ pub struct PartitionVListResult {
 pub struct PaginatedVListContinuation {
     pub pages: Vec<TypesetPage>,
     pub final_content_used: DimensionValue,
+    pub next_partition_content_used: DimensionValue,
     pub continued_on_initial_page: bool,
 }
 
@@ -3440,6 +3441,7 @@ pub fn paginate_vlist_continuing_with_state(
         return PaginatedVListContinuation {
             pages: Vec::new(),
             final_content_used: initial_content_used,
+            next_partition_content_used: initial_content_used,
             continued_on_initial_page: false,
         };
     }
@@ -3452,10 +3454,12 @@ pub fn paginate_vlist_continuing_with_state(
     let mut best_break_candidate: Option<VListBreakCandidate> = None;
     let mut float_queue = initial_float_queue;
     let mut continued_on_initial_page = false;
+    let mut ends_with_explicit_page_break = false;
 
     for item in vlist {
         match item {
             VListItem::Float { spec, content } => {
+                ends_with_explicit_page_break = false;
                 if spec.priority_order.first() == Some(&FloatRegion::Here)
                     && current_height + content.height <= content_height
                 {
@@ -3501,6 +3505,7 @@ pub fn paginate_vlist_continuing_with_state(
                     page_box,
                     layout,
                 );
+                ends_with_explicit_page_break = true;
                 continue;
             }
             VListItem::Penalty { value } if *value <= PENALTY_FORCED => {
@@ -3538,6 +3543,7 @@ pub fn paginate_vlist_continuing_with_state(
                     FloatRegion::Top,
                     content_height,
                 );
+                ends_with_explicit_page_break = true;
                 continue;
             }
             VListItem::OpenRightBreak => {
@@ -3545,6 +3551,7 @@ pub fn paginate_vlist_continuing_with_state(
                     pages.push(typeset_page_from_vlist(&[], page_box, layout));
                     last_page_content_used = DimensionValue::zero();
                 }
+                ends_with_explicit_page_break = true;
                 continue;
             }
             _ => {}
@@ -3676,6 +3683,7 @@ pub fn paginate_vlist_continuing_with_state(
             }
         }
 
+        ends_with_explicit_page_break = false;
         current_page.push(item.clone());
         current_height = current_height + item_height;
         if let VListItem::Penalty { value } = item {
@@ -3687,6 +3695,11 @@ pub fn paginate_vlist_continuing_with_state(
         return PaginatedVListContinuation {
             pages,
             final_content_used: last_page_content_used,
+            next_partition_content_used: if ends_with_explicit_page_break {
+                content_height
+            } else {
+                last_page_content_used
+            },
             continued_on_initial_page,
         };
     }
@@ -3728,6 +3741,11 @@ pub fn paginate_vlist_continuing_with_state(
     PaginatedVListContinuation {
         pages,
         final_content_used: last_page_content_used,
+        next_partition_content_used: if ends_with_explicit_page_break {
+            content_height
+        } else {
+            last_page_content_used
+        },
         continued_on_initial_page,
     }
 }

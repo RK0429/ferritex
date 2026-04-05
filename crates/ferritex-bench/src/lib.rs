@@ -7,9 +7,9 @@ pub use harness::{
     corpus_compat_cases, corpus_embedded_assets_cases, corpus_navigation_cases,
     corpus_partition_article_cases, corpus_partition_book_cases,
     corpus_partition_book_parity_cases, corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases,
-    full_bench_cases, partition_bench_cases, BenchCase, BenchComparison, BenchFailure,
-    BenchHarness, BenchProfile, BenchReport, BenchResult, BenchRunConfig, BenchTiming,
-    CliCompileBackend, CompileBackend, CompileOutput,
+    full_bench_cases, full_bench_strict_cases, partition_bench_cases, stress_bench_cases,
+    BenchCase, BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchReport, BenchResult,
+    BenchRunConfig, BenchTiming, CliCompileBackend, CompileBackend, CompileOutput,
 };
 pub use parity::{
     compute_bibliography_parity_score, compute_embedded_assets_parity_score,

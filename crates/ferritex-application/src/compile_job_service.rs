@@ -2183,6 +2183,7 @@ impl<'a> CompileJobService<'a> {
         selection: &CompileFontSelection,
         graphics_resolver: &CompileGraphicAssetResolver<'_>,
         continues_from_previous_block: bool,
+        initial_float_counters: FloatCounters,
     ) -> PartitionVListResult {
         let (_annotated_document, body_nodes) = annotated_body_nodes(body_document, source_lines)
             .unwrap_or_else(|| (body_document.clone(), body_document.body_nodes()));
@@ -2192,7 +2193,7 @@ impl<'a> CompileJobService<'a> {
             selection,
             graphics_resolver,
             continues_from_previous_block,
-            FloatCounters::default(),
+            initial_float_counters,
             None,
         )
     }
@@ -3936,7 +3937,7 @@ fn run_parallel_pipelined_full_typeset(
         }
 
         all_pages.extend(pages);
-        content_offset = pagination.final_content_used;
+        content_offset = pagination.next_partition_content_used;
     }
 
     Ok(finalize_partitioned_typeset_document(document, all_pages))
@@ -4423,8 +4424,9 @@ fn execute_vlist_build_group(
         )
         .ok_or("failed to build partition-scoped parsed document")?;
         let continues_from_previous_block =
-            matches!(work_item.work_unit.kind, PartitionKind::Section)
-                && work_item.work_unit.locator.ordinal > 0;
+            section_partition_continues_from_previous_block(document, &work_item);
+        let initial_float_counters =
+            float_counters_before_body_range(document, work_item.body_range.0);
         let vlist_result = service.build_partition_vlist_with_selection(
             document,
             &partition_document,
@@ -4432,6 +4434,7 @@ fn execute_vlist_build_group(
             selection,
             &thread_resolver,
             continues_from_previous_block,
+            initial_float_counters,
         );
         worker_results.push(BuiltPartitionVList {
             partition_id: work_item.work_unit.partition_id,
@@ -4440,6 +4443,42 @@ fn execute_vlist_build_group(
         });
     }
     Ok(worker_results)
+}
+
+fn section_partition_continues_from_previous_block(
+    document: &ParsedDocument,
+    work_item: &FullTypesetWorkItem,
+) -> bool {
+    const BODY_PAGE_BREAK_MARKER: char = '\u{E000}';
+    const BODY_CLEAR_PAGE_MARKER: char = '\u{E01B}';
+    const BODY_CLEAR_DOUBLE_PAGE_MARKER: char = '\u{E02A}';
+
+    if !matches!(work_item.work_unit.kind, PartitionKind::Section)
+        || work_item.work_unit.locator.ordinal == 0
+    {
+        return false;
+    }
+
+    let Some(prefix) = document.body.get(..work_item.body_range.0) else {
+        return true;
+    };
+    let last_marker = prefix.chars().rev().find(|ch| !ch.is_whitespace());
+
+    !matches!(
+        last_marker,
+        Some(BODY_PAGE_BREAK_MARKER | BODY_CLEAR_PAGE_MARKER | BODY_CLEAR_DOUBLE_PAGE_MARKER)
+    )
+}
+
+fn float_counters_before_body_range(document: &ParsedDocument, body_start: usize) -> FloatCounters {
+    let mut prefix_document = document.clone();
+    prefix_document.body = document
+        .body
+        .get(..body_start)
+        .unwrap_or_default()
+        .to_string();
+    let (figure, table) = count_floats_in_nodes(&prefix_document.body_nodes());
+    FloatCounters { figure, table }
 }
 
 fn should_force_parallel_full_typeset_collision() -> bool {
@@ -11834,6 +11873,72 @@ mod tests {
                 (
                     "section-three.tex",
                     "\\section{Three}\\label{sec:three}\nSection three keeps the article flow continuous.\n",
+                ),
+            ],
+        );
+        let mut parallel_options = runtime_options(parallel_input, parallel_dir.path().join("out"));
+        parallel_options.no_cache = true;
+        parallel_options.parallelism = 4;
+
+        let (parallel, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &parallel_options);
+        assert_eq!(parallel.exit_code, 0);
+        assert!(trace_messages
+            .iter()
+            .any(|message| message.contains("full typeset executing in parallel")));
+        let parallel_pdf =
+            fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
+
+        assert_eq!(sequential_pdf, parallel_pdf);
+    }
+
+    #[test]
+    fn parallel_full_typeset_preserves_clearpage_boundaries_for_section_partitions() {
+        let loader = MockAssetBundleLoader::valid();
+
+        let sequential_dir = tempdir().expect("create sequential tempdir");
+        let sequential_input = write_partitioned_article_project(
+            sequential_dir.path(),
+            &[
+                (
+                    "section-one.tex",
+                    "\\section{One}\\label{sec:one}\nSection one fills the first partition before forcing a page break.\n\\clearpage\n",
+                ),
+                (
+                    "section-two.tex",
+                    "\\section{Two}\\label{sec:two}\nSection two must start on a fresh page and preserve the explicit clearpage boundary.\n\\clearpage\n",
+                ),
+                (
+                    "section-three.tex",
+                    "\\section{Three}\\label{sec:three}\nSection three should also remain on its own page after the second clearpage.\n",
+                ),
+            ],
+        );
+        let mut sequential_options =
+            runtime_options(sequential_input, sequential_dir.path().join("out"));
+        sequential_options.no_cache = true;
+        sequential_options.parallelism = 1;
+
+        let sequential = service(&FsTestFileAccessGate, &loader).compile(&sequential_options);
+        assert_eq!(sequential.exit_code, 0);
+        let sequential_pdf =
+            fs::read(sequential_options.output_dir.join("main.pdf")).expect("read sequential pdf");
+
+        let parallel_dir = tempdir().expect("create parallel tempdir");
+        let parallel_input = write_partitioned_article_project(
+            parallel_dir.path(),
+            &[
+                (
+                    "section-one.tex",
+                    "\\section{One}\\label{sec:one}\nSection one fills the first partition before forcing a page break.\n\\clearpage\n",
+                ),
+                (
+                    "section-two.tex",
+                    "\\section{Two}\\label{sec:two}\nSection two must start on a fresh page and preserve the explicit clearpage boundary.\n\\clearpage\n",
+                ),
+                (
+                    "section-three.tex",
+                    "\\section{Three}\\label{sec:three}\nSection three should also remain on its own page after the second clearpage.\n",
                 ),
             ],
         );

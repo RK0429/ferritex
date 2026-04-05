@@ -30,6 +30,7 @@ pub struct CompileOutput {
 #[serde(rename_all = "kebab-case")]
 pub enum BenchProfile {
     FullBench,
+    StressBench,
     PartitionBench,
     BundleBootstrap,
     CorpusCompat,
@@ -39,6 +40,7 @@ impl BenchProfile {
     pub fn stable_id(&self) -> &'static str {
         match self {
             Self::FullBench => "FTX-BENCH-001",
+            Self::StressBench => "FTX-STRESS-2000",
             Self::PartitionBench => "FTX-PARTITION-BENCH-001",
             Self::BundleBootstrap => "bundle-bootstrap-smoke",
             Self::CorpusCompat => "FTX-CORPUS-COMPAT-001",
@@ -52,18 +54,48 @@ pub fn bench_fixtures_root() -> PathBuf {
 
 pub fn full_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
     let input = fixture_base.join("bench/ftx_bench_001.tex");
+    let bundle_dir = fixture_base.join("bundle");
     [1, 4]
         .into_iter()
         .map(|jobs| BenchCase {
             name: format!("ftx-bench-001-jobs{jobs}"),
             profile: BenchProfile::FullBench,
             input_fixture: input.clone(),
-            asset_bundle: None,
+            asset_bundle: Some(bundle_dir.clone()),
             jobs,
             reproducible: false,
             no_cache: false,
         })
         .collect()
+}
+
+pub fn full_bench_strict_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    let input = fixture_base.join("bench/ftx_bench_001.tex");
+    let bundle_dir = fixture_base.join("bundle");
+    [1, 4]
+        .into_iter()
+        .map(|jobs| BenchCase {
+            name: format!("ftx-bench-001-strict-jobs{jobs}"),
+            profile: BenchProfile::FullBench,
+            input_fixture: input.clone(),
+            asset_bundle: Some(bundle_dir.clone()),
+            jobs,
+            reproducible: true,
+            no_cache: true,
+        })
+        .collect()
+}
+
+pub fn stress_bench_cases(fixture_base: &Path) -> Vec<BenchCase> {
+    vec![BenchCase {
+        name: "ftx-stress-2000-jobs1".to_string(),
+        profile: BenchProfile::StressBench,
+        input_fixture: fixture_base.join("bench/ftx_stress_2000_cycle.tex"),
+        asset_bundle: None,
+        jobs: 1,
+        reproducible: false,
+        no_cache: false,
+    }]
 }
 
 pub fn bundle_bootstrap_cases(fixture_base: &Path) -> Vec<BenchCase> {
@@ -793,9 +825,10 @@ mod tests {
         corpus_bibliography_cases, corpus_combined_stress_cases, corpus_compat_cases,
         corpus_embedded_assets_cases, corpus_navigation_cases, corpus_partition_article_cases,
         corpus_partition_book_cases, corpus_partition_book_parity_cases,
-        corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, full_bench_cases, BenchCase,
-        BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig,
-        BenchTiming, CompileBackend, CompileOutput,
+        corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, full_bench_cases,
+        full_bench_strict_cases, stress_bench_cases, BenchCase, BenchComparison, BenchFailure,
+        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend,
+        CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -1354,6 +1387,7 @@ mod tests {
     #[test]
     fn test_full_bench_cases_generate_paired_jobs() {
         let fixture_base = fixtures_root();
+        let bundle_dir = fixture_base.join("bundle");
         let cases = full_bench_cases(&fixture_base);
 
         assert_eq!(cases.len(), 2);
@@ -1362,11 +1396,54 @@ mod tests {
         assert_eq!(cases[0].jobs, 1);
         assert_eq!(cases[1].jobs, 4);
         assert!(cases.iter().all(|c| c.profile == BenchProfile::FullBench));
-        assert!(cases.iter().all(|c| c.asset_bundle.is_none()));
+        assert!(cases
+            .iter()
+            .all(|c| c.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
         assert!(cases.iter().all(|c| !c.reproducible));
         assert!(cases.iter().all(|c| !c.no_cache));
         assert!(cases.iter().all(|c| c.input_fixture.exists()));
         assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
+    }
+
+    #[test]
+    fn test_full_bench_strict_cases_generate_paired_jobs() {
+        let fixture_base = fixtures_root();
+        let bundle_dir = fixture_base.join("bundle");
+        let cases = full_bench_strict_cases(&fixture_base);
+
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].name, "ftx-bench-001-strict-jobs1");
+        assert_eq!(cases[1].name, "ftx-bench-001-strict-jobs4");
+        assert_eq!(cases[0].jobs, 1);
+        assert_eq!(cases[1].jobs, 4);
+        assert!(cases.iter().all(|c| c.profile == BenchProfile::FullBench));
+        assert!(cases
+            .iter()
+            .all(|c| c.asset_bundle.as_deref() == Some(bundle_dir.as_path())));
+        assert!(cases.iter().all(|c| c.reproducible));
+        assert!(cases.iter().all(|c| c.no_cache));
+        assert!(cases.iter().all(|c| c.input_fixture.exists()));
+        assert_eq!(cases[0].input_fixture, cases[1].input_fixture);
+    }
+
+    #[test]
+    fn test_stress_bench_cases_generate_single_job() {
+        let fixture_base = fixtures_root();
+        let cases = stress_bench_cases(&fixture_base);
+
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].name, "ftx-stress-2000-jobs1");
+        assert_eq!(cases[0].jobs, 1);
+        assert_eq!(cases[0].profile, BenchProfile::StressBench);
+        assert_eq!(cases[0].profile.stable_id(), "FTX-STRESS-2000");
+        assert_eq!(
+            serde_json::to_string(&cases[0].profile).expect("serialize stress bench profile"),
+            "\"stress-bench\""
+        );
+        assert!(cases[0].asset_bundle.is_none());
+        assert!(!cases[0].reproducible);
+        assert!(!cases[0].no_cache);
+        assert!(cases[0].input_fixture.exists());
     }
 
     #[test]
