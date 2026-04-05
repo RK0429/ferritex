@@ -78,8 +78,12 @@ jobs:
       - name: Expand archive artifact
         run: |
           set -euo pipefail
+          # Convert Windows drive-letter paths to MSYS paths for GNU tar compatibility
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            RUNNER_TEMP="$(cygpath -u "$RUNNER_TEMP")"
+          fi
           mkdir -p "${RUNNER_TEMP}/bundle-expanded" "${RUNNER_TEMP}/compile-out"
-          tar --force-local -xzf "${RUNNER_TEMP}/bundle-archive/FTX-ASSET-BUNDLE-001.tar.gz" -C "${RUNNER_TEMP}/bundle-expanded"
+          tar -xzf "${RUNNER_TEMP}/bundle-archive/FTX-ASSET-BUNDLE-001.tar.gz" -C "${RUNNER_TEMP}/bundle-expanded"
           test -f "${RUNNER_TEMP}/bundle-expanded/FTX-ASSET-BUNDLE-001/manifest.json"
           echo "FERRITEX_ASSET_BUNDLE=${RUNNER_TEMP}/bundle-expanded/FTX-ASSET-BUNDLE-001" >> "$GITHUB_ENV"
           echo "FERRITEX_OUTPUT_DIR=${RUNNER_TEMP}/compile-out" >> "$GITHUB_ENV"
