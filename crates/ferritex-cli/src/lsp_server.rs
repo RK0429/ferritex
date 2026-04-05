@@ -533,8 +533,12 @@ fn diagnostic_to_json(
     json!({
         "range": range_to_json(diagnostic.range),
         "severity": severity_to_lsp(diagnostic.severity),
+        "source": "ferritex",
         "message": diagnostic.message,
-        "data": diagnostic.suggestion.as_ref().map(|suggestion| json!({ "suggestion": suggestion })),
+        "data": {
+            "suggestion": diagnostic.suggestion,
+            "context": diagnostic.context,
+        },
     })
 }
 

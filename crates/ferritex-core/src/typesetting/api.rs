@@ -3691,7 +3691,7 @@ pub fn paginate_vlist_continuing_with_state(
         };
     }
 
-    if current_height == DimensionValue::zero() {
+    if page_start_height == DimensionValue::zero() {
         place_pending_top_floats_before_content(
             &mut current_page,
             &mut current_height,
@@ -5175,6 +5175,49 @@ mod tests {
         assert_eq!(
             result.pages[1].float_placements[0].content.lines[0].text,
             "Queued"
+        );
+    }
+
+    #[test]
+    fn paginate_vlist_continuing_places_pending_top_float_before_body_on_new_page() {
+        let layout = class_layout_for("article");
+        let page_box = page_box_for_class("article");
+        let vlist = vec![VListItem::Box {
+            tex_box: TeXBox::with_height(points(LINE_HEIGHT_PT)),
+            content: "Body".to_string(),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+            source_span: None,
+        }];
+
+        let result = super::paginate_vlist_continuing_with_state(
+            &vlist,
+            &page_box,
+            layout,
+            DimensionValue::zero(),
+            FloatQueue::from_items(vec![FloatItem {
+                spec: PlacementSpec::parse(Some("t")),
+                content: sample_float_content("Queued", LINE_HEIGHT_PT),
+                defer_count: 0,
+            }]),
+        );
+
+        assert!(!result.continued_on_initial_page);
+        assert_eq!(result.pages.len(), 1);
+        assert_eq!(result.pages[0].float_placements.len(), 1);
+        assert_eq!(
+            result.pages[0].float_placements[0].content.lines[0].text,
+            "Queued"
+        );
+        assert_eq!(
+            result.pages[0].float_placements[0].y_position,
+            points(layout.top_float_y_pt)
+        );
+        assert_eq!(result.pages[0].lines[0].text, "Body");
+        assert_eq!(
+            result.pages[0].lines[0].y,
+            super::page_content_top(&page_box, layout) - points(LINE_HEIGHT_PT)
         );
     }
 

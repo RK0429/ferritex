@@ -201,11 +201,16 @@ impl PackageExtension for AmsmathExtension {
         for name in [
             "align",
             "align*",
+            "alignat",
+            "alignat*",
             "equation*",
+            "flalign",
+            "flalign*",
             "gather",
             "gather*",
             "multline",
             "multline*",
+            "split",
         ] {
             register_transparent_environment(engine, name);
         }
@@ -335,7 +340,6 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
         "flushleft",
         "flushright",
         "itemize",
-        "minipage",
         "quote",
         "quotation",
         "table",
@@ -345,11 +349,14 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
     ] {
         register_transparent_environment(engine, name);
     }
+    register_minipage_environment(engine);
 
     register_noop_command(engine, "author", 1);
     register_noop_command(engine, "@gobble", 1);
     register_noop_command(engine, "@gobbletwo", 2);
+    register_noop_command(engine, "centering", 0);
     register_noop_command(engine, "date", 1);
+    register_noop_command(engine, "hfill", 0);
     register_noop_command(engine, "title", 1);
     register_noop_command(engine, "textsf", 1);
     register_noop_command(engine, "texttt", 1);
@@ -435,6 +442,18 @@ fn register_transparent_environment(engine: &mut MacroEngine, name: &str) {
     );
 }
 
+fn register_minipage_environment(engine: &mut MacroEngine) {
+    engine.define_global_environment(
+        "minipage".to_string(),
+        EnvironmentDef {
+            name: "minipage".to_string(),
+            begin_tokens: Vec::new(),
+            end_tokens: Vec::new(),
+            parameter_count: 1,
+        },
+    );
+}
+
 fn register_noop_command(engine: &mut MacroEngine, name: &str, parameter_count: usize) {
     engine.define_global(
         name.to_string(),
@@ -487,8 +506,8 @@ fn register_passthrough_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        load_document_class, load_package, ClassInfo, ClassRegistry, OptionRegistry, PackageInfo,
-        PackageRegistry,
+        load_document_class, load_package, register_base_latex_commands, ClassInfo, ClassRegistry,
+        OptionRegistry, PackageInfo, PackageRegistry,
     };
     use crate::parser::{CatCode, MacroDef, MacroEngine, Token, TokenKind};
 
@@ -601,6 +620,32 @@ mod tests {
         assert!(engine.lookup("chapter").is_some());
         assert!(engine.lookup("section").is_some());
         assert!(engine.lookup_environment("itemize").is_some());
+    }
+
+    #[test]
+    fn base_latex_registration_consumes_minipage_args_and_ignores_layout_hints() {
+        let mut engine = MacroEngine::default();
+
+        register_base_latex_commands(&mut engine);
+
+        let minipage = engine
+            .lookup_environment("minipage")
+            .expect("minipage environment");
+        assert_eq!(minipage.parameter_count, 1);
+        assert!(minipage.begin_tokens.is_empty());
+
+        assert_eq!(
+            engine
+                .lookup("centering")
+                .map(|definition| definition.parameter_count),
+            Some(0)
+        );
+        assert_eq!(
+            engine
+                .lookup("hfill")
+                .map(|definition| definition.parameter_count),
+            Some(0)
+        );
     }
 
     #[test]

@@ -1321,6 +1321,12 @@ fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
     let base_font = line.font_index + 1;
     let base_font_size = line.font_size;
     let script_font_size = scaled_font_size(base_font_size, 7, 10);
+    let rendered_text = strip_math_script_markers(&line.text);
+
+    stream.push_str(&format!(
+        "/Span <</ActualText ({})>> BDC\n",
+        escape_pdf_text(&rendered_text)
+    ));
 
     for segment in parse_math_script_segments(&line.text) {
         if segment.text.is_empty() {
@@ -1372,6 +1378,8 @@ fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
             }
         }
     }
+
+    stream.push_str("EMC\n");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2534,6 +2542,38 @@ mod tests {
         let content = String::from_utf8_lossy(&pdf.bytes);
 
         assert!(content.contains("Float text"));
+    }
+
+    #[test]
+    fn renders_script_lines_with_text_rise_and_actual_text() {
+        let superscripted = format!(
+            "Inline x{}2{} y{}1{} note{}3{}",
+            crate::typesetting::math_layout::SUPERSCRIPT_START_MARKER,
+            crate::typesetting::math_layout::SUPERSCRIPT_END_MARKER,
+            crate::typesetting::math_layout::SUBSCRIPT_START_MARKER,
+            crate::typesetting::math_layout::SUBSCRIPT_END_MARKER,
+            crate::typesetting::api::FOOTNOTE_MARKER_START,
+            crate::typesetting::api::FOOTNOTE_MARKER_END,
+        );
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![TextLine {
+            text: superscripted,
+            x: DimensionValue::zero(),
+            y: points(720),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(10),
+            source_span: None,
+        }];
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains("/Span <</ActualText (Inline x2 y1 note3)>> BDC"));
+        assert!(content.contains("0 4 Td"));
+        assert!(content.contains("0 -4 Td"));
+        assert_eq!(content.matches("0 -3 Td").count(), 2);
+        assert_eq!(content.matches("0 3 Td").count(), 2);
     }
 
     #[test]

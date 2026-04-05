@@ -418,6 +418,115 @@ fn compile_renders_align_environment_with_numbering() {
 }
 
 #[test]
+fn compile_renders_flalign_environment() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("flalign.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\begin{flalign}\na &= b && c &= d \\\\\ne &= f && g &= h\n\\end{flalign}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("flalign.pdf")).expect("read output pdf");
+    assert!(pdf.contains("a=b"));
+    assert!(pdf.contains("c=d"));
+    assert!(pdf.contains("e=f"));
+    assert!(pdf.contains("g=h"));
+}
+
+#[test]
+fn compile_renders_alignat_environment() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("alignat.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\begin{alignat}{2}\na &= b & c &= d \\\\\ne &= f & g &= h\n\\end{alignat}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("alignat.pdf")).expect("read output pdf");
+    assert!(pdf.contains("a=b"));
+    assert!(pdf.contains("c=d"));
+    assert!(pdf.contains("e=f"));
+    assert!(pdf.contains("g=h"));
+}
+
+#[test]
+fn compile_renders_split_inside_equation() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("split.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\begin{equation}\n\\begin{split}\na &= b + c \\\\\nd &= e + f\n\\end{split}\n\\end{equation}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("split.pdf")).expect("read output pdf");
+    assert!(pdf.contains("a=b+c"));
+    assert!(pdf.contains("d=e+f"));
+}
+
+#[test]
+fn compile_renders_intertext_in_align() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("intertext.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\begin{align}\na &= b \\\\\n\\intertext{text here}\nc &= d\n\\end{align}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("intertext.pdf")).expect("read output pdf");
+    assert!(pdf.contains("a=b"));
+    assert!(pdf.contains("text here"));
+    assert!(pdf.contains("c=d"));
+}
+
+#[test]
+fn compile_renders_substack_in_sum() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("substack.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\n\\[\n\\sum_{\\substack{i=1 \\\\ j=2}} a_{ij}\n\\]\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let pdf = std::fs::read_to_string(dir.path().join("substack.pdf")).expect("read output pdf");
+    assert!(pdf.contains("i=1, j=2"));
+}
+
+#[test]
 fn compile_renders_notag_and_tag_in_align_environment() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("tags.tex");
@@ -1570,15 +1679,17 @@ fn corrupted_cache_triggers_safe_fallback_in_incremental_mode() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let cache_file = std::fs::read_dir(output_dir.join(".ferritex-cache"))
+    let record_dir = std::fs::read_dir(output_dir.join(".ferritex-cache"))
         .expect("read cache dir")
         .map(|entry| entry.expect("cache entry").path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .expect("cache metadata file");
-    std::fs::write(&cache_file, b"{not valid json").expect("corrupt cache metadata");
+        .find(|path| path.is_dir())
+        .expect("cache record directory");
+    let index_bin = record_dir.join("index.bin");
+    assert!(
+        index_bin.exists(),
+        "index.bin should exist in cache record directory"
+    );
+    std::fs::write(&index_bin, b"corrupted binary data").expect("corrupt cache index");
 
     std::fs::write(
         dir.path().join("main.tex"),
@@ -2376,6 +2487,110 @@ fn lsp_diagnostics_include_compile_errors() {
 }
 
 #[test]
+fn lsp_diagnostics_include_source_and_context() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("main.tex");
+    let uri = format!("file://{}", tex_file.to_str().expect("utf-8 path"));
+    let mut child = ferritex_bin()
+        .args(["lsp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex lsp");
+    let mut stdin = child.stdin.take().expect("lsp stdin");
+    let stdout = child.stdout.take().expect("lsp stdout");
+    let mut reader = BufReader::new(stdout);
+
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": format!("file://{}", dir.path().to_str().expect("utf-8 path")),
+                "capabilities": {}
+            }
+        }),
+    );
+    let _initialize = read_lsp_message(&mut reader);
+
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    );
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "latex",
+                    "version": 1,
+                    "text": "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n"
+                }
+            }
+        }),
+    );
+
+    let diagnostics = read_lsp_message(&mut reader);
+    assert_eq!(diagnostics["method"], "textDocument/publishDiagnostics");
+    let diagnostics = diagnostics["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(!diagnostics.is_empty());
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic["source"] == "ferritex"
+            && diagnostic.get("range").is_some()
+            && diagnostic["range"]["start"]["line"].is_u64()
+            && diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+            && diagnostic["data"]["context"]
+                .as_str()
+                .is_some_and(|context| !context.is_empty())
+            && diagnostic["data"]["suggestion"]
+                .as_str()
+                .is_some_and(|suggestion| !suggestion.is_empty())
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic["data"]["context"]
+            .as_str()
+            .is_some_and(|context| context == "\\begin{equation}")
+    }));
+
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "shutdown",
+            "params": null
+        }),
+    );
+    let shutdown = read_lsp_message(&mut reader);
+    assert_eq!(shutdown["id"], 2);
+    assert_eq!(shutdown["result"], Value::Null);
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": null
+        }),
+    );
+
+    assert!(child.wait().expect("wait lsp").success());
+}
+
+#[test]
 fn compile_tikz_basic_shapes_emits_vector_pdf_operators() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("tikz-basic.tex");
@@ -2551,6 +2766,30 @@ fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
                     fixture.display()
                 );
             }
+            "arc_basic" => {
+                assert!(
+                    pdf.contains(" c\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("\nS\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "ellipse_native" => {
+                assert!(
+                    pdf.contains(" c\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains("\nS\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
             "grid_pattern" => {
                 assert!(
                     pdf.contains(" m\n"),
@@ -2574,6 +2813,23 @@ fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
                 );
                 assert!(
                     pdf.contains("0 1 0 RG"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+            }
+            "line_width_presets" => {
+                assert!(
+                    pdf.contains(" m\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" l\n"),
+                    "fixture {} pdf: {pdf}",
+                    fixture.display()
+                );
+                assert!(
+                    pdf.contains(" w\n"),
                     "fixture {} pdf: {pdf}",
                     fixture.display()
                 );

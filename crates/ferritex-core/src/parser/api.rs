@@ -2998,6 +2998,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return Ok(());
         };
 
+        if name == "minipage" {
+            let _ = self.read_optional_bracket_tokens()?;
+        }
         let arguments = self.collect_macro_arguments(definition.parameter_count)?;
         let begin_tokens = expand_parameter_tokens(&definition.begin_tokens, &arguments);
         let end_tokens = expand_parameter_tokens(&definition.end_tokens, &arguments);
@@ -3649,9 +3652,18 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
     }
 
     fn parse_math_environment(&mut self, name: &str, line: u32) -> Result<(), ParseError> {
-        let content = self.collect_environment_body(name, line)?;
+        if name.starts_with("alignat") {
+            let _ = self.read_required_braced_tokens()?;
+        }
+
+        let content = self
+            .collect_environment_body(name, line)?
+            .replace(r"\begin{split}", "")
+            .replace(r"\begin {split}", "")
+            .replace(r"\end {split}", "")
+            .replace(r"\end{split}", "");
         let numbered = !name.ends_with('*');
-        let aligned = name.starts_with("align");
+        let aligned = name.starts_with("align") || name.starts_with("flalign") || name == "split";
         let lines = self.parse_math_environment_lines(&content, numbered, aligned);
 
         self.body.push(BODY_EQUATION_ENV_START);
@@ -6343,12 +6355,17 @@ fn is_math_environment(name: &str) -> bool {
         name,
         "align"
             | "align*"
+            | "alignat"
+            | "alignat*"
             | "equation"
             | "equation*"
+            | "flalign"
+            | "flalign*"
             | "gather"
             | "gather*"
             | "multline"
             | "multline*"
+            | "split"
     )
 }
 
@@ -6378,7 +6395,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
 
 fn render_token(token: &Token) -> String {
     match &token.kind {
-        TokenKind::ControlWord(name) => format!(r"\{name}"),
+        TokenKind::ControlWord(name) => format!(r"\{name} "),
         TokenKind::ControlSymbol(symbol) => format!(r"\{symbol}"),
         TokenKind::CharToken { char, .. } => char.to_string(),
         TokenKind::Parameter(index) => format!("#{index}"),
@@ -9145,6 +9162,20 @@ impl<'a> MathParser<'a> {
             return vec![MathNode::Text(self.parse_required_text_group())];
         }
 
+        if name == "intertext" {
+            return vec![MathNode::Text(self.parse_required_text_group())];
+        }
+
+        if name == "substack" {
+            let text = self.parse_required_text_group();
+            let joined = text
+                .split(r"\\")
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return vec![MathNode::Text(joined)];
+        }
+
         if name == "sqrt" {
             let index = self.parse_optional_group('[', ']');
             let radicand = self.parse_required_group();
@@ -10253,6 +10284,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_intertext_as_text_node() {
+        assert_eq!(
+            super::parse_math_content(r"\intertext{hello}"),
+            vec![MathNode::Text("hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_substack_as_text_node() {
+        assert_eq!(
+            super::parse_math_content(r"\substack{a \\ b}"),
+            vec![MathNode::Text("a, b".to_string())]
+        );
+    }
+
+    #[test]
     fn parses_named_symbol_commands_inside_math() {
         assert_eq!(
             parse_document(r"$\alpha\leq\beta\rightarrow\Gamma\quad\infty$").body_nodes(),
@@ -10498,6 +10545,20 @@ mod tests {
             document.labels.get("fig:test").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn minipage_consumes_arguments_and_ignores_layout_hints() {
+        let document = parse_document(
+            "\\begin{figure}[t]\\centering\\begin{minipage}[t]{0.44\\textwidth}\\centering\\includegraphics{pixel.png}Raster source\\end{minipage}\\hfill\\begin{minipage}[t]{0.44\\textwidth}\\centering\\includegraphics{diagram.pdf}PDF source\\end{minipage}\\caption{Two assets}\\end{figure}",
+        );
+
+        assert!(document.body.contains("Raster source"));
+        assert!(document.body.contains("PDF source"));
+        assert!(!document.body.contains("\\centering"));
+        assert!(!document.body.contains("\\hfill"));
+        assert!(!document.body.contains("0.44\\textwidth"));
+        assert!(!document.body.contains("[t]"));
     }
 
     #[test]
@@ -12412,7 +12473,7 @@ mod tests {
             "\\def\\foo{X}\\numexpr(2+3)*4\\relax/\\ifnum\\numexpr(10-4)/3\\relax=2Y\\else N\\fi/\\dimexpr1pt+2pt\\relax/\\detokenize{\\foo bar}/\\unexpanded{\\foo}",
         );
 
-        assert_eq!(document.body, "20/Y/3.0pt/\\foobar/X");
+        assert_eq!(document.body, "20/Y/3.0pt/\\foo bar/X");
     }
 
     #[test]

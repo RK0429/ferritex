@@ -45,6 +45,7 @@ pub struct AnalysisDiagnostic {
     pub range: TextRange,
     pub severity: Severity,
     pub message: String,
+    pub context: Option<String>,
     pub suggestion: Option<String>,
 }
 
@@ -261,14 +262,22 @@ fn compile_diagnostics_to_analysis(
         .collect()
 }
 
+fn context_snippet(text: &str, line: u32) -> Option<String> {
+    let snippet = nth_line(text, line as usize)?.trim();
+    (!snippet.is_empty()).then(|| snippet.to_string())
+}
+
 fn compile_diagnostic_to_analysis(text: &str, diagnostic: &Diagnostic) -> AnalysisDiagnostic {
+    let line = diagnostic.line.unwrap_or(1).saturating_sub(1);
+
     AnalysisDiagnostic {
-        range: diagnostic
-            .line
-            .map(|line| range_for_line(text, line.saturating_sub(1)))
-            .unwrap_or_else(|| range_for_line(text, 0)),
+        range: range_for_line(text, line),
         severity: diagnostic.severity,
         message: diagnostic.message.clone(),
+        context: diagnostic
+            .context
+            .clone()
+            .or_else(|| context_snippet(text, line)),
         suggestion: diagnostic.suggestion.clone(),
     }
 }
@@ -300,6 +309,7 @@ fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnosti
         range: range_for_line(text, line),
         severity: Severity::Error,
         message: error.to_string(),
+        context: context_snippet(text, line),
         suggestion: match error {
             ParseError::MissingDocumentClass => {
                 Some("add \\documentclass{article} at the top of the file".to_string())
@@ -389,6 +399,7 @@ fn environment_diagnostics(text: &str) -> Vec<AnalysisDiagnostic> {
                     message: format!(
                         "unexpected \\end{{{environment}}} while \\begin{{{open_environment}}} is still open"
                     ),
+                    context: context_snippet(text, line_index as u32),
                     suggestion: Some(format!(
                         "close \\begin{{{open_environment}}} before ending {environment}"
                     )),
@@ -397,6 +408,7 @@ fn environment_diagnostics(text: &str) -> Vec<AnalysisDiagnostic> {
                     range,
                     severity: Severity::Error,
                     message: format!("unexpected \\end{{{environment}}}"),
+                    context: context_snippet(text, line_index as u32),
                     suggestion: Some(format!("remove \\end{{{environment}}} or add the matching \\begin")),
                 }),
             }
@@ -410,6 +422,7 @@ fn environment_diagnostics(text: &str) -> Vec<AnalysisDiagnostic> {
                 range,
                 severity: Severity::Error,
                 message: format!("unclosed environment `{environment}`"),
+                context: context_snippet(text, range.start.line),
                 suggestion: Some(format!(
                     "insert \\end{{{environment}}} before the document ends"
                 )),
@@ -831,11 +844,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use super::{CompletionKind, LiveAnalysisSnapshotFactory, TextPosition};
+    use super::{
+        compile_diagnostic_to_analysis, environment_diagnostics, parse_error_to_diagnostic,
+        CompletionKind, LiveAnalysisSnapshotFactory, TextPosition,
+    };
     use crate::open_document_store::OpenDocumentBuffer;
     use crate::stable_compile_state::StableCompileState;
     use ferritex_core::compilation::{CompilationSnapshot, DocumentState, SymbolLocation};
     use ferritex_core::diagnostics::{Diagnostic, Severity};
+    use ferritex_core::parser::ParseError;
 
     fn buffer(text: &str) -> OpenDocumentBuffer {
         OpenDocumentBuffer {
@@ -976,6 +993,56 @@ mod tests {
         assert!(messages
             .iter()
             .any(|message| message.contains("unclosed environment `equation`")));
+    }
+
+    #[test]
+    fn compile_diagnostic_to_analysis_preserves_or_derives_context() {
+        let text = "\\documentclass{article}\n\\badcommand\n";
+
+        let derived = compile_diagnostic_to_analysis(
+            text,
+            &Diagnostic::new(Severity::Error, "unknown command").with_line(2),
+        );
+        assert_eq!(derived.context.as_deref(), Some("\\badcommand"));
+
+        let preserved = compile_diagnostic_to_analysis(
+            text,
+            &Diagnostic::new(Severity::Error, "unknown command")
+                .with_line(2)
+                .with_context("explicit compile context"),
+        );
+        assert_eq!(
+            preserved.context.as_deref(),
+            Some("explicit compile context")
+        );
+    }
+
+    #[test]
+    fn parse_error_to_diagnostic_includes_context_snippet() {
+        let text = "\\documentclass{article}\n\\begin{document}\nHello\n";
+
+        let diagnostic =
+            parse_error_to_diagnostic(text, ParseError::MissingEndDocument { line: 3 });
+
+        assert_eq!(diagnostic.context.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn environment_diagnostics_include_context_snippets() {
+        let text = "\\end{itemize}\n\\begin{equation}\na=b\n";
+
+        let diagnostics = environment_diagnostics(text);
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("unexpected \\end{itemize}")
+                && diagnostic.context.as_deref() == Some("\\end{itemize}")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("unclosed environment `equation`")
+                && diagnostic.context.as_deref() == Some("\\begin{equation}")
+        }));
     }
 
     #[test]

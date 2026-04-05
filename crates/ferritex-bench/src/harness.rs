@@ -1329,7 +1329,7 @@ mod tests {
         let fixture_base = fixtures_root();
         let cases = super::partition_bench_cases(&fixture_base);
 
-        assert_eq!(cases.len(), 38);
+        assert_eq!(cases.len(), 40);
         assert!(cases
             .iter()
             .all(|c| c.profile == BenchProfile::PartitionBench));

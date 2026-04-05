@@ -461,35 +461,39 @@ fn parse_scope_block(
 fn find_matching_scope_end(input: &str, start: usize) -> Option<(usize, usize)> {
     let mut depth = 1usize;
     let mut index = start;
-    let begin_token = "\\begin{scope}";
-    let end_token = "\\end{scope}";
 
     while index < input.len() {
-        let remaining = &input[index..];
-        let next_begin = remaining.find(begin_token).map(|offset| index + offset);
-        let next_end = remaining.find(end_token).map(|offset| index + offset);
-
-        match (next_begin, next_end) {
-            (Some(begin), Some(end)) if begin < end => {
-                depth += 1;
-                index = begin + begin_token.len();
-            }
-            (_, Some(end)) => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((end, end + end_token.len()));
-                }
-                index = end + end_token.len();
-            }
-            (Some(begin), None) => {
-                depth += 1;
-                index = begin + begin_token.len();
-            }
-            (None, None) => break,
+        if let Some(next_index) = parse_scope_environment_control_word(input, index, "begin") {
+            depth += 1;
+            index = next_index;
+            continue;
         }
+        if let Some(next_index) = parse_scope_environment_control_word(input, index, "end") {
+            depth -= 1;
+            if depth == 0 {
+                return Some((index, next_index));
+            }
+            index = next_index;
+            continue;
+        }
+
+        index += input[index..].chars().next()?.len_utf8();
     }
 
     None
+}
+
+fn parse_scope_environment_control_word(
+    input: &str,
+    start: usize,
+    control_word: &str,
+) -> Option<usize> {
+    let mut cursor = Cursor::new(input.get(start..)?);
+    if !cursor.consume_prefix("\\") || !cursor.consume_keyword(control_word) {
+        return None;
+    }
+    let environment = cursor.parse_braced_text()?;
+    (environment == "scope").then_some(start + cursor.index)
 }
 
 fn parse_statement(
@@ -2851,6 +2855,31 @@ mod tests {
             panic!("expected inner vector");
         };
         assert_eq!(blue_line.stroke, Some(named_color("blue")));
+    }
+
+    #[test]
+    fn parses_nested_scopes_with_control_word_space() {
+        let result = parse_tikzpicture(
+            r"\begin {scope}[draw=red]
+                \begin {scope}[draw=blue]
+                    \draw (0,0) -- (1,0);
+                \end {scope}
+            \end {scope}",
+        );
+
+        assert!(result.diagnostics.is_empty());
+        let [GraphicNode::Group(level1)] = result.scene.nodes.as_slice() else {
+            panic!("expected outer scope group");
+        };
+        let [GraphicNode::Group(level2)] = level1.children.as_slice() else {
+            panic!("expected inner scope group");
+        };
+        let [GraphicNode::Vector(line)] = level2.children.as_slice() else {
+            panic!("expected vector node");
+        };
+        assert_eq!(level1.default_stroke, Some(named_color("red")));
+        assert_eq!(level2.default_stroke, Some(named_color("blue")));
+        assert_eq!(line.stroke, Some(named_color("blue")));
     }
 
     #[test]
