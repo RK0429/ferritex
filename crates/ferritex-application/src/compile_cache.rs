@@ -59,6 +59,7 @@ pub struct CacheLookupResult {
     pub cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
     pub partition_hashes: BTreeMap<String, u64>,
     pub scope: Option<RecompilationScope>,
+    pub(crate) cached_index: Option<CacheIndexSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +149,7 @@ impl CacheLookupResult {
             cached_source_subtrees: self.cached_source_subtrees,
             cached_typeset_fragments: self.cached_typeset_fragments,
             cached_page_payloads: self.cached_page_payloads,
+            cached_index: self.cached_index,
         }
     }
 }
@@ -197,6 +199,14 @@ pub struct WarmPartitionCache {
     pub cached_source_subtrees: BTreeMap<PathBuf, CachedSourceSubtree>,
     pub cached_typeset_fragments: BTreeMap<String, CachedTypesetFragment>,
     pub cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
+    pub(crate) cached_index: Option<CacheIndexSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CacheIndexSnapshot {
+    pub(crate) output_pdf_hash: u64,
+    pub(crate) dependency_graph: DependencyGraph,
+    pub(crate) stable_compile_state: StableCompileState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,12 +222,113 @@ struct LoadedCacheRecord {
     cached_page_payloads: BTreeMap<String, Vec<CachedPagePayload>>,
     partition_hashes: BTreeMap<String, u64>,
     diagnostics: Vec<Diagnostic>,
+    cached_index: Option<CacheIndexSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheStoreOutcome {
     pub partition_hashes: BTreeMap<String, u64>,
     pub diagnostic: Option<Diagnostic>,
+    pub(crate) cached_index: Option<CacheIndexSnapshot>,
+}
+
+#[derive(Debug)]
+pub struct BackgroundCacheWriter {
+    sender: Option<std::sync::mpsc::Sender<CacheStoreMessage>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum CacheStoreMessage {
+    Work(CacheStoreWork),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+#[derive(Debug)]
+struct CacheStoreWork {
+    record_dir: PathBuf,
+    partitions_dir: PathBuf,
+    metadata_path: PathBuf,
+    json_metadata_path: PathBuf,
+    cache_dir: PathBuf,
+    partition_blobs: BTreeMap<String, PartitionBlob>,
+    dirty_keys: Option<BTreeSet<String>>,
+    previous_hashes: BTreeMap<String, u64>,
+    index: CacheIndex,
+    legacy_metadata_path: PathBuf,
+    max_record_files: usize,
+}
+
+impl BackgroundCacheWriter {
+    pub fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                match message {
+                    CacheStoreMessage::Work(work) => execute_cache_store_work(work),
+                    CacheStoreMessage::Flush(sender) => {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        });
+
+        Self {
+            sender: Some(sender),
+            handle: Some(handle),
+        }
+    }
+
+    fn enqueue(&self, work: CacheStoreWork) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+
+        if let Err(error) = sender.send(CacheStoreMessage::Work(work)) {
+            tracing::warn!(
+                ?error,
+                "background compile cache writer channel is disconnected"
+            );
+        }
+    }
+
+    pub fn flush(&self) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+
+        let (flush_sender, flush_receiver) = std::sync::mpsc::channel();
+        if let Err(error) = sender.send(CacheStoreMessage::Flush(flush_sender)) {
+            tracing::warn!(
+                ?error,
+                "failed to flush background compile cache writer because the channel is disconnected"
+            );
+            return;
+        }
+
+        if let Err(error) = flush_receiver.recv() {
+            tracing::warn!(
+                ?error,
+                "failed to flush background compile cache writer because the worker stopped unexpectedly"
+            );
+        }
+    }
+}
+
+impl Drop for BackgroundCacheWriter {
+    fn drop(&mut self) {
+        self.flush();
+        self.sender.take();
+
+        if let Some(handle) = self.handle.take() {
+            if let Err(error) = handle.join() {
+                tracing::warn!(
+                    ?error,
+                    "background compile cache writer thread panicked while shutting down"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +427,7 @@ impl<'a> CompileCache<'a> {
                 cached_page_payloads: record.cached_page_payloads,
                 partition_hashes: record.partition_hashes,
                 scope: Some(scope),
+                cached_index: record.cached_index,
             };
         }
 
@@ -339,6 +451,7 @@ impl<'a> CompileCache<'a> {
                     cached_page_payloads: BTreeMap::new(),
                     partition_hashes: BTreeMap::new(),
                     scope: None,
+                    cached_index: None,
                 };
             }
         };
@@ -361,6 +474,7 @@ impl<'a> CompileCache<'a> {
                 cached_page_payloads: BTreeMap::new(),
                 partition_hashes: BTreeMap::new(),
                 scope: None,
+                cached_index: None,
             };
         }
 
@@ -379,6 +493,7 @@ impl<'a> CompileCache<'a> {
             cached_page_payloads: record.cached_page_payloads,
             partition_hashes: record.partition_hashes,
             scope: None,
+            cached_index: record.cached_index,
         }
     }
 
@@ -403,6 +518,135 @@ impl<'a> CompileCache<'a> {
             Ok(outcome) => outcome.diagnostic,
             Err(diagnostic) => Some(diagnostic),
         }
+    }
+
+    pub fn store_background(
+        &self,
+        dependency_graph: &DependencyGraph,
+        stable_compile_state: &StableCompileState,
+        output_pdf_hash: u64,
+        cached_source_subtrees: &BTreeMap<PathBuf, CachedSourceSubtree>,
+        cached_typeset_fragments: &BTreeMap<String, CachedTypesetFragment>,
+        cached_page_payloads: &BTreeMap<String, Vec<CachedPagePayload>>,
+        dirty_partition_ids: Option<&BTreeSet<String>>,
+        dirty_source_paths: Option<&BTreeSet<PathBuf>>,
+        writer: &BackgroundCacheWriter,
+    ) -> Result<CacheStoreOutcome, Diagnostic> {
+        if let Err(error) = self.file_access_gate.ensure_directory(&self.cache_dir) {
+            return Err(cache_info_diagnostic(
+                format!("failed to prepare compile cache directory: {error}"),
+                &self.cache_dir,
+            ));
+        }
+
+        if let Err(error) = self.file_access_gate.ensure_directory(&self.record_dir) {
+            return Err(cache_info_diagnostic(
+                format!("failed to prepare compile cache record directory: {error}"),
+                &self.record_dir,
+            ));
+        }
+
+        if let Err(error) = self.file_access_gate.ensure_directory(&self.partitions_dir) {
+            return Err(cache_info_diagnostic(
+                format!("failed to prepare compile cache partition directory: {error}"),
+                &self.partitions_dir,
+            ));
+        }
+
+        let previous_hashes = self
+            .read_optional_cache_file(&self.metadata_path, "compile cache index")
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                self.deserialize_cache_index(&bytes, &self.metadata_path, CacheRecordFormat::Binary)
+                    .ok()
+            })
+            .or_else(|| {
+                let json_metadata_path = self.json_metadata_path();
+                self.read_optional_cache_file(&json_metadata_path, "compile cache index")
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| {
+                        self.deserialize_cache_index(
+                            &bytes,
+                            &json_metadata_path,
+                            CacheRecordFormat::Json,
+                        )
+                        .ok()
+                    })
+            })
+            .map(|index| index.partition_hashes)
+            .unwrap_or_default();
+        let dirty_keys: Option<BTreeSet<String>> = match (dirty_partition_ids, dirty_source_paths) {
+            (Some(partition_ids), Some(source_paths)) => {
+                let mut keys = BTreeSet::new();
+                for path in source_paths {
+                    let raw_key = format!("source:{}", path.to_string_lossy());
+                    keys.insert(sanitize_partition_key(&raw_key));
+                }
+                for id in partition_ids {
+                    let raw_key = format!("fragment:{id}");
+                    keys.insert(sanitize_partition_key(&raw_key));
+                }
+                Some(keys)
+            }
+            _ => None,
+        };
+
+        let partition_blobs = partition_blobs_for(
+            cached_source_subtrees,
+            cached_typeset_fragments,
+            cached_page_payloads,
+        );
+        let partition_hashes: BTreeMap<String, u64> = partition_blobs
+            .keys()
+            .map(|partition_key| {
+                let hash = match &dirty_keys {
+                    Some(dirty) if !dirty.contains(partition_key) => {
+                        previous_hashes.get(partition_key).copied().unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                (partition_key.clone(), hash)
+            })
+            .collect();
+
+        let index = CacheIndex {
+            version: CACHE_VERSION,
+            primary_input: self.primary_input.clone(),
+            jobname: self.jobname.clone(),
+            output_pdf: self.output_pdf.clone(),
+            output_pdf_hash,
+            dependency_graph: dependency_graph.clone(),
+            stable_compile_state: stable_compile_state.clone(),
+            partition_keys: partition_blobs.keys().cloned().collect(),
+            partition_hashes: partition_hashes.clone(),
+        };
+        let cached_index = CacheIndexSnapshot {
+            output_pdf_hash: index.output_pdf_hash,
+            dependency_graph: index.dependency_graph.clone(),
+            stable_compile_state: index.stable_compile_state.clone(),
+        };
+
+        writer.enqueue(CacheStoreWork {
+            record_dir: self.record_dir.clone(),
+            partitions_dir: self.partitions_dir.clone(),
+            metadata_path: self.metadata_path.clone(),
+            json_metadata_path: self.json_metadata_path(),
+            cache_dir: self.cache_dir.clone(),
+            partition_blobs,
+            dirty_keys,
+            previous_hashes,
+            index,
+            legacy_metadata_path: self.legacy_metadata_path.clone(),
+            max_record_files: MAX_CACHE_RECORD_FILES,
+        });
+
+        Ok(CacheStoreOutcome {
+            partition_hashes,
+            diagnostic: None,
+            cached_index: Some(cached_index),
+        })
     }
 
     pub fn store_with_page_payloads(
@@ -553,6 +797,20 @@ impl<'a> CompileCache<'a> {
             ));
         }
 
+        let CacheIndex {
+            output_pdf_hash: idx_pdf_hash,
+            dependency_graph: idx_dep_graph,
+            stable_compile_state: idx_stable_state,
+            partition_keys: idx_partition_keys,
+            partition_hashes: idx_new_hashes,
+            ..
+        } = index;
+        let cached_index = CacheIndexSnapshot {
+            output_pdf_hash: idx_pdf_hash,
+            dependency_graph: idx_dep_graph,
+            stable_compile_state: idx_stable_state,
+        };
+
         let json_metadata_path = self.json_metadata_path();
         let stale_json_cleanup_diagnostic = match fs::remove_file(&json_metadata_path) {
             Ok(()) => None,
@@ -562,7 +820,7 @@ impl<'a> CompileCache<'a> {
                 &json_metadata_path,
             )),
         };
-        let cleanup_diagnostic = self.cleanup_orphaned_partitions(&index.partition_keys);
+        let cleanup_diagnostic = self.cleanup_orphaned_partitions(&idx_partition_keys);
         let legacy_diagnostic = self.remove_legacy_record_if_present();
         let eviction_diagnostic = self.evict_excess_records().err().map(|error| {
             cache_cleanup_diagnostic(
@@ -572,11 +830,12 @@ impl<'a> CompileCache<'a> {
         });
 
         Ok(CacheStoreOutcome {
-            partition_hashes: index.partition_hashes,
+            partition_hashes: idx_new_hashes,
             diagnostic: cleanup_diagnostic
                 .or(stale_json_cleanup_diagnostic)
                 .or(legacy_diagnostic)
                 .or(eviction_diagnostic),
+            cached_index: Some(cached_index),
         })
     }
 
@@ -643,7 +902,31 @@ impl<'a> CompileCache<'a> {
         &self,
         warm_cache: Option<WarmPartitionCache>,
     ) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
-        let mut warm_cache = warm_cache;
+        let mut warm_cache = match warm_cache {
+            Some(WarmPartitionCache {
+                partition_hashes,
+                cached_source_subtrees,
+                cached_typeset_fragments,
+                cached_page_payloads,
+                cached_index: Some(cached_index),
+            }) => {
+                return Ok(Some(LoadedCacheRecord {
+                    primary_input: self.primary_input.clone(),
+                    jobname: self.jobname.clone(),
+                    output_pdf: self.output_pdf.clone(),
+                    output_pdf_hash: cached_index.output_pdf_hash,
+                    dependency_graph: cached_index.dependency_graph.clone(),
+                    stable_compile_state: cached_index.stable_compile_state.clone(),
+                    cached_source_subtrees,
+                    cached_typeset_fragments,
+                    cached_page_payloads,
+                    partition_hashes,
+                    diagnostics: Vec::new(),
+                    cached_index: Some(cached_index),
+                }));
+            }
+            other => other,
+        };
         let mut fallback_diagnostics = Vec::new();
 
         match self.read_optional_cache_file(&self.metadata_path, "compile cache index") {
@@ -752,6 +1035,11 @@ impl<'a> CompileCache<'a> {
             partition_hashes,
             ..
         } = index;
+        let cached_index = CacheIndexSnapshot {
+            output_pdf_hash,
+            dependency_graph: dependency_graph.clone(),
+            stable_compile_state: stable_compile_state.clone(),
+        };
 
         let mut diagnostics = Vec::new();
         let (cached_source_subtrees, cached_typeset_fragments, cached_page_payloads) =
@@ -761,6 +1049,7 @@ impl<'a> CompileCache<'a> {
                     mut cached_source_subtrees,
                     mut cached_typeset_fragments,
                     mut cached_page_payloads,
+                    cached_index: _,
                 }) => {
                     for partition_key in &partition_keys {
                         if partition_hashes.get(partition_key)
@@ -825,6 +1114,7 @@ impl<'a> CompileCache<'a> {
             cached_page_payloads,
             partition_hashes,
             diagnostics,
+            cached_index: Some(cached_index),
         }))
     }
 
@@ -873,6 +1163,7 @@ impl<'a> CompileCache<'a> {
             cached_page_payloads: BTreeMap::new(),
             partition_hashes: BTreeMap::new(),
             diagnostics: Vec::new(),
+            cached_index: None,
         }))
     }
 
@@ -1178,6 +1469,169 @@ impl<'a> CompileCache<'a> {
     }
 }
 
+fn execute_cache_store_work(work: CacheStoreWork) {
+    let CacheStoreWork {
+        record_dir: _record_dir,
+        partitions_dir,
+        metadata_path,
+        json_metadata_path,
+        cache_dir,
+        partition_blobs,
+        dirty_keys: _dirty_keys,
+        previous_hashes,
+        mut index,
+        legacy_metadata_path,
+        max_record_files,
+    } = work;
+
+    let mut new_hashes = BTreeMap::new();
+    for (partition_key, blob) in &partition_blobs {
+        let path = partition_blob_path_for(&partitions_dir, partition_key);
+        let bytes = match bincode::serialize(blob) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to serialize compile cache partition blob in the background"
+                );
+                return;
+            }
+        };
+        let hash = fingerprint_bytes(&bytes);
+
+        if previous_hashes.get(partition_key) == Some(&hash) && path.exists() {
+            new_hashes.insert(partition_key.clone(), hash);
+            continue;
+        }
+
+        if let Err(error) = fs::write(&path, &bytes) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "failed to persist compile cache partition blob in the background"
+            );
+            return;
+        }
+
+        new_hashes.insert(partition_key.clone(), hash);
+    }
+
+    index.partition_hashes = new_hashes;
+    let bytes = match bincode::serialize(&index) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                path = %metadata_path.display(),
+                %error,
+                "failed to serialize compile cache index in the background"
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = fs::write(&metadata_path, &bytes) {
+        tracing::warn!(
+            path = %metadata_path.display(),
+            %error,
+            "failed to persist compile cache index in the background"
+        );
+        return;
+    }
+
+    if let Err(error) = remove_file_if_exists(
+        &json_metadata_path,
+        "failed to remove stale compile cache JSON index in the background",
+    ) {
+        tracing::warn!(path = %json_metadata_path.display(), %error);
+    }
+    if let Some(error) = cleanup_orphaned_partitions_dir(&partitions_dir, &index.partition_keys) {
+        tracing::warn!(path = %partitions_dir.display(), %error);
+    }
+    if let Err(error) = remove_file_if_exists(
+        &legacy_metadata_path,
+        "failed to remove legacy compile cache metadata in the background",
+    ) {
+        tracing::warn!(path = %legacy_metadata_path.display(), %error);
+    }
+    if let Some(error) = evict_excess_records_in_dir(&cache_dir, max_record_files) {
+        tracing::warn!(path = %cache_dir.display(), %error);
+    }
+}
+
+fn partition_blob_path_for(partitions_dir: &Path, partition_key: &str) -> PathBuf {
+    partitions_dir.join(format!("{partition_key}.{CACHE_RECORD_EXTENSION}"))
+}
+
+fn remove_file_if_exists(path: &Path, context: &str) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{context}: {error}")),
+    }
+}
+
+fn cleanup_orphaned_partitions_dir(partitions_dir: &Path, valid_keys: &[String]) -> Option<String> {
+    let valid_filenames: BTreeSet<_> = valid_keys
+        .iter()
+        .map(|key| format!("{key}.{CACHE_RECORD_EXTENSION}"))
+        .collect();
+    let entries = match fs::read_dir(partitions_dir) {
+        Ok(entries) => entries,
+        Err(_) => return None,
+    };
+
+    let mut first_error = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if !is_partition_blob_extension(extension) {
+            continue;
+        }
+
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if valid_filenames.contains(&filename) {
+            continue;
+        }
+
+        if let Err(error) = fs::remove_file(&path) {
+            first_error.get_or_insert_with(|| {
+                format!(
+                    "failed to remove orphaned compile cache partition blob `{filename}` in the background: {error}"
+                )
+            });
+        }
+    }
+
+    first_error
+}
+
+fn evict_excess_records_in_dir(cache_dir: &Path, max_records: usize) -> Option<String> {
+    let records = match CompileCache::owned_cache_record_files(cache_dir) {
+        Ok(records) => records,
+        Err(error) => {
+            return Some(format!(
+                "failed to list compile cache records for background eviction: {error}"
+            ));
+        }
+    };
+
+    CompileCache::evict_oldest_records(records, max_records)
+        .err()
+        .map(|error| {
+            format!("failed to evict old compile cache records in the background: {error}")
+        })
+}
+
 fn prepend_diagnostics(record: &mut LoadedCacheRecord, mut diagnostics: Vec<Diagnostic>) {
     if diagnostics.is_empty() {
         return;
@@ -1311,6 +1765,7 @@ fn empty_lookup_result(diagnostics: Vec<Diagnostic>) -> CacheLookupResult {
         cached_page_payloads: BTreeMap::new(),
         partition_hashes: BTreeMap::new(),
         scope: None,
+        cached_index: None,
     }
 }
 
@@ -1364,9 +1819,10 @@ mod tests {
     };
 
     use super::{
-        fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CacheIndex,
-        CacheRecordFormat, CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment,
-        CompileCache, LegacyCompileCacheRecord, OwnedCacheRecordFile, PartitionBlob, PendingFloat,
+        fingerprint_bytes, sanitize_partition_key, BackgroundCacheWriter, BlockCheckpoint,
+        BlockCheckpointData, BlockLayoutState, CacheIndex, CacheRecordFormat, CachedPagePayload,
+        CachedSourceSubtree, CachedTypesetFragment, CompileCache, LegacyCompileCacheRecord,
+        OwnedCacheRecordFile, PartitionBlob, PendingFloat, WarmPartitionCache,
         MAX_CACHE_RECORD_FILES,
     };
     use crate::stable_compile_state::StableCompileState;
@@ -2776,7 +3232,8 @@ mod tests {
             )
             .expect_none("cache stored");
 
-        let warm_cache = cache.lookup(&[]).into_warm_cache();
+        let mut warm_cache = cache.lookup(&[]).into_warm_cache();
+        warm_cache.cached_index = None;
 
         let updated_fragments = BTreeMap::from([
             (
@@ -2840,6 +3297,598 @@ mod tests {
                 .get(&second_partition)
                 .expect("expected second fragment")
         );
+    }
+
+    #[test]
+    fn warm_cache_with_cached_index_skips_index_read() {
+        let gate = CountingFsGate::new();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let graph = dependency_graph_for(&input, "stable");
+        let cached_source_subtrees =
+            BTreeMap::from([(input.clone(), test_cached_subtree(&input, "stable"))]);
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+                block_checkpoints: None,
+            },
+        )]);
+        let cached_page_payloads = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            vec![test_cached_page_payload("cached page 1")],
+        )]);
+
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        let outcome = cache
+            .store_with_page_payloads(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &cached_source_subtrees,
+                &cached_typeset_fragments,
+                &cached_page_payloads,
+                None,
+                None,
+            )
+            .expect("cache stored");
+
+        assert!(outcome.cached_index.is_some());
+
+        let warm_cache = WarmPartitionCache {
+            partition_hashes: outcome.partition_hashes,
+            cached_source_subtrees: cached_source_subtrees.clone(),
+            cached_typeset_fragments: cached_typeset_fragments.clone(),
+            cached_page_payloads: cached_page_payloads.clone(),
+            cached_index: outcome.cached_index,
+        };
+        gate.reset();
+
+        let lookup = cache.lookup_with_warm_cache(&[], Some(warm_cache));
+
+        assert!(lookup.artifact.is_some());
+        assert_eq!(gate.read_count(&cache.metadata_path), 0);
+        assert_eq!(lookup.cached_source_subtrees, cached_source_subtrees);
+        assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+        assert_eq!(lookup.cached_page_payloads, cached_page_payloads);
+        assert!(lookup.cached_index.is_some());
+    }
+
+    #[test]
+    fn cached_index_round_trip_through_cache_hit() {
+        let gate = CountingFsGate::new();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let graph = dependency_graph_for(&input, "stable");
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+                block_checkpoints: None,
+            },
+        )]);
+
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+            )
+            .expect_none("cache stored");
+
+        let first_lookup = cache.lookup(&[]);
+        assert!(first_lookup.artifact.is_some());
+        assert!(first_lookup.cached_index.is_some());
+
+        gate.reset();
+        let second_lookup = cache.lookup_with_warm_cache(&[], Some(first_lookup.into_warm_cache()));
+
+        assert!(second_lookup.artifact.is_some());
+        assert!(second_lookup.cached_index.is_some());
+        assert_eq!(gate.read_count(&cache.metadata_path), 0);
+
+        fs::write(&input, "updated").expect("update input");
+        gate.reset();
+
+        let third_lookup = cache.lookup_with_warm_cache(
+            std::slice::from_ref(&input),
+            Some(second_lookup.into_warm_cache()),
+        );
+
+        assert!(third_lookup.artifact.is_none());
+        assert_eq!(third_lookup.changed_paths, vec![input.clone()]);
+        assert_eq!(gate.read_count(&cache.metadata_path), 0);
+        assert!(third_lookup.cached_index.is_some());
+    }
+
+    #[test]
+    fn cold_lookup_populates_cached_index_for_next_warm_lookup() {
+        let gate = CountingFsGate::new();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let graph = dependency_graph_for(&input, "stable");
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+                block_checkpoints: None,
+            },
+        )]);
+
+        let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+        cache
+            .store(
+                &graph,
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &cached_typeset_fragments,
+            )
+            .expect_none("cache stored");
+
+        let cold_lookup = cache.lookup(&[]);
+
+        assert!(cold_lookup.artifact.is_some());
+        assert!(cold_lookup.cached_index.is_some());
+
+        gate.reset();
+        let warm_lookup = cache.lookup_with_warm_cache(&[], Some(cold_lookup.into_warm_cache()));
+
+        assert!(warm_lookup.artifact.is_some());
+        assert_eq!(gate.read_count(&cache.metadata_path), 0);
+        assert!(warm_lookup.cached_index.is_some());
+    }
+
+    mod background {
+        use super::*;
+
+        #[test]
+        fn store_returns_cached_index_and_dirty_hash_sentinels() {
+            let gate = CountingFsGate::new();
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let input = dir.path().join("main.tex");
+            let output_dir = dir.path().join("out");
+            fs::create_dir_all(&output_dir).expect("create output dir");
+            fs::write(&input, "stable").expect("write input");
+            let pdf_bytes = b"%PDF-1.4\ncached\n";
+            fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+            let graph = dependency_graph_for(&input, "stable");
+            let cached_source_subtrees =
+                BTreeMap::from([(input.clone(), test_cached_subtree(&input, "stable"))]);
+            let first_partition = "document:0000:main".to_string();
+            let second_partition = "document:0001:appendix".to_string();
+            let initial_fragments = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment(&first_partition),
+                        source_hash: 1,
+                        block_checkpoints: None,
+                    },
+                ),
+                (
+                    second_partition.clone(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment(&second_partition),
+                        source_hash: 2,
+                        block_checkpoints: None,
+                    },
+                ),
+            ]);
+            let initial_page_payloads = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    vec![test_cached_page_payload("cached page 1")],
+                ),
+                (
+                    second_partition.clone(),
+                    vec![test_cached_page_payload("cached page 2")],
+                ),
+            ]);
+
+            let cache = CompileCache::new(&gate, &output_dir, &input, "main");
+            let initial_outcome = cache
+                .store_with_page_payloads(
+                    &graph,
+                    &stable_state(&input),
+                    fingerprint_bytes(pdf_bytes),
+                    &cached_source_subtrees,
+                    &initial_fragments,
+                    &initial_page_payloads,
+                    None,
+                    None,
+                )
+                .expect("initial cache stored");
+
+            let updated_fragments = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    initial_fragments
+                        .get(&first_partition)
+                        .expect("expected first fragment")
+                        .clone(),
+                ),
+                (
+                    second_partition.clone(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment(&second_partition),
+                        source_hash: 99,
+                        block_checkpoints: None,
+                    },
+                ),
+            ]);
+            let updated_page_payloads = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    initial_page_payloads
+                        .get(&first_partition)
+                        .expect("expected first page payloads")
+                        .clone(),
+                ),
+                (
+                    second_partition.clone(),
+                    vec![test_cached_page_payload("updated page 2")],
+                ),
+            ]);
+            let dirty_partition_ids = BTreeSet::from([second_partition.clone()]);
+            let dirty_source_paths = BTreeSet::new();
+            let writer = BackgroundCacheWriter::new();
+
+            let outcome = cache
+                .store_background(
+                    &graph,
+                    &stable_state(&input),
+                    fingerprint_bytes(pdf_bytes),
+                    &cached_source_subtrees,
+                    &updated_fragments,
+                    &updated_page_payloads,
+                    Some(&dirty_partition_ids),
+                    Some(&dirty_source_paths),
+                    &writer,
+                )
+                .expect("background cache queued");
+
+            assert!(outcome.cached_index.is_some());
+            let first_partition_key =
+                sanitize_partition_key(&format!("fragment:{first_partition}"));
+            let second_partition_key =
+                sanitize_partition_key(&format!("fragment:{second_partition}"));
+            assert_eq!(
+                outcome.partition_hashes.get(&first_partition_key),
+                initial_outcome.partition_hashes.get(&first_partition_key)
+            );
+            assert_eq!(
+                outcome.partition_hashes.get(&second_partition_key),
+                Some(&0)
+            );
+
+            let warm_cache = WarmPartitionCache {
+                partition_hashes: outcome.partition_hashes.clone(),
+                cached_source_subtrees: cached_source_subtrees.clone(),
+                cached_typeset_fragments: updated_fragments.clone(),
+                cached_page_payloads: updated_page_payloads.clone(),
+                cached_index: outcome.cached_index.clone(),
+            };
+            gate.reset();
+
+            let lookup = cache.lookup_with_warm_cache(&[], Some(warm_cache));
+
+            assert!(lookup.artifact.is_some());
+            assert_eq!(gate.read_count(&cache.metadata_path), 0);
+            assert_eq!(lookup.cached_typeset_fragments, updated_fragments);
+            assert_eq!(lookup.cached_page_payloads, updated_page_payloads);
+
+            writer.flush();
+        }
+
+        #[test]
+        fn flush_persists_partition_blobs_and_index() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let input = dir.path().join("main.tex");
+            let output_dir = dir.path().join("out");
+            fs::create_dir_all(&output_dir).expect("create output dir");
+            fs::write(&input, "stable").expect("write input");
+            let pdf_bytes = b"%PDF-1.4\ncached\n";
+            fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+            let graph = dependency_graph_for(&input, "stable");
+            let cached_source_subtrees =
+                BTreeMap::from([(input.clone(), test_cached_subtree(&input, "stable"))]);
+            let cached_typeset_fragments = BTreeMap::from([(
+                "document:0000:main".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0000:main"),
+                    source_hash: 42,
+                    block_checkpoints: None,
+                },
+            )]);
+            let cached_page_payloads = BTreeMap::from([(
+                "document:0000:main".to_string(),
+                vec![test_cached_page_payload("cached page 1")],
+            )]);
+
+            let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+            fs::create_dir_all(&cache.partitions_dir).expect("create partition dir");
+            fs::write(cache.json_metadata_path(), b"stale").expect("write stale json index");
+            fs::write(cache.partition_blob_path("orphaned"), b"orphaned partition")
+                .expect("write orphaned partition");
+
+            let writer = BackgroundCacheWriter::new();
+            let outcome = cache
+                .store_background(
+                    &graph,
+                    &stable_state(&input),
+                    fingerprint_bytes(pdf_bytes),
+                    &cached_source_subtrees,
+                    &cached_typeset_fragments,
+                    &cached_page_payloads,
+                    None,
+                    None,
+                    &writer,
+                )
+                .expect("background cache queued");
+            assert!(outcome.diagnostic.is_none());
+
+            writer.flush();
+
+            let lookup = cache.lookup(&[]);
+            assert_eq!(lookup.cached_source_subtrees, cached_source_subtrees);
+            assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+            assert_eq!(lookup.cached_page_payloads, cached_page_payloads);
+            assert!(!cache.json_metadata_path().exists());
+            assert!(!cache.partition_blob_path("orphaned").exists());
+
+            let index = read_binary_cache_index(&cache.metadata_path);
+            assert_eq!(index.version, super::super::CACHE_VERSION);
+            assert!(!index.partition_hashes.is_empty());
+        }
+
+        #[test]
+        fn flush_waits_for_all_pending_work() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let input = dir.path().join("main.tex");
+            let output_dir = dir.path().join("out");
+            fs::create_dir_all(&output_dir).expect("create output dir");
+            fs::write(&input, "stable").expect("write input");
+            let pdf_bytes = b"%PDF-1.4\ncached\n";
+            fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+            let graph = dependency_graph_for(&input, "stable");
+            let first_partition = "document:0000:main".to_string();
+            let second_partition = "document:0001:appendix".to_string();
+            let initial_fragments = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment(&first_partition),
+                        source_hash: 1,
+                        block_checkpoints: None,
+                    },
+                ),
+                (
+                    second_partition.clone(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment(&second_partition),
+                        source_hash: 10,
+                        block_checkpoints: None,
+                    },
+                ),
+            ]);
+            let initial_page_payloads = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    vec![test_cached_page_payload("initial first page payload")],
+                ),
+                (
+                    second_partition.clone(),
+                    vec![test_cached_page_payload("initial second page payload")],
+                ),
+            ]);
+            let first_work_fragments = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment(&first_partition),
+                        source_hash: 2,
+                        block_checkpoints: None,
+                    },
+                ),
+                (
+                    second_partition.clone(),
+                    initial_fragments
+                        .get(&second_partition)
+                        .expect("expected second fragment")
+                        .clone(),
+                ),
+            ]);
+            let first_work_page_payloads = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    vec![test_cached_page_payload("first page payload")],
+                ),
+                (
+                    second_partition.clone(),
+                    initial_page_payloads
+                        .get(&second_partition)
+                        .expect("expected second page payloads")
+                        .clone(),
+                ),
+            ]);
+            let second_work_fragments = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    first_work_fragments
+                        .get(&first_partition)
+                        .expect("expected first fragment")
+                        .clone(),
+                ),
+                (
+                    second_partition.clone(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment(&second_partition),
+                        source_hash: 20,
+                        block_checkpoints: None,
+                    },
+                ),
+            ]);
+            let second_work_page_payloads = BTreeMap::from([
+                (
+                    first_partition.clone(),
+                    first_work_page_payloads
+                        .get(&first_partition)
+                        .expect("expected first page payloads")
+                        .clone(),
+                ),
+                (
+                    second_partition.clone(),
+                    vec![test_cached_page_payload("second page payload")],
+                ),
+            ]);
+            let first_dirty_partition_ids = BTreeSet::from([first_partition.clone()]);
+            let second_dirty_partition_ids = BTreeSet::from([second_partition.clone()]);
+            let dirty_source_paths = BTreeSet::new();
+
+            let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+            cache
+                .store_with_page_payloads(
+                    &graph,
+                    &stable_state(&input),
+                    fingerprint_bytes(pdf_bytes),
+                    &BTreeMap::new(),
+                    &initial_fragments,
+                    &initial_page_payloads,
+                    None,
+                    None,
+                )
+                .expect("initial cache stored");
+            let writer = BackgroundCacheWriter::new();
+            cache
+                .store_background(
+                    &graph,
+                    &stable_state(&input),
+                    fingerprint_bytes(pdf_bytes),
+                    &BTreeMap::new(),
+                    &first_work_fragments,
+                    &first_work_page_payloads,
+                    Some(&first_dirty_partition_ids),
+                    Some(&dirty_source_paths),
+                    &writer,
+                )
+                .expect("first background cache queued");
+            cache
+                .store_background(
+                    &graph,
+                    &stable_state(&input),
+                    fingerprint_bytes(pdf_bytes),
+                    &BTreeMap::new(),
+                    &second_work_fragments,
+                    &second_work_page_payloads,
+                    Some(&second_dirty_partition_ids),
+                    Some(&dirty_source_paths),
+                    &writer,
+                )
+                .expect("second background cache queued");
+
+            writer.flush();
+
+            let lookup = cache.lookup(&[]);
+            assert_eq!(lookup.cached_typeset_fragments, second_work_fragments);
+            assert_eq!(lookup.cached_page_payloads, second_work_page_payloads);
+
+            let first_partition_key =
+                sanitize_partition_key(&format!("fragment:{first_partition}"));
+            let expected_first_blob = PartitionBlob {
+                cached_source_subtrees: BTreeMap::new(),
+                cached_typeset_fragments: BTreeMap::from([(
+                    first_partition.clone(),
+                    second_work_fragments
+                        .get(&first_partition)
+                        .expect("expected first fragment")
+                        .clone(),
+                )]),
+                cached_page_payloads: second_work_page_payloads.get(&first_partition).cloned(),
+            };
+            let expected_first_hash = fingerprint_bytes(
+                &bincode::serialize(&expected_first_blob).expect("serialize expected first blob"),
+            );
+            let index = read_binary_cache_index(&cache.metadata_path);
+            assert_eq!(
+                index.partition_hashes.get(&first_partition_key),
+                Some(&expected_first_hash)
+            );
+        }
+
+        #[test]
+        fn drop_flushes_pending_work_before_returning() {
+            let dir = tempfile::tempdir().expect("create tempdir");
+            let input = dir.path().join("main.tex");
+            let output_dir = dir.path().join("out");
+            fs::create_dir_all(&output_dir).expect("create output dir");
+            fs::write(&input, "stable").expect("write input");
+            let pdf_bytes = b"%PDF-1.4\ncached\n";
+            fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+            let graph = dependency_graph_for(&input, "stable");
+            let cached_typeset_fragments = BTreeMap::from([(
+                "document:0000:main".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0000:main"),
+                    source_hash: 7,
+                    block_checkpoints: None,
+                },
+            )]);
+            let cached_page_payloads = BTreeMap::from([(
+                "document:0000:main".to_string(),
+                vec![test_cached_page_payload("drop flush payload")],
+            )]);
+
+            let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+            {
+                let writer = BackgroundCacheWriter::new();
+                cache
+                    .store_background(
+                        &graph,
+                        &stable_state(&input),
+                        fingerprint_bytes(pdf_bytes),
+                        &BTreeMap::new(),
+                        &cached_typeset_fragments,
+                        &cached_page_payloads,
+                        None,
+                        None,
+                        &writer,
+                    )
+                    .expect("background cache queued");
+            }
+
+            let lookup = cache.lookup(&[]);
+            assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+            assert_eq!(lookup.cached_page_payloads, cached_page_payloads);
+        }
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
                 Severity::Error,
                 format!("failed to start file watcher: {error}"),
             ));
+            service.flush_cache();
             return 2;
         }
     };
@@ -62,6 +63,7 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
                     Severity::Error,
                     format!("failed to poll watched files: {error}"),
                 ));
+                service.flush_cache();
                 return 2;
             }
         };
@@ -88,6 +90,7 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
                     Severity::Error,
                     format!("failed to refresh watched files: {error}"),
                 ));
+                service.flush_cache();
                 return 2;
             }
         }

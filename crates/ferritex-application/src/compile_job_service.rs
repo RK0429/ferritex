@@ -65,8 +65,9 @@ use ferritex_core::typesetting::{
 use serde_json::json;
 
 use crate::compile_cache::{
-    fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CachedPagePayload,
-    CachedSourceSubtree, CachedTypesetFragment, CompileCache, PendingFloat, WarmPartitionCache,
+    fingerprint_bytes, BackgroundCacheWriter, BlockCheckpoint, BlockCheckpointData,
+    BlockLayoutState, CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment,
+    CompileCache, PendingFloat, WarmPartitionCache,
 };
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
@@ -177,6 +178,7 @@ pub struct CompileJobService<'a> {
     typesetter: MinimalTypesetter,
     pdf_renderer: PdfRenderer,
     warm_partition_cache: Mutex<Option<WarmPartitionCache>>,
+    background_cache_writer: BackgroundCacheWriter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -722,7 +724,12 @@ impl<'a> CompileJobService<'a> {
             typesetter: MinimalTypesetter,
             pdf_renderer: PdfRenderer::default(),
             warm_partition_cache: Mutex::new(None),
+            background_cache_writer: BackgroundCacheWriter::new(),
         }
+    }
+
+    pub fn flush_cache(&self) {
+        self.background_cache_writer.flush();
     }
 
     fn try_generate_bibliography(
@@ -1699,25 +1706,27 @@ impl<'a> CompileJobService<'a> {
                 } else {
                     (None, None)
                 };
-            let stored_partition_hashes = match compile_cache.store_with_page_payloads(
-                &source_tree.dependency_graph,
-                &provisional_stable_state,
-                output_pdf_hash,
-                &source_tree.cached_source_subtrees,
-                &cached_typeset_fragments,
-                &cached_page_payloads,
-                opt_dirty_partitions,
-                opt_dirty_sources,
-            ) {
+            let (stored_partition_hashes, stored_cached_index) = match compile_cache
+                .store_background(
+                    &source_tree.dependency_graph,
+                    &provisional_stable_state,
+                    output_pdf_hash,
+                    &source_tree.cached_source_subtrees,
+                    &cached_typeset_fragments,
+                    &cached_page_payloads,
+                    opt_dirty_partitions,
+                    opt_dirty_sources,
+                    &self.background_cache_writer,
+                ) {
                 Ok(outcome) => {
                     if let Some(diagnostic) = outcome.diagnostic {
                         diagnostics.push(diagnostic);
                     }
-                    Some(outcome.partition_hashes)
+                    (Some(outcome.partition_hashes), outcome.cached_index)
                 }
                 Err(diagnostic) => {
                     diagnostics.push(diagnostic);
-                    None
+                    (None, None)
                 }
             };
             if let Some(partition_hashes) = stored_partition_hashes {
@@ -1726,12 +1735,15 @@ impl<'a> CompileJobService<'a> {
                     cached_source_subtrees: source_tree.cached_source_subtrees,
                     cached_typeset_fragments,
                     cached_page_payloads,
+                    cached_index: stored_cached_index,
                 };
                 *self
                     .warm_partition_cache
                     .lock()
                     .expect("lock warm partition cache") = Some(warm_cache);
             }
+            // cache_store now measures only the synchronous enqueue; background I/O
+            // runs off the critical path.
             stage_timing.cache_store = Some(cache_store_start.elapsed());
         }
 
