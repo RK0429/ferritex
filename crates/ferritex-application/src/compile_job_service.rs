@@ -10573,8 +10573,8 @@ mod tests {
             .map(|entry| entry.expect("cache entry").path())
             .next()
             .expect("cache record dir");
-        let cache_file = cache_record_dir.join("index.bin");
-        fs::write(&cache_file, b"not-valid-bincode").expect("corrupt cache metadata");
+        let cache_file = cache_record_dir.join("index.json");
+        fs::write(&cache_file, b"{not json").expect("corrupt cache metadata");
 
         std::thread::sleep(Duration::from_millis(1100));
 
