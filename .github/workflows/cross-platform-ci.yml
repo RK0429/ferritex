@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/bundle-expanded" "${RUNNER_TEMP}/compile-out"
-          tar -xzf "${RUNNER_TEMP}/bundle-archive/FTX-ASSET-BUNDLE-001.tar.gz" -C "${RUNNER_TEMP}/bundle-expanded"
+          tar --force-local -xzf "${RUNNER_TEMP}/bundle-archive/FTX-ASSET-BUNDLE-001.tar.gz" -C "${RUNNER_TEMP}/bundle-expanded"
           test -f "${RUNNER_TEMP}/bundle-expanded/FTX-ASSET-BUNDLE-001/manifest.json"
           echo "FERRITEX_ASSET_BUNDLE=${RUNNER_TEMP}/bundle-expanded/FTX-ASSET-BUNDLE-001" >> "$GITHUB_ENV"
           echo "FERRITEX_OUTPUT_DIR=${RUNNER_TEMP}/compile-out" >> "$GITHUB_ENV"
