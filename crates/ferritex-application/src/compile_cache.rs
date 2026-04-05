@@ -15,13 +15,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::stable_compile_state::StableCompileState;
 
-const CACHE_VERSION: u32 = 7;
-const PREVIOUS_SPLIT_CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 8;
+const PREVIOUS_SPLIT_CACHE_VERSION: u32 = 7;
+const PREVIOUS_JSON_SPLIT_CACHE_VERSION: u32 = 6;
 const LEGACY_CACHE_VERSION: u32 = 4;
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
-const CACHE_INDEX_FILENAME: &str = "index.json";
+const CACHE_INDEX_FILENAME_BIN: &str = "index.bin";
+const CACHE_INDEX_FILENAME_JSON: &str = "index.json";
 const CACHE_PARTITIONS_DIR_NAME: &str = "partitions";
-const CACHE_RECORD_EXTENSION: &str = "json";
+const CACHE_PARTITIONS_EXTENSION_BIN: &str = "bin";
+const CACHE_PARTITIONS_EXTENSION_JSON: &str = "json";
+const CACHE_RECORD_EXTENSION: &str = CACHE_PARTITIONS_EXTENSION_BIN;
 const MAX_CACHE_RECORD_FILES: usize = 64;
 
 pub struct CompileCache<'a> {
@@ -222,6 +226,12 @@ struct OwnedCacheRecordFile {
     modified: std::time::SystemTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheRecordFormat {
+    Binary,
+    Json,
+}
+
 impl<'a> CompileCache<'a> {
     pub fn new(
         file_access_gate: &'a dyn FileAccessGate,
@@ -244,7 +254,7 @@ impl<'a> CompileCache<'a> {
             output_pdf: output_dir.join(format!("{jobname}.pdf")),
             record_dir: record_dir.clone(),
             partitions_dir: record_dir.join(CACHE_PARTITIONS_DIR_NAME),
-            metadata_path: record_dir.join(CACHE_INDEX_FILENAME),
+            metadata_path: record_dir.join(CACHE_INDEX_FILENAME_BIN),
             legacy_metadata_path: cache_dir.join(format!("{cache_key}.json")),
             cache_dir,
         }
@@ -427,12 +437,29 @@ impl<'a> CompileCache<'a> {
             ));
         }
 
-        let previous_hashes: BTreeMap<String, u64> = self
-            .file_access_gate
-            .read_file(&self.metadata_path)
+        let previous_hashes = self
+            .read_optional_cache_file(&self.metadata_path, "compile cache index")
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<CacheIndex>(&bytes).ok())
-            .map(|idx| idx.partition_hashes)
+            .flatten()
+            .and_then(|bytes| {
+                self.deserialize_cache_index(&bytes, &self.metadata_path, CacheRecordFormat::Binary)
+                    .ok()
+            })
+            .or_else(|| {
+                let json_metadata_path = self.json_metadata_path();
+                self.read_optional_cache_file(&json_metadata_path, "compile cache index")
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| {
+                        self.deserialize_cache_index(
+                            &bytes,
+                            &json_metadata_path,
+                            CacheRecordFormat::Json,
+                        )
+                        .ok()
+                    })
+            })
+            .map(|index| index.partition_hashes)
             .unwrap_or_default();
         let dirty_keys: Option<BTreeSet<String>> = match (dirty_partition_ids, dirty_source_paths) {
             (Some(partition_ids), Some(source_paths)) => {
@@ -468,7 +495,7 @@ impl<'a> CompileCache<'a> {
                     }
                 }
             }
-            let bytes = match serde_json::to_vec(&blob) {
+            let bytes = match bincode::serialize(&blob) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     return Err(cache_info_diagnostic(
@@ -506,7 +533,7 @@ impl<'a> CompileCache<'a> {
             partition_hashes: new_hashes,
         };
 
-        let bytes = match serde_json::to_vec(&index) {
+        let bytes = match bincode::serialize(&index) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return Err(cache_info_diagnostic(
@@ -526,6 +553,15 @@ impl<'a> CompileCache<'a> {
             ));
         }
 
+        let json_metadata_path = self.json_metadata_path();
+        let stale_json_cleanup_diagnostic = match fs::remove_file(&json_metadata_path) {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(cache_cleanup_diagnostic(
+                format!("failed to remove stale compile cache JSON index: {error}"),
+                &json_metadata_path,
+            )),
+        };
         let cleanup_diagnostic = self.cleanup_orphaned_partitions(&index.partition_keys);
         let legacy_diagnostic = self.remove_legacy_record_if_present();
         let eviction_diagnostic = self.evict_excess_records().err().map(|error| {
@@ -538,6 +574,7 @@ impl<'a> CompileCache<'a> {
         Ok(CacheStoreOutcome {
             partition_hashes: index.partition_hashes,
             diagnostic: cleanup_diagnostic
+                .or(stale_json_cleanup_diagnostic)
                 .or(legacy_diagnostic)
                 .or(eviction_diagnostic),
         })
@@ -606,39 +643,101 @@ impl<'a> CompileCache<'a> {
         &self,
         warm_cache: Option<WarmPartitionCache>,
     ) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
-        match self.file_access_gate.read_file(&self.metadata_path) {
-            Ok(bytes) => self.load_split_record_with_warm_cache(&bytes, warm_cache),
-            Err(FileAccessError::Io { source })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                self.load_legacy_record()
+        let mut warm_cache = warm_cache;
+        let mut fallback_diagnostics = Vec::new();
+
+        match self.read_optional_cache_file(&self.metadata_path, "compile cache index") {
+            Ok(Some(bytes)) => {
+                match self.deserialize_cache_index(
+                    &bytes,
+                    &self.metadata_path,
+                    CacheRecordFormat::Binary,
+                ) {
+                    Ok(index) => {
+                        return self.load_split_record_with_warm_cache(
+                            index,
+                            &self.metadata_path,
+                            CacheRecordFormat::Binary,
+                            &mut warm_cache,
+                        )
+                    }
+                    Err(diagnostic) => fallback_diagnostics.push(diagnostic),
+                }
             }
-            Err(error) => Err(cache_info_diagnostic(
-                format!("failed to read compile cache index: {error}"),
-                &self.metadata_path,
-            )),
+            Ok(None) => {}
+            Err(diagnostic) => fallback_diagnostics.push(diagnostic),
+        }
+
+        let json_metadata_path = self.json_metadata_path();
+        match self.read_optional_cache_file(&json_metadata_path, "compile cache index") {
+            Ok(Some(bytes)) => {
+                match self.deserialize_cache_index(
+                    &bytes,
+                    &json_metadata_path,
+                    CacheRecordFormat::Json,
+                ) {
+                    Ok(index) => {
+                        let mut record = self.load_split_record_with_warm_cache(
+                            index,
+                            &json_metadata_path,
+                            CacheRecordFormat::Json,
+                            &mut warm_cache,
+                        )?;
+                        if let Some(record) = &mut record {
+                            prepend_diagnostics(record, fallback_diagnostics);
+                        }
+                        return Ok(record);
+                    }
+                    Err(diagnostic) => fallback_diagnostics.push(diagnostic),
+                }
+            }
+            Ok(None) => {}
+            Err(diagnostic) => fallback_diagnostics.push(diagnostic),
+        }
+
+        match self.load_legacy_record() {
+            Ok(Some(mut record)) => {
+                prepend_diagnostics(&mut record, fallback_diagnostics);
+                Ok(Some(record))
+            }
+            Ok(None) => match fallback_diagnostics.into_iter().next() {
+                Some(diagnostic) => Err(diagnostic),
+                None => Ok(None),
+            },
+            Err(diagnostic) => Err(fallback_diagnostics
+                .into_iter()
+                .next()
+                .unwrap_or(diagnostic)),
         }
     }
 
     fn load_split_record_with_warm_cache(
         &self,
-        bytes: &[u8],
-        warm_cache: Option<WarmPartitionCache>,
+        index: CacheIndex,
+        index_path: &Path,
+        format: CacheRecordFormat,
+        warm_cache: &mut Option<WarmPartitionCache>,
     ) -> Result<Option<LoadedCacheRecord>, Diagnostic> {
-        let index: CacheIndex = serde_json::from_slice(bytes).map_err(|error| {
-            cache_info_diagnostic(
-                format!("compile cache index is invalid: {error}"),
-                &self.metadata_path,
-            )
-        })?;
-
-        if !matches!(index.version, CACHE_VERSION | PREVIOUS_SPLIT_CACHE_VERSION) {
+        let expected_version = match format {
+            CacheRecordFormat::Binary => format!("{CACHE_VERSION}"),
+            CacheRecordFormat::Json => {
+                format!("{PREVIOUS_SPLIT_CACHE_VERSION} or {PREVIOUS_JSON_SPLIT_CACHE_VERSION}")
+            }
+        };
+        let version_matches = match format {
+            CacheRecordFormat::Binary => index.version == CACHE_VERSION,
+            CacheRecordFormat::Json => matches!(
+                index.version,
+                PREVIOUS_SPLIT_CACHE_VERSION | PREVIOUS_JSON_SPLIT_CACHE_VERSION
+            ),
+        };
+        if !version_matches {
             return Err(cache_info_diagnostic(
                 format!(
-                    "compile cache version mismatch (found {}, expected {CACHE_VERSION} or {PREVIOUS_SPLIT_CACHE_VERSION})",
-                    index.version,
+                    "compile cache version mismatch (found {}, expected {expected_version})",
+                    index.version
                 ),
-                &self.metadata_path,
+                index_path,
             ));
         }
 
@@ -656,7 +755,7 @@ impl<'a> CompileCache<'a> {
 
         let mut diagnostics = Vec::new();
         let (cached_source_subtrees, cached_typeset_fragments, cached_page_payloads) =
-            match warm_cache {
+            match warm_cache.take() {
                 Some(WarmPartitionCache {
                     partition_hashes: warm_partition_hashes,
                     mut cached_source_subtrees,
@@ -782,30 +881,48 @@ impl<'a> CompileCache<'a> {
         partition_key: &str,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Option<PartitionBlob> {
+        let mut fallback_diagnostics = Vec::new();
+        let desc = format!("compile cache partition blob `{partition_key}`");
         let path = self.partition_blob_path(partition_key);
-        let bytes = match self.file_access_gate.read_file(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                diagnostics.push(cache_info_diagnostic(
-                    format!(
-                        "failed to read compile cache partition blob `{partition_key}`: {error}"
-                    ),
-                    &path,
-                ));
-                return None;
-            }
-        };
 
-        match serde_json::from_slice(&bytes) {
-            Ok(blob) => Some(blob),
-            Err(error) => {
-                diagnostics.push(cache_info_diagnostic(
-                    format!("compile cache partition blob `{partition_key}` is invalid: {error}"),
+        match self.read_optional_cache_file(&path, &desc) {
+            Ok(Some(bytes)) => {
+                match self.deserialize_partition_blob(
+                    &bytes,
                     &path,
-                ));
-                None
+                    partition_key,
+                    CacheRecordFormat::Binary,
+                ) {
+                    Ok(blob) => return Some(blob),
+                    Err(diagnostic) => fallback_diagnostics.push(diagnostic),
+                }
             }
+            Ok(None) => {}
+            Err(diagnostic) => fallback_diagnostics.push(diagnostic),
         }
+
+        let json_path = self.partition_blob_json_path(partition_key);
+        match self.read_optional_cache_file(&json_path, &desc) {
+            Ok(Some(bytes)) => {
+                match self.deserialize_partition_blob(
+                    &bytes,
+                    &json_path,
+                    partition_key,
+                    CacheRecordFormat::Json,
+                ) {
+                    Ok(blob) => {
+                        diagnostics.extend(fallback_diagnostics);
+                        return Some(blob);
+                    }
+                    Err(diagnostic) => fallback_diagnostics.push(diagnostic),
+                }
+            }
+            Ok(None) => {}
+            Err(diagnostic) => fallback_diagnostics.push(diagnostic),
+        }
+
+        diagnostics.extend(fallback_diagnostics);
+        None
     }
 
     fn remove_legacy_record_if_present(&self) -> Option<Diagnostic> {
@@ -839,9 +956,10 @@ impl<'a> CompileCache<'a> {
             {
                 continue;
             }
-            if path.extension().and_then(|extension| extension.to_str())
-                != Some(CACHE_RECORD_EXTENSION)
-            {
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            if !is_partition_blob_extension(extension) {
                 continue;
             }
 
@@ -866,8 +984,77 @@ impl<'a> CompileCache<'a> {
     }
 
     fn partition_blob_path(&self, partition_key: &str) -> PathBuf {
-        self.partitions_dir
-            .join(format!("{partition_key}.{CACHE_RECORD_EXTENSION}"))
+        self.partition_blob_path_with_extension(partition_key, CACHE_RECORD_EXTENSION)
+    }
+
+    fn json_metadata_path(&self) -> PathBuf {
+        self.record_dir.join(CACHE_INDEX_FILENAME_JSON)
+    }
+
+    fn partition_blob_path_with_extension(&self, partition_key: &str, ext: &str) -> PathBuf {
+        self.partitions_dir.join(format!("{partition_key}.{ext}"))
+    }
+
+    fn partition_blob_json_path(&self, partition_key: &str) -> PathBuf {
+        self.partition_blob_path_with_extension(partition_key, CACHE_PARTITIONS_EXTENSION_JSON)
+    }
+
+    fn read_optional_cache_file(
+        &self,
+        path: &Path,
+        desc: &str,
+    ) -> Result<Option<Vec<u8>>, Diagnostic> {
+        match self.file_access_gate.read_file(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(FileAccessError::Io { source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(cache_info_diagnostic(
+                format!("failed to read {desc}: {error}"),
+                path,
+            )),
+        }
+    }
+
+    fn deserialize_cache_index(
+        &self,
+        bytes: &[u8],
+        path: &Path,
+        format: CacheRecordFormat,
+    ) -> Result<CacheIndex, Diagnostic> {
+        match format {
+            CacheRecordFormat::Binary => bincode::deserialize(bytes).map_err(|error| {
+                cache_info_diagnostic(format!("compile cache index is invalid: {error}"), path)
+            }),
+            CacheRecordFormat::Json => serde_json::from_slice(bytes).map_err(|error| {
+                cache_info_diagnostic(format!("compile cache index is invalid: {error}"), path)
+            }),
+        }
+    }
+
+    fn deserialize_partition_blob(
+        &self,
+        bytes: &[u8],
+        path: &Path,
+        key: &str,
+        format: CacheRecordFormat,
+    ) -> Result<PartitionBlob, Diagnostic> {
+        match format {
+            CacheRecordFormat::Binary => bincode::deserialize(bytes).map_err(|error| {
+                cache_info_diagnostic(
+                    format!("compile cache partition blob `{key}` is invalid: {error}"),
+                    path,
+                )
+            }),
+            CacheRecordFormat::Json => serde_json::from_slice(bytes).map_err(|error| {
+                cache_info_diagnostic(
+                    format!("compile cache partition blob `{key}` is invalid: {error}"),
+                    path,
+                )
+            }),
+        }
     }
 
     fn evict_excess_records(&self) -> std::io::Result<()> {
@@ -923,23 +1110,46 @@ impl<'a> CompileCache<'a> {
 
             let path = entry.path();
             let (owned, modified) = if file_type.is_dir() {
-                let index_path = path.join(CACHE_INDEX_FILENAME);
-                let bytes = match fs::read(&index_path) {
-                    Ok(bytes) => bytes,
-                    Err(_) => continue,
-                };
-                let owned = serde_json::from_slice::<CacheIndex>(&bytes)
-                    .map(|index| {
-                        matches!(index.version, CACHE_VERSION | PREVIOUS_SPLIT_CACHE_VERSION)
-                    })
-                    .unwrap_or(false);
-                let modified = fs::metadata(&index_path)
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(UNIX_EPOCH);
-                (owned, modified)
+                let split_record = [
+                    (
+                        path.join(CACHE_INDEX_FILENAME_BIN),
+                        CacheRecordFormat::Binary,
+                    ),
+                    (
+                        path.join(CACHE_INDEX_FILENAME_JSON),
+                        CacheRecordFormat::Json,
+                    ),
+                ]
+                .into_iter()
+                .find_map(|(index_path, format)| {
+                    let bytes = fs::read(&index_path).ok()?;
+                    let index = match format {
+                        CacheRecordFormat::Binary => {
+                            bincode::deserialize::<CacheIndex>(&bytes).ok()?
+                        }
+                        CacheRecordFormat::Json => {
+                            serde_json::from_slice::<CacheIndex>(&bytes).ok()?
+                        }
+                    };
+                    let owned = match format {
+                        CacheRecordFormat::Binary => index.version == CACHE_VERSION,
+                        CacheRecordFormat::Json => matches!(
+                            index.version,
+                            PREVIOUS_SPLIT_CACHE_VERSION | PREVIOUS_JSON_SPLIT_CACHE_VERSION
+                        ),
+                    };
+                    if !owned {
+                        return None;
+                    }
+                    let modified = fs::metadata(&index_path)
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(UNIX_EPOCH);
+                    Some((true, modified))
+                });
+                split_record.unwrap_or((false, UNIX_EPOCH))
             } else if file_type.is_file()
                 && path.extension().and_then(|extension| extension.to_str())
-                    == Some(CACHE_RECORD_EXTENSION)
+                    == Some(CACHE_PARTITIONS_EXTENSION_JSON)
             {
                 let bytes = match fs::read(&path) {
                     Ok(bytes) => bytes,
@@ -966,6 +1176,18 @@ impl<'a> CompileCache<'a> {
 
         Ok(records)
     }
+}
+
+fn prepend_diagnostics(record: &mut LoadedCacheRecord, mut diagnostics: Vec<Diagnostic>) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    diagnostics.append(&mut record.diagnostics);
+    record.diagnostics = diagnostics;
+}
+
+fn is_partition_blob_extension(ext: &str) -> bool {
+    ext == CACHE_PARTITIONS_EXTENSION_BIN || ext == CACHE_PARTITIONS_EXTENSION_JSON
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1129,7 +1351,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use ferritex_core::compilation::{CompilationSnapshot, DocumentState};
     use ferritex_core::diagnostics::Severity;
@@ -1143,8 +1365,8 @@ mod tests {
 
     use super::{
         fingerprint_bytes, BlockCheckpoint, BlockCheckpointData, BlockLayoutState, CacheIndex,
-        CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment, CompileCache,
-        LegacyCompileCacheRecord, OwnedCacheRecordFile, PartitionBlob, PendingFloat,
+        CacheRecordFormat, CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment,
+        CompileCache, LegacyCompileCacheRecord, OwnedCacheRecordFile, PartitionBlob, PendingFloat,
         MAX_CACHE_RECORD_FILES,
     };
     use crate::stable_compile_state::StableCompileState;
@@ -1751,8 +1973,6 @@ mod tests {
         fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
         let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
         let record_dir = cache.record_dir.clone();
-        fs::create_dir_all(record_dir.join(super::CACHE_PARTITIONS_DIR_NAME))
-            .expect("create record dir");
 
         let cached_typeset_fragments = BTreeMap::from([(
             "document:0000:main".to_string(),
@@ -1764,7 +1984,7 @@ mod tests {
         )]);
         let partition_key = super::sanitize_partition_key("fragment:document:0000:main");
         let index = CacheIndex {
-            version: super::PREVIOUS_SPLIT_CACHE_VERSION,
+            version: super::PREVIOUS_JSON_SPLIT_CACHE_VERSION,
             primary_input: input.clone(),
             jobname: "main".to_string(),
             output_pdf: output_dir.join("main.pdf"),
@@ -1774,28 +1994,19 @@ mod tests {
             partition_keys: vec![partition_key.clone()],
             partition_hashes: BTreeMap::new(),
         };
-        fs::write(
-            record_dir.join(super::CACHE_INDEX_FILENAME),
-            serde_json::to_vec(&index).expect("serialize v6 index"),
-        )
-        .expect("write v6 index");
-        let blob = serde_json::json!({
-            "cached_source_subtrees": {},
-            "cached_typeset_fragments": {
-                "document:0000:main": {
-                    "fragment": test_fragment("document:0000:main"),
-                    "source_hash": 42_u64,
-                    "block_checkpoints": null
-                }
-            }
-        });
-        fs::write(
-            record_dir
-                .join(super::CACHE_PARTITIONS_DIR_NAME)
-                .join(format!("{partition_key}.json")),
-            serde_json::to_vec_pretty(&blob).expect("serialize v6 blob"),
-        )
-        .expect("write v6 blob");
+        write_split_cache_record_dir(
+            &record_dir,
+            index,
+            BTreeMap::from([(
+                partition_key,
+                PartitionBlob {
+                    cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: cached_typeset_fragments.clone(),
+                    cached_page_payloads: None,
+                },
+            )]),
+            CacheRecordFormat::Json,
+        );
 
         let lookup = cache.lookup(&[]);
 
@@ -1870,9 +2081,7 @@ mod tests {
             "partition blob directory should exist"
         );
 
-        let index: CacheIndex =
-            serde_json::from_slice(&fs::read(&cache.metadata_path).expect("read cache index"))
-                .expect("deserialize cache index");
+        let index = read_binary_cache_index(&cache.metadata_path);
         assert_eq!(index.version, super::CACHE_VERSION);
         assert_eq!(
             index.partition_keys.len(),
@@ -1890,6 +2099,80 @@ mod tests {
         assert!(lookup.diagnostics.is_empty());
         assert_eq!(lookup.cached_source_subtrees, cached_source_subtrees);
         assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn split_cache_v7_json_migrates_to_v8_binary_on_store() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        let partition_key = super::sanitize_partition_key("fragment:document:0000:main");
+        write_split_cache_record_dir(
+            &cache.record_dir,
+            CacheIndex {
+                version: super::PREVIOUS_SPLIT_CACHE_VERSION,
+                primary_input: input.clone(),
+                jobname: "main".to_string(),
+                output_pdf: output_dir.join("main.pdf"),
+                output_pdf_hash: fingerprint_bytes(pdf_bytes),
+                dependency_graph: dependency_graph_for(&input, "stable"),
+                stable_compile_state: stable_state(&input),
+                partition_keys: vec![partition_key.clone()],
+                partition_hashes: BTreeMap::from([(partition_key.clone(), 99)]),
+            },
+            BTreeMap::from([(
+                partition_key,
+                PartitionBlob {
+                    cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: BTreeMap::from([(
+                        "document:0000:main".to_string(),
+                        CachedTypesetFragment {
+                            fragment: test_fragment("document:0000:main"),
+                            source_hash: 42,
+                            block_checkpoints: None,
+                        },
+                    )]),
+                    cached_page_payloads: None,
+                },
+            )]),
+            CacheRecordFormat::Json,
+        );
+
+        cache
+            .store(
+                &dependency_graph_for(&input, "stable"),
+                &stable_state(&input),
+                fingerprint_bytes(pdf_bytes),
+                &BTreeMap::new(),
+                &BTreeMap::from([(
+                    "document:0000:main".to_string(),
+                    CachedTypesetFragment {
+                        fragment: test_fragment("document:0000:main"),
+                        source_hash: 42,
+                        block_checkpoints: None,
+                    },
+                )]),
+            )
+            .expect_none("cache stored");
+
+        assert!(
+            cache.metadata_path.exists(),
+            "binary cache index should exist"
+        );
+        assert!(
+            !cache.json_metadata_path().exists(),
+            "stale JSON cache index should be removed"
+        );
+        assert_eq!(
+            read_binary_cache_index(&cache.metadata_path).version,
+            super::CACHE_VERSION
+        );
     }
 
     #[test]
@@ -2206,9 +2489,7 @@ mod tests {
             )
             .expect_none("initial cache stored");
 
-        let initial_index: CacheIndex =
-            serde_json::from_slice(&fs::read(&cache.metadata_path).expect("read initial index"))
-                .expect("deserialize initial index");
+        let initial_index = read_binary_cache_index(&cache.metadata_path);
         let initial_keys = initial_index
             .partition_keys
             .into_iter()
@@ -2228,9 +2509,7 @@ mod tests {
             )
             .expect_none("updated cache stored");
 
-        let updated_index: CacheIndex =
-            serde_json::from_slice(&fs::read(&cache.metadata_path).expect("read updated index"))
-                .expect("deserialize updated index");
+        let updated_index = read_binary_cache_index(&cache.metadata_path);
         let updated_keys = updated_index
             .partition_keys
             .iter()
@@ -2318,6 +2597,63 @@ mod tests {
         assert!(lookup.artifact.is_some());
         assert_eq!(lookup.cached_source_subtrees, cached_source_subtrees);
         assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+    }
+
+    #[test]
+    fn corrupted_binary_index_falls_back_to_json_cache_with_diagnostic() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let input = dir.path().join("main.tex");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&output_dir).expect("create output dir");
+        fs::write(&input, "stable").expect("write input");
+        let pdf_bytes = b"%PDF-1.4\ncached\n";
+        fs::write(output_dir.join("main.pdf"), pdf_bytes).expect("write pdf");
+
+        let cache = CompileCache::new(&FsGate, &output_dir, &input, "main");
+        let partition_key = super::sanitize_partition_key("fragment:document:0000:main");
+        let cached_typeset_fragments = BTreeMap::from([(
+            "document:0000:main".to_string(),
+            CachedTypesetFragment {
+                fragment: test_fragment("document:0000:main"),
+                source_hash: 42,
+                block_checkpoints: None,
+            },
+        )]);
+        write_split_cache_record_dir(
+            &cache.record_dir,
+            CacheIndex {
+                version: super::PREVIOUS_SPLIT_CACHE_VERSION,
+                primary_input: input.clone(),
+                jobname: "main".to_string(),
+                output_pdf: output_dir.join("main.pdf"),
+                output_pdf_hash: fingerprint_bytes(pdf_bytes),
+                dependency_graph: dependency_graph_for(&input, "stable"),
+                stable_compile_state: stable_state(&input),
+                partition_keys: vec![partition_key.clone()],
+                partition_hashes: BTreeMap::new(),
+            },
+            BTreeMap::from([(
+                partition_key,
+                PartitionBlob {
+                    cached_source_subtrees: BTreeMap::new(),
+                    cached_typeset_fragments: cached_typeset_fragments.clone(),
+                    cached_page_payloads: None,
+                },
+            )]),
+            CacheRecordFormat::Json,
+        );
+        fs::write(&cache.metadata_path, b"not-valid-bincode").expect("write corrupt binary index");
+
+        let lookup = cache.lookup(&[]);
+
+        assert_eq!(lookup.cached_typeset_fragments, cached_typeset_fragments);
+        assert!(
+            lookup.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("compile cache index is invalid")),
+            "expected binary corruption diagnostic, got {:?}",
+            lookup.diagnostics
+        );
     }
 
     #[test]
@@ -2841,7 +3177,7 @@ mod tests {
             BTreeMap::new(),
         );
 
-        let unreadable_index_path = unreadable_path.join(super::CACHE_INDEX_FILENAME);
+        let unreadable_index_path = unreadable_path.join(super::CACHE_INDEX_FILENAME_BIN);
         let mut permissions = fs::metadata(&unreadable_index_path)
             .expect("unreadable record metadata")
             .permissions();
@@ -2911,7 +3247,7 @@ mod tests {
                 BTreeMap::new(),
             );
             set_modified_time(
-                &record_path.join(super::CACHE_INDEX_FILENAME),
+                &record_path.join(super::CACHE_INDEX_FILENAME_BIN),
                 UNIX_EPOCH + Duration::from_secs(index as u64),
             );
         }
@@ -2967,24 +3303,113 @@ mod tests {
             .expect("set file modified time");
     }
 
+    #[test]
+    fn serialization_benchmark_prints_json_vs_bincode_timings() {
+        let input = PathBuf::from("main.tex");
+        let partition_key = super::sanitize_partition_key("fragment:document:0000:main");
+        let index = CacheIndex {
+            version: super::CACHE_VERSION,
+            primary_input: input.clone(),
+            jobname: "main".to_string(),
+            output_pdf: PathBuf::from("out/main.pdf"),
+            output_pdf_hash: fingerprint_bytes(b"pdf"),
+            dependency_graph: dependency_graph_for(&input, "stable"),
+            stable_compile_state: stable_state(&input),
+            partition_keys: vec![partition_key.clone()],
+            partition_hashes: BTreeMap::from([(partition_key.clone(), 123)]),
+        };
+        let blob = PartitionBlob {
+            cached_source_subtrees: BTreeMap::from([(
+                input.clone(),
+                test_cached_subtree(&input, "stable"),
+            )]),
+            cached_typeset_fragments: BTreeMap::from([(
+                "document:0000:main".to_string(),
+                CachedTypesetFragment {
+                    fragment: test_fragment("document:0000:main"),
+                    source_hash: 42,
+                    block_checkpoints: None,
+                },
+            )]),
+            cached_page_payloads: Some(vec![test_cached_page_payload("cached page 1")]),
+        };
+
+        let iterations = 200;
+
+        let json_start = Instant::now();
+        for _ in 0..iterations {
+            let _ = serde_json::to_vec(&index).expect("serialize index as json");
+            let _ = serde_json::to_vec(&blob).expect("serialize blob as json");
+        }
+        let json_elapsed = json_start.elapsed();
+
+        let binary_start = Instant::now();
+        for _ in 0..iterations {
+            let _ = bincode::serialize(&index).expect("serialize index as bincode");
+            let _ = bincode::serialize(&blob).expect("serialize blob as bincode");
+        }
+        let binary_elapsed = binary_start.elapsed();
+
+        eprintln!(
+            "serialization benchmark: json={json_elapsed:?}, bincode={binary_elapsed:?}, iterations={iterations}"
+        );
+
+        assert!(json_elapsed >= Duration::ZERO);
+        assert!(binary_elapsed >= Duration::ZERO);
+    }
+
     fn write_owned_cache_record_dir(
         path: &std::path::Path,
         index: CacheIndex,
         partition_blobs: BTreeMap<String, PartitionBlob>,
     ) {
+        write_split_cache_record_dir(path, index, partition_blobs, CacheRecordFormat::Binary);
+    }
+
+    fn write_split_cache_record_dir(
+        path: &std::path::Path,
+        index: CacheIndex,
+        partition_blobs: BTreeMap<String, PartitionBlob>,
+        format: CacheRecordFormat,
+    ) {
         fs::create_dir_all(path.join(super::CACHE_PARTITIONS_DIR_NAME))
             .expect("create cache record dir");
-        let bytes = serde_json::to_vec(&index).expect("serialize cache index");
-        fs::write(path.join(super::CACHE_INDEX_FILENAME), bytes).expect("write cache index");
+        let (index_filename, partition_ext) = match format {
+            CacheRecordFormat::Binary => (
+                super::CACHE_INDEX_FILENAME_BIN,
+                super::CACHE_PARTITIONS_EXTENSION_BIN,
+            ),
+            CacheRecordFormat::Json => (
+                super::CACHE_INDEX_FILENAME_JSON,
+                super::CACHE_PARTITIONS_EXTENSION_JSON,
+            ),
+        };
+        let bytes = match format {
+            CacheRecordFormat::Binary => bincode::serialize(&index).expect("serialize cache index"),
+            CacheRecordFormat::Json => serde_json::to_vec(&index).expect("serialize cache index"),
+        };
+        fs::write(path.join(index_filename), bytes).expect("write cache index");
         for (partition_key, blob) in partition_blobs {
-            let bytes = serde_json::to_vec_pretty(&blob).expect("serialize partition blob");
+            let bytes = match format {
+                CacheRecordFormat::Binary => {
+                    bincode::serialize(&blob).expect("serialize partition blob")
+                }
+                CacheRecordFormat::Json => {
+                    serde_json::to_vec_pretty(&blob).expect("serialize partition blob")
+                }
+            };
             fs::write(
                 path.join(super::CACHE_PARTITIONS_DIR_NAME)
-                    .join(format!("{partition_key}.json")),
+                    .join(format!("{partition_key}.{partition_ext}")),
                 bytes,
             )
             .expect("write partition blob");
         }
+    }
+
+    fn read_binary_cache_index(path: &std::path::Path) -> CacheIndex {
+        bincode::deserialize(&fs::read(path).expect("read cache index"))
+            .expect("deserialize binary cache index")
     }
 
     fn write_legacy_cache_record(path: &std::path::Path, record: LegacyCompileCacheRecord) {
