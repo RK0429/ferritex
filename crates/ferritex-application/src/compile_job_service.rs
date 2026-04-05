@@ -471,14 +471,20 @@ impl ExpandedSourceBuilder {
         }
     }
 
-    fn append_expanded(&mut self, expanded: &ExpandedSource) {
-        for (segment, origin) in expanded
-            .text
-            .split_inclusive('\n')
-            .zip(expanded.source_lines.iter())
-        {
+    fn append_str_with_source_lines(&mut self, text: &str, source_lines: &[SourceLineTrace]) {
+        if text.is_empty() {
+            return;
+        }
+
+        debug_assert_eq!(text.split_inclusive('\n').count(), source_lines.len());
+        // The open line retains its original origin (file, line); only the text content from the cached subtree's first line is merged.
+        for (segment, origin) in text.split_inclusive('\n').zip(source_lines.iter()) {
             self.append_with_origin(segment, &origin.file, origin.line);
         }
+    }
+
+    fn append_expanded(&mut self, expanded: &ExpandedSource) {
+        self.append_str_with_source_lines(&expanded.text, &expanded.source_lines);
     }
 
     fn finish(mut self) -> ExpandedSource {
@@ -5905,6 +5911,7 @@ fn expand_inputs(
 ) -> Result<ExpandedSource, Diagnostic> {
     let mut expanded = ExpandedSourceBuilder::default();
     let source_file = source_path.to_string_lossy().into_owned();
+    let source_path_buf = source_path.to_path_buf();
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let source_line = line_index as u32 + 1;
@@ -5918,19 +5925,38 @@ fn expand_inputs(
         let mut cursor = 0usize;
         for command in matches {
             expanded.append_with_origin(&line[cursor..command.start], &source_file, source_line);
-
-            let resolved = resolve_input_path(
-                base_dir,
-                workspace_root,
-                overlay_roots,
-                &command.value,
-                service.asset_bundle_loader,
-                asset_bundle_path,
-            );
+            let candidate = tex_path_candidate(base_dir, &command.value);
 
             match &command.kind {
                 InlineCommandKind::Input => {
-                    dependency_graph.record_edge(source_path.to_path_buf(), resolved.clone());
+                    if let Some((reuse_plan, cached_subtree)) =
+                        reusable_cached_input_subtree(reuse_plan, &candidate)
+                    {
+                        dependency_graph.record_edge(source_path_buf.clone(), candidate.clone());
+                        append_cached_source_subtree(
+                            &mut expanded,
+                            &candidate,
+                            reuse_plan,
+                            cached_subtree,
+                            source_files,
+                            labels,
+                            citations,
+                            dependency_graph,
+                            cached_source_subtrees,
+                        );
+                        cursor = command.end;
+                        continue;
+                    }
+
+                    let resolved = resolve_input_path(
+                        base_dir,
+                        workspace_root,
+                        overlay_roots,
+                        &command.value,
+                        service.asset_bundle_loader,
+                        asset_bundle_path,
+                    );
+                    dependency_graph.record_edge(source_path_buf.clone(), resolved.clone());
                     let nested = service
                         .load_source_file(
                             &resolved,
@@ -5956,7 +5982,38 @@ fn expand_inputs(
                     expanded.append_expanded(&nested.expanded);
                 }
                 InlineCommandKind::Include => {
-                    dependency_graph.record_edge(source_path.to_path_buf(), resolved.clone());
+                    if let Some((reuse_plan, cached_subtree)) =
+                        reusable_cached_input_subtree(reuse_plan, &candidate)
+                    {
+                        dependency_graph.record_edge(source_path_buf.clone(), candidate.clone());
+                        if !include_guard.insert(candidate.clone()) {
+                            cursor = command.end;
+                            continue;
+                        }
+                        append_cached_source_subtree(
+                            &mut expanded,
+                            &candidate,
+                            reuse_plan,
+                            cached_subtree,
+                            source_files,
+                            labels,
+                            citations,
+                            dependency_graph,
+                            cached_source_subtrees,
+                        );
+                        cursor = command.end;
+                        continue;
+                    }
+
+                    let resolved = resolve_input_path(
+                        base_dir,
+                        workspace_root,
+                        overlay_roots,
+                        &command.value,
+                        service.asset_bundle_loader,
+                        asset_bundle_path,
+                    );
+                    dependency_graph.record_edge(source_path_buf.clone(), resolved.clone());
                     if !include_guard.insert(resolved.clone()) {
                         cursor = command.end;
                         continue;
@@ -5990,8 +6047,37 @@ fn expand_inputs(
                     true_branch,
                     false_branch,
                 } => {
+                    if let Some((reuse_plan, cached_subtree)) =
+                        reusable_cached_input_subtree(reuse_plan, &candidate)
+                    {
+                        dependency_graph.record_edge(source_path_buf.clone(), candidate.clone());
+                        append_cached_source_subtree(
+                            &mut expanded,
+                            &candidate,
+                            reuse_plan,
+                            cached_subtree,
+                            source_files,
+                            labels,
+                            citations,
+                            dependency_graph,
+                            cached_source_subtrees,
+                        );
+                        // A cached subtree implies the file existed and was successfully expanded in the previous compilation.
+                        expanded.append_with_origin(true_branch, &source_file, source_line);
+                        cursor = command.end;
+                        continue;
+                    }
+
+                    let resolved = resolve_input_path(
+                        base_dir,
+                        workspace_root,
+                        overlay_roots,
+                        &command.value,
+                        service.asset_bundle_loader,
+                        asset_bundle_path,
+                    );
                     if resolved.exists() {
-                        dependency_graph.record_edge(source_path.to_path_buf(), resolved.clone());
+                        dependency_graph.record_edge(source_path_buf.clone(), resolved.clone());
                         let nested = service
                             .load_source_file(
                                 &resolved,
@@ -6041,6 +6127,50 @@ fn merge_loaded_subtree(
     extend_symbol_locations(citations, &nested.citations);
 }
 
+fn reusable_cached_input_subtree<'a>(
+    reuse_plan: Option<&'a SourceTreeReusePlan>,
+    candidate: &Path,
+) -> Option<(&'a SourceTreeReusePlan, &'a CachedSourceSubtree)> {
+    let reuse_plan = reuse_plan?;
+    if reuse_plan.rebuild_paths.contains(candidate)
+        || !reuse_plan
+            .cached_dependency_graph
+            .nodes
+            .contains_key(candidate)
+    {
+        return None;
+    }
+
+    reuse_plan
+        .cached_source_subtrees
+        .get(candidate)
+        .map(|cached| (reuse_plan, cached))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_cached_source_subtree(
+    expanded: &mut ExpandedSourceBuilder,
+    cached_path: &Path,
+    reuse_plan: &SourceTreeReusePlan,
+    cached_subtree: &CachedSourceSubtree,
+    source_files: &mut BTreeSet<PathBuf>,
+    labels: &mut BTreeMap<String, SymbolLocation>,
+    citations: &mut BTreeMap<String, SymbolLocation>,
+    dependency_graph: &mut DependencyGraph,
+    cached_source_subtrees: &mut BTreeMap<PathBuf, CachedSourceSubtree>,
+) {
+    restore_cached_subtree_graph(
+        dependency_graph,
+        &reuse_plan.cached_dependency_graph,
+        cached_subtree,
+    );
+    source_files.extend(cached_subtree.source_files.iter().cloned());
+    extend_symbol_locations(labels, &cached_subtree.labels);
+    extend_symbol_locations(citations, &cached_subtree.citations);
+    expanded.append_str_with_source_lines(&cached_subtree.text, &cached_subtree.source_lines);
+    cached_source_subtrees.insert(cached_path.to_path_buf(), cached_subtree.clone());
+}
+
 fn extend_symbol_locations(
     target: &mut BTreeMap<String, SymbolLocation>,
     additional: &BTreeMap<String, SymbolLocation>,
@@ -6050,6 +6180,7 @@ fn extend_symbol_locations(
     }
 }
 
+/// Restores dependency graph entries for a cached source subtree. Edges are filtered to subtree-internal targets only.
 fn restore_cached_subtree_graph(
     dependency_graph: &mut DependencyGraph,
     cached_dependency_graph: &DependencyGraph,
@@ -7690,7 +7821,7 @@ mod tests {
         StageTiming,
     };
     use crate::compile_cache::{
-        BlockCheckpoint, BlockLayoutState, CachedTypesetFragment, CompileCache,
+        BlockCheckpoint, BlockLayoutState, CachedSourceSubtree, CachedTypesetFragment, CompileCache,
     };
     use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort, ShellCommandOutput};
     use crate::runtime_options::{InteractionMode, RuntimeOptions, ShellEscapeMode};
@@ -7699,6 +7830,7 @@ mod tests {
     use ferritex_core::font::OpenTypeFont;
     use ferritex_core::graphics::api::ImageColorSpace;
     use ferritex_core::graphics::GraphicsScene;
+    use ferritex_core::incremental::DependencyGraph;
     use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
     use ferritex_core::parser::api::{DocumentNode, MinimalLatexParser, Parser};
     use ferritex_core::pdf::PageRenderPayload;
@@ -8252,6 +8384,83 @@ mod tests {
                 text: text.to_string(),
             })
             .collect()
+    }
+
+    fn cached_source_subtree_for(
+        path: &Path,
+        source_name: &str,
+        text: &str,
+    ) -> CachedSourceSubtree {
+        CachedSourceSubtree {
+            text: text.to_string(),
+            source_lines: source_lines_for(source_name, text),
+            source_files: vec![path.to_path_buf()],
+            labels: BTreeMap::new(),
+            citations: BTreeMap::new(),
+        }
+    }
+
+    fn reuse_plan_with_cached_subtree(
+        path: &Path,
+        cached_subtree: CachedSourceSubtree,
+    ) -> super::SourceTreeReusePlan {
+        let mut cached_dependency_graph = DependencyGraph::default();
+        cached_dependency_graph.record_node(path.to_path_buf(), 1);
+        let mut cached_source_subtrees = BTreeMap::new();
+        cached_source_subtrees.insert(path.to_path_buf(), cached_subtree);
+        super::SourceTreeReusePlan {
+            rebuild_paths: BTreeSet::new(),
+            cached_dependency_graph,
+            cached_source_subtrees,
+        }
+    }
+
+    fn expand_inputs_for_test(
+        source: &str,
+        source_path: &Path,
+        reuse_plan: Option<&super::SourceTreeReusePlan>,
+    ) -> Result<
+        (
+            super::ExpandedSource,
+            BTreeSet<PathBuf>,
+            DependencyGraph,
+            BTreeMap<PathBuf, CachedSourceSubtree>,
+        ),
+        ferritex_core::diagnostics::Diagnostic,
+    > {
+        let loader = MockAssetBundleLoader::valid();
+        let compile_service = service(&FsTestFileAccessGate, &loader);
+        let base_dir = source_path.parent().expect("source path parent");
+        let mut visited = BTreeSet::new();
+        let mut include_guard = BTreeSet::new();
+        let mut source_files = BTreeSet::from([source_path.to_path_buf()]);
+        let mut labels = BTreeMap::new();
+        let mut citations = BTreeMap::new();
+        let mut dependency_graph = DependencyGraph::default();
+        let mut cached_source_subtrees = BTreeMap::new();
+        let expanded = super::expand_inputs(
+            &compile_service,
+            source,
+            source_path,
+            base_dir,
+            base_dir,
+            &[],
+            None,
+            &mut visited,
+            &mut include_guard,
+            reuse_plan,
+            &mut source_files,
+            &mut labels,
+            &mut citations,
+            &mut dependency_graph,
+            &mut cached_source_subtrees,
+        )?;
+        Ok((
+            expanded,
+            source_files,
+            dependency_graph,
+            cached_source_subtrees,
+        ))
     }
 
     fn parse_article_document(source: &str) -> ferritex_core::parser::ParsedDocument {
@@ -10364,8 +10573,8 @@ mod tests {
             .map(|entry| entry.expect("cache entry").path())
             .next()
             .expect("cache record dir");
-        let cache_file = cache_record_dir.join("index.json");
-        fs::write(&cache_file, b"{not json").expect("corrupt cache metadata");
+        let cache_file = cache_record_dir.join("index.bin");
+        fs::write(&cache_file, b"not-valid-bincode").expect("corrupt cache metadata");
 
         std::thread::sleep(Duration::from_millis(1100));
 
@@ -12261,6 +12470,148 @@ mod tests {
             1,
             "unchanged sibling subtree should only be touched during hash detection",
         );
+    }
+
+    #[test]
+    fn append_str_with_source_lines_preserves_open_line_origin() {
+        let mut builder = super::ExpandedSourceBuilder::default();
+        builder.append_with_origin("ROOT ", "main.tex", 3);
+        builder.append_str_with_source_lines(
+            "cached line\nnext cached",
+            &[
+                SourceLineTrace {
+                    file: "child.tex".to_string(),
+                    line: 7,
+                    text: "cached line".to_string(),
+                },
+                SourceLineTrace {
+                    file: "child.tex".to_string(),
+                    line: 8,
+                    text: "next cached".to_string(),
+                },
+            ],
+        );
+
+        let expanded = builder.finish();
+
+        assert_eq!(
+            expanded.source_lines,
+            vec![
+                SourceLineTrace {
+                    file: "main.tex".to_string(),
+                    line: 3,
+                    text: "ROOT cached line".to_string(),
+                },
+                SourceLineTrace {
+                    file: "child.tex".to_string(),
+                    line: 8,
+                    text: "next cached".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_inputs_reuses_cached_subtree_for_input() {
+        let dir = tempdir().expect("create tempdir");
+        let source_path = dir.path().join("main.tex");
+        let candidate = super::tex_path_candidate(dir.path(), "child");
+        let cached_subtree =
+            cached_source_subtree_for(&candidate, "child.tex", "CACHED INPUT CONTENT");
+        let reuse_plan = reuse_plan_with_cached_subtree(&candidate, cached_subtree);
+
+        let (expanded, source_files, dependency_graph, cached_source_subtrees) =
+            expand_inputs_for_test("\\input{child}\n", &source_path, Some(&reuse_plan))
+                .expect("reuse cached subtree");
+
+        assert!(expanded.text.contains("CACHED INPUT CONTENT"));
+        assert!(source_files.contains(&candidate));
+        assert!(dependency_graph
+            .edges
+            .get(&source_path)
+            .is_some_and(|edges| edges.contains(&candidate)));
+        assert_eq!(
+            cached_source_subtrees
+                .get(&candidate)
+                .map(|entry| entry.text.as_str()),
+            Some("CACHED INPUT CONTENT")
+        );
+    }
+
+    #[test]
+    fn expand_inputs_reuses_cached_subtree_for_include_with_guard() {
+        let dir = tempdir().expect("create tempdir");
+        let source_path = dir.path().join("main.tex");
+        let candidate = super::tex_path_candidate(dir.path(), "child");
+        let cached_subtree =
+            cached_source_subtree_for(&candidate, "child.tex", "CACHED INCLUDE CONTENT");
+        let reuse_plan = reuse_plan_with_cached_subtree(&candidate, cached_subtree);
+
+        let (expanded, _, _, _) = expand_inputs_for_test(
+            "\\include{child}\\include{child}\n",
+            &source_path,
+            Some(&reuse_plan),
+        )
+        .expect("reuse cached include");
+
+        assert_eq!(expanded.text.matches("CACHED INCLUDE CONTENT").count(), 1);
+    }
+
+    #[test]
+    fn expand_inputs_reuses_cached_subtree_for_input_if_file_exists() {
+        let dir = tempdir().expect("create tempdir");
+        let source_path = dir.path().join("main.tex");
+        let candidate = super::tex_path_candidate(dir.path(), "child");
+        let cached_subtree =
+            cached_source_subtree_for(&candidate, "child.tex", "CACHED CONDITIONAL");
+        let reuse_plan = reuse_plan_with_cached_subtree(&candidate, cached_subtree);
+
+        let (expanded, _, _, _) = expand_inputs_for_test(
+            "\\InputIfFileExists{child}{TRUE BRANCH}{FALSE BRANCH}\n",
+            &source_path,
+            Some(&reuse_plan),
+        )
+        .expect("reuse cached conditional input");
+
+        assert!(expanded.text.contains("CACHED CONDITIONAL"));
+        assert!(expanded.text.contains("TRUE BRANCH"));
+        assert!(!expanded.text.contains("FALSE BRANCH"));
+    }
+
+    #[test]
+    fn expand_inputs_falls_back_to_disk_when_path_rebuild_is_required() {
+        let dir = tempdir().expect("create tempdir");
+        let source_path = dir.path().join("main.tex");
+        let candidate = super::tex_path_candidate(dir.path(), "child");
+        fs::write(&candidate, "DISK CONTENT").expect("write child");
+        let cached_subtree = cached_source_subtree_for(&candidate, "child.tex", "CACHED CONTENT");
+        let mut reuse_plan = reuse_plan_with_cached_subtree(&candidate, cached_subtree);
+        reuse_plan.rebuild_paths.insert(candidate.clone());
+
+        let (expanded, _, _, _) =
+            expand_inputs_for_test("\\input{child}\n", &source_path, Some(&reuse_plan))
+                .expect("fallback to disk");
+
+        assert!(expanded.text.contains("DISK CONTENT"));
+        assert!(!expanded.text.contains("CACHED CONTENT"));
+    }
+
+    #[test]
+    fn expand_inputs_falls_back_to_disk_when_cached_node_is_missing_from_graph() {
+        let dir = tempdir().expect("create tempdir");
+        let source_path = dir.path().join("main.tex");
+        let candidate = super::tex_path_candidate(dir.path(), "child");
+        fs::write(&candidate, "DISK ONLY CONTENT").expect("write child");
+        let cached_subtree = cached_source_subtree_for(&candidate, "child.tex", "CACHED CONTENT");
+        let mut reuse_plan = reuse_plan_with_cached_subtree(&candidate, cached_subtree);
+        reuse_plan.cached_dependency_graph.nodes.clear();
+
+        let (expanded, _, _, _) =
+            expand_inputs_for_test("\\input{child}\n", &source_path, Some(&reuse_plan))
+                .expect("fallback when cached node missing");
+
+        assert!(expanded.text.contains("DISK ONLY CONTENT"));
+        assert!(!expanded.text.contains("CACHED CONTENT"));
     }
 
     #[test]
