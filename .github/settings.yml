@@ -1,0 +1,61 @@
+# Managed by the Probot Settings App (https://github.com/apps/settings).
+# Install the App once on this repository, and every push to the default
+# branch will sync the settings declared here. Fields omitted from this file
+# are left unchanged, so existing values (description, topics, has_wiki, ...)
+# are preserved.
+
+repository:
+  allow_squash_merge: true
+  allow_merge_commit: false
+  allow_rebase_merge: true
+  delete_branch_on_merge: true
+  allow_update_branch: true
+
+labels:
+  - name: bug
+    color: d73a4a
+    description: Something isn't working
+  - name: enhancement
+    color: a2eeef
+    description: New feature or request
+  - name: documentation
+    color: 0075ca
+    description: Improvements or additions to documentation
+  - name: question
+    color: d876e3
+    description: Further information is requested
+  - name: help wanted
+    color: 008672
+    description: Extra attention is needed
+  - name: good first issue
+    color: 7057ff
+    description: Good for newcomers
+  - name: dependencies
+    color: 0366d6
+    description: Pull requests that update a dependency file
+  - name: duplicate
+    color: cfd3d7
+    description: This issue or pull request already exists
+  - name: invalid
+    color: e4e669
+    description: This doesn't seem right
+  - name: wontfix
+    color: ffffff
+    description: This will not be worked on
+
+branches:
+  - name: main
+    protection:
+      # Solo maintainer repo — keep review enforcement off so the owner can
+      # still merge without requiring another reviewer. Switch to a non-null
+      # value once a second collaborator joins.
+      required_pull_request_reviews: null
+      required_status_checks:
+        strict: true
+        # Populate with exact workflow job names once CI job contexts are
+        # stable. Leave empty for now so the rule does not block merges
+        # before Probot first applies it.
+        contexts: []
+      enforce_admins: false
+      required_linear_history: true
+      restrictions: null
