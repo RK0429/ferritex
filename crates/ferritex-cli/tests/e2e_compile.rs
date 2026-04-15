@@ -1983,6 +1983,51 @@ fn compile_rejects_commented_out_documentclass() {
 }
 
 #[test]
+fn compile_unsupported_document_class_reports_supported_set() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("revtex.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{revtex4-1}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unsupported document class"));
+    assert!(stderr.contains("revtex4-1"));
+    assert!(stderr.contains("article"));
+    assert!(stderr.contains("report"));
+    assert!(stderr.contains("book"));
+    assert!(stderr.contains("letter"));
+}
+
+#[test]
+fn compile_malformed_documentclass_reports_invalid_declaration() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("malformed.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{\n}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid \\documentclass declaration"));
+}
+
+#[test]
 fn compile_rejects_trailing_content_after_end_document() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("trailing.tex");

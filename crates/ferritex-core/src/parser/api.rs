@@ -539,6 +539,8 @@ pub enum ParseError {
     MissingDocumentClass,
     #[error("invalid \\documentclass declaration")]
     InvalidDocumentClass { line: u32 },
+    #[error("unsupported document class `{class_name}`")]
+    UnsupportedDocumentClass { line: u32, class_name: String },
     #[error("missing \\begin{{document}}")]
     MissingBeginDocument { line: u32 },
     #[error("missing \\end{{document}}")]
@@ -612,6 +614,7 @@ impl ParseError {
         match self {
             Self::EmptyInput | Self::MissingDocumentClass => None,
             Self::InvalidDocumentClass { line }
+            | Self::UnsupportedDocumentClass { line, .. }
             | Self::MissingBeginDocument { line }
             | Self::MissingEndDocument { line }
             | Self::UnexpectedEndDocument { line }
@@ -1674,6 +1677,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             error,
             ParseError::UnexpectedClosingBrace { .. }
                 | ParseError::InvalidDocumentClass { .. }
+                | ParseError::UnsupportedDocumentClass { .. }
                 | ParseError::UnclosedEnvironment { .. }
                 | ParseError::UnexpectedElse { .. }
                 | ParseError::UnexpectedFi { .. }
@@ -1754,7 +1758,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                             .is_err()
                             {
                                 self.document_class_error =
-                                    Some(ParseError::InvalidDocumentClass { line: token.line });
+                                    Some(ParseError::UnsupportedDocumentClass {
+                                        line: token.line,
+                                        class_name: class_name.clone(),
+                                    });
                             }
                         }
                         Ok(None) => {
@@ -10829,6 +10836,45 @@ mod tests {
     fn rejects_document_class_with_control_characters() {
         let error = MinimalLatexParser
             .parse("\\documentclass{arti\ncle}\n\\begin{document}\nHello\n\\end{document}\n")
+            .expect_err("parse should fail");
+
+        assert_eq!(error, ParseError::InvalidDocumentClass { line: 1 });
+    }
+
+    #[test]
+    fn unsupported_document_class_emits_unsupported_error() {
+        let error = MinimalLatexParser
+            .parse("\\documentclass{revtex4-1}\n\\begin{document}\nHello\n\\end{document}\n")
+            .expect_err("parse should fail");
+
+        assert_eq!(
+            error,
+            ParseError::UnsupportedDocumentClass {
+                line: 1,
+                class_name: "revtex4-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_document_class_with_options() {
+        let error = MinimalLatexParser
+            .parse("\\documentclass[11pt]{memoir}\n\\begin{document}\nHello\n\\end{document}\n")
+            .expect_err("parse should fail");
+
+        assert_eq!(
+            error,
+            ParseError::UnsupportedDocumentClass {
+                line: 1,
+                class_name: "memoir".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_documentclass_still_gives_invalid_error() {
+        let error = MinimalLatexParser
+            .parse("\\documentclass{}\n\\begin{document}\nHello\n\\end{document}\n")
             .expect_err("parse should fail");
 
         assert_eq!(error, ParseError::InvalidDocumentClass { line: 1 });

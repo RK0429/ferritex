@@ -134,6 +134,8 @@ pub trait PackageExtension {
 
 pub type StyPackageResolver<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
+pub const SUPPORTED_CLASSES: &[&str] = &["article", "report", "book", "letter"];
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AmsmathExtension;
 

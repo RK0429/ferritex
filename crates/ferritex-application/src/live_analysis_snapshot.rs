@@ -326,6 +326,10 @@ fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnosti
             ParseError::InvalidRegisterIndex { .. } => {
                 Some("use a count or dimen register between 0 and 32767".to_string())
             }
+            ParseError::UnsupportedDocumentClass { .. } => Some(format!(
+                "change \\documentclass to one of: {}",
+                ferritex_core::parser::package_loading::SUPPORTED_CLASSES.join(", ")
+            )),
             ParseError::UnclosedConditional { .. } => {
                 Some("add the missing \\fi for the open conditional".to_string())
             }

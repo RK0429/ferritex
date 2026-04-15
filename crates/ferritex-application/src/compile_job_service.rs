@@ -5857,6 +5857,14 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         ParseError::InvalidDocumentClass { .. } => diagnostic
             .with_context("could not extract a class name from \\documentclass")
             .with_suggestion("use a form like \\documentclass{article}"),
+        ParseError::UnsupportedDocumentClass { .. } => diagnostic
+            .with_context(format!(
+                "ferritex currently supports: {}",
+                ferritex_core::parser::package_loading::SUPPORTED_CLASSES.join(", ")
+            ))
+            .with_suggestion(
+                "change \\documentclass to one of the supported classes, or track kernel compatibility in ROADMAP.md",
+            ),
         ParseError::MissingBeginDocument { .. } => diagnostic
             .with_context("the parser could not find the document body start")
             .with_suggestion("add \\begin{document} before the document body"),
