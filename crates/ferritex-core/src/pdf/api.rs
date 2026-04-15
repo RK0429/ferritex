@@ -32,6 +32,7 @@ pub struct PdfDocument {
     pub bytes: Vec<u8>,
     pub page_count: usize,
     pub total_lines: usize,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,7 +267,10 @@ impl PdfRenderer {
         let mut image_objects = self.images.clone();
         let mut form_xobjects = self.form_xobjects.clone();
         let page_partition_ids = page_partition_ids_for_plan(document, partition_plan);
-        let page_payloads = render_page_payloads(
+        let RenderedPagePayloads {
+            page_payloads,
+            warnings,
+        } = render_page_payloads(
             &document.pages,
             &self.page_images,
             &image_objects,
@@ -409,11 +413,11 @@ impl PdfRenderer {
                 let action = match &annotation.target {
                     PdfLinkTarget::Uri(url) => format!(
                         "/A << /Type /Action /S /URI /URI ({}) >>",
-                        escape_pdf_text(url)
+                        encode_pdf_text(url).encoded
                     ),
                     PdfLinkTarget::InternalDestination(name) => format!(
                         "/A << /Type /Action /S /GoTo /D ({}) >>",
-                        escape_pdf_text(name)
+                        encode_pdf_text(name).encoded
                     ),
                 };
                 append_object(
@@ -524,6 +528,7 @@ impl PdfRenderer {
                 bytes: pdf,
                 page_count,
                 total_lines,
+                warnings,
             },
             page_payloads,
         }
@@ -554,13 +559,37 @@ pub struct PageRenderPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PartitionRenderPayload {
     partition_id: String,
-    page_payloads: Vec<PageRenderPayload>,
+    page_payloads: Vec<RenderedPagePayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PageRenderWorkload {
     partition_id: String,
     page_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedPagePayload {
+    page_payload: PageRenderPayload,
+    unencodable_chars: Vec<char>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RenderedPagePayloads {
+    page_payloads: Vec<PageRenderPayload>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfRenderStringResult {
+    rendered: String,
+    unencodable_chars: Vec<char>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfTextEncodeResult {
+    encoded: String,
+    unencodable_chars: Vec<char>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -678,7 +707,7 @@ fn build_font_objects(fonts: &[FontResource], start_object_id: usize) -> Vec<Fon
                     dictionary_object_id,
                     objects: vec![
                         format!(
-                            "{dictionary_object_id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{} >>\nendobj\n",
+                            "{dictionary_object_id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /{} /Encoding /WinAnsiEncoding >>\nendobj\n",
                             base_font
                         )
                         .into_bytes(),
@@ -904,10 +933,10 @@ fn render_page_payloads(
     parallelism: usize,
     _pass_number: u32,
     pre_rendered_page_payloads: Option<&BTreeMap<usize, PageRenderPayload>>,
-) -> Vec<PageRenderPayload> {
+) -> RenderedPagePayloads {
     let workloads = page_render_workloads(page_partition_ids, pages.len(), parallelism);
-    if workloads.len() <= 1 {
-        return workloads
+    let rendered_payloads = if workloads.len() <= 1 {
+        workloads
             .into_iter()
             .flat_map(|workload| {
                 workload
@@ -927,50 +956,67 @@ fn render_page_payloads(
                     })
                     .collect::<Vec<_>>()
             })
-            .collect();
-    }
-
-    let payloads = thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for workload in workloads {
-            handles.push(scope.spawn(move || {
-                let mut page_payloads = workload
-                    .page_indices
-                    .iter()
-                    .copied()
-                    .map(|page_index| {
-                        render_page_payload_for_index(
-                            pages,
-                            page_images,
-                            image_objects,
-                            page_form_xobjects,
-                            form_xobjects,
-                            link_style,
-                            pre_rendered_page_payloads,
-                            page_index,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                page_payloads.sort_by_key(|payload| payload.page_index);
-                PartitionRenderPayload {
-                    partition_id: workload.partition_id,
-                    page_payloads,
-                }
-            }));
-        }
-
-        handles
-            .into_iter()
-            .rev()
-            .map(|handle| handle.join().expect("page render worker should not panic"))
             .collect::<Vec<_>>()
-    });
-    let mut ordered_payloads = payloads;
-    ordered_payloads.sort_by(|left, right| left.partition_id.cmp(&right.partition_id));
-    ordered_payloads
+    } else {
+        let payloads = thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for workload in workloads {
+                handles.push(scope.spawn(move || {
+                    let mut page_payloads = workload
+                        .page_indices
+                        .iter()
+                        .copied()
+                        .map(|page_index| {
+                            render_page_payload_for_index(
+                                pages,
+                                page_images,
+                                image_objects,
+                                page_form_xobjects,
+                                form_xobjects,
+                                link_style,
+                                pre_rendered_page_payloads,
+                                page_index,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    page_payloads.sort_by_key(|payload| payload.page_payload.page_index);
+                    PartitionRenderPayload {
+                        partition_id: workload.partition_id,
+                        page_payloads,
+                    }
+                }));
+            }
+
+            handles
+                .into_iter()
+                .rev()
+                .map(|handle| handle.join().expect("page render worker should not panic"))
+                .collect::<Vec<_>>()
+        });
+        let mut ordered_payloads = payloads;
+        ordered_payloads.sort_by(|left, right| left.partition_id.cmp(&right.partition_id));
+        ordered_payloads
+            .into_iter()
+            .flat_map(|payload| payload.page_payloads)
+            .collect::<Vec<_>>()
+    };
+
+    let mut warning_chars = BTreeSet::new();
+    let page_payloads = rendered_payloads
         .into_iter()
-        .flat_map(|payload| payload.page_payloads)
-        .collect()
+        .map(|payload| {
+            warning_chars.extend(payload.unencodable_chars);
+            payload.page_payload
+        })
+        .collect();
+
+    RenderedPagePayloads {
+        page_payloads,
+        warnings: warning_chars
+            .into_iter()
+            .map(pdf_encoding_warning)
+            .collect(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -983,7 +1029,9 @@ fn render_page_payload_for_index(
     link_style: &LinkStyle,
     pre_rendered_page_payloads: Option<&BTreeMap<usize, PageRenderPayload>>,
     page_index: usize,
-) -> PageRenderPayload {
+) -> RenderedPagePayload {
+    let warning_chars = collect_page_warning_chars(&pages[page_index]);
+
     if !page_has_xobject_resources(page_images, page_form_xobjects, page_index) {
         if let Some(payload) = pre_rendered_page_payloads
             .and_then(|payloads| payloads.get(&page_index))
@@ -991,30 +1039,37 @@ fn render_page_payload_for_index(
         {
             let mut cached_payload = payload.clone();
             cached_payload.page_index = page_index;
-            return cached_payload;
+            return RenderedPagePayload {
+                page_payload: cached_payload,
+                unencodable_chars: warning_chars,
+            };
         }
     }
 
+    let render_result = render_page_stream(
+        &pages[page_index],
+        page_images
+            .get(page_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        image_objects,
+        page_form_xobjects
+            .get(page_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        form_xobjects,
+        link_style,
+    );
     let page = &pages[page_index];
-    PageRenderPayload::new(
-        page_index,
-        page_link_annotations(page),
-        collect_page_opacity_graphics_states(page),
-        render_page_stream(
-            page,
-            page_images
-                .get(page_index)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            image_objects,
-            page_form_xobjects
-                .get(page_index)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            form_xobjects,
-            link_style,
+    RenderedPagePayload {
+        page_payload: PageRenderPayload::new(
+            page_index,
+            page_link_annotations(page),
+            collect_page_opacity_graphics_states(page),
+            render_result.rendered,
         ),
-    )
+        unencodable_chars: warning_chars,
+    }
 }
 
 fn page_has_xobject_resources(
@@ -1132,18 +1187,24 @@ fn render_page_stream(
     placed_form_xobjects: &[PlacedFormXObject],
     form_xobjects: &[PdfFormXObject],
     link_style: &LinkStyle,
-) -> String {
+) -> PdfRenderStringResult {
     let mut stream = String::new();
+    let mut warning_chars = BTreeSet::new();
 
-    stream.push_str(&render_text_lines(&page.lines, link_style));
+    let rendered_lines = render_text_lines(&page.lines, link_style);
+    warning_chars.extend(rendered_lines.unencodable_chars);
+    stream.push_str(&rendered_lines.rendered);
     for placement in &page.float_placements {
         let lines = resolve_float_lines(placement);
-        stream.push_str(&render_text_lines(&lines, link_style));
+        let rendered_lines = render_text_lines(&lines, link_style);
+        warning_chars.extend(rendered_lines.unencodable_chars);
+        stream.push_str(&rendered_lines.rendered);
     }
 
     let mut image_index = 0usize;
     let mut form_index = 0usize;
     for image in &page.images {
+        collect_scene_warning_chars(&image.scene, &mut warning_chars);
         match single_scene_node(&image.scene) {
             Some(GraphicNode::External(_)) => {
                 if let Some(placement) = placed_images.get(image_index) {
@@ -1169,7 +1230,10 @@ fn render_page_stream(
         }
     }
 
-    stream
+    PdfRenderStringResult {
+        rendered: stream,
+        unencodable_chars: warning_chars.into_iter().collect(),
+    }
 }
 
 fn collect_page_opacity_graphics_states(page: &TypesetPage) -> BTreeSet<OpacityGraphicsStateKey> {
@@ -1180,12 +1244,30 @@ fn collect_page_opacity_graphics_states(page: &TypesetPage) -> BTreeSet<OpacityG
     opacity_graphics_states
 }
 
+fn collect_page_warning_chars(page: &TypesetPage) -> Vec<char> {
+    let mut warning_chars = BTreeSet::new();
+    collect_text_line_warning_chars(&page.lines, &mut warning_chars);
+    for placement in &page.float_placements {
+        collect_text_line_warning_chars(&resolve_float_lines(placement), &mut warning_chars);
+    }
+    for image in &page.images {
+        collect_scene_warning_chars(&image.scene, &mut warning_chars);
+    }
+    warning_chars.into_iter().collect()
+}
+
 fn collect_scene_opacity_graphics_states(
     scene: &GraphicsScene,
     opacity_graphics_states: &mut BTreeSet<OpacityGraphicsStateKey>,
 ) {
     for node in &scene.nodes {
         collect_graphic_node_opacity_graphics_states(node, opacity_graphics_states);
+    }
+}
+
+fn collect_scene_warning_chars(scene: &GraphicsScene, warning_chars: &mut BTreeSet<char>) {
+    for node in &scene.nodes {
+        collect_graphic_node_warning_chars(node, warning_chars);
     }
 }
 
@@ -1210,9 +1292,33 @@ fn collect_graphic_node_opacity_graphics_states(
     }
 }
 
-fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
+fn collect_graphic_node_warning_chars(node: &GraphicNode, warning_chars: &mut BTreeSet<char>) {
+    match node {
+        GraphicNode::External(_) | GraphicNode::Pdf(_) | GraphicNode::Vector(_) => {}
+        GraphicNode::Group(group) => {
+            for child in &group.children {
+                collect_graphic_node_warning_chars(child, warning_chars);
+            }
+        }
+        GraphicNode::Text(text) => {
+            warning_chars.extend(encode_pdf_text(&text.content).unencodable_chars);
+        }
+    }
+}
+
+fn collect_text_line_warning_chars(lines: &[TextLine], warning_chars: &mut BTreeSet<char>) {
+    for line in lines {
+        warning_chars
+            .extend(encode_pdf_text(&strip_math_script_markers(&line.text)).unencodable_chars);
+    }
+}
+
+fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> PdfRenderStringResult {
     let Some(first_line) = lines.first() else {
-        return String::new();
+        return PdfRenderStringResult {
+            rendered: String::new(),
+            unencodable_chars: Vec::new(),
+        };
     };
 
     let mut stream = format!(
@@ -1220,6 +1326,7 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
         first_line.font_index + 1,
         points_to_pdf_number(first_line.font_size)
     );
+    let mut warning_chars = BTreeSet::new();
     let mut current_font = first_line.font_index;
     let mut current_font_size = first_line.font_size;
     let first_x = LEFT_MARGIN_PT as i64 * SCALED_POINTS_PER_POINT + first_line.x.0;
@@ -1228,7 +1335,7 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
         points_to_pdf_number(DimensionValue(first_x)),
         points_to_pdf_number(first_line.y)
     ));
-    render_text_line(&mut stream, first_line, link_style);
+    render_text_line(&mut stream, first_line, link_style, &mut warning_chars);
 
     let mut previous_x = first_line.x;
     let mut previous_y = first_line.y;
@@ -1248,24 +1355,32 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> String {
             current_font = line.font_index;
             current_font_size = line.font_size;
         }
-        render_text_line(&mut stream, line, link_style);
+        render_text_line(&mut stream, line, link_style, &mut warning_chars);
         previous_x = line.x;
         previous_y = line.y;
     }
     stream.push_str("ET\n");
-    stream
+    PdfRenderStringResult {
+        rendered: stream,
+        unencodable_chars: warning_chars.into_iter().collect(),
+    }
 }
 
-fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle) {
+fn render_text_line(
+    stream: &mut String,
+    line: &TextLine,
+    link_style: &LinkStyle,
+    warning_chars: &mut BTreeSet<char>,
+) {
     if contains_script_markers(&line.text) && line.links.is_empty() {
-        render_text_line_with_scripts(stream, line);
+        render_text_line_with_scripts(stream, line, warning_chars);
         return;
     }
 
     let Some(link_color) = active_link_color(link_style) else {
         stream.push_str(&format!(
             "({}) Tj\n",
-            escape_pdf_text(&strip_math_script_markers(&line.text))
+            encode_pdf_text_collecting(&strip_math_script_markers(&line.text), warning_chars)
         ));
         return;
     };
@@ -1278,7 +1393,7 @@ fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle
     if links.is_empty() {
         stream.push_str(&format!(
             "({}) Tj\n",
-            escape_pdf_text(&strip_math_script_markers(&line.text))
+            encode_pdf_text_collecting(&strip_math_script_markers(&line.text), warning_chars)
         ));
         return;
     }
@@ -1297,13 +1412,19 @@ fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle
         if cursor < start {
             stream.push_str(&format!(
                 "({}) Tj\n",
-                escape_pdf_text(char_slice(&rendered_text, &boundaries, cursor, start))
+                encode_pdf_text_collecting(
+                    char_slice(&rendered_text, &boundaries, cursor, start),
+                    warning_chars,
+                )
             ));
         }
         stream.push_str(&pdf_rgb_operator(link_color));
         stream.push_str(&format!(
             "({}) Tj\n",
-            escape_pdf_text(char_slice(&rendered_text, &boundaries, start, end))
+            encode_pdf_text_collecting(
+                char_slice(&rendered_text, &boundaries, start, end),
+                warning_chars,
+            )
         ));
         stream.push_str("0 0 0 rg\n");
         cursor = end;
@@ -1312,12 +1433,19 @@ fn render_text_line(stream: &mut String, line: &TextLine, link_style: &LinkStyle
     if cursor < char_count {
         stream.push_str(&format!(
             "({}) Tj\n",
-            escape_pdf_text(char_slice(&rendered_text, &boundaries, cursor, char_count))
+            encode_pdf_text_collecting(
+                char_slice(&rendered_text, &boundaries, cursor, char_count),
+                warning_chars,
+            )
         ));
     }
 }
 
-fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
+fn render_text_line_with_scripts(
+    stream: &mut String,
+    line: &TextLine,
+    warning_chars: &mut BTreeSet<char>,
+) {
     let base_font = line.font_index + 1;
     let base_font_size = line.font_size;
     let script_font_size = scaled_font_size(base_font_size, 7, 10);
@@ -1325,7 +1453,7 @@ fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
 
     stream.push_str(&format!(
         "/Span <</ActualText ({})>> BDC\n",
-        escape_pdf_text(&rendered_text)
+        encode_pdf_text_collecting(&rendered_text, warning_chars)
     ));
 
     for segment in parse_math_script_segments(&line.text) {
@@ -1335,7 +1463,10 @@ fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
 
         match segment.kind {
             ScriptSegmentKind::Base => {
-                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+                stream.push_str(&format!(
+                    "({}) Tj\n",
+                    encode_pdf_text_collecting(&segment.text, warning_chars)
+                ));
             }
             ScriptSegmentKind::Superscript => {
                 stream.push_str(&format!("0 {SUPERSCRIPT_RISE_PT} Td\n"));
@@ -1343,7 +1474,10 @@ fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
                 ));
-                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+                stream.push_str(&format!(
+                    "({}) Tj\n",
+                    encode_pdf_text_collecting(&segment.text, warning_chars)
+                ));
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
@@ -1356,7 +1490,10 @@ fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
                 ));
-                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+                stream.push_str(&format!(
+                    "({}) Tj\n",
+                    encode_pdf_text_collecting(&segment.text, warning_chars)
+                ));
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
@@ -1369,7 +1506,10 @@ fn render_text_line_with_scripts(stream: &mut String, line: &TextLine) {
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
                 ));
-                stream.push_str(&format!("({}) Tj\n", escape_pdf_text(&segment.text)));
+                stream.push_str(&format!(
+                    "({}) Tj\n",
+                    encode_pdf_text_collecting(&segment.text, warning_chars)
+                ));
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
@@ -1815,7 +1955,7 @@ fn render_graphic_text(text: &crate::graphics::api::GraphicText) -> String {
         "BT\n/F1 12 Tf\n0 0 0 rg\n{} {} Td\n({}) Tj\nET\n",
         pdf_real(text.position.x),
         pdf_real(text.position.y),
-        escape_pdf_text(&text.content)
+        encode_pdf_text(&text.content).encoded
     )
 }
 
@@ -2145,7 +2285,7 @@ fn build_outline_objects(
 
             let mut body = format!(
                 "<< /Title ({}) /Parent {} 0 R",
-                escape_pdf_text(&outline.title),
+                encode_pdf_text(&outline.title).encoded,
                 parent_object_id,
             );
             if let Some(prev_id) = prev {
@@ -2194,7 +2334,7 @@ fn build_named_destination_object(
         .map(|destination| {
             format!(
                 "({}) [{} 0 R /XYZ {} {} 0]",
-                escape_pdf_text(&destination.name),
+                encode_pdf_text(&destination.name).encoded,
                 page_object_start + destination.page_index,
                 LEFT_MARGIN_PT,
                 points_to_pdf_number(destination.y),
@@ -2216,7 +2356,7 @@ fn build_info_dictionary(document: &TypesetDocument) -> Option<String> {
         .as_deref()
         .filter(|title| !title.is_empty())
     {
-        fields.push(format!("/Title ({})", escape_pdf_text(title)));
+        fields.push(format!("/Title ({})", encode_pdf_text(title).encoded));
     }
     if let Some(author) = document
         .navigation
@@ -2225,7 +2365,7 @@ fn build_info_dictionary(document: &TypesetDocument) -> Option<String> {
         .as_deref()
         .filter(|author| !author.is_empty())
     {
-        fields.push(format!("/Author ({})", escape_pdf_text(author)));
+        fields.push(format!("/Author ({})", encode_pdf_text(author).encoded));
     }
 
     (!fields.is_empty()).then(|| format!("<< {} >>", fields.join(" ")))
@@ -2260,18 +2400,83 @@ fn append_object_bytes(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, object: &
     buffer.extend_from_slice(object);
 }
 
-fn escape_pdf_text(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => result.push_str("\\\\"),
-            '(' => result.push_str("\\("),
-            ')' => result.push_str("\\)"),
-            '\r' | '\n' | '\t' => result.push(' '),
-            _ => result.push(ch),
+fn unicode_to_winansi(ch: char) -> Option<u8> {
+    match ch {
+        '\u{20AC}' => Some(0x80),
+        '\u{201A}' => Some(0x82),
+        '\u{0192}' => Some(0x83),
+        '\u{201E}' => Some(0x84),
+        '\u{2026}' => Some(0x85),
+        '\u{2020}' => Some(0x86),
+        '\u{2021}' => Some(0x87),
+        '\u{02C6}' => Some(0x88),
+        '\u{2030}' => Some(0x89),
+        '\u{0160}' => Some(0x8A),
+        '\u{2039}' => Some(0x8B),
+        '\u{0152}' => Some(0x8C),
+        '\u{017D}' => Some(0x8E),
+        '\u{2018}' => Some(0x91),
+        '\u{2019}' => Some(0x92),
+        '\u{201C}' => Some(0x93),
+        '\u{201D}' => Some(0x94),
+        '\u{2022}' => Some(0x95),
+        '\u{2013}' => Some(0x96),
+        '\u{2014}' => Some(0x97),
+        '\u{02DC}' => Some(0x98),
+        '\u{2122}' => Some(0x99),
+        '\u{0161}' => Some(0x9A),
+        '\u{203A}' => Some(0x9B),
+        '\u{0153}' => Some(0x9C),
+        '\u{017E}' => Some(0x9E),
+        '\u{0178}' => Some(0x9F),
+        _ => {
+            let code_point = u32::from(ch);
+            ((0x20..=0x7E).contains(&code_point) || (0xA0..=0xFF).contains(&code_point))
+                .then_some(code_point as u8)
         }
     }
-    result
+}
+
+fn encode_pdf_text(value: &str) -> PdfTextEncodeResult {
+    let mut result = String::with_capacity(value.len());
+    let mut unencodable_chars = Vec::new();
+    for ch in value.chars() {
+        if matches!(ch, '\r' | '\n' | '\t') {
+            result.push(' ');
+            continue;
+        }
+
+        match unicode_to_winansi(ch) {
+            Some(b'\\') => result.push_str("\\\\"),
+            Some(b'(') => result.push_str("\\("),
+            Some(b')') => result.push_str("\\)"),
+            Some(byte @ 0x20..=0x7E) => result.push(byte as char),
+            Some(byte) => result.push_str(&format!("\\{:03o}", byte)),
+            None => {
+                result.push('?');
+                unencodable_chars.push(ch);
+            }
+        }
+    }
+
+    PdfTextEncodeResult {
+        encoded: result,
+        unencodable_chars,
+    }
+}
+
+fn encode_pdf_text_collecting(value: &str, warning_chars: &mut BTreeSet<char>) -> String {
+    let result = encode_pdf_text(value);
+    warning_chars.extend(result.unencodable_chars);
+    result.encoded
+}
+
+fn pdf_encoding_warning(ch: char) -> String {
+    format!(
+        "PDF encoding: character '{}' (U+{:04X}) cannot be represented in WinAnsiEncoding and was replaced with '?'",
+        ch,
+        u32::from(ch)
+    )
 }
 
 #[cfg(test)]
@@ -2279,10 +2484,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        opacity_graphics_state_name, render_vector_primitive, resolve_named_color, FontResource,
-        ImageColorSpace, ImageFilter, OpacityGraphicsStateKey, PageRenderPayload, PdfFormXObject,
-        PdfImageXObject, PdfLinkAnnotation, PdfLinkTarget, PdfRenderer, PlacedFormXObject,
-        PlacedImage,
+        encode_pdf_text, opacity_graphics_state_name, render_vector_primitive, resolve_named_color,
+        unicode_to_winansi, FontResource, ImageColorSpace, ImageFilter, OpacityGraphicsStateKey,
+        PageRenderPayload, PdfFormXObject, PdfImageXObject, PdfLinkAnnotation, PdfLinkTarget,
+        PdfRenderer, PlacedFormXObject, PlacedImage,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::compilation::{
@@ -3293,11 +3498,123 @@ mod tests {
     }
 
     #[test]
+    fn unicode_to_winansi_maps_windows_1252_extras() {
+        let cases = [
+            ('\u{20AC}', 0x80),
+            ('\u{201A}', 0x82),
+            ('\u{0192}', 0x83),
+            ('\u{201E}', 0x84),
+            ('\u{2026}', 0x85),
+            ('\u{2020}', 0x86),
+            ('\u{2021}', 0x87),
+            ('\u{02C6}', 0x88),
+            ('\u{2030}', 0x89),
+            ('\u{0160}', 0x8A),
+            ('\u{2039}', 0x8B),
+            ('\u{0152}', 0x8C),
+            ('\u{017D}', 0x8E),
+            ('\u{2018}', 0x91),
+            ('\u{2019}', 0x92),
+            ('\u{201C}', 0x93),
+            ('\u{201D}', 0x94),
+            ('\u{2022}', 0x95),
+            ('\u{2013}', 0x96),
+            ('\u{2014}', 0x97),
+            ('\u{02DC}', 0x98),
+            ('\u{2122}', 0x99),
+            ('\u{0161}', 0x9A),
+            ('\u{203A}', 0x9B),
+            ('\u{0153}', 0x9C),
+            ('\u{017E}', 0x9E),
+            ('\u{0178}', 0x9F),
+        ];
+
+        for (ch, expected) in cases {
+            assert_eq!(unicode_to_winansi(ch), Some(expected));
+        }
+        assert_eq!(unicode_to_winansi('A'), Some(b'A'));
+        assert_eq!(unicode_to_winansi('\u{00B7}'), Some(0xB7));
+        assert_eq!(unicode_to_winansi('δ'), None);
+    }
+
+    #[test]
+    fn encode_pdf_text_ascii_passthrough() {
+        let result = encode_pdf_text("Hello, Ferritex!");
+
+        assert_eq!(result.encoded, "Hello, Ferritex!");
+        assert!(result.unencodable_chars.is_empty());
+    }
+
+    #[test]
+    fn encode_pdf_text_winansi_mappable() {
+        let result = encode_pdf_text("• · —");
+
+        assert_eq!(result.encoded, r"\225 \267 \227");
+        assert!(result.unencodable_chars.is_empty());
+    }
+
+    #[test]
+    fn encode_pdf_text_replaces_unencodable() {
+        let result = encode_pdf_text("δ∫");
+
+        assert_eq!(result.encoded, "??");
+        assert_eq!(result.unencodable_chars, vec!['δ', '∫']);
+    }
+
+    #[test]
+    fn encode_pdf_text_escapes_special() {
+        let result = encode_pdf_text(r#"A (test) \ sample"#);
+
+        assert_eq!(result.encoded, r#"A \(test\) \\ sample"#);
+        assert!(result.unencodable_chars.is_empty());
+    }
+
+    #[test]
+    fn render_non_ascii_winansi_in_pdf() {
+        let pdf = PdfRenderer::default().render(&single_page(&["• ·"]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains(r"(\225 \267) Tj"));
+        assert!(!pdf
+            .bytes
+            .windows("•".len())
+            .any(|window| window == "•".as_bytes()));
+        assert!(!pdf
+            .bytes
+            .windows("·".len())
+            .any(|window| window == "·".as_bytes()));
+    }
+
+    #[test]
+    fn render_unencodable_chars_produces_warnings() {
+        let pdf = PdfRenderer::default().render(&single_page(&["δ δ"]));
+
+        assert_eq!(
+            pdf.warnings,
+            vec![String::from(
+                "PDF encoding: character 'δ' (U+03B4) cannot be represented in WinAnsiEncoding and was replaced with '?'"
+            )]
+        );
+    }
+
+    #[test]
+    fn builtin_type1_font_has_winansi_encoding() {
+        let pdf = PdfRenderer::default().render(&single_page(&["Hello, Ferritex!"]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        assert!(content.contains(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+        ));
+    }
+
+    #[test]
     fn renders_builtin_font_reference_by_default() {
         let pdf = PdfRenderer::default().render(&single_page(&["Hello, Ferritex!"]));
         let content = String::from_utf8_lossy(&pdf.bytes);
 
-        assert!(content.contains("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"));
+        assert!(content.contains(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+        ));
         assert!(content.contains("/Resources << /Font << /F1 5 0 R >> >>"));
     }
 
@@ -3529,7 +3846,9 @@ mod tests {
         let content = String::from_utf8_lossy(&pdf.bytes);
 
         assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>"));
-        assert!(content.contains("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"));
+        assert!(content.contains(
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+        ));
         assert!(content.contains("6 0 obj\n<< /Type /Font /Subtype /TrueType"));
     }
 

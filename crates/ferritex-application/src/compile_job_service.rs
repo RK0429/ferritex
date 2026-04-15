@@ -1623,6 +1623,9 @@ impl<'a> CompileJobService<'a> {
         let cacheable_diagnostics = parse_diagnostics;
         let mut diagnostics = cache_diagnostics;
         diagnostics.extend(cacheable_diagnostics.clone());
+        for warning in &pdf_document.document.warnings {
+            diagnostics.push(Diagnostic::new(Severity::Warning, warning.clone()));
+        }
         let cached_typeset_fragments = cached_typeset_fragments_for(
             self,
             &parsed_document,
@@ -13072,6 +13075,30 @@ mod tests {
             diagnostic.suggestion.as_deref(),
             Some("use --shell-escape to enable external command execution")
         );
+    }
+
+    #[test]
+    fn pdf_encoding_warning_is_propagated_to_compile_diagnostics() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("Hello δ")).expect("write input");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 1);
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.severity == Severity::Warning
+                    && diagnostic.message.contains("δ")
+                    && diagnostic.message.contains("WinAnsiEncoding")
+            })
+            .expect("pdf encoding warning diagnostic");
+        assert!(diagnostic.message.contains("replaced with '?'"));
     }
 
     #[test]
