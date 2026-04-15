@@ -2004,6 +2004,28 @@ fn compile_rejects_trailing_content_after_end_document() {
 }
 
 #[test]
+fn compile_reports_issue_1_diagnostics_and_exits_nonzero() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\begin{unclosedenv}\ntext\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("undefined control sequence `\\nonexistentcommand`"));
+    assert!(stderr.contains("unclosed environment `unclosedenv`"));
+    assert!(dir.path().join("broken.pdf").exists());
+}
+
+#[test]
 fn compile_with_missing_asset_bundle_reports_validation_error() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello.tex");

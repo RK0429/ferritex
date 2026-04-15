@@ -66,8 +66,8 @@ use serde_json::json;
 
 use crate::compile_cache::{
     fingerprint_bytes, BackgroundCacheWriter, BlockCheckpoint, BlockCheckpointData,
-    BlockLayoutState, CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment,
-    CompileCache, PendingFloat, WarmPartitionCache,
+    BlockLayoutState, CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment, CompileCache,
+    PendingFloat, WarmPartitionCache,
 };
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
@@ -5886,6 +5886,13 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
                 "the parser reached EOF while `{name}` was still open"
             ))
             .with_suggestion(format!("add the matching \\end{{{name}}}")),
+        ParseError::UndefinedControlSequence { name, .. } => diagnostic
+            .with_context(format!(
+                "the parser could not resolve `\\{name}` to a built-in or user-defined command"
+            ))
+            .with_suggestion(format!(
+                "define \\{name} before use or replace it with a supported command"
+            )),
         ParseError::UnexpectedElse { .. } => diagnostic
             .with_context("the parser found \\else without a matching open conditional")
             .with_suggestion("remove the stray \\else or add the matching \\if..."),

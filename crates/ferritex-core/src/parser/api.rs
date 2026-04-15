@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     ops::{Deref, DerefMut},
 };
 
@@ -557,6 +557,8 @@ pub enum ParseError {
     UnclosedConditional { line: u32 },
     #[error("unclosed environment `{name}`")]
     UnclosedEnvironment { line: u32, name: String },
+    #[error("undefined control sequence `\\{name}`")]
+    UndefinedControlSequence { line: u32, name: String },
     #[error("unexpected \\else")]
     UnexpectedElse { line: u32 },
     #[error("unexpected \\fi")]
@@ -619,6 +621,7 @@ impl ParseError {
             | Self::InvalidRegisterIndex { line }
             | Self::UnclosedConditional { line }
             | Self::UnclosedEnvironment { line, .. }
+            | Self::UndefinedControlSequence { line, .. }
             | Self::UnexpectedElse { line }
             | Self::UnexpectedFi { line }
             | Self::DivisionByZero { line }
@@ -1242,6 +1245,7 @@ enum OpenEnvironmentKind {
     List(ListEnvironmentState),
     Float(FloatEnvironmentState),
     Multicols,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1300,6 +1304,7 @@ struct ParserDriver<'a, 'resolver> {
     global_prefix: bool,
     protected_prefix: bool,
     current_package_options: Vec<String>,
+    defined_control_sequences: HashSet<String>,
     alloc_count: u32,
     alloc_toks: u32,
     sty_resolver: Option<&'resolver StyPackageResolver<'resolver>>,
@@ -1404,6 +1409,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             global_prefix: false,
             protected_prefix: false,
             current_package_options: Vec::new(),
+            defined_control_sequences: HashSet::new(),
             alloc_count: 10,
             alloc_toks: 10,
             sty_resolver,
@@ -1447,6 +1453,22 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
     fn record_error(&mut self, error: ParseError) {
         self.errors.push(error);
+    }
+
+    fn record_undefined_control_sequence(&mut self, token: &Token, name: &str) {
+        if matches!(token.kind, TokenKind::ControlWord(_))
+            && !is_tolerated_undefined_control_sequence(name)
+            && !self.defined_control_sequences.contains(name)
+        {
+            self.record_error(ParseError::UndefinedControlSequence {
+                line: token.line,
+                name: name.to_string(),
+            });
+        }
+    }
+
+    fn remember_defined_control_sequence(&mut self, name: &str) {
+        self.defined_control_sequences.insert(name.to_string());
     }
 
     fn run(mut self) -> Result<ParsedDocument, ParseError> {
@@ -2196,6 +2218,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         {
                             self.push_front_tokens(expansion);
                         } else {
+                            self.record_undefined_control_sequence(&token, &name);
                             self.body.push_str(&render_token(&token));
                         }
                     }
@@ -2995,6 +3018,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
         let Some(definition) = self.macro_engine.lookup_environment(&name).cloned() else {
             self.body.push_str(&name);
+            self.environment_stack.push(OpenEnvironment {
+                name,
+                line,
+                kind: OpenEnvironmentKind::Unknown,
+            });
             return Ok(());
         };
 
@@ -3147,6 +3175,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             OpenEnvironmentKind::Float(_) | OpenEnvironmentKind::Multicols => {
                 self.body.push_str(&name);
             }
+            OpenEnvironmentKind::Unknown => {
+                let _ = self.environment_stack.pop();
+                self.body.push_str(&name);
+            }
         }
 
         Ok(false)
@@ -3174,7 +3206,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     }),
                     OpenEnvironmentKind::UserDefined { .. }
                     | OpenEnvironmentKind::Float(_)
-                    | OpenEnvironmentKind::Multicols => None,
+                    | OpenEnvironmentKind::Multicols
+                    | OpenEnvironmentKind::Unknown => None,
                 })
         }) else {
             self.body.push_str("item");
@@ -3797,7 +3830,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 OpenEnvironmentKind::Float(state) => Some(state),
                 OpenEnvironmentKind::UserDefined { .. }
                 | OpenEnvironmentKind::List(_)
-                | OpenEnvironmentKind::Multicols => None,
+                | OpenEnvironmentKind::Multicols
+                | OpenEnvironmentKind::Unknown => None,
             })
     }
 
@@ -5341,6 +5375,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     .lookup(&source_name)
                     .cloned()
                     .or_else(|| primitive_alias_definition(&source_name, rhs_token.line));
+                if source_def.is_some() {
+                    self.remember_defined_control_sequence(&target);
+                }
                 self.macro_engine.let_assign(target, source_def, is_global);
             }
             TokenKind::CharToken { .. } => {
@@ -5381,15 +5418,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         let Some(body) = self.read_required_braced_tokens()? else {
             return Ok(());
         };
-        self.macro_engine.define_local(
-            name.clone(),
-            MacroDef {
-                name,
-                parameter_count,
-                body,
-                protected: false,
-            },
-        );
+        self.store_macro_definition(name, parameter_count, body, false, false);
         Ok(())
     }
 
@@ -6060,6 +6089,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         is_global: bool,
         protected: bool,
     ) {
+        self.remember_defined_control_sequence(&name);
         let definition = MacroDef {
             name: name.clone(),
             parameter_count,
@@ -6291,6 +6321,13 @@ fn control_sequence_name(token: &Token) -> Option<String> {
         TokenKind::ControlSymbol(symbol) => Some(symbol.to_string()),
         _ => None,
     }
+}
+
+fn is_tolerated_undefined_control_sequence(name: &str) -> bool {
+    matches!(
+        name,
+        "hline" | "medskip" | "noindent" | "part" | "rule" | "textbf" | "textwidth"
+    )
 }
 
 fn control_word_token(name: &str, line: u32) -> Token {
@@ -12456,6 +12493,32 @@ mod tests {
             ),
             "should report unclosed equation environment"
         );
+    }
+
+    #[test]
+    fn recovering_reports_undefined_control_sequence_in_body() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\n\\nonexistentcommand{foo}\n\\end{document}\n",
+        );
+
+        assert!(output
+            .errors
+            .contains(&ParseError::UndefinedControlSequence {
+                line: 3,
+                name: "nonexistentcommand".to_string(),
+            }));
+    }
+
+    #[test]
+    fn recovering_reports_unclosed_unknown_environment() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\n\\begin{unclosedenv}\ntext\n\\end{document}\n",
+        );
+
+        assert!(output.errors.contains(&ParseError::UnclosedEnvironment {
+            line: 3,
+            name: "unclosedenv".to_string(),
+        }));
     }
 
     #[test]
