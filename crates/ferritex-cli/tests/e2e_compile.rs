@@ -99,14 +99,40 @@ fn compile_existing_file_writes_pdf_with_document_content() {
         .expect("failed to run ferritex");
 
     assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.trim().is_empty());
+    assert!(stdout.contains(tex_file.to_str().expect("utf-8 path")));
+    assert!(stdout.contains("hello.pdf"));
+    assert!(stdout.contains("(1 page)"));
 
     let pdf_file = dir.path().join("hello.pdf");
     let pdf = std::fs::read_to_string(&pdf_file).expect("read output pdf");
     assert!(pdf.starts_with("%PDF-1.4"));
     assert!(pdf.contains("Hello, Ferritex!"));
     assert!(!pdf.contains("Ferritex placeholder PDF"));
+}
+
+#[test]
+fn compile_with_warnings_prints_summary_including_warning_count() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("warn.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello δ\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(1), "warnings should exit with code 1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("->"), "summary should contain arrow separator");
+    assert!(stdout.contains(".pdf"), "summary should mention PDF output");
+    assert!(stdout.contains("warning"), "summary should mention warnings");
 }
 
 #[test]
@@ -3257,6 +3283,61 @@ fn compile_fixture_via_cli(fixture: &Path, jobs: Option<&str>) -> (String, Strin
     let pdf_bytes = std::fs::read(&pdf_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", pdf_path.display()));
     (stderr, String::from_utf8_lossy(&pdf_bytes).into_owned())
+}
+
+#[test]
+fn version_flag_prints_version_info() {
+    let output = ferritex_bin()
+        .arg("--version")
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ferritex"));
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn help_flag_shows_description() {
+    let output = ferritex_bin()
+        .arg("--help")
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("compile"),
+        "help should list compile subcommand"
+    );
+    assert!(
+        stdout.contains("Compile a LaTeX document to PDF"),
+        "help should show compile description"
+    );
+    assert!(
+        stdout.contains("A Rust-native LaTeX compiler"),
+        "help should show about text"
+    );
+}
+
+#[test]
+fn compile_help_shows_option_descriptions() {
+    let output = ferritex_bin()
+        .args(["compile", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--output-dir"),
+        "compile help should show --output-dir"
+    );
+    assert!(
+        stdout.contains("Output directory"),
+        "compile help should describe --output-dir"
+    );
 }
 
 fn pdf_page_count(pdf: &str) -> usize {

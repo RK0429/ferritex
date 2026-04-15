@@ -24,7 +24,7 @@ mod lsp_server;
 mod watch_runner;
 
 #[derive(Debug, Parser)]
-#[command(name = "ferritex")]
+#[command(name = "ferritex", version, about = "A Rust-native LaTeX compiler")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -32,37 +32,54 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Compile a LaTeX document to PDF
     Compile(CompileCommand),
+    /// Compile and start a live preview server
     Preview(CompileCommand),
+    /// Watch for changes and recompile automatically
     Watch(CompileCommand),
+    /// Start the Language Server Protocol server
     Lsp,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 struct CompileCommand {
+    /// Input LaTeX file to compile
     file: PathBuf,
+    /// Output directory for generated files
     #[arg(long, value_name = "DIR")]
     output_dir: Option<PathBuf>,
+    /// Job name for the output file (defaults to input file stem)
     #[arg(long, value_name = "NAME")]
     jobname: Option<String>,
+    /// Number of parallel font resolution tasks
     #[arg(long, value_name = "N")]
     jobs: Option<usize>,
+    /// Additional directories to search for TeX files
     #[arg(long = "overlay", value_name = "DIR")]
     overlay_roots: Vec<PathBuf>,
+    /// Disable compilation cache
     #[arg(long)]
     no_cache: bool,
+    /// Path to a pre-built asset bundle
     #[arg(long, value_name = "PATH")]
     asset_bundle: Option<PathBuf>,
+    /// Enable reproducible output (deterministic timestamps)
     #[arg(long)]
     reproducible: bool,
+    /// TeX interaction mode
     #[arg(long, value_name = "MODE", value_enum)]
     interaction: Option<InteractionArg>,
+    /// Generate SyncTeX data for editor synchronization
     #[arg(long)]
     synctex: bool,
+    /// Emit font task tracing to stderr
     #[arg(long)]
     trace_font_tasks: bool,
+    /// Enable shell escape for \write18 commands
     #[arg(long)]
     shell_escape: bool,
+    /// Disable shell escape (overrides --shell-escape)
     #[arg(long)]
     no_shell_escape: bool,
 }
@@ -136,6 +153,36 @@ fn handle_compile(command: &CompileCommand) -> i32 {
     );
     let result = service.compile(&options);
     emit_diagnostics(&result.diagnostics);
+    if let Some(output_pdf) = &result.output_pdf {
+        let page_count = result
+            .stable_compile_state
+            .as_ref()
+            .map_or(0, |state| state.page_count);
+        let warning_count = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Warning)
+            .count();
+        if warning_count > 0 {
+            println!(
+                "{} -> {} ({} page{}, {} warning{})",
+                command.file.display(),
+                output_pdf.display(),
+                page_count,
+                if page_count == 1 { "" } else { "s" },
+                warning_count,
+                if warning_count == 1 { "" } else { "s" }
+            );
+        } else {
+            println!(
+                "{} -> {} ({} page{})",
+                command.file.display(),
+                output_pdf.display(),
+                page_count,
+                if page_count == 1 { "" } else { "s" }
+            );
+        }
+    }
     result.exit_code
 }
 
