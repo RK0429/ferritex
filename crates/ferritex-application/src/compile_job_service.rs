@@ -2733,6 +2733,10 @@ fn block_signature(nodes: &[DocumentNode], source_lines: &[SourceLineTrace]) -> 
             match node {
                 DocumentNode::Text(text, _) => parts.push(normalize_block_text(text)),
                 DocumentNode::FontFamily { children, .. }
+                | DocumentNode::Bold { children }
+                | DocumentNode::Italic { children }
+                | DocumentNode::SmallCaps { children }
+                | DocumentNode::Underline { children }
                 | DocumentNode::HBox(children)
                 | DocumentNode::VBox(children) => collect_parts(children, source_lines, parts),
                 DocumentNode::Link { children, .. } => collect_parts(children, source_lines, parts),
@@ -2768,6 +2772,7 @@ fn block_signature(nodes: &[DocumentNode], source_lines: &[SourceLineTrace]) -> 
                     }
                 }
                 DocumentNode::ParBreak => parts.push("<parbreak>".to_string()),
+                DocumentNode::LineBreak => parts.push("<linebreak>".to_string()),
                 DocumentNode::PageBreak => parts.push("<pagebreak>".to_string()),
                 DocumentNode::ClearPage => parts.push("<clearpage>".to_string()),
                 DocumentNode::ClearDoublePage => parts.push("<cleardoublepage>".to_string()),

@@ -76,11 +76,21 @@ const BODY_MULTICOL_START: char = '\u{E02B}';
 const BODY_MULTICOL_END: char = '\u{E02C}';
 const BODY_MULTICOL_COL_SEP: char = '\u{E02D}';
 const BODY_COLUMNBREAK: char = '\u{E02E}';
+const BODY_BOLD_START: char = '\u{E02F}';
+const BODY_BOLD_END: char = '\u{E030}';
+const BODY_ITALIC_START: char = '\u{E031}';
+const BODY_ITALIC_END: char = '\u{E032}';
+const BODY_SMALLCAPS_START: char = '\u{E033}';
+const BODY_SMALLCAPS_END: char = '\u{E034}';
+const BODY_UNDERLINE_START: char = '\u{E035}';
+const BODY_UNDERLINE_END: char = '\u{E036}';
+const BODY_LINE_BREAK: char = '\u{E037}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
 const EQUATION_ENV_SEGMENT_SEPARATOR: char = '\u{001D}';
 const PDF_CREATION_DATE_PLACEHOLDER: &str = "D:20700101000000+00'00'";
+const TODAY_PLACEHOLDER: &str = "January 1, 2070";
 const MAX_KERNEL_LOOP_ITERATIONS: usize = 1_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -441,12 +451,25 @@ pub enum DocumentNode {
         role: FontFamilyRole,
         children: Vec<DocumentNode>,
     },
+    Bold {
+        children: Vec<DocumentNode>,
+    },
+    Italic {
+        children: Vec<DocumentNode>,
+    },
+    SmallCaps {
+        children: Vec<DocumentNode>,
+    },
+    Underline {
+        children: Vec<DocumentNode>,
+    },
     Link {
         url: String,
         children: Vec<DocumentNode>,
     },
     IndexMarker(IndexRawEntry),
     ParBreak,
+    LineBreak,
     PageBreak,
     ClearPage,
     ClearDoublePage,
@@ -1989,6 +2012,16 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         let _ = self.take_global_prefix();
                         self.body.push(BODY_COLUMNBREAK);
                     }
+                    "\\" => {
+                        let _ = self.take_global_prefix();
+                        let _ = self.consume_optional_star();
+                        let _ = self.read_optional_bracket_tokens()?;
+                        self.body.push(BODY_LINE_BREAK);
+                    }
+                    "," | ";" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push(' ');
+                    }
                     "cite" => {
                         let _ = self.take_global_prefix();
                         self.parse_cite_command()?;
@@ -2187,6 +2220,62 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         let _ = self.take_global_prefix();
                         self.parse_font_family_body_command(FontFamilyRole::Mono)?;
                     }
+                    "textbf" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_text_style_body_command(BODY_BOLD_START, BODY_BOLD_END)?;
+                    }
+                    "textit" | "emph" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_text_style_body_command(BODY_ITALIC_START, BODY_ITALIC_END)?;
+                    }
+                    "textsc" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_text_style_body_command(
+                            BODY_SMALLCAPS_START,
+                            BODY_SMALLCAPS_END,
+                        )?;
+                    }
+                    "underline" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_text_style_body_command(
+                            BODY_UNDERLINE_START,
+                            BODY_UNDERLINE_END,
+                        )?;
+                    }
+                    "today" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push_str(TODAY_PLACEHOLDER);
+                    }
+                    "vspace" | "hspace" => {
+                        let _ = self.take_global_prefix();
+                        let _ = self.consume_optional_star();
+                        let _ = self.read_required_braced_tokens()?;
+                        if name == "vspace" {
+                            self.body.push_str("\n\n");
+                        } else {
+                            self.body.push(' ');
+                        }
+                    }
+                    "bigskip" | "medskip" | "smallskip" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push_str("\n\n");
+                    }
+                    "setlength" | "addtolength" => {
+                        let _ = self.take_global_prefix();
+                        let _ = self.read_required_braced_tokens()?;
+                        let _ = self.read_required_braced_tokens()?;
+                    }
+                    "quad" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push_str("    ");
+                    }
+                    "qquad" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push_str("        ");
+                    }
+                    "noindent" => {
+                        let _ = self.take_global_prefix();
+                    }
                     "begin" => {
                         let _ = self.take_global_prefix();
                         self.parse_begin_environment(token.line)?;
@@ -2236,6 +2325,16 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             _ => {
                 let _ = self.take_global_prefix();
                 let _ = self.take_protected_prefix();
+                if matches!(
+                    token.kind,
+                    TokenKind::CharToken {
+                        char: '~',
+                        cat: CatCode::Active,
+                    }
+                ) {
+                    self.body.push(' ');
+                    return Ok(false);
+                }
                 if self.should_skip_insignificant_space(&token) {
                     return Ok(false);
                 }
@@ -2265,11 +2364,19 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
     }
 
     fn parse_font_family_body_command(&mut self, role: FontFamilyRole) -> Result<(), ParseError> {
+        let (start_marker, end_marker) = font_family_markers(role);
+        self.parse_text_style_body_command(start_marker, end_marker)
+    }
+
+    fn parse_text_style_body_command(
+        &mut self,
+        start_marker: char,
+        end_marker: char,
+    ) -> Result<(), ParseError> {
         let Some(tokens) = self.read_required_braced_tokens()? else {
             return Ok(());
         };
         let content = encode_body_markers_in_text(&tokens_to_text(&tokens));
-        let (start_marker, end_marker) = font_family_markers(role);
         self.body.push(start_marker);
         self.body.push_str(&content);
         self.body.push(end_marker);
@@ -6331,10 +6438,7 @@ fn control_sequence_name(token: &Token) -> Option<String> {
 }
 
 fn is_tolerated_undefined_control_sequence(name: &str) -> bool {
-    matches!(
-        name,
-        "hline" | "medskip" | "noindent" | "part" | "rule" | "textbf" | "textwidth"
-    )
+    matches!(name, "hline" | "part" | "rule" | "textwidth")
 }
 
 fn control_word_token(name: &str, line: u32) -> Token {
@@ -7290,6 +7394,7 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
             || *ch == BODY_CLEAR_PAGE_MARKER
             || *ch == BODY_CLEAR_DOUBLE_PAGE_MARKER
             || *ch == BODY_COLUMNBREAK
+            || *ch == BODY_LINE_BREAK
     }) {
         nodes.extend(body_text_nodes(
             &body_with_placeholders[segment_start..index],
@@ -7300,6 +7405,7 @@ fn body_nodes_from_text(body: &str) -> Vec<DocumentNode> {
             BODY_CLEAR_PAGE_MARKER => DocumentNode::ClearPage,
             BODY_CLEAR_DOUBLE_PAGE_MARKER => DocumentNode::ClearDoublePage,
             BODY_COLUMNBREAK => DocumentNode::ColumnBreak,
+            BODY_LINE_BREAK => DocumentNode::LineBreak,
             _ => unreachable!("filtered markers should only include break markers"),
         });
         segment_start = index + marker.len_utf8();
@@ -7407,6 +7513,18 @@ impl BodySourceSpanAnnotator {
             }
             DocumentNode::FontFamily { role, children } => DocumentNode::FontFamily {
                 role,
+                children: self.annotate_nodes(children),
+            },
+            DocumentNode::Bold { children } => DocumentNode::Bold {
+                children: self.annotate_nodes(children),
+            },
+            DocumentNode::Italic { children } => DocumentNode::Italic {
+                children: self.annotate_nodes(children),
+            },
+            DocumentNode::SmallCaps { children } => DocumentNode::SmallCaps {
+                children: self.annotate_nodes(children),
+            },
+            DocumentNode::Underline { children } => DocumentNode::Underline {
                 children: self.annotate_nodes(children),
             },
             DocumentNode::Link { url, children } => DocumentNode::Link {
@@ -7689,6 +7807,22 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_BOLD_START | BODY_ITALIC_START | BODY_SMALLCAPS_START | BODY_UNDERLINE_START => {
+                let (content, next_index) =
+                    extract_recursive_marker_content(body, index, text_style_end_marker(ch));
+                let placeholder = next_box_placeholder(placeholders.len());
+                let children = body_nodes_from_text(content);
+                let node = match ch {
+                    BODY_BOLD_START => DocumentNode::Bold { children },
+                    BODY_ITALIC_START => DocumentNode::Italic { children },
+                    BODY_SMALLCAPS_START => DocumentNode::SmallCaps { children },
+                    BODY_UNDERLINE_START => DocumentNode::Underline { children },
+                    _ => unreachable!("matched text-style start marker"),
+                };
+                placeholders.push(node);
+                text.push(placeholder);
+                index = next_index;
+            }
             BODY_HREF_START => {
                 let (url, display_text, next_index) = extract_href_marker_content(body, index);
                 let placeholder = next_box_placeholder(placeholders.len());
@@ -7847,12 +7981,24 @@ fn extract_font_family_marker_content(body: &str, start_index: usize) -> (&str, 
         .chars()
         .next()
         .expect("font family marker should exist at start index");
-    let content_start = start_index + start_char.len_utf8();
     let end_marker = if start_char == BODY_SANS_FAMILY_START {
         BODY_SANS_FAMILY_END
     } else {
         BODY_MONO_FAMILY_END
     };
+    extract_recursive_marker_content(body, start_index, end_marker)
+}
+
+fn extract_recursive_marker_content(
+    body: &str,
+    start_index: usize,
+    end_marker: char,
+) -> (&str, usize) {
+    let start_char = body[start_index..]
+        .chars()
+        .next()
+        .expect("marker should exist at start index");
+    let content_start = start_index + start_char.len_utf8();
     let mut index = content_start;
     let mut depth = 1usize;
 
@@ -8399,6 +8545,26 @@ fn font_family_markers(role: FontFamilyRole) -> (char, char) {
     }
 }
 
+fn text_style_markers(command: &str) -> (char, char) {
+    match command {
+        "textbf" => (BODY_BOLD_START, BODY_BOLD_END),
+        "textit" | "emph" => (BODY_ITALIC_START, BODY_ITALIC_END),
+        "textsc" => (BODY_SMALLCAPS_START, BODY_SMALLCAPS_END),
+        "underline" => (BODY_UNDERLINE_START, BODY_UNDERLINE_END),
+        _ => unreachable!("unexpected text style command"),
+    }
+}
+
+fn text_style_end_marker(start_marker: char) -> char {
+    match start_marker {
+        BODY_BOLD_START => BODY_BOLD_END,
+        BODY_ITALIC_START => BODY_ITALIC_END,
+        BODY_SMALLCAPS_START => BODY_SMALLCAPS_END,
+        BODY_UNDERLINE_START => BODY_UNDERLINE_END,
+        _ => unreachable!("unexpected text style start marker"),
+    }
+}
+
 fn box_placeholder_index(ch: char, placeholder_count: usize) -> Option<usize> {
     let codepoint = ch as u32;
     if codepoint < BODY_BOX_PLACEHOLDER_BASE {
@@ -8434,6 +8600,12 @@ fn encode_body_markers_in_text(text: &str) -> String {
             continue;
         }
 
+        if ch == '~' {
+            encoded.push(' ');
+            index += ch.len_utf8();
+            continue;
+        }
+
         if ch != '\\' {
             encoded.push(ch);
             index += ch.len_utf8();
@@ -8464,9 +8636,26 @@ fn encode_body_markers_in_text(text: &str) -> String {
         }
 
         if !next_char.is_ascii_alphabetic() {
-            encoded.push(ch);
-            encoded.push(next_char);
-            index = command_start + next_char.len_utf8();
+            let mut next_index = command_start + next_char.len_utf8();
+            match next_char {
+                '\\' => {
+                    next_index = skip_optional_command_whitespace(text, next_index);
+                    if text[next_index..].starts_with('*') {
+                        next_index += '*'.len_utf8();
+                        next_index = skip_optional_command_whitespace(text, next_index);
+                    }
+                    if let Some((_, after_bracket)) = extract_bracket_text(text, next_index) {
+                        next_index = after_bracket;
+                    }
+                    encoded.push(BODY_LINE_BREAK);
+                }
+                ',' | ';' => encoded.push(' '),
+                _ => {
+                    encoded.push(ch);
+                    encoded.push(next_char);
+                }
+            }
+            index = next_index;
             continue;
         }
 
@@ -8524,6 +8713,22 @@ fn encode_body_markers_in_text(text: &str) -> String {
                 encoded.push_str(command);
                 index = command_end;
             }
+            "textbf" | "textit" | "emph" | "textsc" | "underline" => {
+                let brace_start = skip_optional_command_whitespace(text, command_end);
+                if let Some((content, next_index)) = extract_braced_text(text, brace_start) {
+                    let encoded_content = encode_body_markers_in_text(content);
+                    let (start_marker, end_marker) = text_style_markers(command);
+                    encoded.push(start_marker);
+                    encoded.push_str(&encoded_content);
+                    encoded.push(end_marker);
+                    index = next_index;
+                    continue;
+                }
+
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
             "pagebreak" | "newpage" => {
                 encoded.push(BODY_PAGE_BREAK_MARKER);
                 index = command_end;
@@ -8538,6 +8743,58 @@ fn encode_body_markers_in_text(text: &str) -> String {
             }
             "columnbreak" => {
                 encoded.push(BODY_COLUMNBREAK);
+                index = command_end;
+            }
+            "today" => {
+                encoded.push_str(TODAY_PLACEHOLDER);
+                index = command_end;
+            }
+            "vspace" | "hspace" => {
+                let mut arg_start = skip_optional_command_whitespace(text, command_end);
+                if text[arg_start..].starts_with('*') {
+                    arg_start += '*'.len_utf8();
+                    arg_start = skip_optional_command_whitespace(text, arg_start);
+                }
+                if let Some((_, next_index)) = extract_braced_text(text, arg_start) {
+                    if command == "vspace" {
+                        encoded.push_str("\n\n");
+                    } else {
+                        encoded.push(' ');
+                    }
+                    index = next_index;
+                } else {
+                    encoded.push(ch);
+                    encoded.push_str(command);
+                    index = command_end;
+                }
+            }
+            "bigskip" | "medskip" | "smallskip" => {
+                encoded.push_str("\n\n");
+                index = command_end;
+            }
+            "setlength" | "addtolength" => {
+                let first_arg_start = skip_optional_command_whitespace(text, command_end);
+                if let Some((_, after_first_arg)) = extract_braced_text(text, first_arg_start) {
+                    let second_arg_start = skip_optional_command_whitespace(text, after_first_arg);
+                    if let Some((_, next_index)) = extract_braced_text(text, second_arg_start) {
+                        index = next_index;
+                        continue;
+                    }
+                }
+
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
+            "quad" => {
+                encoded.push_str("    ");
+                index = command_end;
+            }
+            "qquad" => {
+                encoded.push_str("        ");
+                index = command_end;
+            }
+            "noindent" => {
                 index = command_end;
             }
             "href" => {
@@ -10039,6 +10296,142 @@ mod tests {
             vec![DocumentNode::FontFamily {
                 role: FontFamilyRole::Mono,
                 children: vec![DocumentNode::Text("code".to_string(), None)],
+            }]
+        );
+    }
+
+    #[test]
+    fn textbf_produces_bold_node() {
+        assert_eq!(
+            parse_document(r"\textbf{hello}").body_nodes(),
+            vec![DocumentNode::Bold {
+                children: vec![DocumentNode::Text("hello".to_string(), None)],
+            }]
+        );
+    }
+
+    #[test]
+    fn textit_and_emph_produce_italic_nodes() {
+        assert_eq!(
+            parse_document(r"\textit{hello}").body_nodes(),
+            vec![DocumentNode::Italic {
+                children: vec![DocumentNode::Text("hello".to_string(), None)],
+            }]
+        );
+        assert_eq!(
+            parse_document(r"\emph{hello}").body_nodes(),
+            vec![DocumentNode::Italic {
+                children: vec![DocumentNode::Text("hello".to_string(), None)],
+            }]
+        );
+    }
+
+    #[test]
+    fn textsc_produces_smallcaps_node() {
+        assert_eq!(
+            parse_document(r"\textsc{hello}").body_nodes(),
+            vec![DocumentNode::SmallCaps {
+                children: vec![DocumentNode::Text("hello".to_string(), None)],
+            }]
+        );
+    }
+
+    #[test]
+    fn underline_produces_underline_node() {
+        assert_eq!(
+            parse_document(r"\underline{hello}").body_nodes(),
+            vec![DocumentNode::Underline {
+                children: vec![DocumentNode::Text("hello".to_string(), None)],
+            }]
+        );
+    }
+
+    #[test]
+    fn double_backslash_produces_line_break_node() {
+        assert_eq!(
+            parse_document(r"a\\*[1em]b").body_nodes(),
+            vec![
+                DocumentNode::Text("a".to_string(), None),
+                DocumentNode::LineBreak,
+                DocumentNode::Text("b".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn tilde_produces_space() {
+        assert_eq!(
+            parse_document("a~b").body_nodes(),
+            vec![DocumentNode::Text("a b".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn spacing_commands_produce_spacing_instead_of_literal_text() {
+        assert_eq!(
+            parse_document(r"a\,b\;c\quad d\qquad e").body_nodes(),
+            vec![DocumentNode::Text("a b c    d        e".to_string(), None,)]
+        );
+    }
+
+    #[test]
+    fn today_produces_date_text() {
+        let nodes = parse_document(r"\today").body_nodes();
+        assert_eq!(
+            nodes,
+            vec![DocumentNode::Text(super::TODAY_PLACEHOLDER.to_string(), None)]
+        );
+        assert_ne!(nodes, vec![DocumentNode::Text(r"\today".to_string(), None)]);
+    }
+
+    #[test]
+    fn vspace_and_hspace_are_consumed() {
+        assert_eq!(
+            parse_document(r"a\vspace{1em}b\hspace{1em}c").body_nodes(),
+            vec![
+                DocumentNode::Text("a".to_string(), None),
+                DocumentNode::ParBreak,
+                DocumentNode::Text("b c".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_commands_produce_par_breaks() {
+        assert_eq!(
+            parse_document(r"a\bigskip b\medskip c\smallskip d").body_nodes(),
+            vec![
+                DocumentNode::Text("a".to_string(), None),
+                DocumentNode::ParBreak,
+                DocumentNode::Text("b".to_string(), None),
+                DocumentNode::ParBreak,
+                DocumentNode::Text("c".to_string(), None),
+                DocumentNode::ParBreak,
+                DocumentNode::Text("d".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn setlength_addtolength_and_noindent_are_consumed_silently() {
+        assert!(
+            parse_document(r"\setlength{\parindent}{0pt}\addtolength{\parskip}{1pt}\noindent")
+                .body_nodes()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nested_text_formatting_is_preserved() {
+        assert_eq!(
+            parse_document(r"\textbf{bold \textit{italic}}").body_nodes(),
+            vec![DocumentNode::Bold {
+                children: vec![
+                    DocumentNode::Text("bold ".to_string(), None),
+                    DocumentNode::Italic {
+                        children: vec![DocumentNode::Text("italic".to_string(), None)],
+                    },
+                ],
             }]
         );
     }

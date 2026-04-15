@@ -1267,6 +1267,18 @@ fn extract_footnotes_from_node(
             role,
             children: extract_footnotes_from_children(children, footnotes),
         }),
+        DocumentNode::Bold { children } => Some(DocumentNode::Bold {
+            children: extract_footnotes_from_children(children, footnotes),
+        }),
+        DocumentNode::Italic { children } => Some(DocumentNode::Italic {
+            children: extract_footnotes_from_children(children, footnotes),
+        }),
+        DocumentNode::SmallCaps { children } => Some(DocumentNode::SmallCaps {
+            children: extract_footnotes_from_children(children, footnotes),
+        }),
+        DocumentNode::Underline { children } => Some(DocumentNode::Underline {
+            children: extract_footnotes_from_children(children, footnotes),
+        }),
         DocumentNode::Link { url, children } => Some(DocumentNode::Link {
             url,
             children: extract_footnotes_from_children(children, footnotes),
@@ -1632,6 +1644,27 @@ fn document_nodes_to_hlist_with_font_config(
                     font_index_for_role(*role),
                 ));
             }
+            DocumentNode::Bold { children }
+            | DocumentNode::Italic { children }
+            | DocumentNode::SmallCaps { children }
+            | DocumentNode::Underline { children } => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                    current_font_index,
+                );
+                hlist.extend(document_nodes_to_hlist_with_font_config(
+                    children,
+                    provider,
+                    hyphenator,
+                    hyphen_penalty,
+                    line_width,
+                    current_font_index,
+                ));
+            }
             DocumentNode::HBox(children) | DocumentNode::VBox(children) => {
                 flush_word(
                     &mut hlist,
@@ -1759,6 +1792,19 @@ fn document_nodes_to_hlist_with_font_config(
                 hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
+                hlist.push(HListItem::Penalty {
+                    value: PENALTY_FORCED,
+                });
+            }
+            DocumentNode::LineBreak => {
+                flush_word(
+                    &mut hlist,
+                    &mut current_word,
+                    &mut current_word_items,
+                    hyphenator,
+                    hyphen_penalty,
+                    current_font_index,
+                );
                 hlist.push(HListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
@@ -2804,6 +2850,10 @@ fn push_visible_text_from_node(text: &mut String, node: &DocumentNode) {
     match node {
         DocumentNode::Text(content, _) => text.push_str(content),
         DocumentNode::FontFamily { children, .. }
+        | DocumentNode::Bold { children }
+        | DocumentNode::Italic { children }
+        | DocumentNode::SmallCaps { children }
+        | DocumentNode::Underline { children }
         | DocumentNode::Link { children, .. }
         | DocumentNode::HBox(children)
         | DocumentNode::VBox(children) => {
@@ -2821,6 +2871,7 @@ fn push_visible_text_from_node(text: &mut String, node: &DocumentNode) {
         | DocumentNode::EquationEnv { .. }
         | DocumentNode::IndexMarker(_)
         | DocumentNode::ParBreak
+        | DocumentNode::LineBreak
         | DocumentNode::PageBreak
         | DocumentNode::ClearPage
         | DocumentNode::ClearDoublePage
@@ -2841,12 +2892,17 @@ fn node_source_span(node: &DocumentNode) -> Option<SourceSpan> {
         DocumentNode::DisplayMath(_, span) => *span,
         DocumentNode::EquationEnv { source_span, .. } => *source_span,
         DocumentNode::FontFamily { children, .. }
+        | DocumentNode::Bold { children }
+        | DocumentNode::Italic { children }
+        | DocumentNode::SmallCaps { children }
+        | DocumentNode::Underline { children }
         | DocumentNode::Link { children, .. }
         | DocumentNode::HBox(children)
         | DocumentNode::VBox(children) => direct_source_span_from_nodes(children),
         DocumentNode::InlineMath(_)
         | DocumentNode::IndexMarker(_)
         | DocumentNode::ParBreak
+        | DocumentNode::LineBreak
         | DocumentNode::PageBreak
         | DocumentNode::ClearPage
         | DocumentNode::ClearDoublePage
@@ -4894,6 +4950,24 @@ mod tests {
         assert_eq!(document.pages[0].lines.len(), 1);
         assert_eq!(document.pages[0].lines[0].text, "Mono body");
         assert_eq!(document.pages[0].lines[0].font_index, 2);
+    }
+
+    #[test]
+    fn textbf_passes_through_children_with_current_font_index() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(r"\textbf{Bold body}"));
+
+        assert_eq!(document.pages[0].lines.len(), 1);
+        assert_eq!(document.pages[0].lines[0].text, "Bold body");
+        assert_eq!(document.pages[0].lines[0].font_index, 0);
+    }
+
+    #[test]
+    fn line_break_node_typesets_as_separate_lines() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document(r"Alpha\\Beta"));
+
+        assert_eq!(document.pages[0].lines.len(), 2);
+        assert_eq!(document.pages[0].lines[0].text, "Alpha");
+        assert_eq!(document.pages[0].lines[1].text, "Beta");
     }
 
     #[test]

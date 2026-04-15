@@ -360,8 +360,24 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
     register_noop_command(engine, "date", 1);
     register_noop_command(engine, "hfill", 0);
     register_noop_command(engine, "title", 1);
+    register_noop_command(engine, "textbf", 1);
+    register_noop_command(engine, "textit", 1);
+    register_noop_command(engine, "emph", 1);
+    register_noop_command(engine, "textsc", 1);
     register_noop_command(engine, "textsf", 1);
     register_noop_command(engine, "texttt", 1);
+    register_noop_command(engine, "underline", 1);
+    register_noop_command(engine, "today", 0);
+    register_noop_command(engine, "vspace", 1);
+    register_noop_command(engine, "hspace", 1);
+    register_noop_command(engine, "bigskip", 0);
+    register_noop_command(engine, "medskip", 0);
+    register_noop_command(engine, "smallskip", 0);
+    register_noop_command(engine, "setlength", 2);
+    register_noop_command(engine, "addtolength", 2);
+    register_noop_command(engine, "quad", 0);
+    register_noop_command(engine, "qquad", 0);
+    register_noop_command(engine, "noindent", 0);
     register_passthrough_command(engine, "@firstoftwo", 2, 1);
     register_passthrough_command(engine, "@secondoftwo", 2, 2);
 }
