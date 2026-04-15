@@ -1469,7 +1469,7 @@ fn render_text_line_with_scripts(
                 ));
             }
             ScriptSegmentKind::Superscript => {
-                stream.push_str(&format!("0 {SUPERSCRIPT_RISE_PT} Td\n"));
+                stream.push_str(&format!("{SUPERSCRIPT_RISE_PT} Ts\n"));
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
@@ -1482,10 +1482,10 @@ fn render_text_line_with_scripts(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
                 ));
-                stream.push_str(&format!("0 {} Td\n", -SUPERSCRIPT_RISE_PT));
+                stream.push_str("0 Ts\n");
             }
             ScriptSegmentKind::FootnoteSuperscript => {
-                stream.push_str(&format!("0 {FOOTNOTE_SUPERSCRIPT_RISE_PT} Td\n"));
+                stream.push_str(&format!("{FOOTNOTE_SUPERSCRIPT_RISE_PT} Ts\n"));
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
@@ -1498,10 +1498,10 @@ fn render_text_line_with_scripts(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
                 ));
-                stream.push_str(&format!("0 {} Td\n", -FOOTNOTE_SUPERSCRIPT_RISE_PT));
+                stream.push_str("0 Ts\n");
             }
             ScriptSegmentKind::Subscript => {
-                stream.push_str(&format!("0 {} Td\n", -SUBSCRIPT_DROP_PT));
+                stream.push_str(&format!("{} Ts\n", -SUBSCRIPT_DROP_PT));
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
@@ -1514,7 +1514,7 @@ fn render_text_line_with_scripts(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
                 ));
-                stream.push_str(&format!("0 {SUBSCRIPT_DROP_PT} Td\n"));
+                stream.push_str("0 Ts\n");
             }
         }
     }
@@ -2775,10 +2775,10 @@ mod tests {
         let content = String::from_utf8_lossy(&pdf.bytes);
 
         assert!(content.contains("/Span <</ActualText (Inline x2 y1 note3)>> BDC"));
-        assert!(content.contains("0 4 Td"));
-        assert!(content.contains("0 -4 Td"));
-        assert_eq!(content.matches("0 -3 Td").count(), 2);
-        assert_eq!(content.matches("0 3 Td").count(), 2);
+        assert!(content.contains("4 Ts"));
+        assert!(content.contains("-3 Ts"));
+        assert!(content.contains("\n3 Ts\n"));
+        assert_eq!(content.matches("0 Ts").count(), 3);
     }
 
     #[test]

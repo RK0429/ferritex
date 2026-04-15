@@ -1745,7 +1745,9 @@ fn document_nodes_to_hlist_with_font_config(
                     hyphen_penalty,
                     current_font_index,
                 );
-                push_forced_break_if_needed(&mut hlist);
+                if !hlist.is_empty() {
+                    push_forced_break_if_needed(&mut hlist);
+                }
                 let mut math_hlist = math_layout::math_nodes_to_hlist(
                     nodes,
                     provider,
@@ -2146,10 +2148,22 @@ fn document_nodes_to_vlist_with_state(
                 segment_start = index + 1;
             }
             DocumentNode::DisplayMath(_, _) | DocumentNode::EquationEnv { .. } => {
+                if segment_start < index {
+                    let _ = append_nodes_segment_to_vlist(
+                        &mut vlist,
+                        document,
+                        &nodes[segment_start..index],
+                        provider,
+                        hyphenator,
+                        params,
+                        layout,
+                        &mut previous_block,
+                    );
+                }
                 let _ = append_nodes_segment_to_vlist(
                     &mut vlist,
                     document,
-                    &nodes[segment_start..index + 1],
+                    &nodes[index..index + 1],
                     provider,
                     hyphenator,
                     params,
@@ -6898,6 +6912,34 @@ mod tests {
             visible_line_texts(&document.pages[0]),
             vec!["Inline x2.", "a/b", "After"]
         );
+    }
+
+    #[test]
+    fn display_math_preceded_by_text_gets_separate_line_height() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document("Prefix text\\[x=1\\]"));
+        let page = &document.pages[0];
+
+        assert_eq!(visible_line_texts(page), vec!["Prefix text", "x=1"]);
+
+        let y0 = page.lines[0].y;
+        let y1 = page.lines[1].y;
+        assert!(y0 > y1, "Lines should have distinct y: y0={y0:?} y1={y1:?}");
+
+        let gap = y0 - y1;
+        let baselineskip = points(12);
+        assert!(
+            gap > baselineskip,
+            "Display math gap {gap:?} should exceed baselineskip {baselineskip:?}"
+        );
+    }
+
+    #[test]
+    fn inline_math_superscript_preserves_script_markers() {
+        let document = MinimalTypesetter.typeset(&parsed_latex_document("Value $x^2$."));
+        let line_text = &document.pages[0].lines[0].text;
+
+        assert!(line_text.contains(crate::typesetting::math_layout::SUPERSCRIPT_START_MARKER));
+        assert!(line_text.contains(crate::typesetting::math_layout::SUPERSCRIPT_END_MARKER));
     }
 
     #[test]
