@@ -1639,11 +1639,12 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             });
         }
 
+        let had_document_class_error = self.document_class_error.is_some();
         if let Some(error) = self.document_class_error.take() {
             self.record_error(error);
         }
 
-        if self.class_registry.active_class().is_none() {
+        if self.class_registry.active_class().is_none() && !had_document_class_error {
             self.record_error(ParseError::MissingDocumentClass);
         }
 
@@ -1837,6 +1838,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             "begin" => {
                 if self.read_environment_name()?.as_deref() == Some("document") {
                     self.begin_found = true;
+                    if self.document_class_error.is_some() {
+                        self.skip_to_end_document();
+                        return Ok(false);
+                    }
                     return Ok(true);
                 }
             }
@@ -1853,6 +1858,19 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         Ok(false)
+    }
+
+    fn skip_to_end_document(&mut self) {
+        while let Some(token) = self.next_raw_token() {
+            if let Some(name) = control_sequence_name(&token) {
+                if name == "end" {
+                    if self.read_environment_name().ok().flatten().as_deref() == Some("document") {
+                        self.end_found = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn process_sty_token(&mut self, token: Token) -> Result<(), ParseError> {
@@ -5018,9 +5036,27 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             .read_optional_bracket_tokens()?
             .map(|tokens| split_comma_separated_values(&tokens_to_text(&tokens)))
             .unwrap_or_default();
-        let Some(tokens) = self.read_required_braced_tokens()? else {
+
+        let Some(token) = self.next_significant_token() else {
             return Ok(None);
         };
+        let tokens = match token.kind {
+            TokenKind::CharToken {
+                cat: CatCode::BeginGroup,
+                ..
+            } => self.read_group_contents(token.line)?,
+            TokenKind::CharToken {
+                cat: CatCode::EndGroup,
+                ..
+            } => {
+                return Err(ParseError::UnexpectedClosingBrace { line: token.line });
+            }
+            _ => {
+                self.push_front_token(token);
+                return Ok(None);
+            }
+        };
+
         let class_name = tokens_to_text(&tokens).trim().to_string();
         if class_name.is_empty() || !is_valid_document_class(&class_name) {
             return Ok(None);
@@ -11262,6 +11298,50 @@ mod tests {
                 class_name: "memoir".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parse_recovering_unsupported_class_emits_single_error() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{revtex4-1}\n\\begin{document}\nHello\n\\end{document}\n",
+        );
+
+        assert_eq!(
+            output.errors,
+            vec![ParseError::UnsupportedDocumentClass {
+                line: 1,
+                class_name: "revtex4-1".to_string(),
+            }]
+        );
+        assert!(output.document.is_none());
+    }
+
+    #[test]
+    fn parse_recovering_invalid_class_emits_single_error() {
+        let output = MinimalLatexParser
+            .parse_recovering("\\documentclass\n\\begin{document}\nHello\n\\end{document}\n");
+
+        assert_eq!(
+            output.errors,
+            vec![ParseError::InvalidDocumentClass { line: 1 }]
+        );
+        assert!(output.document.is_none());
+    }
+
+    #[test]
+    fn parse_recovering_unsupported_class_suppresses_body_errors() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{revtex4-1}\n\\begin{document}\nA}\n\\begin{unknownenv}\n\\nonexistentcommand{foo}\n\\end{document}\n",
+        );
+
+        assert_eq!(
+            output.errors,
+            vec![ParseError::UnsupportedDocumentClass {
+                line: 1,
+                class_name: "revtex4-1".to_string(),
+            }]
+        );
+        assert!(output.document.is_none());
     }
 
     #[test]
