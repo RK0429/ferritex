@@ -334,6 +334,44 @@ fn compile_with_warnings_prints_summary_including_warning_count() {
 }
 
 #[test]
+fn compile_with_unimplemented_package_emits_warning_and_still_produces_pdf() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("unimpl.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{definitelyunknownpkg}\n\\begin{document}\nHello.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unimplemented-package warnings should exit 1 (non-fatal)"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("package `definitelyunknownpkg` is not implemented"),
+        "stderr should contain the unimplemented-package warning, got: {stderr}"
+    );
+    assert!(stderr.contains("warning"), "warning severity should be mentioned");
+    assert!(
+        stdout.contains("unimpl.pdf"),
+        "pdf output should still be produced"
+    );
+
+    let pdf_file = dir.path().join("unimpl.pdf");
+    let pdf = std::fs::read_to_string(&pdf_file).expect("read output pdf");
+    assert!(pdf.starts_with("%PDF-1.4"));
+    assert!(pdf.contains("Hello."));
+}
+
+#[test]
 fn compile_with_trace_font_tasks_emits_font_task_trace_to_stderr() {
     // Cold path: the first compile should emit concrete font task traces.
     let dir = tempfile::tempdir().expect("create tempdir");

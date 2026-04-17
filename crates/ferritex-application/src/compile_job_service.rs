@@ -5870,7 +5870,8 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
     let severity = match error {
         ParseError::FontspecNotLoaded { .. }
         | ParseError::SetmainfontInBody { .. }
-        | ParseError::ShellEscapeNotAllowed { .. } => Severity::Warning,
+        | ParseError::ShellEscapeNotAllowed { .. }
+        | ParseError::UnimplementedPackage { .. } => Severity::Warning,
         _ => Severity::Error,
     };
     let diagnostic = Diagnostic::new(severity, error.to_string()).with_file(input_path);
@@ -5964,6 +5965,13 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         }
         ParseError::ShellEscapeError { .. } => diagnostic,
         ParseError::FileOperationDenied { reason, .. } => diagnostic.with_context(reason),
+        ParseError::UnimplementedPackage { name, .. } => diagnostic
+            .with_context(format!(
+                "ferritex has no implementation or bundled .sty for `{name}`; commands it would define will surface as undefined control sequences"
+            ))
+            .with_suggestion(format!(
+                "remove \\usepackage{{{name}}} or provide a .sty for it"
+            )),
     }
 }
 

@@ -11,9 +11,9 @@ pub use api::{
 };
 pub use macro_engine::{EnvironmentDef, MacroDef, MacroEngine};
 pub use package_loading::{
-    load_document_class, load_package, AmsmathExtension, ClassInfo, ClassRegistry,
-    FontspecExtension, GeometryExtension, GraphicxExtension, OptionRegistry, PackageExtension,
-    PackageInfo, PackageRegistry, XcolorExtension, SUPPORTED_CLASSES,
+    is_implemented_package, load_document_class, load_package, AmsmathExtension, ClassInfo,
+    ClassRegistry, FontspecExtension, GeometryExtension, GraphicxExtension, OptionRegistry,
+    PackageExtension, PackageInfo, PackageRegistry, XcolorExtension, SUPPORTED_CLASSES,
 };
 pub use registers::{CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX};
 pub use tokenizer::{

@@ -21,8 +21,8 @@ use crate::synctex::api::SourceLineTrace;
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
     package_loading::{
-        load_document_class, load_package, ClassInfo, ClassRegistry, OptionRegistry, PackageInfo,
-        PackageRegistry, StyPackageResolver,
+        is_implemented_package, load_document_class, load_package, ClassInfo, ClassRegistry,
+        OptionRegistry, PackageInfo, PackageRegistry, StyPackageResolver,
     },
     registers::{CompatDimenRegister, CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX},
     CatCode, EnvironmentDef, MacroDef, MacroEngine, Token, TokenKind, Tokenizer,
@@ -602,6 +602,8 @@ pub enum ParseError {
     ShellEscapeNotAllowed { line: u32, command: String },
     #[error("{message}")]
     ShellEscapeError { line: u32, message: String },
+    #[error("package `{name}` is not implemented in ferritex; commands from it may not be available")]
+    UnimplementedPackage { line: u32, name: String },
     #[error("file access denied: \\{operation} {path}")]
     FileOperationDenied {
         line: u32,
@@ -657,6 +659,7 @@ impl ParseError {
             | Self::SetmainfontInBody { line }
             | Self::ShellEscapeNotAllowed { line, .. }
             | Self::ShellEscapeError { line, .. }
+            | Self::UnimplementedPackage { line, .. }
             | Self::FileOperationDenied { line, .. } => Some(*line),
         }
     }
@@ -5068,6 +5071,13 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         Ok(Some((class_name, options)))
     }
 
+    /// Loads packages requested by `\usepackage` / `\RequirePackage`.
+    ///
+    /// Packages that ferritex does not implement get a non-fatal
+    /// `UnimplementedPackage` warning, emitted once per first load. Warnings
+    /// are suppressed while interpreting a `.sty` source (sty_interpreter_mode)
+    /// so dependency loads inside a recognized package don't surface here;
+    /// user-facing diagnostics come from the top-level `\usepackage` only.
     fn parse_package_directive(&mut self, line: u32) -> Result<(), ParseError> {
         let options = self
             .read_optional_bracket_tokens()?
@@ -5082,7 +5092,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.current_package_options = options.clone();
                 self.option_registry.clear();
             }
-            let _ = load_package(
+            let implemented = is_implemented_package(&package_name, self.sty_resolver);
+            let newly_loaded = load_package(
                 &package_name,
                 &options,
                 &mut self.package_registry,
@@ -5091,6 +5102,12 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.sty_resolver,
             )
             .map_err(|_| ParseError::InvalidDocumentClass { line })?;
+            if newly_loaded && !implemented && !self.sty_interpreter_mode {
+                self.record_error(ParseError::UnimplementedPackage {
+                    line,
+                    name: package_name.clone(),
+                });
+            }
         }
 
         Ok(())
@@ -11192,6 +11209,144 @@ mod tests {
             }]
         );
         assert_eq!(document.package_count, 1);
+    }
+
+    #[test]
+    fn usepackage_emits_warning_for_unimplemented_package_and_continues_compilation() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{amsmath}\n\
+             \\usepackage{definitelyunknownpkg}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        let document = output.document.expect("recoverable parse yields a document");
+        assert!(document.body.contains("Body"));
+        assert!(document
+            .loaded_packages
+            .iter()
+            .any(|package| package.name == "definitelyunknownpkg"));
+
+        let warnings: Vec<_> = output
+            .errors
+            .iter()
+            .filter(|error| matches!(error, ParseError::UnimplementedPackage { .. }))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(matches!(
+            warnings[0],
+            ParseError::UnimplementedPackage { name, line: 3 } if name == "definitelyunknownpkg"
+        ));
+
+        assert!(!output
+            .errors
+            .iter()
+            .any(|error| matches!(
+                error,
+                ParseError::UnimplementedPackage { name, .. } if name == "amsmath"
+            )));
+    }
+
+    #[test]
+    fn usepackage_does_not_duplicate_warning_on_repeated_load() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{unknownpkg}\n\
+             \\usepackage{unknownpkg}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        let warnings: Vec<_> = output
+            .errors
+            .iter()
+            .filter(|error| matches!(
+                error,
+                ParseError::UnimplementedPackage { name, .. } if name == "unknownpkg"
+            ))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn requirepackage_also_emits_warning_for_unimplemented_package() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\RequirePackage{unknownpkg}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::UnimplementedPackage { name, line: 2 }] if name == "unknownpkg"
+        ));
+    }
+
+    #[test]
+    fn usepackage_does_not_warn_for_kernel_integrated_hyperref() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{hyperref}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert!(!output
+            .errors
+            .iter()
+            .any(|error| matches!(error, ParseError::UnimplementedPackage { .. })));
+    }
+
+    #[test]
+    fn usepackage_does_not_warn_for_tikz_and_pgf() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{tikz}\n\
+             \\usepackage{pgf}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert!(!output
+            .errors
+            .iter()
+            .any(|error| matches!(error, ParseError::UnimplementedPackage { .. })));
+    }
+
+    #[test]
+    fn usepackage_warning_is_suppressed_inside_sty_interpreter_mode() {
+        use crate::parser::package_loading::{PackageRegistry, StyPackageResolver};
+        use crate::parser::MacroEngine;
+
+        // A .sty that RequirePackages an unknown dependency. Interpreting the
+        // .sty should not surface a top-level UnimplementedPackage warning;
+        // the sty_interpreter_mode guard in parse_package_directive suppresses
+        // diagnostics whose line numbers would point into the .sty source.
+        let resolver_closure =
+            |name: &str| -> Option<String> {
+                match name {
+                    "wrappingpkg" => Some(
+                        "\\NeedsTeXFormat{LaTeX2e}\n\
+                         \\ProvidesPackage{wrappingpkg}[2024/01/01]\n\
+                         \\RequirePackage{innerunknownpkg}\n"
+                            .to_string(),
+                    ),
+                    _ => None,
+                }
+            };
+        let resolver: &StyPackageResolver<'_> = &resolver_closure;
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+
+        crate::parser::package_loading::load_package(
+            "wrappingpkg",
+            &[],
+            &mut registry,
+            &mut engine,
+            None,
+            Some(resolver),
+        )
+        .expect("load wrappingpkg");
+
+        assert!(registry.is_loaded("wrappingpkg"));
+        assert!(registry.is_loaded("innerunknownpkg"));
     }
 
     #[test]
