@@ -2097,6 +2097,33 @@ fn compile_reports_issue_1_diagnostics_and_exits_nonzero() {
 }
 
 #[test]
+fn compile_with_errors_suppresses_success_summary_on_stdout() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\begin{unclosedenv}\ntext\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(dir.path().join("broken.pdf").exists());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("->"));
+    assert!(!stdout.contains(".pdf"));
+    assert!(!stdout.contains("page"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("undefined control sequence"));
+}
+
+#[test]
 fn compile_with_missing_asset_bundle_reports_validation_error() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello.tex");
