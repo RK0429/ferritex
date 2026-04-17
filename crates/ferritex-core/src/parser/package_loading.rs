@@ -324,6 +324,8 @@ pub fn load_document_class(
                 options: options.to_vec(),
             });
             register_base_latex_commands(engine);
+            register_passthrough_command(engine, "opening", 1, 1);
+            register_passthrough_command(engine, "closing", 1, 1);
             Ok(())
         }
         _ => Err(format!("Unknown document class: {name}")),
@@ -358,6 +360,7 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
     register_noop_command(engine, "@gobbletwo", 2);
     register_noop_command(engine, "centering", 0);
     register_noop_command(engine, "date", 1);
+    register_noop_command(engine, "footnote", 1);
     register_noop_command(engine, "hfill", 0);
     register_noop_command(engine, "title", 1);
     register_noop_command(engine, "textbf", 1);
@@ -673,6 +676,29 @@ mod tests {
         assert!(engine.lookup("chapter").is_some());
         assert!(engine.lookup("section").is_some());
         assert!(engine.lookup_environment("itemize").is_some());
+    }
+
+    #[test]
+    fn load_letter_class_registers_letter_specific_commands() {
+        let mut registry = ClassRegistry::default();
+        let mut engine = MacroEngine::default();
+
+        load_document_class("letter", &[], &mut registry, &mut engine).expect("load letter class");
+
+        let opening = engine.lookup("opening").expect("\\opening defined");
+        assert_eq!(opening.parameter_count, 1);
+        let closing = engine.lookup("closing").expect("\\closing defined");
+        assert_eq!(closing.parameter_count, 1);
+    }
+
+    #[test]
+    fn base_latex_registration_defines_kernel_footnote_command() {
+        let mut engine = MacroEngine::default();
+
+        register_base_latex_commands(&mut engine);
+
+        let footnote = engine.lookup("footnote").expect("\\footnote defined");
+        assert_eq!(footnote.parameter_count, 1);
     }
 
     #[test]

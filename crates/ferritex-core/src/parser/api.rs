@@ -13247,6 +13247,67 @@ mod tests {
     }
 
     #[test]
+    fn letter_class_accepts_opening_and_closing_without_undefined_errors() {
+        let output = MinimalLatexParser.parse_recovering(concat!(
+            "\\documentclass{letter}\n",
+            "\\begin{document}\n",
+            "\\begin{letter}{Recipient\\\\123 Main St.}\n",
+            "\\opening{Dear Recipient,}\n",
+            "Body.\n",
+            "\\closing{Sincerely,}\n",
+            "\\end{letter}\n",
+            "\\end{document}\n",
+        ));
+
+        let undefined = output
+            .errors
+            .iter()
+            .filter_map(|error| match error {
+                ParseError::UndefinedControlSequence { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            undefined.is_empty(),
+            "letter macros should not surface as undefined: {undefined:?}"
+        );
+
+        let body = output
+            .document
+            .as_ref()
+            .expect("letter parses to a document")
+            .body
+            .as_str();
+        assert!(
+            body.contains("Dear Recipient,"),
+            "\\opening argument should pass through to the body: {body:?}",
+        );
+        assert!(
+            body.contains("Sincerely,"),
+            "\\closing argument should pass through to the body: {body:?}",
+        );
+    }
+
+    #[test]
+    fn footnote_in_article_does_not_surface_as_undefined() {
+        let output = MinimalLatexParser.parse_recovering(concat!(
+            "\\documentclass{article}\n",
+            "\\begin{document}\n",
+            "A footnote\\footnote{note body} mark.\n",
+            "\\end{document}\n",
+        ));
+
+        assert!(
+            !output.errors.iter().any(|error| matches!(
+                error,
+                ParseError::UndefinedControlSequence { name, .. } if name == "footnote"
+            )),
+            "\\footnote should resolve to a built-in command: {:?}",
+            output.errors
+        );
+    }
+
+    #[test]
     fn pdftex_stub_primitives_expand_and_assign() {
         let document = parse_document(
             "\\pdfoutput=0\\pdfoutput/\\pdftexversion/\\pdfstrcmp{a}{b}/\\pdfstrcmp{a}{a}/\\pdfstrcmp{b}{a}/\\pdffilesize{demo.pdf}/\\pdftexbanner",
