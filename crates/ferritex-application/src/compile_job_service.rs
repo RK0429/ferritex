@@ -13079,9 +13079,12 @@ mod tests {
 
     #[test]
     fn pdf_encoding_warning_is_propagated_to_compile_diagnostics() {
+        // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
+        // triggers the encoding warning. (Greek/math glyphs are now routed
+        // through the Symbol font rather than the WinAnsi text path.)
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
-        fs::write(&input_file, document("Hello δ")).expect("write input");
+        fs::write(&input_file, document("Hello 漢")).expect("write input");
 
         let options = runtime_options(input_file, dir.path().join("out"));
         let loader = MockAssetBundleLoader::valid();
@@ -13094,11 +13097,44 @@ mod tests {
             .iter()
             .find(|diagnostic| {
                 diagnostic.severity == Severity::Warning
-                    && diagnostic.message.contains("δ")
+                    && diagnostic.message.contains('漢')
                     && diagnostic.message.contains("WinAnsiEncoding")
             })
             .expect("pdf encoding warning diagnostic");
         assert!(diagnostic.message.contains("replaced with '?'"));
+    }
+
+    #[test]
+    fn pdf_math_mode_unicode_glyphs_emit_no_winansi_warning() {
+        // Regression for Issue #9: math-mode Unicode glyphs (\alpha, \pi, \int,
+        // \sqrt{}, \infty, thin-space) must render through a math-capable font
+        // rather than via WinAnsi '?' substitution.
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            document(
+                "Inline math: $\\alpha + \\beta = \\gamma$.\n\nDisplay math:\n\\[\n  \\int_0^\\infty e^{-x^2} \\, dx = \\frac{\\sqrt{\\pi}}{2}\n\\]",
+            ),
+        )
+        .expect("write input");
+
+        let options = runtime_options(input_file, dir.path().join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        let winansi_messages: Vec<String> = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("WinAnsiEncoding"))
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+
+        assert!(
+            winansi_messages.is_empty(),
+            "expected no WinAnsi encoding warnings for math-mode glyphs, got: {winansi_messages:?}",
+        );
     }
 
     #[test]

@@ -45,6 +45,9 @@ pub struct RenderedPdfDocument {
 pub enum FontResource {
     /// A bare Type1 reference (e.g., Helvetica) - no embedding
     BuiltinType1 { base_font: String },
+    /// Adobe Symbol Type1 font reference - uses the font's built-in Symbol encoding
+    /// (Greek letters and math glyphs); not a WinAnsi encoded text font.
+    SymbolBuiltin,
     /// An embedded Type1 font backed by a PFB program
     EmbeddedType1 {
         base_font: String,
@@ -267,6 +270,8 @@ impl PdfRenderer {
         let mut image_objects = self.images.clone();
         let mut form_xobjects = self.form_xobjects.clone();
         let page_partition_ids = page_partition_ids_for_plan(document, partition_plan);
+        let rendering_fonts = fonts_with_math_font(&self.fonts);
+        let math_font_number = math_font_f_number(&rendering_fonts);
         let RenderedPagePayloads {
             page_payloads,
             warnings,
@@ -281,6 +286,7 @@ impl PdfRenderer {
             parallelism,
             pass_number,
             pre_rendered_page_payloads,
+            math_font_number,
         );
         let mut page_annotations = page_payloads
             .iter()
@@ -311,7 +317,7 @@ impl PdfRenderer {
                 )
             });
         let font_object_start = outline_item_object_start + outline_build.objects.len();
-        let font_objects = build_font_objects(&self.fonts, font_object_start);
+        let font_objects = build_font_objects(&rendering_fonts, font_object_start);
         let font_object_count = font_objects
             .iter()
             .map(|font_object| font_object.objects.len())
@@ -693,6 +699,30 @@ fn default_font_resources() -> Vec<FontResource> {
     }]
 }
 
+/// Returns a rendering-ready copy of `fonts` with the built-in Symbol font
+/// appended (if absent). The Symbol font is always available so that math-mode
+/// Unicode glyphs never have to fall through the WinAnsi text path.
+fn fonts_with_math_font(fonts: &[FontResource]) -> Vec<FontResource> {
+    let mut rendering_fonts = fonts.to_vec();
+    if !rendering_fonts
+        .iter()
+        .any(|font| matches!(font, FontResource::SymbolBuiltin))
+    {
+        rendering_fonts.push(FontResource::SymbolBuiltin);
+    }
+    rendering_fonts
+}
+
+/// Returns the PDF `/Fn` number (1-based) that points at the Symbol font in
+/// the rendering-ready fonts array produced by [`fonts_with_math_font`].
+fn math_font_f_number(rendering_fonts: &[FontResource]) -> usize {
+    rendering_fonts
+        .iter()
+        .position(|font| matches!(font, FontResource::SymbolBuiltin))
+        .map(|index| index + 1)
+        .expect("rendering fonts always contain the Symbol font")
+}
+
 fn build_font_objects(fonts: &[FontResource], start_object_id: usize) -> Vec<FontObjectSet> {
     let mut next_object_id = start_object_id;
     let mut font_objects = Vec::with_capacity(fonts.len());
@@ -712,6 +742,18 @@ fn build_font_objects(fonts: &[FontResource], start_object_id: usize) -> Vec<Fon
                         )
                         .into_bytes(),
                     ],
+                });
+            }
+            FontResource::SymbolBuiltin => {
+                let dictionary_object_id = next_object_id;
+                next_object_id += 1;
+
+                font_objects.push(FontObjectSet {
+                    dictionary_object_id,
+                    objects: vec![format!(
+                        "{dictionary_object_id} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>\nendobj\n"
+                    )
+                    .into_bytes()],
                 });
             }
             FontResource::EmbeddedType1 {
@@ -933,6 +975,7 @@ fn render_page_payloads(
     parallelism: usize,
     _pass_number: u32,
     pre_rendered_page_payloads: Option<&BTreeMap<usize, PageRenderPayload>>,
+    math_font_number: usize,
 ) -> RenderedPagePayloads {
     let workloads = page_render_workloads(page_partition_ids, pages.len(), parallelism);
     let rendered_payloads = if workloads.len() <= 1 {
@@ -952,6 +995,7 @@ fn render_page_payloads(
                             link_style,
                             pre_rendered_page_payloads,
                             page_index,
+                            math_font_number,
                         )
                     })
                     .collect::<Vec<_>>()
@@ -976,6 +1020,7 @@ fn render_page_payloads(
                                 link_style,
                                 pre_rendered_page_payloads,
                                 page_index,
+                                math_font_number,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -1029,6 +1074,7 @@ fn render_page_payload_for_index(
     link_style: &LinkStyle,
     pre_rendered_page_payloads: Option<&BTreeMap<usize, PageRenderPayload>>,
     page_index: usize,
+    math_font_number: usize,
 ) -> RenderedPagePayload {
     let warning_chars = collect_page_warning_chars(&pages[page_index]);
 
@@ -1059,6 +1105,7 @@ fn render_page_payload_for_index(
             .unwrap_or(&[]),
         form_xobjects,
         link_style,
+        math_font_number,
     );
     let page = &pages[page_index];
     RenderedPagePayload {
@@ -1187,16 +1234,17 @@ fn render_page_stream(
     placed_form_xobjects: &[PlacedFormXObject],
     form_xobjects: &[PdfFormXObject],
     link_style: &LinkStyle,
+    math_font_number: usize,
 ) -> PdfRenderStringResult {
     let mut stream = String::new();
     let mut warning_chars = BTreeSet::new();
 
-    let rendered_lines = render_text_lines(&page.lines, link_style);
+    let rendered_lines = render_text_lines(&page.lines, link_style, math_font_number);
     warning_chars.extend(rendered_lines.unencodable_chars);
     stream.push_str(&rendered_lines.rendered);
     for placement in &page.float_placements {
         let lines = resolve_float_lines(placement);
-        let rendered_lines = render_text_lines(&lines, link_style);
+        let rendered_lines = render_text_lines(&lines, link_style, math_font_number);
         warning_chars.extend(rendered_lines.unencodable_chars);
         stream.push_str(&rendered_lines.rendered);
     }
@@ -1301,19 +1349,22 @@ fn collect_graphic_node_warning_chars(node: &GraphicNode, warning_chars: &mut BT
             }
         }
         GraphicNode::Text(text) => {
-            warning_chars.extend(encode_pdf_text(&text.content).unencodable_chars);
+            collect_unencodable_chars(&text.content, warning_chars);
         }
     }
 }
 
 fn collect_text_line_warning_chars(lines: &[TextLine], warning_chars: &mut BTreeSet<char>) {
     for line in lines {
-        warning_chars
-            .extend(encode_pdf_text(&strip_math_script_markers(&line.text)).unencodable_chars);
+        collect_unencodable_chars(&strip_math_script_markers(&line.text), warning_chars);
     }
 }
 
-fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> PdfRenderStringResult {
+fn render_text_lines(
+    lines: &[TextLine],
+    link_style: &LinkStyle,
+    math_font_number: usize,
+) -> PdfRenderStringResult {
     let Some(first_line) = lines.first() else {
         return PdfRenderStringResult {
             rendered: String::new(),
@@ -1335,7 +1386,13 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> PdfRenderStr
         points_to_pdf_number(DimensionValue(first_x)),
         points_to_pdf_number(first_line.y)
     ));
-    render_text_line(&mut stream, first_line, link_style, &mut warning_chars);
+    render_text_line(
+        &mut stream,
+        first_line,
+        link_style,
+        &mut warning_chars,
+        math_font_number,
+    );
 
     let mut previous_x = first_line.x;
     let mut previous_y = first_line.y;
@@ -1355,7 +1412,13 @@ fn render_text_lines(lines: &[TextLine], link_style: &LinkStyle) -> PdfRenderStr
             current_font = line.font_index;
             current_font_size = line.font_size;
         }
-        render_text_line(&mut stream, line, link_style, &mut warning_chars);
+        render_text_line(
+            &mut stream,
+            line,
+            link_style,
+            &mut warning_chars,
+            math_font_number,
+        );
         previous_x = line.x;
         previous_y = line.y;
     }
@@ -1371,17 +1434,25 @@ fn render_text_line(
     line: &TextLine,
     link_style: &LinkStyle,
     warning_chars: &mut BTreeSet<char>,
+    math_font_number: usize,
 ) {
     if contains_script_markers(&line.text) && line.links.is_empty() {
-        render_text_line_with_scripts(stream, line, warning_chars);
+        render_text_line_with_scripts(stream, line, warning_chars, math_font_number);
         return;
     }
 
+    let primary_font_number = usize::from(line.font_index) + 1;
+    let font_size = line.font_size;
+
     let Some(link_color) = active_link_color(link_style) else {
-        stream.push_str(&format!(
-            "({}) Tj\n",
-            encode_pdf_text_collecting(&strip_math_script_markers(&line.text), warning_chars)
-        ));
+        emit_text_with_font_runs(
+            stream,
+            &strip_math_script_markers(&line.text),
+            primary_font_number,
+            math_font_number,
+            font_size,
+            warning_chars,
+        );
         return;
     };
 
@@ -1391,10 +1462,14 @@ fn render_text_line(
         .filter(|link| !link.url.is_empty() && link.start_char < link.end_char)
         .collect::<Vec<_>>();
     if links.is_empty() {
-        stream.push_str(&format!(
-            "({}) Tj\n",
-            encode_pdf_text_collecting(&strip_math_script_markers(&line.text), warning_chars)
-        ));
+        emit_text_with_font_runs(
+            stream,
+            &strip_math_script_markers(&line.text),
+            primary_font_number,
+            math_font_number,
+            font_size,
+            warning_chars,
+        );
         return;
     }
 
@@ -1410,34 +1485,37 @@ fn render_text_line(
             continue;
         }
         if cursor < start {
-            stream.push_str(&format!(
-                "({}) Tj\n",
-                encode_pdf_text_collecting(
-                    char_slice(&rendered_text, &boundaries, cursor, start),
-                    warning_chars,
-                )
-            ));
+            emit_text_with_font_runs(
+                stream,
+                char_slice(&rendered_text, &boundaries, cursor, start),
+                primary_font_number,
+                math_font_number,
+                font_size,
+                warning_chars,
+            );
         }
         stream.push_str(&pdf_rgb_operator(link_color));
-        stream.push_str(&format!(
-            "({}) Tj\n",
-            encode_pdf_text_collecting(
-                char_slice(&rendered_text, &boundaries, start, end),
-                warning_chars,
-            )
-        ));
+        emit_text_with_font_runs(
+            stream,
+            char_slice(&rendered_text, &boundaries, start, end),
+            primary_font_number,
+            math_font_number,
+            font_size,
+            warning_chars,
+        );
         stream.push_str("0 0 0 rg\n");
         cursor = end;
     }
 
     if cursor < char_count {
-        stream.push_str(&format!(
-            "({}) Tj\n",
-            encode_pdf_text_collecting(
-                char_slice(&rendered_text, &boundaries, cursor, char_count),
-                warning_chars,
-            )
-        ));
+        emit_text_with_font_runs(
+            stream,
+            char_slice(&rendered_text, &boundaries, cursor, char_count),
+            primary_font_number,
+            math_font_number,
+            font_size,
+            warning_chars,
+        );
     }
 }
 
@@ -1445,8 +1523,9 @@ fn render_text_line_with_scripts(
     stream: &mut String,
     line: &TextLine,
     warning_chars: &mut BTreeSet<char>,
+    math_font_number: usize,
 ) {
-    let base_font = line.font_index + 1;
+    let base_font = usize::from(line.font_index) + 1;
     let base_font_size = line.font_size;
     let script_font_size = scaled_font_size(base_font_size, 7, 10);
     let rendered_text = strip_math_script_markers(&line.text);
@@ -1463,10 +1542,14 @@ fn render_text_line_with_scripts(
 
         match segment.kind {
             ScriptSegmentKind::Base => {
-                stream.push_str(&format!(
-                    "({}) Tj\n",
-                    encode_pdf_text_collecting(&segment.text, warning_chars)
-                ));
+                emit_text_with_font_runs(
+                    stream,
+                    &segment.text,
+                    base_font,
+                    math_font_number,
+                    base_font_size,
+                    warning_chars,
+                );
             }
             ScriptSegmentKind::Superscript => {
                 stream.push_str(&format!("{SUPERSCRIPT_RISE_PT} Ts\n"));
@@ -1474,10 +1557,14 @@ fn render_text_line_with_scripts(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
                 ));
-                stream.push_str(&format!(
-                    "({}) Tj\n",
-                    encode_pdf_text_collecting(&segment.text, warning_chars)
-                ));
+                emit_text_with_font_runs(
+                    stream,
+                    &segment.text,
+                    base_font,
+                    math_font_number,
+                    script_font_size,
+                    warning_chars,
+                );
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
@@ -1490,10 +1577,14 @@ fn render_text_line_with_scripts(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
                 ));
-                stream.push_str(&format!(
-                    "({}) Tj\n",
-                    encode_pdf_text_collecting(&segment.text, warning_chars)
-                ));
+                emit_text_with_font_runs(
+                    stream,
+                    &segment.text,
+                    base_font,
+                    math_font_number,
+                    script_font_size,
+                    warning_chars,
+                );
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
@@ -1506,10 +1597,14 @@ fn render_text_line_with_scripts(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(script_font_size)
                 ));
-                stream.push_str(&format!(
-                    "({}) Tj\n",
-                    encode_pdf_text_collecting(&segment.text, warning_chars)
-                ));
+                emit_text_with_font_runs(
+                    stream,
+                    &segment.text,
+                    base_font,
+                    math_font_number,
+                    script_font_size,
+                    warning_chars,
+                );
                 stream.push_str(&format!(
                     "/F{base_font} {} Tf\n",
                     points_to_pdf_number(base_font_size)
@@ -2469,6 +2564,286 @@ fn encode_pdf_text_collecting(value: &str, warning_chars: &mut BTreeSet<char>) -
     let result = encode_pdf_text(value);
     warning_chars.extend(result.unencodable_chars);
     result.encoded
+}
+
+/// Maps a Unicode math/Greek codepoint to a byte in the built-in Symbol Type1 font
+/// encoding (Adobe Symbol character set). Returns `None` for code points that are
+/// not covered by the Symbol font.
+fn unicode_to_symbol_byte(ch: char) -> Option<u8> {
+    match ch {
+        // Greek lowercase
+        '\u{03B1}' => Some(0x61), // α
+        '\u{03B2}' => Some(0x62), // β
+        '\u{03B3}' => Some(0x67), // γ
+        '\u{03B4}' => Some(0x64), // δ
+        '\u{03B5}' | '\u{03F5}' => Some(0x65), // ε / ϵ
+        '\u{03B6}' => Some(0x7A), // ζ
+        '\u{03B7}' => Some(0x68), // η
+        '\u{03B8}' => Some(0x71), // θ
+        '\u{03D1}' => Some(0x4A), // ϑ (theta1)
+        '\u{03B9}' => Some(0x69), // ι
+        '\u{03BA}' => Some(0x6B), // κ
+        '\u{03BB}' => Some(0x6C), // λ
+        '\u{03BC}' => Some(0x6D), // μ
+        '\u{03BD}' => Some(0x6E), // ν
+        '\u{03BE}' => Some(0x78), // ξ
+        '\u{03BF}' => Some(0x6F), // ο
+        '\u{03C0}' => Some(0x70), // π
+        '\u{03D6}' => Some(0x76), // ϖ (varpi)
+        '\u{03C1}' => Some(0x72), // ρ
+        '\u{03C3}' => Some(0x73), // σ
+        '\u{03C2}' => Some(0x56), // ς (final sigma) → Symbol's sigma1 at 'V'
+        '\u{03C4}' => Some(0x74), // τ
+        '\u{03C5}' => Some(0x75), // υ
+        '\u{03C6}' => Some(0x66), // φ (phi)
+        '\u{03D5}' => Some(0x6A), // ϕ (phi1 variant)
+        '\u{03C7}' => Some(0x63), // χ
+        '\u{03C8}' => Some(0x79), // ψ
+        '\u{03C9}' => Some(0x77), // ω
+
+        // Greek uppercase
+        '\u{0391}' => Some(0x41), // Α
+        '\u{0392}' => Some(0x42), // Β
+        '\u{0393}' => Some(0x47), // Γ
+        '\u{0394}' => Some(0x44), // Δ
+        '\u{0395}' => Some(0x45), // Ε
+        '\u{0396}' => Some(0x5A), // Ζ
+        '\u{0397}' => Some(0x48), // Η
+        '\u{0398}' => Some(0x51), // Θ
+        '\u{0399}' => Some(0x49), // Ι
+        '\u{039A}' => Some(0x4B), // Κ
+        '\u{039B}' => Some(0x4C), // Λ
+        '\u{039C}' => Some(0x4D), // Μ
+        '\u{039D}' => Some(0x4E), // Ν
+        '\u{039E}' => Some(0x58), // Ξ
+        '\u{039F}' => Some(0x4F), // Ο
+        '\u{03A0}' => Some(0x50), // Π
+        '\u{03A1}' => Some(0x52), // Ρ
+        '\u{03A3}' => Some(0x53), // Σ
+        '\u{03A4}' => Some(0x54), // Τ
+        '\u{03A5}' => Some(0x55), // Υ
+        '\u{03D2}' => Some(0xA1), // ϒ (Upsilon1)
+        '\u{03A6}' => Some(0x46), // Φ
+        '\u{03A7}' => Some(0x43), // Χ
+        '\u{03A8}' => Some(0x59), // Ψ
+        '\u{03A9}' | '\u{2126}' => Some(0x57), // Ω / ohm sign
+
+        // Math operators and relations
+        '\u{2200}' => Some(0x22), // ∀
+        '\u{2203}' => Some(0x24), // ∃
+        '\u{2205}' => Some(0xC6), // ∅
+        '\u{2207}' => Some(0xD1), // ∇
+        '\u{2202}' => Some(0xB6), // ∂
+        '\u{2208}' => Some(0xCE), // ∈
+        '\u{2209}' => Some(0xCF), // ∉
+        '\u{221D}' => Some(0xB5), // ∝
+        '\u{221E}' => Some(0xA5), // ∞
+        '\u{2220}' => Some(0xD0), // ∠
+        '\u{2227}' => Some(0xD9), // ∧
+        '\u{2228}' => Some(0xDA), // ∨
+        '\u{2229}' => Some(0xC7), // ∩
+        '\u{222A}' => Some(0xC8), // ∪
+        '\u{222B}' => Some(0xF2), // ∫
+        '\u{2320}' => Some(0xF3), // ⌠
+        '\u{2321}' => Some(0xF5), // ⌡
+        '\u{223C}' => Some(0x7E), // ∼
+        '\u{2245}' => Some(0x40), // ≅
+        '\u{2248}' => Some(0xBB), // ≈
+        '\u{2260}' => Some(0xB9), // ≠
+        '\u{2261}' => Some(0xBA), // ≡
+        '\u{2264}' => Some(0xA3), // ≤
+        '\u{2265}' => Some(0xB3), // ≥
+        '\u{2282}' => Some(0xCC), // ⊂
+        '\u{2283}' => Some(0xC9), // ⊃
+        '\u{2284}' => Some(0xCB), // ⊄
+        '\u{2286}' => Some(0xCD), // ⊆
+        '\u{2287}' => Some(0xCA), // ⊇
+        '\u{2295}' => Some(0xC5), // ⊕
+        '\u{2297}' => Some(0xC4), // ⊗
+        '\u{22A5}' => Some(0x5E), // ⊥
+        '\u{22C5}' => Some(0xD7), // ⋅
+        '\u{221A}' => Some(0xD6), // √
+        '\u{2211}' => Some(0xE5), // ∑
+        '\u{220F}' => Some(0xD5), // ∏
+        '\u{00B0}' => Some(0xB0), // °
+        '\u{00B1}' => Some(0xB1), // ±
+        '\u{00D7}' => Some(0xB4), // ×
+        '\u{00F7}' => Some(0xB8), // ÷
+        '\u{00AC}' => Some(0xD8), // ¬
+
+        // Arrows
+        '\u{2190}' => Some(0xAC), // ←
+        '\u{2191}' => Some(0xAD), // ↑
+        '\u{2192}' => Some(0xAE), // →
+        '\u{2193}' => Some(0xAF), // ↓
+        '\u{2194}' => Some(0xAB), // ↔
+        '\u{21D0}' => Some(0xDC), // ⇐
+        '\u{21D1}' => Some(0xDD), // ⇑
+        '\u{21D2}' => Some(0xDE), // ⇒
+        '\u{21D3}' => Some(0xDF), // ⇓
+        '\u{21D4}' => Some(0xDB), // ⇔
+
+        // Delimiters and brackets
+        '\u{27E8}' => Some(0xE1), // ⟨
+        '\u{27E9}' => Some(0xF1), // ⟩
+        '\u{2308}' => Some(0xE9), // ⌈
+        '\u{2309}' => Some(0xF9), // ⌉
+        '\u{230A}' => Some(0xEB), // ⌊
+        '\u{230B}' => Some(0xFB), // ⌋
+
+        // Misc math symbols
+        '\u{2135}' => Some(0xC0), // ℵ
+        '\u{2111}' => Some(0xC1), // ℑ
+        '\u{211C}' => Some(0xC2), // ℜ
+        '\u{2118}' => Some(0xC3), // ℘
+        '\u{2032}' => Some(0xA2), // ′
+        '\u{2026}' => Some(0xBC), // … (ellipsis)
+
+        _ => None,
+    }
+}
+
+/// Appends one PDF literal-string byte to `out`, escaping specials and
+/// encoding non-printables as octal sequences.
+fn append_pdf_string_byte(byte: u8, out: &mut String) {
+    match byte {
+        b'\\' => out.push_str("\\\\"),
+        b'(' => out.push_str("\\("),
+        b')' => out.push_str("\\)"),
+        0x20..=0x7E => out.push(byte as char),
+        _ => out.push_str(&format!("\\{:03o}", byte)),
+    }
+}
+
+/// Slot describing which PDF font a run of bytes should be written with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdfTextFontSlot {
+    /// The line's configured primary text font (WinAnsi encoded).
+    Primary,
+    /// The Symbol Type1 font (built-in Symbol encoding, covers Greek/math glyphs).
+    Symbol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdfTextRun {
+    slot: PdfTextFontSlot,
+    encoded: String,
+    unencodable_chars: Vec<char>,
+}
+
+/// Splits `value` into PDF text runs, routing WinAnsi-representable code points
+/// through the primary font and Greek/math code points through the Symbol font.
+/// Thin space (U+2009) is folded to regular space to avoid spurious warnings
+/// from a codepoint the Symbol font does not cover.
+fn split_into_font_runs(value: &str) -> Vec<PdfTextRun> {
+    let mut runs: Vec<PdfTextRun> = Vec::new();
+
+    let push_byte = |runs: &mut Vec<PdfTextRun>, slot: PdfTextFontSlot, byte: u8| {
+        if let Some(last) = runs.last_mut() {
+            if last.slot == slot {
+                append_pdf_string_byte(byte, &mut last.encoded);
+                return;
+            }
+        }
+        let mut encoded = String::new();
+        append_pdf_string_byte(byte, &mut encoded);
+        runs.push(PdfTextRun {
+            slot,
+            encoded,
+            unencodable_chars: Vec::new(),
+        });
+    };
+
+    let push_unencodable = |runs: &mut Vec<PdfTextRun>, ch: char| {
+        if let Some(last) = runs.last_mut() {
+            if last.slot == PdfTextFontSlot::Primary {
+                last.encoded.push('?');
+                last.unencodable_chars.push(ch);
+                return;
+            }
+        }
+        runs.push(PdfTextRun {
+            slot: PdfTextFontSlot::Primary,
+            encoded: "?".to_string(),
+            unencodable_chars: vec![ch],
+        });
+    };
+
+    for ch in value.chars() {
+        if matches!(ch, '\r' | '\n' | '\t' | '\u{2009}') {
+            push_byte(&mut runs, PdfTextFontSlot::Primary, b' ');
+            continue;
+        }
+
+        if let Some(byte) = unicode_to_winansi(ch) {
+            push_byte(&mut runs, PdfTextFontSlot::Primary, byte);
+            continue;
+        }
+
+        if let Some(byte) = unicode_to_symbol_byte(ch) {
+            push_byte(&mut runs, PdfTextFontSlot::Symbol, byte);
+            continue;
+        }
+
+        push_unencodable(&mut runs, ch);
+    }
+
+    runs
+}
+
+/// Collects all characters that remain unrepresentable even after the Symbol
+/// font fallback. These are the only characters that produce user-visible
+/// encoding warnings.
+fn collect_unencodable_chars(value: &str, warning_chars: &mut BTreeSet<char>) {
+    for run in split_into_font_runs(value) {
+        warning_chars.extend(run.unencodable_chars);
+    }
+}
+
+/// Emits one line's worth of text content as PDF text showing operators,
+/// switching between the primary font (`primary_font_number`) and the Symbol
+/// font (`math_font_number`) as needed so that math-mode Unicode glyphs are
+/// rendered with an appropriate font rather than being dropped to `?`.
+///
+/// Assumes the current text font when the function is entered is the primary
+/// font at `font_size`. On exit, the current font is restored to the primary
+/// font at `font_size`.
+fn emit_text_with_font_runs(
+    stream: &mut String,
+    value: &str,
+    primary_font_number: usize,
+    math_font_number: usize,
+    font_size: DimensionValue,
+    warning_chars: &mut BTreeSet<char>,
+) {
+    let runs = split_into_font_runs(value);
+    if runs.is_empty() {
+        stream.push_str("() Tj\n");
+        return;
+    }
+
+    let size_str = points_to_pdf_number(font_size);
+    let mut primary_active = true;
+    for run in runs {
+        warning_chars.extend(run.unencodable_chars);
+        match run.slot {
+            PdfTextFontSlot::Primary => {
+                if !primary_active {
+                    stream.push_str(&format!("/F{primary_font_number} {size_str} Tf\n"));
+                    primary_active = true;
+                }
+            }
+            PdfTextFontSlot::Symbol => {
+                stream.push_str(&format!("/F{math_font_number} {size_str} Tf\n"));
+                primary_active = false;
+            }
+        }
+        stream.push_str(&format!("({}) Tj\n", run.encoded));
+    }
+
+    if !primary_active {
+        stream.push_str(&format!("/F{primary_font_number} {size_str} Tf\n"));
+    }
 }
 
 fn pdf_encoding_warning(ch: char) -> String {
@@ -3587,14 +3962,43 @@ mod tests {
 
     #[test]
     fn render_unencodable_chars_produces_warnings() {
-        let pdf = PdfRenderer::default().render(&single_page(&["δ δ"]));
+        // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
+        // triggers the encoding warning.
+        let pdf = PdfRenderer::default().render(&single_page(&["漢 漢"]));
 
         assert_eq!(
             pdf.warnings,
             vec![String::from(
-                "PDF encoding: character 'δ' (U+03B4) cannot be represented in WinAnsiEncoding and was replaced with '?'"
+                "PDF encoding: character '漢' (U+6F22) cannot be represented in WinAnsiEncoding and was replaced with '?'"
             )]
         );
+    }
+
+    #[test]
+    fn math_mode_unicode_glyphs_use_symbol_font_and_dont_warn() {
+        // Glyphs from Issue #9: α, β, γ, π, √, ∞, ∫ plus thin-space (U+2009).
+        let pdf = PdfRenderer::default().render(&single_page(&[
+            "\u{03B1} + \u{03B2} = \u{03B3} \u{03C0} \u{2009} \u{221A} \u{221E} \u{222B}",
+        ]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+
+        // No warning should be emitted for any of these math-mode glyphs.
+        assert!(
+            pdf.warnings.is_empty(),
+            "expected no PDF encoding warnings, got: {:?}",
+            pdf.warnings,
+        );
+
+        // A dedicated Symbol font must be declared and referenced as /F2.
+        assert!(content.contains(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"
+        ));
+        assert!(content.contains("/F2 "));
+
+        // Math-mode glyphs should be rendered through the Symbol font rather
+        // than appearing as '?' placeholders in the content stream.
+        assert!(content.contains("/F2 "));
+        assert!(!content.matches("(?)").any(|_| true));
     }
 
     #[test]
@@ -3615,7 +4019,11 @@ mod tests {
         assert!(content.contains(
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
         ));
-        assert!(content.contains("/Resources << /Font << /F1 5 0 R >> >>"));
+        // Default resources carry Helvetica as F1 plus the always-appended
+        // Symbol math font as F2.
+        assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>"));
+        assert!(content
+            .contains("<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
     }
 
     #[test]
@@ -3845,11 +4253,17 @@ mod tests {
         let pdf = renderer.render(&single_page(&["Hello, Ferritex!"]));
         let content = String::from_utf8_lossy(&pdf.bytes);
 
-        assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>"));
+        // F1 = Helvetica (1 object: 5), F2 = embedded TrueType (3 consecutive
+        // objects starting at 6: dict/descriptor/fontfile), F3 = Symbol math
+        // font (always appended at 9).
+        assert!(content
+            .contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 9 0 R >> >>"));
         assert!(content.contains(
             "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
         ));
         assert!(content.contains("6 0 obj\n<< /Type /Font /Subtype /TrueType"));
+        assert!(content
+            .contains("9 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
     }
 
     #[test]
