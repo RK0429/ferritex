@@ -32,6 +32,7 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub file: Option<String>,
     pub line: Option<u32>,
+    pub column: Option<u32>,
     pub message: String,
     pub context: Option<String>,
     pub suggestion: Option<String>,
@@ -43,6 +44,7 @@ impl Diagnostic {
             severity,
             file: None,
             line: None,
+            column: None,
             message: message.into(),
             context: None,
             suggestion: None,
@@ -56,6 +58,11 @@ impl Diagnostic {
 
     pub fn with_line(mut self, line: u32) -> Self {
         self.line = Some(line);
+        self
+    }
+
+    pub fn with_column(mut self, column: u32) -> Self {
+        self.column = Some(column);
         self
     }
 
@@ -74,11 +81,13 @@ impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:", self.severity)?;
 
-        match (&self.file, self.line) {
-            (Some(file), Some(line)) => write!(f, " {file}:{line}:")?,
-            (Some(file), None) => write!(f, " {file}:")?,
-            (None, Some(line)) => write!(f, " line {line}:")?,
-            (None, None) => {}
+        match (&self.file, self.line, self.column) {
+            (Some(file), Some(line), Some(column)) => write!(f, " {file}:{line}:{column}:")?,
+            (Some(file), Some(line), None) => write!(f, " {file}:{line}:")?,
+            (Some(file), None, _) => write!(f, " {file}:")?,
+            (None, Some(line), Some(column)) => write!(f, " line {line}:{column}:")?,
+            (None, Some(line), None) => write!(f, " line {line}:")?,
+            (None, None, _) => {}
         }
 
         write!(f, " {}", self.message)?;
@@ -107,6 +116,7 @@ mod tests {
         assert_eq!(diagnostic.message, "unexpected token");
         assert_eq!(diagnostic.file, None);
         assert_eq!(diagnostic.line, None);
+        assert_eq!(diagnostic.column, None);
         assert_eq!(diagnostic.context, None);
         assert_eq!(diagnostic.suggestion, None);
     }
@@ -124,5 +134,22 @@ mod tests {
         assert!(rendered.contains("warning: main.tex:12: deprecated command"));
         assert!(rendered.contains("context: inside bibliography block"));
         assert!(rendered.contains("help: replace with the newer form"));
+    }
+
+    #[test]
+    fn display_includes_column_when_present_and_preserves_legacy_format_without_it() {
+        let with_column = Diagnostic::new(Severity::Error, "undefined control sequence")
+            .with_file("E3.tex")
+            .with_line(3)
+            .with_column(14)
+            .to_string();
+        let without_column = Diagnostic::new(Severity::Error, "undefined control sequence")
+            .with_file("E3.tex")
+            .with_line(3)
+            .to_string();
+
+        assert!(with_column.contains("error: E3.tex:3:14: undefined control sequence"));
+        assert!(without_column.contains("error: E3.tex:3: undefined control sequence"));
+        assert!(!without_column.contains("E3.tex:3:14:"));
     }
 }

@@ -5893,6 +5893,11 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
     } else {
         diagnostic
     };
+    let diagnostic = if let Some(column) = error.column() {
+        diagnostic.with_column(column)
+    } else {
+        diagnostic
+    };
 
     match error {
         ParseError::EmptyInput => diagnostic

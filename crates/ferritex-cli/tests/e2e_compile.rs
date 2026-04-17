@@ -416,44 +416,6 @@ fn compile_with_unimplemented_package_emits_warning_and_still_produces_pdf() {
 }
 
 #[test]
-fn compile_with_unimplemented_package_emits_warning_and_still_produces_pdf() {
-    let dir = tempfile::tempdir().expect("create tempdir");
-    let tex_file = dir.path().join("unimpl.tex");
-    std::fs::write(
-        &tex_file,
-        "\\documentclass{article}\n\\usepackage{definitelyunknownpkg}\n\\begin{document}\nHello.\n\\end{document}\n",
-    )
-    .expect("write input file");
-
-    let output = ferritex_bin()
-        .args(["compile", tex_file.to_str().expect("utf-8 path")])
-        .output()
-        .expect("failed to run ferritex");
-
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "unimplemented-package warnings should exit 1 (non-fatal)"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("package `definitelyunknownpkg` is not implemented"),
-        "stderr should contain the unimplemented-package warning, got: {stderr}"
-    );
-    assert!(stderr.contains("warning"), "warning severity should be mentioned");
-    assert!(
-        stdout.contains("unimpl.pdf"),
-        "pdf output should still be produced"
-    );
-
-    let pdf_file = dir.path().join("unimpl.pdf");
-    let pdf = std::fs::read_to_string(&pdf_file).expect("read output pdf");
-    assert!(pdf.starts_with("%PDF-1.4"));
-    assert!(pdf.contains("Hello."));
-}
-
-#[test]
 fn compile_with_trace_font_tasks_emits_font_task_trace_to_stderr() {
     // Cold path: the first compile should emit concrete font task traces.
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -2572,6 +2534,35 @@ fn compile_reports_issue_1_diagnostics_and_exits_nonzero() {
     assert!(stderr.contains("undefined control sequence `\\nonexistentcommand`"));
     assert!(stderr.contains("unclosed environment `unclosedenv`"));
     assert!(dir.path().join("broken.pdf").exists());
+}
+
+#[test]
+fn compile_reports_undefined_control_sequence_with_column() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("column.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nhello \\xyz\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let filename = tex_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("column.tex");
+
+    assert!(stderr.contains("undefined control sequence `\\xyz`"));
+    assert!(
+        stderr.contains(&format!("{filename}:3:7:")),
+        "stderr did not include line/column location: {stderr}"
+    );
 }
 
 #[test]
