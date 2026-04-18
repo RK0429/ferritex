@@ -85,6 +85,8 @@ const BODY_SMALLCAPS_END: char = '\u{E034}';
 const BODY_UNDERLINE_START: char = '\u{E035}';
 const BODY_UNDERLINE_END: char = '\u{E036}';
 const BODY_LINE_BREAK: char = '\u{E037}';
+pub const BODY_FOOTNOTE_START: char = '\u{E038}';
+pub const BODY_FOOTNOTE_END: char = '\u{E039}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -2342,6 +2344,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                             BODY_UNDERLINE_START,
                             BODY_UNDERLINE_END,
                         )?;
+                    }
+                    "footnote" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_text_style_body_command(BODY_FOOTNOTE_START, BODY_FOOTNOTE_END)?;
                     }
                     "today" => {
                         let _ = self.take_global_prefix();
@@ -8980,6 +8986,21 @@ fn encode_body_markers_in_text(text: &str) -> String {
                 encoded.push_str(command);
                 index = command_end;
             }
+            "footnote" => {
+                let brace_start = skip_optional_command_whitespace(text, command_end);
+                if let Some((content, next_index)) = extract_braced_text(text, brace_start) {
+                    let encoded_content = encode_body_markers_in_text(content);
+                    encoded.push(BODY_FOOTNOTE_START);
+                    encoded.push_str(&encoded_content);
+                    encoded.push(BODY_FOOTNOTE_END);
+                    index = next_index;
+                    continue;
+                }
+
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
             "pagebreak" | "newpage" => {
                 encoded.push(BODY_PAGE_BREAK_MARKER);
                 index = command_end;
@@ -9872,8 +9893,8 @@ mod tests {
         replace_body_markers_with_placeholders, CaptionEntry, DocumentLabels, DocumentNode,
         FloatType, FontFamilyRole, IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine,
         MathNode, MinimalLatexParser, OverUnderKind, PackageInfo, ParseError, ParsedDocument,
-        Parser, ParserDriver, SectionEntry, BODY_MULTICOL_COL_SEP, BODY_MULTICOL_END,
-        BODY_MULTICOL_START, MAX_KERNEL_LOOP_ITERATIONS,
+        Parser, ParserDriver, SectionEntry, BODY_FOOTNOTE_END, BODY_FOOTNOTE_START,
+        BODY_MULTICOL_COL_SEP, BODY_MULTICOL_END, BODY_MULTICOL_START, MAX_KERNEL_LOOP_ITERATIONS,
     };
     use crate::bibliography::api::BibliographyState;
     use crate::compilation::IndexEntry;
@@ -13575,6 +13596,25 @@ mod tests {
             )),
             "\\footnote should resolve to a built-in command: {:?}",
             output.errors
+        );
+    }
+
+    #[test]
+    fn footnote_in_article_preserves_body_markers() {
+        let document = MinimalLatexParser
+            .parse(concat!(
+                "\\documentclass{article}\n",
+                "\\begin{document}\n",
+                "A footnote\\footnote{note body} mark.\n",
+                "\\end{document}\n",
+            ))
+            .expect("parse document");
+
+        let expected = format!("{BODY_FOOTNOTE_START}note body{BODY_FOOTNOTE_END}");
+        assert!(
+            document.body.contains(&expected),
+            "\\footnote body should survive parser encoding: {:?}",
+            document.body
         );
     }
 

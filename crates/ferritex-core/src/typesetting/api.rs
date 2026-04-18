@@ -18,7 +18,10 @@ use crate::graphics::api::{
     compile_includegraphics, GraphicAssetResolver, GraphicsBox, GraphicsScene,
 };
 use crate::kernel::api::{DimensionValue, SourceSpan};
-use crate::parser::api::{DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument};
+use crate::parser::api::{
+    DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument, BODY_FOOTNOTE_END,
+    BODY_FOOTNOTE_START,
+};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
@@ -1251,16 +1254,17 @@ fn extract_footnotes_from_node(
 ) -> Option<DocumentNode> {
     match node {
         DocumentNode::Text(content, span) => {
-            if let Some((sanitized, footnote_text)) = split_inline_footnote(&content) {
-                if !footnote_text.is_empty() {
+            let (sanitized, footnote_texts) = split_inline_footnote(&content);
+            if footnote_texts.is_empty() {
+                Some(DocumentNode::Text(content, span))
+            } else {
+                for footnote_text in footnote_texts {
                     footnotes.push(FootnoteEntry {
                         text: footnote_text,
                         source_span: span,
                     });
                 }
                 (!sanitized.is_empty()).then_some(DocumentNode::Text(sanitized, span))
-            } else {
-                Some(DocumentNode::Text(content, span))
             }
         }
         DocumentNode::FontFamily { role, children } => Some(DocumentNode::FontFamily {
@@ -1325,24 +1329,42 @@ fn extract_footnotes_from_children(
         .collect()
 }
 
-fn split_inline_footnote(text: &str) -> Option<(String, String)> {
-    let marker = r"\footnote";
-    let index = text.find(marker)?;
-    let prefix = text[..index].trim_end();
-    let mut suffix = text[index + marker.len()..].trim().to_string();
-    if suffix.is_empty() {
-        return Some((prefix.to_string(), String::new()));
+fn split_inline_footnote(text: &str) -> (String, Vec<String>) {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut footnote_bodies = Vec::new();
+    let mut footnote_index = 0usize;
+    let mut chars = text.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != BODY_FOOTNOTE_START {
+            sanitized.push(ch);
+            continue;
+        }
+
+        let mut footnote_body = String::new();
+        let mut found_end = false;
+        for next in chars.by_ref() {
+            if next == BODY_FOOTNOTE_END {
+                found_end = true;
+                break;
+            }
+            footnote_body.push(next);
+        }
+
+        if found_end {
+            footnote_index += 1;
+            footnote_bodies.push(footnote_body);
+            sanitized.push(FOOTNOTE_MARKER_START);
+            sanitized.push_str(&footnote_index.to_string());
+            sanitized.push(FOOTNOTE_MARKER_END);
+        } else {
+            sanitized.push(BODY_FOOTNOTE_START);
+            sanitized.push_str(&footnote_body);
+            break;
+        }
     }
 
-    let mut paragraph_tail = String::new();
-    if let Some(stripped) = suffix.strip_suffix("..") {
-        suffix = stripped.to_string();
-        paragraph_tail.push('.');
-    }
-
-    let sanitized =
-        format!("{prefix}{FOOTNOTE_MARKER_START}1{FOOTNOTE_MARKER_END}{paragraph_tail}",);
-    Some((sanitized, suffix))
+    (sanitized, footnote_bodies)
 }
 
 pub fn append_footnotes_to_pages(
@@ -4784,9 +4806,9 @@ mod tests {
         GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PageBox,
         PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TextLineLink,
         TfmWidthProvider, TypesetNamedDestination, TypesetOutline, TypesetPage,
-        TypesetterReusePlan, VBox, VListItem, DEFAULT_BODY_FONT_SIZE_PT, LEFT_MARGIN_PT,
-        LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN,
-        PENALTY_FORCED, TOP_MARGIN_PT,
+        TypesetterReusePlan, VBox, VListItem, DEFAULT_BODY_FONT_SIZE_PT, FOOTNOTE_MARKER_END,
+        FOOTNOTE_MARKER_START, LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH,
+        PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::bibliography::api::{parse_bbl, BibliographyState};
@@ -4804,7 +4826,7 @@ mod tests {
     use crate::parser::api::{
         CaptionEntry, DocumentNode, FloatType, IncludeGraphicsOptions, IndexRawEntry, LineTag,
         MathLine, MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser,
-        SectionEntry,
+        SectionEntry, BODY_FOOTNOTE_END, BODY_FOOTNOTE_START,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -7045,6 +7067,62 @@ mod tests {
                 ("First footnote".to_string(), points(169)),
                 ("2".to_string(), points(162)),
                 ("Second footnote".to_string(), points(159)),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_from_nodes_rewrites_inline_markers_and_collects_body() {
+        let (sanitized, footnotes) = super::extract_footnotes_from_nodes(vec![DocumentNode::Text(
+            format!("A footnote{BODY_FOOTNOTE_START}note body{BODY_FOOTNOTE_END} mark."),
+            None,
+        )]);
+
+        assert_eq!(
+            sanitized,
+            vec![DocumentNode::Text(
+                format!("A footnote{FOOTNOTE_MARKER_START}1{FOOTNOTE_MARKER_END} mark."),
+                None,
+            )]
+        );
+        assert_eq!(
+            footnotes,
+            vec![FootnoteEntry {
+                text: "note body".to_string(),
+                source_span: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_from_nodes_collects_multiple_footnotes_from_one_text_node() {
+        let (sanitized, footnotes) = super::extract_footnotes_from_nodes(vec![DocumentNode::Text(
+            format!(
+                "A{BODY_FOOTNOTE_START}first{BODY_FOOTNOTE_END} B{BODY_FOOTNOTE_START}second{BODY_FOOTNOTE_END} C",
+            ),
+            None,
+        )]);
+
+        assert_eq!(
+            sanitized,
+            vec![DocumentNode::Text(
+                format!(
+                    "A{FOOTNOTE_MARKER_START}1{FOOTNOTE_MARKER_END} B{FOOTNOTE_MARKER_START}2{FOOTNOTE_MARKER_END} C",
+                ),
+                None,
+            )]
+        );
+        assert_eq!(
+            footnotes,
+            vec![
+                FootnoteEntry {
+                    text: "first".to_string(),
+                    source_span: None,
+                },
+                FootnoteEntry {
+                    text: "second".to_string(),
+                    source_span: None,
+                },
             ]
         );
     }

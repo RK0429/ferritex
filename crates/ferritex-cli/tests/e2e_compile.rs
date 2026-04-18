@@ -2511,7 +2511,16 @@ fn compile_article_with_footnote_succeeds() {
         !stderr.contains("undefined control sequence `\\footnote`"),
         "stderr should not report undefined \\footnote: {stderr}",
     );
-    assert!(dir.path().join("article_footnote.pdf").exists());
+    let pdf_path = dir.path().join("article_footnote.pdf");
+    assert!(pdf_path.exists());
+
+    let pdf_bytes = std::fs::read(&pdf_path).expect("read generated pdf");
+    assert!(
+        pdf_bytes
+            .windows("note body".len())
+            .any(|window| window == b"note body"),
+        "generated PDF should contain footnote body"
+    );
 }
 
 #[test]

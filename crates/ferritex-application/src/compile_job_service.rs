@@ -38,7 +38,7 @@ use ferritex_core::graphics::api::{
 use ferritex_core::incremental::{DependencyGraph, DocumentPartitionPlanner, RecompilationScope};
 use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
 use ferritex_core::kernel::StableId;
-use ferritex_core::parser::api::{DocumentNode, FloatType};
+use ferritex_core::parser::api::{DocumentNode, FloatType, BODY_FOOTNOTE_START};
 use ferritex_core::parser::{
     MinimalLatexParser, ParseError, ParseOutput, ParsedDocument, RegisterStore,
 };
@@ -2941,7 +2941,7 @@ fn parse_partition_body_document(
 }
 
 fn count_footnotes_in_text(text: &str) -> usize {
-    text.match_indices(r"\footnote").count()
+    text.matches(BODY_FOOTNOTE_START).count()
 }
 
 fn count_footnotes_in_nodes(nodes: &[DocumentNode]) -> usize {

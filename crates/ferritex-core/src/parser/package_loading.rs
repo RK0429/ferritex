@@ -360,7 +360,6 @@ pub fn register_base_latex_commands(engine: &mut MacroEngine) {
     register_noop_command(engine, "@gobbletwo", 2);
     register_noop_command(engine, "centering", 0);
     register_noop_command(engine, "date", 1);
-    register_noop_command(engine, "footnote", 1);
     register_noop_command(engine, "hfill", 0);
     register_noop_command(engine, "title", 1);
     register_noop_command(engine, "textbf", 1);
@@ -473,10 +472,7 @@ fn is_kernel_integrated_package(name: &str) -> bool {
 /// commands will typically surface as undefined control sequences at use
 /// site. Callers emit a non-fatal warning so users see the gap at preamble
 /// time rather than deep in the document body.
-pub fn is_implemented_package(
-    name: &str,
-    sty_resolver: Option<&StyPackageResolver<'_>>,
-) -> bool {
+pub fn is_implemented_package(name: &str, sty_resolver: Option<&StyPackageResolver<'_>>) -> bool {
     if get_native_extension(name).is_some() {
         return true;
     }
@@ -689,16 +685,6 @@ mod tests {
         assert_eq!(opening.parameter_count, 1);
         let closing = engine.lookup("closing").expect("\\closing defined");
         assert_eq!(closing.parameter_count, 1);
-    }
-
-    #[test]
-    fn base_latex_registration_defines_kernel_footnote_command() {
-        let mut engine = MacroEngine::default();
-
-        register_base_latex_commands(&mut engine);
-
-        let footnote = engine.lookup("footnote").expect("\\footnote defined");
-        assert_eq!(footnote.parameter_count, 1);
     }
 
     #[test]
