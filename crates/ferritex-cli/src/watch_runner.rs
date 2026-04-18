@@ -25,6 +25,7 @@ where
     F: FnMut(&CompileResult),
 {
     let options = runtime_options_from_command(command);
+    let interaction_mode = options.interaction_mode;
     let policy = ExecutionPolicyFactory::create(&options);
     let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
     let file_access_gate = FsFileAccessGate::from_policy(policy);
@@ -41,7 +42,7 @@ where
         .unwrap_or_else(|| Path::new("."));
 
     let initial_result = scheduler.run(workspace_root, || service.compile(&options));
-    emit_diagnostics(&initial_result.diagnostics);
+    emit_diagnostics(&initial_result.diagnostics, interaction_mode);
     on_compile(&initial_result);
 
     let mut watched_paths =
@@ -58,10 +59,10 @@ where
     let mut watcher = match PollingFileWatcher::new(watched_paths) {
         Ok(watcher) => watcher,
         Err(error) => {
-            emit_diagnostic(&watcher_io_diagnostic(
-                &error,
-                "failed to start file watcher",
-            ));
+            emit_diagnostic(
+                &watcher_io_diagnostic(&error, "failed to start file watcher"),
+                interaction_mode,
+            );
             service.flush_cache();
             return 2;
         }
@@ -74,10 +75,13 @@ where
         let changes = match watcher.poll_changes() {
             Ok(changes) => changes,
             Err(error) => {
-                emit_diagnostic(&Diagnostic::new(
-                    Severity::Error,
-                    format!("failed to poll watched files: {error}"),
-                ));
+                emit_diagnostic(
+                    &Diagnostic::new(
+                        Severity::Error,
+                        format!("failed to poll watched files: {error}"),
+                    ),
+                    interaction_mode,
+                );
                 service.flush_cache();
                 return 2;
             }
@@ -93,7 +97,7 @@ where
             let result = scheduler.run(workspace_root, || {
                 service.compile_with_changed_paths(&options, &hint)
             });
-            emit_diagnostics(&result.diagnostics);
+            emit_diagnostics(&result.diagnostics, interaction_mode);
             on_compile(&result);
             emit_recompile_end(&result);
             recompile_scheduler.finish_current();
@@ -116,10 +120,10 @@ where
                 tracked_paths = new_watched_paths.clone();
             }
             if let Err(error) = watcher.replace_paths(new_watched_paths) {
-                emit_diagnostic(&watcher_io_diagnostic(
-                    &error,
-                    "failed to refresh watched files",
-                ));
+                emit_diagnostic(
+                    &watcher_io_diagnostic(&error, "failed to refresh watched files"),
+                    interaction_mode,
+                );
                 service.flush_cache();
                 return 2;
             }

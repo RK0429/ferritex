@@ -2701,6 +2701,47 @@ fn compile_reports_undefined_control_sequence_with_column() {
 }
 
 #[test]
+fn compile_batchmode_suppresses_stderr_diagnostics() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken.tex");
+    let source = "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\begin{unclosedenv}\ntext\n\\end{document}\n";
+    std::fs::write(&tex_file, source).expect("write input file");
+
+    let nonstop = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--interaction",
+            "nonstopmode",
+        ])
+        .output()
+        .expect("run ferritex nonstopmode");
+    let batch = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--interaction",
+            "batchmode",
+        ])
+        .output()
+        .expect("run ferritex batchmode");
+
+    assert_eq!(nonstop.status.code(), Some(2));
+    assert_eq!(batch.status.code(), Some(2));
+
+    let nonstop_stderr = String::from_utf8_lossy(&nonstop.stderr);
+    let batch_stderr = String::from_utf8_lossy(&batch.stderr);
+    assert!(
+        nonstop_stderr.contains("error:"),
+        "nonstopmode should emit diagnostics to stderr, got: {nonstop_stderr}"
+    );
+    assert!(
+        batch_stderr.trim().is_empty(),
+        "batchmode should suppress diagnostic stderr, got: {batch_stderr}"
+    );
+}
+
+#[test]
 fn compile_with_errors_suppresses_success_summary_on_stdout() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("broken.tex");

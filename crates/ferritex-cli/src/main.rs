@@ -1,4 +1,5 @@
 use std::{
+    io::{self, Write},
     path::PathBuf,
     process,
     sync::{Arc, Mutex},
@@ -12,7 +13,9 @@ use ferritex_application::preview_session_service::{
     PreviewSessionService, PreviewTarget, PreviewViewState, PublishDecision, SessionErrorResponse,
     SessionId,
 };
-use ferritex_application::runtime_options::{CompileArgs, CompileInteraction, RuntimeOptions};
+use ferritex_application::runtime_options::{
+    CompileArgs, CompileInteraction, InteractionMode, RuntimeOptions,
+};
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_infra::asset_bundle::AssetBundleLoader;
 use ferritex_infra::fs::FsFileAccessGate;
@@ -78,7 +81,11 @@ struct CompileCommand {
     /// Enable reproducible output (deterministic timestamps)
     #[arg(long)]
     reproducible: bool,
-    /// TeX interaction mode
+    /// TeX interaction mode.
+    ///
+    /// `batchmode` suppresses diagnostic output to stderr.
+    /// `nonstopmode`, `scrollmode`, and `errorstopmode` are currently treated
+    /// as equivalent non-interactive continuation modes in ferritex.
     #[arg(long, value_name = "MODE", value_enum)]
     interaction: Option<InteractionArg>,
     /// Generate SyncTeX data for editor synchronization
@@ -166,7 +173,7 @@ fn handle_compile(command: &CompileCommand) -> i32 {
         &shell_command_gateway,
     );
     let result = service.compile(&options);
-    emit_diagnostics(&result.diagnostics);
+    emit_diagnostics(&result.diagnostics, options.interaction_mode);
     print_compile_success_summary(command, &result);
     result.exit_code
 }
@@ -232,7 +239,7 @@ fn handle_preview(command: &CompileCommand) -> i32 {
         )
         .with_file(options.input_file.to_string_lossy().into_owned())
         .with_suggestion("rerun with preview publication enabled")];
-        emit_diagnostics(&diagnostics);
+        emit_diagnostics(&diagnostics, options.interaction_mode);
         return diagnostics_exit_code(&diagnostics);
     };
 
@@ -245,7 +252,7 @@ fn handle_preview(command: &CompileCommand) -> i32 {
             )
             .with_file(options.input_file.to_string_lossy().into_owned())
             .with_suggestion("retry after ensuring loopback TCP ports are available")];
-            emit_diagnostics(&diagnostics);
+            emit_diagnostics(&diagnostics, options.interaction_mode);
             return diagnostics_exit_code(&diagnostics);
         }
     });
@@ -392,14 +399,36 @@ fn runtime_options_from_command(command: &CompileCommand) -> RuntimeOptions {
     RuntimeOptions::from_compile_args(&compile_args)
 }
 
-fn emit_diagnostics(diagnostics: &[Diagnostic]) {
-    for diagnostic in diagnostics {
-        emit_diagnostic(diagnostic);
-    }
+fn emit_diagnostics(diagnostics: &[Diagnostic], mode: InteractionMode) {
+    let mut stderr = io::stderr().lock();
+    let _ = emit_diagnostics_to(&mut stderr, diagnostics, mode);
 }
 
-fn emit_diagnostic(diagnostic: &Diagnostic) {
-    eprintln!("{diagnostic}");
+fn emit_diagnostics_to<W: Write>(
+    writer: &mut W,
+    diagnostics: &[Diagnostic],
+    mode: InteractionMode,
+) -> io::Result<()> {
+    for diagnostic in diagnostics {
+        emit_diagnostic_to(writer, diagnostic, mode)?;
+    }
+    Ok(())
+}
+
+fn emit_diagnostic(diagnostic: &Diagnostic, mode: InteractionMode) {
+    let mut stderr = io::stderr().lock();
+    let _ = emit_diagnostic_to(&mut stderr, diagnostic, mode);
+}
+
+fn emit_diagnostic_to<W: Write>(
+    writer: &mut W,
+    diagnostic: &Diagnostic,
+    mode: InteractionMode,
+) -> io::Result<()> {
+    if mode == InteractionMode::Batchmode {
+        return Ok(());
+    }
+    writeln!(writer, "{diagnostic}")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -613,12 +642,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        execute_preview, runtime_options_from_command, Cli, Commands, CompileCommand,
-        InteractionArg,
+        emit_diagnostics_to, execute_preview, runtime_options_from_command, Cli, Commands,
+        CompileCommand, InteractionArg,
     };
     use clap::Parser;
     use ferritex_application::runtime_options::{InteractionMode, ShellEscapeMode};
-    use ferritex_core::diagnostics::Severity;
+    use ferritex_core::diagnostics::{Diagnostic, Severity};
     use tempfile::tempdir;
 
     fn compile_command() -> CompileCommand {
@@ -815,5 +844,28 @@ mod tests {
             !dir.path().join("missing.pdf").exists(),
             "no output PDF should be produced when the initial compile fails",
         );
+    }
+
+    #[test]
+    fn emit_diagnostics_to_suppresses_batchmode_output() {
+        let diagnostics = vec![Diagnostic::new(Severity::Error, "broken document")];
+        let mut stderr = Vec::new();
+
+        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Batchmode)
+            .expect("write diagnostics");
+
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn emit_diagnostics_to_emits_non_batchmode_output() {
+        let diagnostics = vec![Diagnostic::new(Severity::Error, "broken document")];
+        let mut stderr = Vec::new();
+
+        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Nonstopmode)
+            .expect("write diagnostics");
+
+        let output = String::from_utf8(stderr).expect("utf-8 stderr");
+        assert!(output.contains("error: broken document"));
     }
 }
