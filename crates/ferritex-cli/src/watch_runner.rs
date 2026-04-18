@@ -53,7 +53,8 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
             return 2;
         }
     };
-    let mut recompile_scheduler = RecompileScheduler::default();
+    let mut recompile_scheduler =
+        RecompileScheduler::with_settle_window(Duration::from_millis(150));
 
     loop {
         thread::sleep(Duration::from_millis(100));
@@ -69,11 +70,10 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
             }
         };
 
-        if changes.is_empty() {
-            continue;
+        if !changes.is_empty() {
+            recompile_scheduler.enqueue(changes);
         }
 
-        recompile_scheduler.enqueue(changes);
         while let Some(coalesced_changes) = recompile_scheduler.start_next() {
             let hint = coalesced_changes;
             let result = scheduler.run(workspace_root, || {
