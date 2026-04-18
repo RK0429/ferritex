@@ -852,6 +852,12 @@ fn compile_with_synctex_writes_searchable_sidecar_with_float_caption_fragment() 
         .fragments
         .iter()
         .any(|fragment| fragment.text == "Figure 1: Embedded pixel"));
+    assert!(
+        !synctex.pages.is_empty(),
+        "sidecar must expose a populated pages array"
+    );
+    assert!(synctex.pages.iter().any(|entry| entry.page == 1));
+    assert!(synctex.pages.iter().any(|entry| entry.page == 2));
 }
 
 #[test]

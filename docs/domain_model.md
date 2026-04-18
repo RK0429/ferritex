@@ -1627,8 +1627,15 @@ classDiagram
         +int pageNumber
         +Rect rect
     }
+    class SyncTexPage {
+        <<ValueObject>>
+        +int page
+        +int fragmentCount
+    }
     class SyncTexData {
         <<ValueObject>>
+        +List~String~ files
+        +List~SyncTexPage~ pages
         +List~SyncTraceFragment~ fragments
         +forwardSearch(SourceLocation) List~SyncTraceFragment~
         +inverseSearch(PdfPosition) SourceSpan
@@ -1687,6 +1694,7 @@ classDiagram
     SyncTexBuilder ..> PlacedNode : consumes source spans
     SyncTexBuilder --> SyncTexData
     SyncTexData o-- SyncTraceFragment
+    SyncTexData o-- SyncTexPage
     SyncTexData ..> PdfPosition : inverse lookup
     PdfPosition --> PdfPoint
     SyncTraceFragment --> SourceSpan

@@ -5621,6 +5621,7 @@ fn synctex_data_for(document: &TypesetDocument, source_lines: &[SourceLineTrace]
         remap_synctex_file_ids(&mut fallback, &fallback_file_ids);
         synctex.fragments.extend(fallback.fragments);
         synctex.files = merged_files;
+        synctex.recompute_pages();
     } else if !annotator.files.is_empty() {
         synctex.files = annotator.files;
     }
@@ -10607,6 +10608,37 @@ mod tests {
                 })
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn synctex_data_for_populates_pages_for_minimal_document() {
+        let source_lines = vec![ferritex_core::synctex::SourceLineTrace {
+            file: "/tmp/main.tex".to_string(),
+            line: 3,
+            text: "Hello world".to_string(),
+        }];
+        let document = test_typeset_document(vec![TextLine {
+            text: "Hello world".to_string(),
+            x: DimensionValue::zero(),
+            y: points(720),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(10),
+            source_span: None,
+        }]);
+
+        let synctex = super::synctex_data_for(&document, &source_lines);
+
+        assert!(
+            !synctex.pages.is_empty(),
+            "minimal document must still expose a pages array"
+        );
+        assert_eq!(synctex.pages[0].page, 1);
+        assert_eq!(
+            synctex.pages[0].fragment_count as usize,
+            synctex.fragments.len(),
+            "single-page document must account for every fragment"
         );
     }
 

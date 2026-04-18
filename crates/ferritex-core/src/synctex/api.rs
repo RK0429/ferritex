@@ -75,9 +75,16 @@ pub struct SyncTraceFragment {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncTexPage {
+    pub page: u32,
+    pub fragment_count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SyncTexData {
     pub files: Vec<String>,
+    pub pages: Vec<SyncTexPage>,
     pub fragments: Vec<SyncTraceFragment>,
 }
 
@@ -115,7 +122,12 @@ impl SyncTexData {
             }
         }
 
-        Self { files, fragments }
+        let pages = pages_from_fragments(&fragments);
+        Self {
+            files,
+            pages,
+            fragments,
+        }
     }
 
     pub fn build_from_placed_nodes(nodes: Vec<PlacedTextNode>) -> Self {
@@ -134,12 +146,21 @@ impl SyncTexData {
             .max()
             .unwrap_or(0);
         let files = (0..=max_file_id).map(|_| String::new()).collect();
-        let fragments = nodes
+        let fragments: Vec<SyncTraceFragment> = nodes
             .into_iter()
             .map(fragment_for_placed_text_node)
             .collect();
+        let pages = pages_from_fragments(&fragments);
 
-        Self { files, fragments }
+        Self {
+            files,
+            pages,
+            fragments,
+        }
+    }
+
+    pub fn recompute_pages(&mut self) {
+        self.pages = pages_from_fragments(&self.fragments);
     }
 
     pub fn forward_search(&self, location: SourceLocation) -> Vec<PdfPosition> {
@@ -401,6 +422,20 @@ fn fragment_for_placed_text_node(node: PlacedTextNode) -> SyncTraceFragment {
     }
 }
 
+fn pages_from_fragments(fragments: &[SyncTraceFragment]) -> Vec<SyncTexPage> {
+    let mut counts: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for fragment in fragments {
+        *counts.entry(fragment.page).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(page, fragment_count)| SyncTexPage {
+            page,
+            fragment_count,
+        })
+        .collect()
+}
+
 fn file_id_for(files: &mut Vec<String>, file: &str) -> u32 {
     if let Some(index) = files.iter().position(|entry| entry == file) {
         index as u32
@@ -519,7 +554,7 @@ fn leading_control_word(text: &str) -> Option<&str> {
 mod tests {
     use super::{
         points, PdfPosition, PlacedTextNode, RenderedLineTrace, RenderedPageTrace, SourceLineTrace,
-        SyncTexData,
+        SyncTexData, SyncTexPage,
     };
     use crate::kernel::api::{SourceLocation, SourceSpan};
 
@@ -736,6 +771,152 @@ mod tests {
             })
             .len(),
             2
+        );
+    }
+
+    #[test]
+    fn build_line_based_populates_pages_for_minimal_document() {
+        let document = simple_document(vec![text_line("Hello world", 700)]);
+        let data = SyncTexData::build_line_based(
+            &document,
+            &[SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 3,
+                text: "Hello world".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            data.pages,
+            vec![SyncTexPage {
+                page: 1,
+                fragment_count: data.fragments.len() as u32,
+            }]
+        );
+    }
+
+    #[test]
+    fn build_from_placed_nodes_populates_pages_grouped_by_page_number() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 12,
+            },
+        };
+        let data = SyncTexData::build_from_placed_nodes(vec![
+            PlacedTextNode::from_text_line("Hello".to_string(), span, 1, points(700)),
+            PlacedTextNode::from_text_line("world".to_string(), span, 1, points(682)),
+            PlacedTextNode::from_text_line("Second".to_string(), span, 2, points(700)),
+        ]);
+
+        assert_eq!(
+            data.pages,
+            vec![
+                SyncTexPage {
+                    page: 1,
+                    fragment_count: 2,
+                },
+                SyncTexPage {
+                    page: 2,
+                    fragment_count: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_from_placed_nodes_pages_sorted_when_inputs_unordered() {
+        let span = SourceSpan {
+            start: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            },
+            end: SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 12,
+            },
+        };
+        let data = SyncTexData::build_from_placed_nodes(vec![
+            PlacedTextNode::from_text_line("Third".to_string(), span, 3, points(700)),
+            PlacedTextNode::from_text_line("First".to_string(), span, 1, points(700)),
+            PlacedTextNode::from_text_line("Second".to_string(), span, 2, points(700)),
+        ]);
+
+        assert_eq!(
+            data.pages.iter().map(|entry| entry.page).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn default_sync_tex_data_exposes_empty_pages_array() {
+        let data = SyncTexData::default();
+        assert!(data.pages.is_empty());
+
+        let json = serde_json::to_value(&data).expect("serialize default SyncTexData");
+        assert!(json.get("pages").is_some(), "pages field must be present");
+        assert!(json["pages"].is_array());
+    }
+
+    #[test]
+    fn minimal_document_serializes_pages_array() {
+        let data = SyncTexData::build_line_based(
+            &simple_document(vec![text_line("Hello", 700)]),
+            &[SourceLineTrace {
+                file: "/tmp/main.tex".to_string(),
+                line: 3,
+                text: "Hello".to_string(),
+            }],
+        );
+
+        let json = serde_json::to_value(&data).expect("serialize SyncTexData");
+        let pages = json["pages"].as_array().expect("pages must be an array");
+        assert!(
+            !pages.is_empty(),
+            "minimal document must still expose a populated pages array"
+        );
+        assert_eq!(pages[0]["page"], 1);
+    }
+
+    #[test]
+    fn recompute_pages_reflects_manually_added_fragments() {
+        let mut data = SyncTexData::default();
+        data.fragments.push(super::SyncTraceFragment {
+            span: SourceSpan {
+                start: SourceLocation {
+                    file_id: 0,
+                    line: 1,
+                    column: 1,
+                },
+                end: SourceLocation {
+                    file_id: 0,
+                    line: 1,
+                    column: 5,
+                },
+            },
+            page: 5,
+            x_start: points(72),
+            x_end: points(100),
+            y_bottom: points(700),
+            y_top: points(710),
+            text: "manual".to_string(),
+        });
+        data.recompute_pages();
+
+        assert_eq!(
+            data.pages,
+            vec![SyncTexPage {
+                page: 5,
+                fragment_count: 1,
+            }]
         );
     }
 }
