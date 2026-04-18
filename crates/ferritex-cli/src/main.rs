@@ -74,6 +74,9 @@ struct CompileCommand {
     /// Generate SyncTeX data for editor synchronization
     #[arg(long)]
     synctex: bool,
+    /// Print each watched file path in addition to the tracked count (watch only; ignored elsewhere)
+    #[arg(short = 'v', long)]
+    verbose: bool,
     /// Emit font task tracing to stderr
     #[arg(long)]
     trace_font_tasks: bool,
@@ -188,6 +191,8 @@ fn handle_compile(command: &CompileCommand) -> i32 {
 }
 
 fn handle_watch(command: &CompileCommand) -> i32 {
+    eprintln!("watching {}", command.file.display());
+    eprintln!("press Ctrl+C to stop");
     watch_runner::run_watch(command)
 }
 
@@ -458,6 +463,7 @@ mod tests {
             reproducible: false,
             interaction: Some(InteractionArg::Batchmode),
             synctex: true,
+            verbose: false,
             trace_font_tasks: true,
             shell_escape: true,
             no_shell_escape: false,
@@ -544,6 +550,7 @@ mod tests {
         assert_eq!(command.file, PathBuf::from("notes.tex"));
         assert_eq!(command.output_dir, Some(PathBuf::from("out")));
         assert_eq!(command.jobs, Some(2));
+        assert!(!command.verbose);
     }
 
     #[test]
