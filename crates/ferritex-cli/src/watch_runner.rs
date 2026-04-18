@@ -21,6 +21,14 @@ use ferritex_infra::watcher::PollingFileWatcher;
 use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, CompileCommand};
 
 pub fn run_watch(command: &CompileCommand) -> i32 {
+    run_watch_loop(command, |_| {})
+}
+
+/// Variant of [`run_watch`] that invokes `on_compile` after each successful or failed compile.
+pub fn run_watch_loop<F>(command: &CompileCommand, mut on_compile: F) -> i32
+where
+    F: FnMut(&CompileResult),
+{
     let options = runtime_options_from_command(command);
     let policy = ExecutionPolicyFactory::create(&options);
     let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
@@ -39,6 +47,7 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
 
     let initial_result = scheduler.run(workspace_root, || service.compile(&options));
     emit_diagnostics(&initial_result.diagnostics);
+    on_compile(&initial_result);
 
     let watched_paths =
         watched_paths_for_result(&initial_result, &options.input_file, &file_access_gate);
@@ -89,6 +98,7 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
                 service.compile_with_changed_paths(&options, &hint)
             });
             emit_diagnostics(&result.diagnostics);
+            on_compile(&result);
             recompile_scheduler.finish_current();
 
             let new_watched_paths =

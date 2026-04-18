@@ -1,4 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -26,6 +29,86 @@ fn ferritex_bin() -> Command {
 fn read_synctex(path: &Path) -> SyncTexData {
     serde_json::from_slice(&std::fs::read(path).expect("read output synctex"))
         .expect("parse output synctex")
+}
+
+fn parse_loopback_document_url(url: &str) -> (String, u16, String) {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .expect("preview document URL should use http");
+    let (host_port, path) = without_scheme
+        .split_once('/')
+        .expect("preview document URL should include a path");
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .expect("preview document URL should include a port");
+    (
+        host.to_string(),
+        port.parse().expect("preview port"),
+        format!("/{path}"),
+    )
+}
+
+fn spawn_stderr_collector<R>(stderr: R) -> thread::JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut captured = String::new();
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).expect("read child stderr");
+            if read == 0 {
+                break;
+            }
+            eprint!("{line}");
+            captured.push_str(&line);
+        }
+
+        captured
+    })
+}
+
+fn issue_get_request(host: &str, port: u16, path: &str) -> Vec<u8> {
+    let address: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .expect("preview socket address");
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+        .expect("connect to preview server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set preview read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .expect("set preview write timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write preview request");
+    stream.shutdown(Shutdown::Write).expect("shutdown write");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read preview response");
+    response
+}
+
+fn http_response_body(response: &[u8]) -> &[u8] {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("missing HTTP response header delimiter");
+    &response[header_end + 4..]
+}
+
+fn body_hash(body: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn build_minimal_cmr10_tfm() -> Vec<u8> {
@@ -403,7 +486,10 @@ fn compile_with_unimplemented_package_emits_warning_and_still_produces_pdf() {
         stderr.contains("package `definitelyunknownpkg` is not implemented"),
         "stderr should contain the unimplemented-package warning, got: {stderr}"
     );
-    assert!(stderr.contains("warning"), "warning severity should be mentioned");
+    assert!(
+        stderr.contains("warning"),
+        "warning severity should be mentioned"
+    );
     assert!(
         stdout.contains("unimpl.pdf"),
         "pdf output should still be produced"
@@ -2676,7 +2762,6 @@ fn watch_writes_initial_pdf_and_recompiles_on_change() {
     child.wait().expect("wait for watch process");
 }
 
-#[test]
 fn watch_prints_startup_banner_and_tracked_count_by_default() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -2719,6 +2804,92 @@ fn watch_prints_startup_banner_and_tracked_count_by_default() {
     child.kill().expect("kill watch process");
     child.wait().expect("wait for watch process");
     stderr_handle.join().expect("join stderr collector");
+}
+
+#[test]
+fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["preview", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let stderr = child.stderr.take().expect("preview stderr");
+    let stderr_handle = spawn_stderr_collector(stderr);
+
+    let stdout = child.stdout.take().expect("preview stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut document_url = String::new();
+    stdout
+        .read_line(&mut document_url)
+        .expect("read preview document URL");
+    let mut events_url = String::new();
+    stdout
+        .read_line(&mut events_url)
+        .expect("read preview events URL");
+
+    let document_url = document_url.trim().to_string();
+    let events_url = events_url.trim().to_string();
+    assert!(document_url.starts_with("http://127.0.0.1:"));
+    assert!(events_url.starts_with("ws://127.0.0.1:"));
+    assert!(document_url.ends_with("/document"));
+    assert!(events_url.ends_with("/events"));
+
+    let (host, port, path) = parse_loopback_document_url(&document_url);
+    let mut initial_hash = None;
+    wait_until(
+        || {
+            let response = issue_get_request(&host, port, &path);
+            if !response.starts_with(b"HTTP/1.1 200 OK") {
+                return false;
+            }
+            initial_hash = Some(body_hash(http_response_body(&response)));
+            true
+        },
+        Duration::from_secs(2),
+        "preview should publish the initial PDF",
+    );
+    let initial_hash = initial_hash.expect("initial preview body hash");
+
+    // Ensure mtime advances on filesystems with millisecond granularity.
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nUpdated preview\n\\end{document}\n",
+    )
+    .expect("rewrite input file");
+
+    wait_until(
+        || {
+            let response = issue_get_request(&host, port, &path);
+            response.starts_with(b"HTTP/1.1 200 OK")
+                && body_hash(http_response_body(&response)) != initial_hash
+        },
+        Duration::from_secs(10),
+        "preview should serve an updated PDF after a source change",
+    );
+
+    child.kill().expect("kill preview process");
+    child.wait().expect("wait for preview process");
+    let stderr = stderr_handle.join().expect("join preview stderr collector");
+    assert!(
+        stderr.contains("preview server listening on http://127.0.0.1:")
+            && stderr.contains("(waiting for first successful compile)"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("press Ctrl+C to stop").count(),
+        1,
+        "stderr: {stderr}"
+    );
 }
 
 #[test]

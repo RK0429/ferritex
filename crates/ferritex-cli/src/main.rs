@@ -2,11 +2,10 @@ use std::{
     path::PathBuf,
     process,
     sync::{Arc, Mutex},
-    thread,
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ferritex_application::compile_job_service::CompileJobService;
+use ferritex_application::compile_job_service::{CompileJobService, CompileResult};
 use ferritex_application::execution_policy_factory::ExecutionPolicyFactory;
 use ferritex_application::ports::{PreviewTransportPort, TransportRevisionEvent};
 use ferritex_application::preview_session_service::{
@@ -215,25 +214,164 @@ fn handle_watch(command: &CompileCommand) -> i32 {
 }
 
 fn handle_preview(command: &CompileCommand) -> i32 {
-    match execute_preview(command) {
-        Ok(preview) => {
-            println!("{}", preview.document_url);
-            println!("{}", preview.events_url);
-            eprintln!(
-                "preview server listening on http://127.0.0.1:{}",
-                preview.server_port
-            );
-            eprintln!("press Ctrl+C to stop");
+    let options = runtime_options_from_command(command);
+    let policy = ExecutionPolicyFactory::create(&options);
+    let Some(_preview_policy) = &policy.preview_publication else {
+        let diagnostics = vec![Diagnostic::new(
+            Severity::Error,
+            "preview is disabled by the execution policy",
+        )
+        .with_file(options.input_file.to_string_lossy().into_owned())
+        .with_suggestion("rerun with preview publication enabled")];
+        emit_diagnostics(&diagnostics);
+        return diagnostics_exit_code(&diagnostics);
+    };
 
-            loop {
-                thread::park();
-            }
-        }
-        Err(diagnostics) => {
+    let transport = Arc::new(match LoopbackPreviewTransport::bind() {
+        Ok(transport) => transport,
+        Err(error) => {
+            let diagnostics = vec![Diagnostic::new(
+                Severity::Error,
+                format!("failed to start loopback preview server: {error}"),
+            )
+            .with_file(options.input_file.to_string_lossy().into_owned())
+            .with_suggestion("retry after ensuring loopback TCP ports are available")];
             emit_diagnostics(&diagnostics);
-            diagnostics_exit_code(&diagnostics)
+            return diagnostics_exit_code(&diagnostics);
         }
-    }
+    });
+    let server_port = transport.port();
+    transport.start_background();
+    eprintln!(
+        "preview server listening on http://127.0.0.1:{server_port} (waiting for first successful compile)"
+    );
+    eprintln!("press Ctrl+C to stop");
+
+    let preview_transport: Arc<dyn PreviewTransportPort> = transport.clone();
+    let session_service = Arc::new(Mutex::new(PreviewSessionService::new(Arc::clone(
+        &preview_transport,
+    ))));
+    let target = PreviewTarget {
+        input_file: options.input_file.clone(),
+        jobname: options.jobname.clone(),
+    };
+
+    let callback_transport = Arc::clone(&transport);
+    let callback_service = Arc::clone(&session_service);
+    let callback_target = target.clone();
+    let callback_policy = policy.clone();
+    let mut session_id: Option<SessionId> = None;
+    let on_compile = move |result: &CompileResult| {
+        if result.exit_code != 0 {
+            return;
+        }
+
+        let Some(output_pdf) = result.output_pdf.as_ref() else {
+            return;
+        };
+
+        let pdf_bytes = match std::fs::read(output_pdf) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("warning: failed to read compiled PDF for preview publish: {error}");
+                return;
+            }
+        };
+        let page_count = estimate_pdf_page_count(&pdf_bytes);
+
+        if session_id.is_none() {
+            let bootstrap = {
+                let mut service = callback_service
+                    .lock()
+                    .expect("preview session service poisoned");
+                match service.create_session(&callback_target, &callback_policy) {
+                    Ok(bootstrap) => bootstrap,
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to create preview session: {} ({})",
+                            error.error_kind, error.recovery_instruction
+                        );
+                        return;
+                    }
+                }
+            };
+
+            println!("{}", bootstrap.document_url);
+            println!("{}", bootstrap.events_url);
+
+            let svc = Arc::clone(&callback_service);
+            callback_transport.set_view_state_handler(Arc::new(move |session_id, update| {
+                let view_state = PreviewViewState {
+                    page_number: update.page_number,
+                    zoom: update.zoom,
+                    viewport_offset_y: update.viewport_offset_y,
+                };
+                svc.lock()
+                    .expect("preview session service poisoned")
+                    .update_view_state(&SessionId::new(session_id), view_state);
+            }));
+            session_id = Some(bootstrap.session_id);
+        }
+
+        let current_session_id = session_id
+            .clone()
+            .expect("preview session should exist before publish");
+
+        let publish_decision = callback_service
+            .lock()
+            .expect("preview session service poisoned")
+            .check_publish(&current_session_id, &callback_target, &callback_policy);
+        if let PublishDecision::Denied(error) = publish_decision {
+            eprintln!(
+                "warning: failed to authorize preview publish: {} ({})",
+                error.error_kind, error.recovery_instruction
+            );
+            return;
+        }
+
+        if callback_service
+            .lock()
+            .expect("preview session service poisoned")
+            .apply_page_fallback(&current_session_id, page_count)
+            .is_none()
+        {
+            eprintln!(
+                "warning: failed to apply preview page fallback for session {}",
+                current_session_id
+            );
+            return;
+        }
+
+        if let Err(error) = callback_transport.publish_pdf(current_session_id.as_str(), &pdf_bytes)
+        {
+            eprintln!("warning: failed to publish preview PDF: {error}");
+            return;
+        }
+
+        let Some(revision) = callback_service
+            .lock()
+            .expect("preview session service poisoned")
+            .advance_revision(&current_session_id, page_count)
+        else {
+            eprintln!(
+                "warning: failed to advance preview revision for session {}",
+                current_session_id
+            );
+            return;
+        };
+
+        if let Err(error) = callback_transport.publish_revision_event(&TransportRevisionEvent {
+            session_id: current_session_id.to_string(),
+            target_input: revision.target.input_file.to_string_lossy().into_owned(),
+            target_jobname: revision.target.jobname,
+            revision: revision.revision,
+            page_count: revision.page_count,
+        }) {
+            eprintln!("warning: failed to publish preview revision event: {error}");
+        }
+    };
+
+    watch_runner::run_watch_loop(command, on_compile)
 }
 
 fn handle_lsp() -> i32 {
@@ -255,6 +393,7 @@ fn emit_diagnostic(diagnostic: &Diagnostic) {
     eprintln!("{diagnostic}");
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewExecution {
     document_url: String,
@@ -262,6 +401,7 @@ struct PreviewExecution {
     server_port: u16,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Diagnostic>> {
     let options = runtime_options_from_command(command);
     let policy = ExecutionPolicyFactory::create(&options);
@@ -433,6 +573,7 @@ fn estimate_pdf_page_count(pdf_bytes: &[u8]) -> usize {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn diagnostic_for_session_error(error: &SessionErrorResponse) -> Diagnostic {
     Diagnostic::new(
         Severity::Error,

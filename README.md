@@ -58,7 +58,7 @@ cargo run --release -- compile hello.tex --synctex
 
 ```sh
 cargo run --release -- watch hello.tex     # polls and recompiles on source changes
-cargo run --release -- preview hello.tex   # serves the current PDF on a loopback preview URL
+cargo run --release -- preview hello.tex   # live preview: recompiles on source edits and pushes updates to the loopback URL
 cargo run --release -- lsp                 # starts an LSP server over stdio
 ```
 
