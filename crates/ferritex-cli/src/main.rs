@@ -39,6 +39,17 @@ enum Commands {
     /// Watch for changes and recompile automatically
     Watch(CompileCommand),
     /// Start the Language Server Protocol server
+    #[command(
+        long_about = "Start the Language Server Protocol server over stdio.
+
+The server speaks JSON-RPC 2.0 using `Content-Length: <N>\\r\\n\\r\\n<N bytes of UTF-8 JSON>` framing.
+Oversize or malformed frames are treated as fatal session errors and terminate the session.
+
+Handshake: clients send `initialize` (request), wait for the InitializeResult response, and then send `initialized` (notification) before textDocument requests.
+
+Diagnostics are delivered through `textDocument/publishDiagnostics` notifications.
+See README.md for a minimal publishDiagnostics example."
+    )]
     Lsp,
 }
 

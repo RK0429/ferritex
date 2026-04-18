@@ -62,6 +62,34 @@ cargo run --release -- preview hello.tex   # serves the current PDF on a loopbac
 cargo run --release -- lsp                 # starts an LSP server over stdio
 ```
 
+## LSP (Language Server Protocol)
+
+`ferritex lsp` starts a Language Server Protocol server over stdio. It speaks JSON-RPC 2.0, so each message must use `Content-Length: <N>\r\n\r\n<N bytes of UTF-8 JSON>` framing. Oversize or malformed frames are treated as fatal session errors and end the current session.
+
+The handshake follows the standard LSP sequence: the client sends an `initialize` request, the server replies with an `InitializeResult`, and the client then sends an `initialized` notification before issuing `textDocument/*` requests.
+
+Minimal `publishDiagnostics` notification payload:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/publishDiagnostics",
+  "params": {
+    "uri": "file:///workspace/hello.tex",
+    "diagnostics": [
+      {
+        "range": {
+          "start": { "line": 0, "character": 0 },
+          "end": { "line": 0, "character": 5 }
+        },
+        "severity": 1,
+        "message": "Undefined control sequence"
+      }
+    ]
+  }
+}
+```
+
 ## Crate layout
 
 | Crate | Role |
