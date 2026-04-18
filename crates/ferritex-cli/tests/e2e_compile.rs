@@ -84,6 +84,61 @@ fn compile_nonexistent_file_exits_with_code_2() {
 }
 
 #[test]
+fn preview_nonexistent_file_exits_without_binding_port_or_printing_url() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("missing.tex");
+    let mut child = ferritex_bin()
+        .args(["preview", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+
+    let exit_status = wait_for_exit(&mut child, Duration::from_secs(10));
+    assert!(
+        exit_status.is_some(),
+        "preview should exit when the initial compile fails instead of entering the listen loop",
+    );
+    assert_eq!(
+        exit_status.and_then(|status| status.code()),
+        Some(2),
+        "preview should surface the compile failure as exit code 2",
+    );
+
+    let mut stdout_buf = String::new();
+    child
+        .stdout
+        .take()
+        .expect("captured stdout")
+        .read_to_string(&mut stdout_buf)
+        .expect("read stdout");
+    assert!(
+        !stdout_buf.contains("http://127.0.0.1:"),
+        "stdout must not print a preview URL when bootstrap compile fails: {stdout_buf}",
+    );
+    assert!(
+        !stdout_buf.contains("http://localhost:"),
+        "stdout must not print a localhost preview URL when bootstrap compile fails: {stdout_buf}",
+    );
+
+    let mut stderr_buf = String::new();
+    child
+        .stderr
+        .take()
+        .expect("captured stderr")
+        .read_to_string(&mut stderr_buf)
+        .expect("read stderr");
+    assert!(
+        !stderr_buf.contains("preview server listening"),
+        "stderr must not print the listening banner when bootstrap compile fails: {stderr_buf}",
+    );
+    assert!(
+        stderr_buf.contains("input file not found"),
+        "stderr should surface the original compile failure: {stderr_buf}",
+    );
+}
+
+#[test]
 fn compile_existing_file_writes_pdf_with_document_content() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello.tex");

@@ -251,16 +251,6 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
         .with_suggestion("rerun with preview publication enabled")]);
     };
 
-    let transport = Arc::new(LoopbackPreviewTransport::bind().map_err(|error| {
-        vec![Diagnostic::new(
-            Severity::Error,
-            format!("failed to start loopback preview server: {error}"),
-        )
-        .with_file(options.input_file.to_string_lossy().into_owned())
-        .with_suggestion("retry after ensuring loopback TCP ports are available")]
-    })?);
-    transport.start_background();
-
     let target = PreviewTarget {
         input_file: options.input_file.clone(),
         jobname: options.jobname.clone(),
@@ -286,6 +276,17 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
         .with_file(options.input_file.to_string_lossy().into_owned())
         .with_suggestion("inspect the compile pipeline and retry the preview command")]
     })?;
+
+    // Initial compile succeeded; safe to bind the loopback port now.
+    let transport = Arc::new(LoopbackPreviewTransport::bind().map_err(|error| {
+        vec![Diagnostic::new(
+            Severity::Error,
+            format!("failed to start loopback preview server: {error}"),
+        )
+        .with_file(options.input_file.to_string_lossy().into_owned())
+        .with_suggestion("retry after ensuring loopback TCP ports are available")]
+    })?);
+    transport.start_background();
 
     let preview_transport: Arc<dyn PreviewTransportPort> = transport.clone();
     let session_service = Arc::new(Mutex::new(PreviewSessionService::new(Arc::clone(
@@ -444,6 +445,7 @@ mod tests {
     };
     use clap::Parser;
     use ferritex_application::runtime_options::{InteractionMode, ShellEscapeMode};
+    use ferritex_core::diagnostics::Severity;
     use tempfile::tempdir;
 
     fn compile_command() -> CompileCommand {
@@ -604,5 +606,39 @@ mod tests {
             .contains("/preview/preview-session-1/events"));
         assert!(preview.server_port > 0);
         assert!(dir.path().join("hello.pdf").exists());
+    }
+
+    #[test]
+    fn preview_surfaces_initial_compile_failure_without_bootstrapping_transport() {
+        let dir = tempdir().expect("create tempdir");
+        let tex_file = dir.path().join("missing.tex");
+
+        let mut command = compile_command();
+        command.file = tex_file.clone();
+        command.output_dir = Some(dir.path().to_path_buf());
+        command.jobname = Some("missing".to_string());
+        command.jobs = Some(1);
+        command.no_cache = false;
+        command.asset_bundle = None;
+        command.reproducible = false;
+        command.interaction = None;
+        command.synctex = false;
+        command.trace_font_tasks = false;
+        command.shell_escape = false;
+        command.no_shell_escape = true;
+
+        let diagnostics =
+            execute_preview(&command).expect_err("expected initial compile to fail");
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error),
+            "expected at least one error-level diagnostic, got {diagnostics:?}",
+        );
+        assert!(
+            !dir.path().join("missing.pdf").exists(),
+            "no output PDF should be produced when the initial compile fails",
+        );
     }
 }
