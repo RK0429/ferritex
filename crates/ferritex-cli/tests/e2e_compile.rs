@@ -245,43 +245,6 @@ fn build_minimal_cmr10_tfm() -> Vec<u8> {
     bytes
 }
 
-fn spawn_streaming_collector<R>(reader: R) -> (Arc<Mutex<String>>, thread::JoinHandle<()>)
-where
-    R: Read + Send + 'static,
-{
-    let buffer = Arc::new(Mutex::new(String::new()));
-    let buffer_clone = Arc::clone(&buffer);
-    let handle = thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .expect("read streaming child output");
-            if read == 0 {
-                break;
-            }
-            buffer_clone
-                .lock()
-                .expect("lock streaming buffer")
-                .push_str(&line);
-        }
-    });
-    (buffer, handle)
-}
-
-fn buffer_contains(buffer: &Arc<Mutex<String>>, needle: &str) -> bool {
-    buffer
-        .lock()
-        .expect("lock streaming buffer")
-        .contains(needle)
-}
-
-fn buffer_snapshot(buffer: &Arc<Mutex<String>>) -> String {
-    buffer.lock().expect("lock streaming buffer").clone()
-}
-
 #[test]
 fn compile_nonexistent_file_exits_with_code_2() {
     let output = ferritex_bin()
@@ -2935,6 +2898,7 @@ fn watch_writes_initial_pdf_and_recompiles_on_change() {
     child.wait().expect("wait for watch process");
 }
 
+#[test]
 fn watch_prints_startup_banner_and_tracked_count_by_default() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -3135,6 +3099,7 @@ fn watch_refreshes_dependency_set_after_new_input_is_added() {
     child.wait().expect("wait for watch process");
 }
 
+#[test]
 fn watch_verbose_prints_watched_dependency_paths() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");

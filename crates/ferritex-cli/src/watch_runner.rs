@@ -45,7 +45,7 @@ where
     emit_diagnostics(&initial_result.diagnostics, interaction_mode);
     on_compile(&initial_result);
 
-    let mut watched_paths =
+    let watched_paths =
         watched_paths_for_result(&initial_result, &options.input_file, &file_access_gate);
     emit_watch_status(&format!(
         "tracking {} file{}",

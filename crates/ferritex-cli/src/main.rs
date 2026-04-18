@@ -9,7 +9,9 @@ use std::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ferritex_application::compile_job_service::{CompileJobService, CompileResult};
 use ferritex_application::execution_policy_factory::ExecutionPolicyFactory;
-use ferritex_application::ports::{PreviewTransportPort, TransportRevisionEvent};
+use ferritex_application::ports::{
+    PreviewTransportPort, TransportRevisionEvent, TransportViewStateUpdate,
+};
 use ferritex_application::preview_session_service::{
     PreviewSessionService, PreviewTarget, PreviewViewState, PublishDecision, SessionErrorResponse,
     SessionId,
@@ -326,6 +328,7 @@ fn handle_preview(command: &CompileCommand) -> i32 {
                 svc.lock()
                     .expect("preview session service poisoned")
                     .update_view_state(&SessionId::new(session_id), view_state);
+                eprintln!("{}", format_view_state_diagnostic(session_id, update));
             }));
             session_id = Some(bootstrap.session_id);
         }
@@ -575,6 +578,7 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
                     svc.lock()
                         .expect("preview session service poisoned")
                         .update_view_state(&SessionId::new(session_id), view_state);
+                    eprintln!("{}", format_view_state_diagnostic(session_id, update));
                 }));
             }
 
@@ -597,6 +601,13 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
         }
         PublishDecision::Denied(error) => Err(vec![diagnostic_for_session_error(&error)]),
     }
+}
+
+fn format_view_state_diagnostic(session_id: &str, update: &TransportViewStateUpdate) -> String {
+    format!(
+        "preview view-state received for session {session_id}: page={} zoom={} offset_y={}",
+        update.page_number, update.zoom, update.viewport_offset_y
+    )
 }
 
 fn estimate_pdf_page_count(pdf_bytes: &[u8]) -> usize {
@@ -643,10 +654,11 @@ mod tests {
     use std::{num::NonZeroUsize, path::PathBuf};
 
     use super::{
-        emit_diagnostics_to, execute_preview, runtime_options_from_command, Cli, Commands,
-        CompileCommand, InteractionArg,
+        emit_diagnostics_to, execute_preview, format_view_state_diagnostic,
+        runtime_options_from_command, Cli, Commands, CompileCommand, InteractionArg,
     };
     use clap::Parser;
+    use ferritex_application::ports::TransportViewStateUpdate;
     use ferritex_application::runtime_options::{InteractionMode, ShellEscapeMode};
     use ferritex_core::diagnostics::{Diagnostic, Severity};
     use tempfile::tempdir;
@@ -852,6 +864,22 @@ mod tests {
             !dir.path().join("missing.pdf").exists(),
             "no output PDF should be produced when the initial compile fails",
         );
+    }
+
+    #[test]
+    fn format_view_state_diagnostic_includes_session_id_and_update_fields() {
+        let update = TransportViewStateUpdate {
+            page_number: 3,
+            zoom: 1.5,
+            viewport_offset_y: 240.25,
+        };
+
+        let diagnostic = format_view_state_diagnostic("preview-session-7", &update);
+
+        assert!(diagnostic.contains("preview-session-7"));
+        assert!(diagnostic.contains("page=3"));
+        assert!(diagnostic.contains("zoom=1.5"));
+        assert!(diagnostic.contains("offset_y=240.25"));
     }
 
     #[test]
