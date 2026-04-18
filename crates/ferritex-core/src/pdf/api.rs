@@ -263,7 +263,7 @@ impl PdfRenderer {
         let total_lines = document.pages.iter().map(|page| page.lines.len()).sum();
         let link_style = &document.navigation.default_link_style;
         let mut pdf = Vec::<u8>::new();
-        let mut offsets = Vec::<usize>::new();
+        let mut offsets = BTreeMap::<usize, usize>::new();
         let page_object_start = 3usize;
         let content_object_start = page_object_start + page_count;
         let annotation_object_start = content_object_start + page_count;
@@ -340,6 +340,7 @@ impl PdfRenderer {
         append_object(
             &mut pdf,
             &mut offsets,
+            1,
             &format!(
                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R{catalog_named_destinations}{catalog_outlines} >>\nendobj\n"
             ),
@@ -347,6 +348,7 @@ impl PdfRenderer {
         append_object(
             &mut pdf,
             &mut offsets,
+            2,
             &format!(
                 "2 0 obj\n<< /Type /Pages /Kids [{}] /Count {} >>\nendobj\n",
                 page_kids(page_count, page_object_start),
@@ -385,6 +387,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                page_object_id,
                 &format!(
                     "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >>{}{} >>{annots_entry} >>\nendobj\n",
                     points_to_pdf_number(page.page_box.width),
@@ -401,6 +404,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                content_object_id,
                 &format!(
                     "{content_object_id} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
                     payload.stream.len(),
@@ -429,6 +433,7 @@ impl PdfRenderer {
                 append_object(
                     &mut pdf,
                     &mut offsets,
+                    annotation.object_id,
                     &format!(
                         "{} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border {}{} {} >>\nendobj\n",
                         annotation.object_id,
@@ -461,6 +466,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                object_id,
                 &build_named_destination_object(document, page_object_start, object_id),
             );
         }
@@ -471,6 +477,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                root_object_id,
                 &format!(
                     "{root_object_id} 0 obj\n<< /Type /Outlines{}{} /Count {} >>\nendobj\n",
                     first_object_id
@@ -487,6 +494,7 @@ impl PdfRenderer {
                 append_object(
                     &mut pdf,
                     &mut offsets,
+                    outline_object.object_id,
                     &format!(
                         "{} 0 obj\n{}\nendobj\n",
                         outline_object.object_id, outline_object.body
@@ -496,8 +504,9 @@ impl PdfRenderer {
         }
 
         for font_object in &font_objects {
-            for object in &font_object.objects {
-                append_object_bytes(&mut pdf, &mut offsets, object);
+            for (index, object) in font_object.objects.iter().enumerate() {
+                let object_id = font_object.dictionary_object_id + index;
+                append_object_bytes(&mut pdf, &mut offsets, object_id, object);
             }
         }
 
@@ -507,20 +516,31 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                object_id,
                 &format!("{object_id} 0 obj\n{info_dictionary}\nendobj\n"),
             );
         }
 
         let xref_offset = pdf.len();
-        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        let max_object_id = offsets.keys().copied().max().unwrap_or(0);
+        debug_assert_eq!(
+            offsets.len(),
+            max_object_id,
+            "PDF object ids must be contiguous starting at 1"
+        );
+        pdf.extend_from_slice(format!("xref\n0 {}\n", max_object_id + 1).as_bytes());
         pdf.extend_from_slice(b"0000000000 65535 f \n");
-        for offset in &offsets {
+        for object_id in 1..=max_object_id {
+            let offset = offsets
+                .get(&object_id)
+                .copied()
+                .unwrap_or_else(|| panic!("missing xref entry for object {object_id}"));
             pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
         pdf.extend_from_slice(
             format!(
                 "trailer\n<< /Size {} /Root 1 0 R{} >>\nstartxref\n{}\n%%EOF\n",
-                offsets.len() + 1,
+                max_object_id + 1,
                 info_object_id
                     .map(|object_id| format!(" /Info {object_id} 0 R"))
                     .unwrap_or_default(),
@@ -2172,13 +2192,14 @@ fn page_ext_gstate_resources(
 
 fn append_opacity_graphics_state_objects(
     buffer: &mut Vec<u8>,
-    offsets: &mut Vec<usize>,
+    offsets: &mut BTreeMap<usize, usize>,
     object_ids: &BTreeMap<OpacityGraphicsStateKey, usize>,
 ) {
     for (key, object_id) in object_ids {
         append_object(
             buffer,
             offsets,
+            *object_id,
             &format!(
                 "{object_id} 0 obj\n<< /Type /ExtGState /CA {} /ca {} >>\nendobj\n",
                 pdf_real(key.stroke_opacity()),
@@ -2188,8 +2209,12 @@ fn append_opacity_graphics_state_objects(
     }
 }
 
-fn append_image_xobject(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, image: &PdfImageXObject) {
-    offsets.push(buffer.len());
+fn append_image_xobject(
+    buffer: &mut Vec<u8>,
+    offsets: &mut BTreeMap<usize, usize>,
+    image: &PdfImageXObject,
+) {
+    record_object_offset(offsets, image.object_id, buffer.len());
     buffer.extend_from_slice(
         format!(
             "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent {} /Filter /{}{} /Length {} >>\nstream\n",
@@ -2210,10 +2235,10 @@ fn append_image_xobject(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, image: &
 
 fn append_form_xobject(
     buffer: &mut Vec<u8>,
-    offsets: &mut Vec<usize>,
+    offsets: &mut BTreeMap<usize, usize>,
     form_xobject: &PdfFormXObject,
 ) {
-    offsets.push(buffer.len());
+    record_object_offset(offsets, form_xobject.object_id, buffer.len());
     let resources_dict = form_xobject.resources_dict.as_deref().unwrap_or("<< >>");
     buffer.extend_from_slice(
         format!(
@@ -2486,13 +2511,35 @@ fn points(value: i64) -> DimensionValue {
     DimensionValue(value * SCALED_POINTS_PER_POINT)
 }
 
-fn append_object(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, object: &str) {
-    append_object_bytes(buffer, offsets, object.as_bytes());
+fn append_object(
+    buffer: &mut Vec<u8>,
+    offsets: &mut BTreeMap<usize, usize>,
+    object_id: usize,
+    object: &str,
+) {
+    append_object_bytes(buffer, offsets, object_id, object.as_bytes());
 }
 
-fn append_object_bytes(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, object: &[u8]) {
-    offsets.push(buffer.len());
+fn append_object_bytes(
+    buffer: &mut Vec<u8>,
+    offsets: &mut BTreeMap<usize, usize>,
+    object_id: usize,
+    object: &[u8],
+) {
+    record_object_offset(offsets, object_id, buffer.len());
     buffer.extend_from_slice(object);
+}
+
+fn record_object_offset(
+    offsets: &mut BTreeMap<usize, usize>,
+    object_id: usize,
+    byte_offset: usize,
+) {
+    let previous = offsets.insert(object_id, byte_offset);
+    debug_assert!(
+        previous.is_none(),
+        "duplicate PDF object id {object_id}: previous offset {previous:?}, new offset {byte_offset}"
+    );
 }
 
 fn unicode_to_winansi(ch: char) -> Option<u8> {
@@ -4446,6 +4493,136 @@ mod tests {
 
         assert!(subsetted_font_data.len() < 10);
         assert!(content.contains("/Length1 4"));
+    }
+
+    #[test]
+    fn xref_entries_point_to_object_markers_with_mixed_indirect_objects() {
+        // Regression for issue #23: PDFs containing images, form XObjects,
+        // outlines, and named destinations were written with object IDs that
+        // did not match the write order, leaving xref offsets pointing at the
+        // wrong bytes. This exercises the full set and verifies the xref
+        // table actually reaches each `{id} 0 obj` marker.
+        let mut document = single_page_with_images(
+            &["Body"],
+            vec![
+                TypesetImage {
+                    scene: raster_scene(),
+                    x: points(72),
+                    y: points(600),
+                    display_width: points(100),
+                    display_height: points(100),
+                },
+                TypesetImage {
+                    scene: pdf_scene(),
+                    x: points(72),
+                    y: points(480),
+                    display_width: points(100),
+                    display_height: points(50),
+                },
+            ],
+        );
+        document.outlines = vec![TypesetOutline {
+            level: 0,
+            title: "Heading".to_string(),
+            page_index: 0,
+            y: points(720),
+        }];
+        document.named_destinations = vec![TypesetNamedDestination {
+            name: "heading".to_string(),
+            page_index: 0,
+            y: points(720),
+        }];
+
+        let renderer = PdfRenderer::default()
+            .with_images(
+                vec![PdfImageXObject {
+                    object_id: 0,
+                    width: 1,
+                    height: 1,
+                    color_space: ImageColorSpace::DeviceRGB,
+                    bits_per_component: 8,
+                    data: vec![120, 156, 99, 248, 207, 192, 0, 0, 3, 1, 1, 0],
+                    filter: ImageFilter::FlateDecode,
+                }],
+                vec![vec![PlacedImage {
+                    xobject_index: 0,
+                    x: points(72),
+                    y: points(600),
+                    display_width: points(100),
+                    display_height: points(100),
+                }]],
+            )
+            .with_form_xobjects(
+                vec![PdfFormXObject {
+                    object_id: 0,
+                    media_box: [0.0, 0.0, 200.0, 100.0],
+                    data: b"0 0 m\n200 100 l\nS".to_vec(),
+                    resources_dict: Some("<< /ProcSet [/PDF] >>".to_string()),
+                }],
+                vec![vec![PlacedFormXObject {
+                    xobject_index: 0,
+                    x: points(72),
+                    y: points(480),
+                    display_width: points(100),
+                    display_height: points(50),
+                }]],
+            );
+
+        let pdf = renderer.render(&document);
+        let bytes = pdf.bytes.as_slice();
+
+        // Locate the xref section header at the start of a line.
+        let xref_header = b"\nxref\n";
+        let xref_pos = bytes
+            .windows(xref_header.len())
+            .position(|window| window == xref_header)
+            .expect("rendered PDF must contain an xref section")
+            + 1;
+        let xref_body = std::str::from_utf8(&bytes[xref_pos..])
+            .expect("xref section should be ASCII");
+        let mut lines = xref_body.lines();
+        let header = lines.next().expect("xref header");
+        assert_eq!(header, "xref");
+        let subsection = lines.next().expect("xref subsection header");
+        let mut parts = subsection.split_whitespace();
+        let first_id: usize = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("first object id");
+        let count: usize = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("object count");
+        assert_eq!(first_id, 0, "xref subsection should start at object 0");
+        assert!(count >= 2, "PDF must contain at least the catalog and pages");
+
+        // The first entry is the free object (id 0); skip it. For every other
+        // declared object id, verify the byte offset actually lands on the
+        // `{id} 0 obj` marker.
+        let free_entry = lines.next().expect("free entry line");
+        assert!(
+            free_entry.starts_with("0000000000"),
+            "free entry must point at offset 0: {free_entry}"
+        );
+        for object_id in 1..count {
+            let line = lines
+                .next()
+                .unwrap_or_else(|| panic!("missing xref entry for object {object_id}"));
+            let offset: usize = line
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("unparsable xref entry: {line}"));
+            let expected_marker = format!("{object_id} 0 obj");
+            let actual = std::str::from_utf8(
+                &bytes[offset..offset.saturating_add(expected_marker.len())],
+            )
+            .unwrap_or_else(|_| panic!("non-UTF8 bytes at offset {offset}"));
+            assert_eq!(
+                actual, expected_marker,
+                "xref entry for object {object_id} at offset {offset} should start with {expected_marker:?}"
+            );
+        }
     }
 
     fn embedded_font_resource() -> FontResource {
