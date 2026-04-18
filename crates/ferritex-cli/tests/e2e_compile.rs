@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -2331,6 +2331,68 @@ fn watch_refreshes_dependency_set_after_new_input_is_added() {
 }
 
 #[test]
+fn watch_exits_with_friendly_message_when_watched_directory_is_deleted() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let tex_file = workspace.join("hello.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["watch", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex watch");
+
+    let pdf_file = workspace.join("hello.pdf");
+    wait_until(
+        || pdf_file.exists(),
+        Duration::from_secs(2),
+        "watch should emit the initial PDF",
+    );
+
+    std::fs::remove_dir_all(&workspace).expect("delete workspace directory");
+
+    let exit_status = wait_for_exit(&mut child, Duration::from_secs(5))
+        .expect("watch should exit after the workspace is removed");
+    assert_eq!(
+        exit_status.code(),
+        Some(2),
+        "watch should exit with status 2 after losing its workspace",
+    );
+
+    let mut stderr_buf = String::new();
+    child
+        .stderr
+        .take()
+        .expect("captured stderr")
+        .read_to_string(&mut stderr_buf)
+        .expect("read stderr");
+
+    assert!(
+        stderr_buf.contains("no longer exists"),
+        "stderr should explain that the watched path is gone: {stderr_buf}",
+    );
+    assert!(
+        stderr_buf.contains("help:"),
+        "stderr should include a help line guiding the user: {stderr_buf}",
+    );
+    assert!(
+        stderr_buf.contains("rerun `ferritex watch`"),
+        "stderr should suggest rerunning watch after restoring the path: {stderr_buf}",
+    );
+    assert!(
+        !stderr_buf.contains("os error"),
+        "stderr should not surface the raw OS error: {stderr_buf}",
+    );
+}
+
+#[test]
 fn lsp_initialize_and_diagnostics_work_over_stdio() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -3490,6 +3552,22 @@ fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration, message: &
         thread::sleep(Duration::from_millis(25));
     }
     panic!("{message}");
+}
+
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait().expect("poll child status") {
+            Some(status) => return Some(status),
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
 }
 
 fn write_lsp_message(writer: &mut impl Write, value: &Value) {

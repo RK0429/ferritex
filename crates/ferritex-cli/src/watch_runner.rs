@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -44,9 +45,9 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
     let mut watcher = match PollingFileWatcher::new(watched_paths) {
         Ok(watcher) => watcher,
         Err(error) => {
-            emit_diagnostic(&Diagnostic::new(
-                Severity::Error,
-                format!("failed to start file watcher: {error}"),
+            emit_diagnostic(&watcher_io_diagnostic(
+                &error,
+                "failed to start file watcher",
             ));
             service.flush_cache();
             return 2;
@@ -86,14 +87,28 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
                 &options.input_file,
                 &file_access_gate,
             )) {
-                emit_diagnostic(&Diagnostic::new(
-                    Severity::Error,
-                    format!("failed to refresh watched files: {error}"),
+                emit_diagnostic(&watcher_io_diagnostic(
+                    &error,
+                    "failed to refresh watched files",
                 ));
                 service.flush_cache();
                 return 2;
             }
         }
+    }
+}
+
+fn watcher_io_diagnostic(error: &io::Error, fallback_context: &str) -> Diagnostic {
+    if error.kind() == io::ErrorKind::NotFound {
+        Diagnostic::new(
+            Severity::Error,
+            "stopped watching: a watched file or its parent directory no longer exists",
+        )
+        .with_suggestion(
+            "restore the missing path (or revert the deletion), then rerun `ferritex watch`",
+        )
+    } else {
+        Diagnostic::new(Severity::Error, format!("{fallback_context}: {error}"))
     }
 }
 
@@ -248,7 +263,47 @@ fn normalize_candidate(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::discover_watched_paths;
+    use std::io;
+
+    use super::{discover_watched_paths, watcher_io_diagnostic};
+    use ferritex_core::diagnostics::Severity;
+
+    #[test]
+    fn watcher_io_diagnostic_for_not_found_explains_cause_and_suggests_revert() {
+        let error = io::Error::from(io::ErrorKind::NotFound);
+        let diagnostic = watcher_io_diagnostic(&error, "failed to refresh watched files");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(
+            diagnostic.message.contains("no longer exists"),
+            "message should explain that the path is gone: {}",
+            diagnostic.message,
+        );
+        let suggestion = diagnostic
+            .suggestion
+            .as_deref()
+            .expect("NotFound diagnostic should include a suggestion");
+        assert!(
+            suggestion.contains("revert") || suggestion.contains("restore"),
+            "suggestion should hint at reverting the deletion: {suggestion}",
+        );
+        assert!(
+            !diagnostic.message.contains("os error"),
+            "raw OS error string should not leak into the message: {}",
+            diagnostic.message,
+        );
+    }
+
+    #[test]
+    fn watcher_io_diagnostic_falls_back_to_raw_error_for_other_kinds() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "denied by policy");
+        let diagnostic = watcher_io_diagnostic(&error, "failed to refresh watched files");
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(diagnostic.message.contains("failed to refresh watched files"));
+        assert!(diagnostic.message.contains("denied by policy"));
+        assert!(diagnostic.suggestion.is_none());
+    }
 
     #[test]
     fn watches_input_and_nested_dependencies() {
