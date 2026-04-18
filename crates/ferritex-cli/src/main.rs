@@ -1,5 +1,6 @@
 use std::{
     io::{self, Write},
+    num::NonZeroUsize,
     path::PathBuf,
     process,
     sync::{Arc, Mutex},
@@ -68,7 +69,7 @@ struct CompileCommand {
     /// Number of parallel compilation tasks (default: CPU cores). High values (>
     /// available cores) can significantly increase peak RSS on heavy fixtures.
     #[arg(long, value_name = "N")]
-    jobs: Option<usize>,
+    jobs: Option<NonZeroUsize>,
     /// Additional directories to search for TeX files
     #[arg(long = "overlay", value_name = "DIR")]
     overlay_roots: Vec<PathBuf>,
@@ -123,7 +124,7 @@ impl CompileCommand {
             input_file: self.file.clone(),
             output_dir: self.output_dir.clone(),
             jobname: self.jobname.clone(),
-            jobs: self.jobs,
+            jobs: self.jobs.map(NonZeroUsize::get),
             overlay_roots: self.overlay_roots.clone(),
             no_cache: self.no_cache,
             asset_bundle: self.asset_bundle.clone(),
@@ -639,7 +640,7 @@ fn diagnostics_exit_code(diagnostics: &[Diagnostic]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{num::NonZeroUsize, path::PathBuf};
 
     use super::{
         emit_diagnostics_to, execute_preview, runtime_options_from_command, Cli, Commands,
@@ -655,7 +656,7 @@ mod tests {
             file: PathBuf::from("chapters/main.tex"),
             output_dir: Some(PathBuf::from("build")),
             jobname: None,
-            jobs: Some(4),
+            jobs: NonZeroUsize::new(4),
             overlay_roots: vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")],
             no_cache: true,
             asset_bundle: Some(PathBuf::from("bundle")),
@@ -748,7 +749,7 @@ mod tests {
 
         assert_eq!(command.file, PathBuf::from("notes.tex"));
         assert_eq!(command.output_dir, Some(PathBuf::from("out")));
-        assert_eq!(command.jobs, Some(2));
+        assert_eq!(command.jobs, NonZeroUsize::new(2));
         assert!(!command.verbose);
     }
 
@@ -771,7 +772,14 @@ mod tests {
 
         assert_eq!(command.file, PathBuf::from("notes.tex"));
         assert_eq!(command.output_dir, Some(PathBuf::from("out")));
-        assert_eq!(command.jobs, Some(2));
+        assert_eq!(command.jobs, NonZeroUsize::new(2));
+    }
+
+    #[test]
+    fn compile_rejects_zero_jobs() {
+        let result = Cli::try_parse_from(["ferritex", "compile", "book.tex", "--jobs", "0"]);
+
+        assert!(result.is_err(), "--jobs 0 must be rejected");
     }
 
     #[test]
@@ -788,7 +796,7 @@ mod tests {
         command.file = tex_file.clone();
         command.output_dir = Some(dir.path().to_path_buf());
         command.jobname = Some("hello".to_string());
-        command.jobs = Some(1);
+        command.jobs = NonZeroUsize::new(1);
         command.no_cache = false;
         command.asset_bundle = None;
         command.reproducible = false;
@@ -821,7 +829,7 @@ mod tests {
         command.file = tex_file.clone();
         command.output_dir = Some(dir.path().to_path_buf());
         command.jobname = Some("missing".to_string());
-        command.jobs = Some(1);
+        command.jobs = NonZeroUsize::new(1);
         command.no_cache = false;
         command.asset_bundle = None;
         command.reproducible = false;
