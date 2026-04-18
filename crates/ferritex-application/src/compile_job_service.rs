@@ -78,6 +78,8 @@ use crate::stable_compile_state::{
 
 const DEFAULT_TFM_FALLBACK_WIDTH: DimensionValue = DimensionValue(65_536);
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
+const FONT_CACHE_HIT_TASK_ID: &str = "font-load-cache-hit";
+const FONT_CACHE_HIT_ASSET_SENTINEL: &str = "builtin:font-cache-hit";
 const CMR10_TFM_CANDIDATES: [&str; 4] = [
     "texmf/fonts/tfm/public/cm/cmr10.tfm",
     "fonts/tfm/public/cm/cmr10.tfm",
@@ -1010,6 +1012,16 @@ impl<'a> CompileJobService<'a> {
                     output = %cached_artifact.output_pdf.display(),
                     "compile cache hit"
                 );
+                if options.trace_font_tasks {
+                    let timestamp = trace_timestamp_micros();
+                    emit_font_task_trace(
+                        FONT_CACHE_HIT_TASK_ID,
+                        FONT_CACHE_HIT_ASSET_SENTINEL,
+                        timestamp,
+                        timestamp,
+                        0,
+                    );
+                }
                 let diagnostics = cached_artifact.stable_compile_state.diagnostics.clone();
                 let warm_cache = lookup.into_warm_cache();
                 *self

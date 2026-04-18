@@ -925,6 +925,7 @@
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`）
   - `--synctex`: SyncTeX データの生成有無
   - `--trace-font-tasks`: `REQ-FUNC-033` の検証に使う `FontTaskTrace` を `stderr` に出力する
+    - incremental cache が hit した場合でも、検証用に `fontTaskId="font-load-cache-hit"` / `fontAsset="builtin:font-cache-hit"` のセンチネル `FontTaskTrace` を `stderr` に 1 件 emit する。このセンチネルは `--trace-font-tasks` フラグが warm 経路でも機能していることを示す presence marker であり、`REQ-FUNC-033` の overlap 受け入れ基準（独立タスク 2 件以上の並走）には寄与しない。overlap は `--no-cache` を指定した cold 経路で検証する
   - `--shell-escape` / `--no-shell-escape`: 外部コマンド実行の許可
   - compile / watch / LSP の各入口で受け取った指定は `primaryInput`, `artifactRoot`, `jobname`, `parallelism`, `reuseCache`, `assetBundleRef`, `interactionMode`, `synctex`, `traceFontTasks`, `shellEscapeAllowed` から成る共通の `Runtime Options` に正規化され、それを基に同一の `Execution Policy` を構築する
 - **出力**: 指定オプションに従ったコンパイル動作
@@ -1151,6 +1152,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.44 | 2026-04-19 | `REQ-FUNC-043` の `--trace-font-tasks` に incremental warm-cache hit 時でも `font-load-cache-hit` センチネル trace を `stderr` に 1 件 emit する契約を追加し、`REQ-FUNC-033` overlap 判定との関係（presence marker であり overlap には寄与しない旨）を明記 | Codex |
 | 0.1.43 | 2026-04-04 | `REQ-FUNC-032` に multi-second no-cache evidence と pipelined VList build + sequential pagination の strict-proof 対応方針を追記 | Codex |
 | 0.1.42 | 2026-04-04 | `REQ-FUNC-032` に実装メモを追加。出力等価性確認済み・bounded no-regression evidence 確立済み・strict speedup 条件の sub-1s 構造的限界と適用済み最適化を記録 | Claude Opus 4.6 |
 | 0.1.41 | 2026-03-18 | `REQ-FUNC-046` の baseline 文書群成功条件を `--asset-bundle <展開先>` 明示指定へ統一し、`REQ-NF-009` / architecture の bootstrap 契約と整合させた | Codex |

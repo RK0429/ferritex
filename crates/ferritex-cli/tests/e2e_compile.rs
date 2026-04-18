@@ -137,6 +137,7 @@ fn compile_with_warnings_prints_summary_including_warning_count() {
 
 #[test]
 fn compile_with_trace_font_tasks_emits_font_task_trace_to_stderr() {
+    // Cold path: the first compile should emit concrete font task traces.
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("trace-fonts.tex");
     std::fs::write(
@@ -162,6 +163,84 @@ fn compile_with_trace_font_tasks_emits_font_task_trace_to_stderr() {
     assert!(stderr.contains("\"finishedAt\""));
     assert!(stderr.contains("\"workerId\""));
     assert!(!stderr.contains("error:"));
+}
+
+#[test]
+fn compile_with_trace_font_tasks_emits_trace_on_warm_cache_hit() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    let output_dir = dir.path().join("build");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello warm cache\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let first = ferritex_bin()
+        .args([
+            "compile",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+            "--trace-font-tasks",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let cold_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(cold_stderr.contains("\"fontTaskId\""));
+    assert!(!cold_stderr.contains("error:"));
+
+    let cache_dir = output_dir.join(".ferritex-cache");
+    let cache_entries = std::fs::read_dir(&cache_dir).expect("read warm cache dir");
+    assert!(
+        cache_entries.count() > 0,
+        "warm cache dir should contain at least one cache record"
+    );
+
+    let second = ferritex_bin()
+        .args([
+            "compile",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+            "--trace-font-tasks",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let warm_stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(
+        warm_stderr.lines().count(),
+        1,
+        "warm cache hit must emit exactly one FontTaskTrace sentinel line, got: {warm_stderr}"
+    );
+    assert!(warm_stderr.contains("\"fontTaskId\""));
+    assert!(warm_stderr.contains("\"fontAsset\""));
+    assert!(warm_stderr.contains("\"startedAt\""));
+    assert!(warm_stderr.contains("\"finishedAt\""));
+    assert!(warm_stderr.contains("\"workerId\""));
+    assert!(warm_stderr.contains("font-load-cache-hit"));
+    assert!(warm_stderr.contains("builtin:font-cache-hit"));
+    assert!(
+        !warm_stderr.contains("font-load-main"),
+        "warm cache hit must not re-run cold-path main font load: {warm_stderr}"
+    );
+    assert!(
+        !warm_stderr.contains("font-load-basic-fallback"),
+        "warm cache hit must not re-run cold-path basic fallback: {warm_stderr}"
+    );
+    assert!(!warm_stderr.contains("error:"));
 }
 
 #[test]
