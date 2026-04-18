@@ -1630,11 +1630,24 @@ impl<'a> CompileJobService<'a> {
             options.jobname.clone(),
             execution_policy,
         );
-        let cacheable_diagnostics = parse_diagnostics;
+        let encoding_error_diagnostics = pdf_document
+            .document
+            .encoding_errors
+            .iter()
+            .map(|encoding_error| Diagnostic::new(Severity::Error, encoding_error.clone()))
+            .collect::<Vec<_>>();
+        let mut cacheable_diagnostics = parse_diagnostics;
+        cacheable_diagnostics.extend(encoding_error_diagnostics.clone());
         let mut diagnostics = cache_diagnostics;
         diagnostics.extend(cacheable_diagnostics.clone());
-        for warning in &pdf_document.document.warnings {
-            diagnostics.push(Diagnostic::new(Severity::Warning, warning.clone()));
+        if !pdf_document.document.encoding_errors.is_empty() {
+            return CompileResult {
+                exit_code: exit_code_for(&diagnostics),
+                diagnostics,
+                output_pdf: None,
+                stable_compile_state: None,
+                stage_timing,
+            };
         }
         let cached_typeset_fragments = cached_typeset_fragments_for(
             self,
@@ -1691,7 +1704,7 @@ impl<'a> CompileJobService<'a> {
             cross_reference_seed.clone(),
             pass_count,
             pdf_document.document.page_count,
-            true,
+            pdf_document.document.encoding_errors.is_empty(),
             cacheable_diagnostics.clone(),
         );
         if !options.no_cache {
@@ -1766,7 +1779,7 @@ impl<'a> CompileJobService<'a> {
             cross_reference_seed,
             pass_count,
             pdf_document.document.page_count,
-            true,
+            pdf_document.document.encoding_errors.is_empty(),
             diagnostics.clone(),
         );
 
@@ -13173,9 +13186,9 @@ mod tests {
     }
 
     #[test]
-    fn pdf_encoding_warning_is_propagated_to_compile_diagnostics() {
+    fn pdf_encoding_error_is_propagated_to_compile_diagnostics() {
         // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
-        // triggers the encoding warning. (Greek/math glyphs are now routed
+        // triggers an explicit encoding error. (Greek/math glyphs are now routed
         // through the Symbol font rather than the WinAnsi text path.)
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -13186,21 +13199,65 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.exit_code, 2);
+        assert_eq!(result.output_pdf, None);
+        assert_eq!(result.stable_compile_state, None);
         let diagnostic = result
             .diagnostics
             .iter()
             .find(|diagnostic| {
-                diagnostic.severity == Severity::Warning
+                diagnostic.severity == Severity::Error
                     && diagnostic.message.contains('漢')
-                    && diagnostic.message.contains("WinAnsiEncoding")
+                    && diagnostic.message.contains("U+6F22")
             })
-            .expect("pdf encoding warning diagnostic");
+            .expect("pdf encoding error diagnostic");
+        assert!(diagnostic.message.contains("is not supported"));
         assert!(diagnostic.message.contains("replaced with '?'"));
     }
 
     #[test]
-    fn pdf_math_mode_unicode_glyphs_emit_no_winansi_warning() {
+    fn pdf_encoding_error_survives_cache_hit() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("Hello 漢")).expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 2);
+        assert_eq!(first.output_pdf, None);
+        assert_eq!(first.stable_compile_state, None);
+        assert!(
+            !options.output_dir.join("main.pdf").exists(),
+            "unsupported CJK should not emit a PDF artifact",
+        );
+
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let second = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(second.exit_code, 2);
+        assert_eq!(second.output_pdf, None);
+        assert_eq!(second.stable_compile_state, None);
+        assert!(
+            !options.output_dir.join("main.pdf").exists(),
+            "repeated compile should still avoid writing a PDF artifact",
+        );
+        let diagnostic = second
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.severity == Severity::Error
+                    && diagnostic.message.contains('漢')
+                    && diagnostic.message.contains("U+6F22")
+            })
+            .expect("cached pdf encoding error diagnostic");
+        assert!(diagnostic.message.contains("is not supported"));
+    }
+
+    #[test]
+    fn pdf_math_mode_unicode_glyphs_do_not_produce_encoding_error() {
         // Regression for Issue #9: math-mode Unicode glyphs (\alpha, \pi, \int,
         // \sqrt{}, \infty, thin-space) must render through a math-capable font
         // rather than via WinAnsi '?' substitution.
@@ -13219,16 +13276,36 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        let winansi_messages: Vec<String> = result
+        const MATH_GLYPHS: &[char] = &[
+            '\u{03B1}', '\u{03B2}', '\u{03B3}', '\u{03C0}', '\u{221A}', '\u{221E}', '\u{222B}',
+            '\u{2009}',
+        ];
+        const MATH_GLYPH_CODEPOINTS: &[&str] = &[
+            "U+03B1", "U+03B2", "U+03B3", "U+03C0", "U+221A", "U+221E", "U+222B", "U+2009",
+        ];
+
+        let glyph_errors: Vec<String> = result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.message.contains("WinAnsiEncoding"))
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .filter(|diagnostic| {
+                MATH_GLYPHS
+                    .iter()
+                    .any(|glyph| diagnostic.message.contains(*glyph))
+                    || MATH_GLYPH_CODEPOINTS
+                        .iter()
+                        .any(|codepoint| diagnostic.message.contains(codepoint))
+            })
             .map(|diagnostic| diagnostic.message.clone())
             .collect();
 
         assert!(
-            winansi_messages.is_empty(),
-            "expected no WinAnsi encoding warnings for math-mode glyphs, got: {winansi_messages:?}",
+            glyph_errors.is_empty(),
+            "expected no encoding errors for math-mode glyphs, got: {glyph_errors:?}",
+        );
+        assert_ne!(
+            result.exit_code, 2,
+            "math-mode Unicode glyphs must not produce a fatal encoding error",
         );
     }
 
