@@ -20,11 +20,6 @@ use ferritex_infra::watcher::PollingFileWatcher;
 
 use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, CompileCommand};
 
-pub fn run_watch(command: &CompileCommand) -> i32 {
-    run_watch_loop(command, |_| {})
-}
-
-/// Variant of [`run_watch`] that invokes `on_compile` after each successful or failed compile.
 pub fn run_watch_loop<F>(command: &CompileCommand, mut on_compile: F) -> i32
 where
     F: FnMut(&CompileResult),
@@ -49,7 +44,7 @@ where
     emit_diagnostics(&initial_result.diagnostics);
     on_compile(&initial_result);
 
-    let watched_paths =
+    let mut watched_paths =
         watched_paths_for_result(&initial_result, &options.input_file, &file_access_gate);
     emit_watch_status(&format!(
         "tracking {} file{}",
@@ -94,11 +89,13 @@ where
 
         while let Some(coalesced_changes) = recompile_scheduler.start_next() {
             let hint = coalesced_changes;
+            emit_recompile_start(&hint);
             let result = scheduler.run(workspace_root, || {
                 service.compile_with_changed_paths(&options, &hint)
             });
             emit_diagnostics(&result.diagnostics);
             on_compile(&result);
+            emit_recompile_end(&result);
             recompile_scheduler.finish_current();
 
             let new_watched_paths =
@@ -153,6 +150,46 @@ fn watcher_io_diagnostic(error: &io::Error, fallback_context: &str) -> Diagnosti
         Diagnostic::new(Severity::Error, format!("{fallback_context}: {error}"))
     }
 }
+
+fn emit_recompile_start(changes: &[PathBuf]) {
+    let descriptor = describe_changed_paths(changes);
+    eprintln!("recompiling ({descriptor})");
+}
+
+fn emit_recompile_end(result: &CompileResult) {
+    if result.exit_code == 0 {
+        eprintln!("recompile finished");
+    } else {
+        let error_count = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .count();
+        eprintln!(
+            "recompile failed ({} error{})",
+            error_count,
+            if error_count == 1 { "" } else { "s" }
+        );
+    }
+}
+
+fn describe_changed_paths(changes: &[PathBuf]) -> String {
+    const LIMIT: usize = 3;
+    if changes.is_empty() {
+        return String::from("changes detected");
+    }
+    let displayed: Vec<String> = changes
+        .iter()
+        .take(LIMIT)
+        .map(|path| path.display().to_string())
+        .collect();
+    let mut summary = format!("changed: {}", displayed.join(", "));
+    if changes.len() > LIMIT {
+        summary.push_str(&format!(" (+{} more)", changes.len() - LIMIT));
+    }
+    summary
+}
+
 
 fn watched_paths_for_result(
     result: &CompileResult,

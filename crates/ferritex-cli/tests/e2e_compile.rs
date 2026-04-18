@@ -71,6 +71,46 @@ where
     })
 }
 
+fn spawn_streaming_collector<R>(reader: R) -> (Arc<Mutex<String>>, thread::JoinHandle<()>)
+where
+    R: Read + Send + 'static,
+{
+    let buffer = Arc::new(Mutex::new(String::new()));
+    let buffer_clone = Arc::clone(&buffer);
+    let handle = thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .expect("read streaming child output");
+            if read == 0 {
+                break;
+            }
+            buffer_clone
+                .lock()
+                .expect("streaming collector buffer poisoned")
+                .push_str(&line);
+        }
+    });
+    (buffer, handle)
+}
+
+fn buffer_contains(buffer: &Arc<Mutex<String>>, needle: &str) -> bool {
+    buffer
+        .lock()
+        .expect("streaming collector buffer poisoned")
+        .contains(needle)
+}
+
+fn buffer_snapshot(buffer: &Arc<Mutex<String>>) -> String {
+    buffer
+        .lock()
+        .expect("streaming collector buffer poisoned")
+        .clone()
+}
+
 fn issue_get_request(host: &str, port: u16, path: &str) -> Vec<u8> {
     let address: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -2962,7 +3002,6 @@ fn watch_refreshes_dependency_set_after_new_input_is_added() {
     child.wait().expect("wait for watch process");
 }
 
-#[test]
 fn watch_verbose_prints_watched_dependency_paths() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -3094,6 +3133,109 @@ fn watch_exits_with_friendly_message_when_watched_directory_is_deleted() {
     assert!(
         !stderr_buf.contains("os error"),
         "stderr should not surface the raw OS error: {stderr_buf}",
+    );
+}
+
+#[test]
+fn watch_emits_status_logs_for_startup_recompile_and_dependency_updates() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    let appendix = dir.path().join("appendix.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["watch", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex watch");
+    let stdout = child.stdout.take().expect("watch stdout");
+    let stderr = child.stderr.take().expect("watch stderr");
+    let (stdout_buffer, stdout_handle) = spawn_streaming_collector(stdout);
+    let (stderr_buffer, stderr_handle) = spawn_streaming_collector(stderr);
+
+    wait_until(
+        || buffer_contains(&stderr_buffer, "press Ctrl+C to stop"),
+        Duration::from_secs(5),
+        "watch should print the Ctrl+C stop guidance on startup",
+    );
+    let startup_stderr = buffer_snapshot(&stderr_buffer);
+    assert!(
+        startup_stderr.contains("watching"),
+        "stderr should announce the watched file, got: {startup_stderr}"
+    );
+    assert!(
+        startup_stderr.contains(tex_file.to_str().expect("utf-8 path")),
+        "stderr should mention the input file, got: {startup_stderr}"
+    );
+
+    wait_until(
+        || buffer_contains(&stdout_buffer, "hello.pdf"),
+        Duration::from_secs(10),
+        "watch should print the initial compile success summary on stdout",
+    );
+    let initial_stdout = buffer_snapshot(&stdout_buffer);
+    assert!(
+        initial_stdout.contains("(1 page)"),
+        "initial summary should describe the page count, got: {initial_stdout}"
+    );
+    wait_until(
+        || buffer_contains(&stderr_buffer, "tracking 1 file"),
+        Duration::from_secs(5),
+        "watch should report the initial tracked-file count",
+    );
+
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nUpdated\n\\end{document}\n",
+    )
+    .expect("rewrite input file");
+
+    wait_until(
+        || buffer_contains(&stderr_buffer, "recompiling"),
+        Duration::from_secs(10),
+        "watch should announce the start of a recompile",
+    );
+    wait_until(
+        || buffer_contains(&stderr_buffer, "recompile finished"),
+        Duration::from_secs(10),
+        "watch should announce the end of a successful recompile",
+    );
+
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(&appendix, "Appendix v1\n").expect("write appendix");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\input{appendix}\n\\end{document}\n",
+    )
+    .expect("rewrite main with new dependency");
+
+    wait_until(
+        || buffer_contains(&stderr_buffer, "watched dependencies updated"),
+        Duration::from_secs(10),
+        "watch should announce when the watched dependency set changes",
+    );
+
+    child.kill().expect("kill watch process");
+    child.wait().expect("wait for watch process");
+    stdout_handle.join().expect("join stdout collector");
+    stderr_handle.join().expect("join stderr collector");
+
+    let final_stdout = buffer_snapshot(&stdout_buffer);
+    assert!(
+        final_stdout.matches("hello.pdf").count() >= 2,
+        "stdout should include at least the initial and one recompile summary, got: {final_stdout}"
+    );
+    let final_stderr = buffer_snapshot(&stderr_buffer);
+    assert_eq!(
+        final_stderr.matches("press Ctrl+C to stop").count(),
+        1,
+        "press Ctrl+C to stop should appear exactly once, got: {final_stderr}"
     );
 }
 

@@ -167,50 +167,59 @@ fn handle_compile(command: &CompileCommand) -> i32 {
     );
     let result = service.compile(&options);
     emit_diagnostics(&result.diagnostics);
-    if let Some(output_pdf) = &result.output_pdf {
-        let page_count = result
-            .stable_compile_state
-            .as_ref()
-            .map_or(0, |state| state.page_count);
-        let error_count = result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Error)
-            .count();
-        let warning_count = result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Warning)
-            .count();
-        if error_count == 0 {
-            if warning_count > 0 {
-                println!(
-                    "{} -> {} ({} page{}, {} warning{})",
-                    command.file.display(),
-                    output_pdf.display(),
-                    page_count,
-                    if page_count == 1 { "" } else { "s" },
-                    warning_count,
-                    if warning_count == 1 { "" } else { "s" }
-                );
-            } else {
-                println!(
-                    "{} -> {} ({} page{})",
-                    command.file.display(),
-                    output_pdf.display(),
-                    page_count,
-                    if page_count == 1 { "" } else { "s" }
-                );
-            }
-        }
-    }
+    print_compile_success_summary(command, &result);
     result.exit_code
+}
+
+fn print_compile_success_summary(command: &CompileCommand, result: &CompileResult) {
+    let Some(output_pdf) = &result.output_pdf else {
+        return;
+    };
+    let error_count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .count();
+    if error_count > 0 {
+        return;
+    }
+    let page_count = result
+        .stable_compile_state
+        .as_ref()
+        .map_or(0, |state| state.page_count);
+    let warning_count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Warning)
+        .count();
+    if warning_count > 0 {
+        println!(
+            "{} -> {} ({} page{}, {} warning{})",
+            command.file.display(),
+            output_pdf.display(),
+            page_count,
+            if page_count == 1 { "" } else { "s" },
+            warning_count,
+            if warning_count == 1 { "" } else { "s" }
+        );
+    } else {
+        println!(
+            "{} -> {} ({} page{})",
+            command.file.display(),
+            output_pdf.display(),
+            page_count,
+            if page_count == 1 { "" } else { "s" }
+        );
+    }
 }
 
 fn handle_watch(command: &CompileCommand) -> i32 {
     eprintln!("watching {}", command.file.display());
     eprintln!("press Ctrl+C to stop");
-    watch_runner::run_watch(command)
+    let command_for_summary = command.clone();
+    watch_runner::run_watch_loop(command, move |result| {
+        print_compile_success_summary(&command_for_summary, result);
+    })
 }
 
 fn handle_preview(command: &CompileCommand) -> i32 {
