@@ -151,6 +151,56 @@ fn body_hash(body: &[u8]) -> u64 {
     hasher.finish()
 }
 
+fn actual_text_payloads<'a>(content: &'a str) -> Vec<&'a str> {
+    let mut payloads = Vec::new();
+    let marker = "/ActualText ";
+    let mut remaining = content;
+
+    while let Some(start) = remaining.find(marker) {
+        let payload_source = &remaining[start + marker.len()..];
+        let Some(first) = payload_source.chars().next() else {
+            break;
+        };
+
+        let payload_len = match first {
+            '(' => {
+                let mut escaped = false;
+                let mut depth = 0usize;
+                let mut end = None;
+                for (offset, ch) in payload_source.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    match ch {
+                        '\\' => escaped = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                end = Some(offset + ch.len_utf8());
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                end.expect("unterminated literal ActualText")
+            }
+            '<' => payload_source
+                .find('>')
+                .map(|index| index + 1)
+                .expect("unterminated hex ActualText"),
+            _ => panic!("unexpected ActualText payload start: {first}"),
+        };
+
+        payloads.push(&payload_source[..payload_len]);
+        remaining = &payload_source[payload_len..];
+    }
+
+    payloads
+}
+
 fn build_minimal_cmr10_tfm() -> Vec<u8> {
     const BC: u16 = 65;
     const EC: u16 = 66;
@@ -828,6 +878,42 @@ fn compile_renders_inline_and_display_math_without_raw_tex_delimiters() {
     assert!(!pdf.contains("$x^2$"));
     assert!(!pdf.contains("\\frac{a}{b}"));
     assert!(!pdf.contains("\\["));
+}
+
+#[test]
+fn compile_display_math_preserves_unicode_in_actualtext() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("display-math-actualtext.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\[\n  \\int_0^\\infty e^{-x^2} \\, dx = \\frac{\\sqrt{\\pi}}{2}\n\\]\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf =
+        std::fs::read(dir.path().join("display-math-actualtext.pdf")).expect("read output pdf");
+    let content = String::from_utf8_lossy(&pdf);
+    let payloads = actual_text_payloads(&content);
+
+    assert!(
+        payloads.iter().any(|payload| payload.starts_with("<FEFF")),
+        "expected UTF-16BE ActualText payload, got: {payloads:?}"
+    );
+    assert!(
+        payloads.iter().any(|payload| payload.contains("03C0")),
+        "expected ActualText payload to contain UTF-16BE pi, got: {payloads:?}"
+    );
+    assert!(
+        payloads.iter().all(|payload| !payload.contains('?')),
+        "ActualText payloads must not contain '?': {payloads:?}"
+    );
 }
 
 #[test]
