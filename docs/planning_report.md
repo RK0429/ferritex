@@ -54,7 +54,7 @@ completion 監査（2026-04-06）の結果、以下は BLOCKER ではなく docs
 |---|---|---|---|
 | REQ-NF-001 (フルコンパイル < 1.0s) | NON-BLOCKER (docs) | `bench_full_profile.rs` の `full_bench_docs_protocol_median_and_timing_proof` が jobs=1/jobs=4 の中央値を計測しログ出力。CI 環境のばらつきによる flaky リスクを考慮し assert は省略 | CI 安定環境での assert 追加を検討 |
 | REQ-NF-001a (pdfLaTeX 比 50x) | NON-BLOCKER (defer) | `requirements.md` §5 未確定事項 #2 で管理済み。ローカル計測では 54.89x（LTO jobs=4、2026-04-05） | pdfLaTeX インストール前提の比較テスト |
-| REQ-NF-003 (メモリ < 1 GiB) | NON-BLOCKER (defer) | Should 優先度。RSS 計測テスト不在だが、100 ページ文書 + Rust メモリ効率 + binary cache 設計から超過は考えにくい | `jemalloc stats_print` や `/proc/self/status` VmRSS での計測テスト追加 |
+| REQ-NF-003 (メモリ < 1 GiB) | NON-BLOCKER (defer) | Should 優先度。heavy fixture `artifacts/c-opt-03/heavy_sections_independent.tex` を `--jobs 16` で走らせると RSS が約 1133 MiB まで増える観測があり、高並列時は 1 GiB を超えうる。短期対応として `--jobs` help に peak RSS 注意書きを追加済み | `jemalloc stats_print` や `/proc/self/status` VmRSS での計測テスト追加 |
 | REQ-NF-004 (LSP 応答速度) | NON-BLOCKER (docs) | `bench_lsp_latency.rs` で 3 テスト pass（diagnostics < 500ms, completion < 100ms, definition < 200ms）。入力は minimal document であり、`FTX-LSP-BENCH-001` 規定の 100 ページ warm 状態ではない | FTX-LSP-BENCH-001 準拠の full-scale benchmark |
 | REQ-NF-010 (エラーメッセージ品質) | NON-BLOCKER (docs) | `Diagnostic` 構造体（`ferritex-core/src/diagnostics/diagnostic.rs`）が severity / file / line / message / context / suggestion を持ち、`Display` impl が file:line:message 形式で出力。TikZ パーサー、shell escape 等で使用 | 全エラーパスの構造化診断網羅テスト、preview session エラー応答フォーマット検証 |
 

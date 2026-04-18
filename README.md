@@ -82,7 +82,7 @@ All 48 functional requirements (REQ-FUNC-001–048) and 6 of 11 non-functional r
 |---|---|---|
 | REQ-NF-001 (full compile < 1.0s) | Infra ready | Benchmark harness measures and logs; CI assert deferred to avoid flaky results from runner variance |
 | REQ-NF-001a (50x vs pdfLaTeX) | Managed risk | Tracked in `docs/requirements.md` §5 as open item. Local measurement shows 54.89x (2026-04-05) |
-| REQ-NF-003 (memory < 1 GiB) | Deferred | Should priority. No profiling infra yet; unlikely to exceed given Rust memory model |
+| REQ-NF-003 (memory < 1 GiB) | Deferred | Should priority. A heavy fixture run at `--jobs 16` observed RSS around 1133 MiB, so `ferritex compile --help` now warns that high parallelism can increase peak RSS |
 | REQ-NF-004 (LSP latency) | Tests pass | Current tests use minimal input; full-scale `FTX-LSP-BENCH-001` benchmark is a future task |
 | REQ-NF-010 (error messages) | Design complete | `Diagnostic` struct covers file/line/message/context/suggestion; exhaustive path coverage is future work |
 

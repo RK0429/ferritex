@@ -919,7 +919,7 @@
 - **処理**: 以下のオプションをサポート
   - `--output-dir <dir>`: PDF / `.aux` / `.log` / SyncTeX 等の成果物出力先。指定時は正規化後のディレクトリを明示的 output root として `ExecutionPolicy` に追加する。未指定時は `primaryInput` の親ディレクトリを既定 `artifactRoot` / output root とみなす。Output Artifact Registry に記録された `.aux` / `.toc` / `.lof` / `.lot` / `.bbl` / `.synctex` 等のうち、current Compilation Job の `jobname` と主入力に整合するものだけ `engine-readback` を許可する。現在パス番号と生成パス番号は監査用に保持するが一致条件には含めない
   - `--jobname <name>`: ジョブ名（出力ファイル名）の指定。`Runtime Options.jobname` に正規化され、same-job 判定と出力命名の共通語彙として使う
-  - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）
+  - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）。高並列では heavy fixture で peak RSS が 1 GiB を超え `REQ-NF-003` と衝突しうるため、メモリ制約が厳しい環境では値を抑制することを推奨
   - `--no-cache`: キャッシュを無効化しフルコンパイル
   - `--asset-bundle <ref>`: 使用する Ferritex Asset Bundle の指定。`<ref>` はファイルパスまたは組み込みバンドル識別子
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`）

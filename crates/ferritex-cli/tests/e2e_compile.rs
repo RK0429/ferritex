@@ -128,11 +128,21 @@ fn compile_with_warnings_prints_summary_including_warning_count() {
         .output()
         .expect("failed to run ferritex");
 
-    assert_eq!(output.status.code(), Some(1), "warnings should exit with code 1");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "warnings should exit with code 1"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("->"), "summary should contain arrow separator");
+    assert!(
+        stdout.contains("->"),
+        "summary should contain arrow separator"
+    );
     assert!(stdout.contains(".pdf"), "summary should mention PDF output");
-    assert!(stdout.contains("warning"), "summary should mention warnings");
+    assert!(
+        stdout.contains("warning"),
+        "summary should mention warnings"
+    );
 }
 
 #[test]
@@ -3437,6 +3447,26 @@ fn compile_help_shows_option_descriptions() {
     assert!(
         stdout.contains("Output directory"),
         "compile help should describe --output-dir"
+    );
+}
+
+#[test]
+fn compile_help_warns_about_high_jobs_rss() {
+    let output = ferritex_bin()
+        .args(["compile", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--jobs"), "compile help should show --jobs");
+    assert!(
+        stdout.contains("parallel compilation tasks"),
+        "compile help should describe parallel compilation tasks"
+    );
+    assert!(
+        stdout.contains("peak RSS"),
+        "compile help should warn about peak RSS"
     );
 }
 

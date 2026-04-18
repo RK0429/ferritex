@@ -52,7 +52,8 @@ struct CompileCommand {
     /// Job name for the output file (defaults to input file stem)
     #[arg(long, value_name = "NAME")]
     jobname: Option<String>,
-    /// Number of parallel font resolution tasks
+    /// Number of parallel compilation tasks (default: CPU cores). High values (>
+    /// available cores) can significantly increase peak RSS on heavy fixtures.
     #[arg(long, value_name = "N")]
     jobs: Option<usize>,
     /// Additional directories to search for TeX files
