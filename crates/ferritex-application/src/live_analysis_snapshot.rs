@@ -205,9 +205,11 @@ impl LiveAnalysisSnapshotFactory {
         buffer: &OpenDocumentBuffer,
         compile_state: Option<&StableCompileState>,
     ) -> LiveAnalysisSnapshot {
-        let mut labels = compile_state_symbol_locations(compile_state, |state| &state.labels);
+        let mut labels =
+            compile_state_symbol_locations(compile_state, "label", |state| &state.labels);
         labels.extend(collect_symbol_locations(&buffer.uri, &buffer.text, "label"));
-        let mut citations = compile_state_symbol_locations(compile_state, |state| &state.citations);
+        let mut citations =
+            compile_state_symbol_locations(compile_state, "bibitem", |state| &state.citations);
         citations.extend(collect_symbol_locations(
             &buffer.uri,
             &buffer.text,
@@ -519,6 +521,7 @@ fn collect_symbol_locations(
 
 fn compile_state_symbol_locations(
     compile_state: Option<&StableCompileState>,
+    command: &str,
     select: impl Fn(&DocumentState) -> &BTreeMap<String, SymbolLocation>,
 ) -> BTreeMap<String, DefinitionLocation> {
     compile_state
@@ -526,15 +529,18 @@ fn compile_state_symbol_locations(
             select(&state.document_state)
                 .iter()
                 .map(|(name, location)| {
+                    let start_line = location.line.saturating_sub(1);
+                    let end_character =
+                        location.column + format!("\\{command}{{{name}}}").chars().count() as u32;
                     (
                         name.clone(),
                         DefinitionLocation {
                             uri: path_to_file_uri(&location.file),
                             range: TextRange::new(
-                                location.line.saturating_sub(1),
+                                start_line,
                                 location.column,
-                                location.line.saturating_sub(1),
-                                location.column,
+                                start_line,
+                                end_character,
                             ),
                         },
                     )
@@ -1357,5 +1363,7 @@ mod tests {
         assert_eq!(definition.uri, "file:///tmp/chapters/figures.tex");
         assert_eq!(definition.range.start.line, 11);
         assert_eq!(definition.range.start.character, 4);
+        assert_eq!(definition.range.end.line, 11);
+        assert_eq!(definition.range.end.character, 24);
     }
 }

@@ -3468,6 +3468,8 @@ fn lsp_definition_resolves_labels_from_included_files() {
         format!("file://{}", expected_target.to_str().expect("utf-8 path"))
     );
     assert_eq!(definition["result"]["range"]["start"]["line"], 0);
+    assert_eq!(definition["result"]["range"]["end"]["line"], 0);
+    assert_eq!(definition["result"]["range"]["end"]["character"], 20);
 
     write_lsp_message(
         &mut stdin,
