@@ -3237,6 +3237,27 @@ fn corpus_partition_article_fixtures_compile_via_cli() {
     }
 }
 
+// Regression for https://github.com/RK0429/ferritex/issues/24: \section
+// partitioning sliced a multicols environment across boundaries, so the last
+// partition's body ended with a stray BODY_MULTICOL_END sentinel (U+E02C) that
+// surfaced as "cannot be represented in WinAnsiEncoding" and a '?' glyph.
+#[test]
+fn multicol_article_does_not_leak_private_use_sentinels() {
+    let fixture = bench_fixtures_root()
+        .join("corpus")
+        .join("partition-article")
+        .join("multicol_article.tex");
+    let (stderr, _pdf) = compile_fixture_via_cli(&fixture, None);
+    assert!(
+        !stderr.contains("cannot be represented in WinAnsiEncoding"),
+        "multicol_article leaked a WinAnsi fallback warning: {stderr}"
+    );
+    assert!(
+        !stderr.contains("U+E0"),
+        "multicol_article leaked a private-use-area sentinel: {stderr}"
+    );
+}
+
 fn corpus_tex_fixtures(subset: &str) -> Vec<PathBuf> {
     let mut fixtures = std::fs::read_dir(bench_fixtures_root().join("corpus").join(subset))
         .unwrap_or_else(|error| panic!("failed to read corpus fixtures for {subset}: {error}"))

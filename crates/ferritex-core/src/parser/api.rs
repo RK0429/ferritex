@@ -7959,13 +7959,40 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 index = next_index;
             }
             _ => {
-                text.push(ch);
+                if is_orphan_body_marker(ch) {
+                    // A paired body marker (e.g. BODY_MULTICOL_END) survived the
+                    // upstream pairing because the document body was sliced across
+                    // the pair — for instance when \section partitions cut through a
+                    // multicols environment. Drop the sentinel so it does not reach
+                    // the PDF text writer as a U+E0xx private-use codepoint.
+                } else {
+                    text.push(ch);
+                }
                 index += ch.len_utf8();
             }
         }
     }
 
     (text, placeholders)
+}
+
+fn is_orphan_body_marker(ch: char) -> bool {
+    // Body sentinels live in U+E000..U+E0FF. Everything that reaches the `_` arm
+    // of `replace_body_markers_with_placeholders` is either a "passthrough" break
+    // marker handled later by `body_nodes_from_text`, a placeholder produced by
+    // `next_box_placeholder` (U+E100+), or an orphan end/separator marker left
+    // behind by a split pair. Only the last category should be discarded.
+    if (ch as u32) < 0xE000 || (ch as u32) >= 0xE100 {
+        return false;
+    }
+    !matches!(
+        ch,
+        BODY_PAGE_BREAK_MARKER
+            | BODY_CLEAR_PAGE_MARKER
+            | BODY_CLEAR_DOUBLE_PAGE_MARKER
+            | BODY_COLUMNBREAK
+            | BODY_LINE_BREAK
+    )
 }
 
 fn deserialize_multicol_marker(content: &str) -> DocumentNode {
@@ -9654,10 +9681,11 @@ fn eof_line(source: &str) -> u32 {
 mod tests {
     use super::{
         parse_bbl_input, render_math_nodes_for_anchor, render_math_nodes_for_encoding,
-        CaptionEntry, DocumentLabels, DocumentNode, FloatType, FontFamilyRole,
-        IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine, MathNode, MinimalLatexParser,
-        OverUnderKind, PackageInfo, ParseError, ParsedDocument, Parser, ParserDriver, SectionEntry,
-        MAX_KERNEL_LOOP_ITERATIONS,
+        replace_body_markers_with_placeholders, CaptionEntry, DocumentLabels, DocumentNode,
+        FloatType, FontFamilyRole, IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine,
+        MathNode, MinimalLatexParser, OverUnderKind, PackageInfo, ParseError, ParsedDocument,
+        Parser, ParserDriver, SectionEntry, BODY_MULTICOL_COL_SEP, BODY_MULTICOL_END,
+        BODY_MULTICOL_START, MAX_KERNEL_LOOP_ITERATIONS,
     };
     use crate::bibliography::api::BibliographyState;
     use crate::compilation::IndexEntry;
@@ -13422,5 +13450,36 @@ mod tests {
                 .any(|n| matches!(n, DocumentNode::ColumnBreak));
             assert!(has_break, "should contain a ColumnBreak node");
         }
+    }
+
+    #[test]
+    fn orphan_body_markers_are_dropped_when_body_is_sliced_mid_multicols() {
+        // Simulates what `partition_document_for_work_unit` produces when \section
+        // partitions cut across a multicols environment. Parsing the sliced body
+        // directly must not surface the U+E02B/E02C sentinels as Text content —
+        // otherwise the PDF encoder would emit them via WinAnsi and replace them
+        // with '?'. Regression for https://github.com/RK0429/ferritex/issues/24.
+        let tail_of_multicols = format!(
+            "3 Outcome\n\nTail content.{BODY_MULTICOL_END}"
+        );
+        let (rewritten, placeholders) = replace_body_markers_with_placeholders(&tail_of_multicols);
+        assert!(placeholders.is_empty(), "no placeholders should be created");
+        for ch in rewritten.chars() {
+            let code = ch as u32;
+            assert!(
+                !(0xE000..0xE100).contains(&code),
+                "private-use sentinel U+{:04X} leaked through the placeholder step",
+                code,
+            );
+        }
+
+        let head_of_multicols = format!(
+            "{BODY_MULTICOL_START}2{BODY_MULTICOL_COL_SEP} \n\n1 Head.\n\nBody."
+        );
+        let (_head_text, head_placeholders) =
+            replace_body_markers_with_placeholders(&head_of_multicols);
+        // The unterminated start is still consumed as a (possibly ambiguous) Multicols
+        // placeholder, but the output must not contain any raw sentinel codepoints.
+        assert_eq!(head_placeholders.len(), 1);
     }
 }
