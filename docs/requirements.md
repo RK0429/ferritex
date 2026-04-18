@@ -962,11 +962,13 @@
   - `primaryInput` は現在開いている TeX 文書の URI から導出し、`artifactRoot` は workspace 設定の `ferritex.outputDir` があればその正規化先、なければ `primaryInput` の親ディレクトリ、`jobname` は workspace 設定の `ferritex.jobname` があればその値、なければ `primaryInput` の stem を使う
   - LSP 由来の `Runtime Options` で未指定の compile-affecting 項目は固定既定値で補う。`parallelism=利用可能 CPU コア数`、`reuseCache=true`、`assetBundleRef=互換な組み込み Ferritex Asset Bundle`、`interactionMode=nonstopmode`、`synctex=false`、`traceFontTasks=false`、`shellEscapeAllowed=false`
 - **出力**: LSP プロトコルに準拠したリクエスト/レスポンス
+- **例外**: `stdin` から受信した LSP メッセージの `Content-Length` header が欠落している、値が 10 MiB (`MAX_LSP_MESSAGE_BYTES`) を超える、または body が JSON として不正な場合は診断を emit した上で exit code 2 でプロセスを終了する。クライアント（エディタ）はプロセスを再起動して接続を復旧する
 - **受け入れ基準**:
   - Given `ferritex lsp` を起動, When エディタから `initialize` リクエストを受信, Then 必須 capability（`textDocumentSync`, `completionProvider`, `codeActionProvider`）を含む応答が返される
   - Given definition provider が有効な build, When `initialize` リクエストを受信, Then `definitionProvider` を含む応答が返される
   - Given hover provider が有効なビルド, When `initialize` リクエストを受信, Then `hoverProvider` を含む応答が返される
   - Given workspace 設定に `ferritex.outputDir` と `ferritex.jobname` がない環境, When `chapters/main.tex` を `didOpen` した LSP session が background compile を要求, Then `primaryInput=chapters/main.tex`, `artifactRoot=chapters/`, `jobname=main`, `parallelism=利用可能 CPU コア数`, `reuseCache=true`, `assetBundleRef=互換な組み込み Ferritex Asset Bundle`, `interactionMode=nonstopmode`, `synctex=false`, `traceFontTasks=false`, `shellEscapeAllowed=false` として `Runtime Options` が構築される
+  - Given LSP session, When `Content-Length` header が欠落したメッセージ・`Content-Length` が 10 MiB を超えるメッセージ・不正 JSON を受信, Then 診断を出して exit code 2 で終了し、クライアントのプロセス再起動で接続を復旧できる
 - **優先度**: Must
 - **出典**: ユーザー明示
 
@@ -1152,6 +1154,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.45 | 2026-04-19 | `REQ-FUNC-045` に LSP fatal session 条件（`Content-Length` header 欠落 / 10 MiB 超過 / 不正 JSON 時は診断 emit 後に exit code 2 で終了し、クライアント再起動で回復）を明記 | Claude Opus 4.7 (1M context) |
 | 0.1.44 | 2026-04-19 | `REQ-FUNC-043` の `--trace-font-tasks` に incremental warm-cache hit 時でも `font-load-cache-hit` センチネル trace を `stderr` に 1 件 emit する契約を追加し、`REQ-FUNC-033` overlap 判定との関係（presence marker であり overlap には寄与しない旨）を明記 | Codex |
 | 0.1.43 | 2026-04-04 | `REQ-FUNC-032` に multi-second no-cache evidence と pipelined VList build + sequential pagination の strict-proof 対応方針を追記 | Codex |
 | 0.1.42 | 2026-04-04 | `REQ-FUNC-032` に実装メモを追加。出力等価性確認済み・bounded no-regression evidence 確立済み・strict speedup 条件の sub-1s 構造的限界と適用済み最適化を記録 | Claude Opus 4.6 |
