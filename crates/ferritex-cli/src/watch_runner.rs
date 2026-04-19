@@ -300,7 +300,9 @@ mod tests {
         let diagnostic = watcher_io_diagnostic(&error, "failed to refresh watched files");
 
         assert_eq!(diagnostic.severity, Severity::Error);
-        assert!(diagnostic.message.contains("failed to refresh watched files"));
+        assert!(diagnostic
+            .message
+            .contains("failed to refresh watched files"));
         assert!(diagnostic.message.contains("denied by policy"));
         assert!(diagnostic.suggestion.is_none());
     }

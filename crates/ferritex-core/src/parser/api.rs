@@ -2044,6 +2044,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         let _ = self.take_global_prefix();
                         self.parse_cite_command()?;
                     }
+                    "nocite" => {
+                        let _ = self.take_global_prefix();
+                        let _ = self.read_required_braced_tokens()?;
+                    }
                     "bibliography" => {
                         let _ = self.take_global_prefix();
                         self.parse_bibliography_command()?;
@@ -10443,7 +10447,10 @@ mod tests {
         let nodes = parse_document(r"\today").body_nodes();
         assert_eq!(
             nodes,
-            vec![DocumentNode::Text(super::TODAY_PLACEHOLDER.to_string(), None)]
+            vec![DocumentNode::Text(
+                super::TODAY_PLACEHOLDER.to_string(),
+                None
+            )]
         );
         assert_ne!(nodes, vec![DocumentNode::Text(r"\today".to_string(), None)]);
     }
@@ -12324,6 +12331,22 @@ mod tests {
     }
 
     #[test]
+    fn nocite_consumes_keys_without_emitting_output() {
+        let document = parse_document("\\nocite{a,b}\n\\bibliography{refs}");
+
+        assert!(document.body.trim().is_empty());
+        assert!(document.citations.is_empty());
+    }
+
+    #[test]
+    fn nocite_wildcard_parses_without_error() {
+        let document = parse_document("\\nocite{*}\n\\bibliography{refs}");
+
+        assert!(document.body.trim().is_empty());
+        assert!(document.citations.is_empty());
+    }
+
+    #[test]
     fn bibliography_state_separate_from_labels() {
         let bibliography_state = parse_bbl_input(
             "\\begin{thebibliography}{99}\\bibitem{shared} Shared Reference\\end{thebibliography}",
@@ -13459,9 +13482,7 @@ mod tests {
         // directly must not surface the U+E02B/E02C sentinels as Text content —
         // otherwise the PDF encoder would emit them via WinAnsi and replace them
         // with '?'. Regression for https://github.com/RK0429/ferritex/issues/24.
-        let tail_of_multicols = format!(
-            "3 Outcome\n\nTail content.{BODY_MULTICOL_END}"
-        );
+        let tail_of_multicols = format!("3 Outcome\n\nTail content.{BODY_MULTICOL_END}");
         let (rewritten, placeholders) = replace_body_markers_with_placeholders(&tail_of_multicols);
         assert!(placeholders.is_empty(), "no placeholders should be created");
         for ch in rewritten.chars() {
@@ -13473,9 +13494,8 @@ mod tests {
             );
         }
 
-        let head_of_multicols = format!(
-            "{BODY_MULTICOL_START}2{BODY_MULTICOL_COL_SEP} \n\n1 Head.\n\nBody."
-        );
+        let head_of_multicols =
+            format!("{BODY_MULTICOL_START}2{BODY_MULTICOL_COL_SEP} \n\n1 Head.\n\nBody.");
         let (_head_text, head_placeholders) =
             replace_body_markers_with_placeholders(&head_of_multicols);
         // The unterminated start is still consumed as a (possibly ambiguous) Multicols

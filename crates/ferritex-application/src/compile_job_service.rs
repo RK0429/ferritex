@@ -873,6 +873,7 @@ impl<'a> CompileJobService<'a> {
         let input_path = options.input_file.to_string_lossy().into_owned();
         let execution_policy = ExecutionPolicyFactory::create(options);
         let project_root = project_root_for_policy(&execution_policy, &options.input_file);
+        let input_dir = input_dir_for_input(&options.input_file, &project_root);
         let mut stage_timing = StageTiming::default();
 
         if let Some(bundle_path) = &options.asset_bundle {
@@ -1096,6 +1097,7 @@ impl<'a> CompileJobService<'a> {
         let mut loaded_bibliography_state = load_bibliography_state(
             self.file_access_gate,
             &project_root,
+            &input_dir,
             &options.overlay_roots,
             &options.output_dir,
             &options.jobname,
@@ -1140,6 +1142,7 @@ impl<'a> CompileJobService<'a> {
             loaded_bibliography_state = load_bibliography_state(
                 self.file_access_gate,
                 &project_root,
+                &input_dir,
                 &options.overlay_roots,
                 &options.output_dir,
                 &options.jobname,
@@ -1152,12 +1155,6 @@ impl<'a> CompileJobService<'a> {
             source_tree.document_state.bibliography_state = bibliography_state.clone();
         }
 
-        let input_dir = options
-            .input_file
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .map(normalize_existing_path)
-            .unwrap_or_else(|| project_root.clone());
         let graphics_resolver = CompileGraphicAssetResolver {
             file_access_gate: self.file_access_gate,
             input_dir: &input_dir,
@@ -1501,6 +1498,7 @@ impl<'a> CompileJobService<'a> {
                 BibliographyDiagnostic::MissingBbl,
                 bibliography_candidate_paths(
                     &project_root,
+                    &input_dir,
                     &options.overlay_roots,
                     &options.output_dir,
                     &options.jobname,
@@ -5098,13 +5096,18 @@ struct BibliographySidecarMetadata {
 fn load_bibliography_state(
     file_access_gate: &dyn FileAccessGate,
     project_root: &Path,
+    input_dir: &Path,
     overlay_roots: &[PathBuf],
     artifact_root: &Path,
     jobname: &str,
 ) -> Option<LoadedBibliographyState> {
-    for candidate in
-        bibliography_candidate_paths(project_root, overlay_roots, artifact_root, jobname)
-    {
+    for candidate in bibliography_candidate_paths(
+        project_root,
+        input_dir,
+        overlay_roots,
+        artifact_root,
+        jobname,
+    ) {
         if !candidate.exists()
             || file_access_gate.check_read(&candidate) == PathAccessDecision::Denied
         {
@@ -5135,6 +5138,7 @@ fn load_bibliography_state(
 
 fn bibliography_candidate_paths(
     project_root: &Path,
+    input_dir: &Path,
     overlay_roots: &[PathBuf],
     artifact_root: &Path,
     jobname: &str,
@@ -5143,6 +5147,7 @@ fn bibliography_candidate_paths(
     let mut seen = BTreeSet::new();
 
     for root in std::iter::once(artifact_root)
+        .chain(std::iter::once(input_dir))
         .chain(std::iter::once(project_root))
         .chain(overlay_roots.iter().map(PathBuf::as_path))
     {
@@ -5474,6 +5479,14 @@ fn project_root_for_policy(policy: &ExecutionPolicy, input_file: &Path) -> PathB
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."))
         })
+}
+
+fn input_dir_for_input(input_file: &Path, project_root: &Path) -> PathBuf {
+    input_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(normalize_existing_path)
+        .unwrap_or_else(|| project_root.to_path_buf())
 }
 
 fn compilation_job(
@@ -12873,6 +12886,68 @@ mod tests {
     }
 
     #[test]
+    fn bibliography_candidate_paths_include_input_dir_before_project_root() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let input_dir = project_root.join("fixtures");
+        let artifact_root = project_root.join("out");
+        let overlay_root = dir.path().join("overlay");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        fs::create_dir_all(&artifact_root).expect("create artifact root");
+        fs::create_dir_all(&overlay_root).expect("create overlay root");
+
+        let candidates = super::bibliography_candidate_paths(
+            &project_root,
+            &input_dir,
+            std::slice::from_ref(&overlay_root),
+            &artifact_root,
+            "main",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                artifact_root.join("main.bbl"),
+                input_dir.join("main.bbl"),
+                project_root.join("main.bbl"),
+                overlay_root.join("main.bbl"),
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_bbl_from_input_dir_when_project_root_differs() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let input_dir = project_root.join("fixtures/chapters");
+        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        let input_file = input_dir.join("main.tex");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            input_dir.join("main.bbl"),
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Adjacent reference\n\\end{thebibliography}\n",
+        )
+        .expect("write adjacent bbl");
+
+        let options = runtime_options(input_file, project_root.join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [1]."));
+        assert!(pdf.contains("[1] Adjacent reference"));
+    }
+
+    #[test]
     fn loads_bbl_from_overlay_root_and_renders_bibliography() {
         let dir = tempdir().expect("create tempdir");
         let overlay_root = dir.path().join("overlay");
@@ -13193,6 +13268,37 @@ mod tests {
             .any(|diagnostic| diagnostic.message == "unresolved citation `missing`"));
         let pdf = read_pdf(&options.output_dir.join("main.pdf"));
         assert!(pdf.contains("See [?]."));
+    }
+
+    #[test]
+    fn nocite_with_adjacent_bbl_renders_bibliography_without_parse_error() {
+        let dir = tempdir().expect("create tempdir");
+        let project_root = dir.path().join("project");
+        let input_dir = project_root.join("fixtures/chapters");
+        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        let input_file = input_dir.join("main.tex");
+        fs::write(&input_file, document("\\nocite{key}\n\\bibliography{refs}"))
+            .expect("write input");
+        fs::write(
+            input_dir.join("main.bbl"),
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Hidden reference\n\\end{thebibliography}\n",
+        )
+        .expect("write adjacent bbl");
+
+        let options = runtime_options(input_file, project_root.join("out"));
+        let loader = MockAssetBundleLoader::valid();
+
+        let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(!result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("undefined control sequence")));
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("[1] Hidden reference"));
     }
 
     #[test]
