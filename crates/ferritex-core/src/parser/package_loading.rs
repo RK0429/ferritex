@@ -324,6 +324,8 @@ pub fn load_document_class(
                 options: options.to_vec(),
             });
             register_base_latex_commands(engine);
+            register_passthrough_command(engine, "opening", 1, 1);
+            register_passthrough_command(engine, "closing", 1, 1);
             Ok(())
         }
         _ => Err(format!("Unknown document class: {name}")),
@@ -470,10 +472,7 @@ fn is_kernel_integrated_package(name: &str) -> bool {
 /// commands will typically surface as undefined control sequences at use
 /// site. Callers emit a non-fatal warning so users see the gap at preamble
 /// time rather than deep in the document body.
-pub fn is_implemented_package(
-    name: &str,
-    sty_resolver: Option<&StyPackageResolver<'_>>,
-) -> bool {
+pub fn is_implemented_package(name: &str, sty_resolver: Option<&StyPackageResolver<'_>>) -> bool {
     if get_native_extension(name).is_some() {
         return true;
     }
@@ -673,6 +672,19 @@ mod tests {
         assert!(engine.lookup("chapter").is_some());
         assert!(engine.lookup("section").is_some());
         assert!(engine.lookup_environment("itemize").is_some());
+    }
+
+    #[test]
+    fn load_letter_class_registers_letter_specific_commands() {
+        let mut registry = ClassRegistry::default();
+        let mut engine = MacroEngine::default();
+
+        load_document_class("letter", &[], &mut registry, &mut engine).expect("load letter class");
+
+        let opening = engine.lookup("opening").expect("\\opening defined");
+        assert_eq!(opening.parameter_count, 1);
+        let closing = engine.lookup("closing").expect("\\closing defined");
+        assert_eq!(closing.parameter_count, 1);
     }
 
     #[test]

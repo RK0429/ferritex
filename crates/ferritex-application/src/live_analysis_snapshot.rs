@@ -1033,8 +1033,13 @@ mod tests {
     fn parse_error_to_diagnostic_includes_context_snippet() {
         let text = "\\documentclass{article}\n\\begin{document}\nHello\n";
 
-        let diagnostic =
-            parse_error_to_diagnostic(text, ParseError::MissingEndDocument { line: 3 });
+        let diagnostic = parse_error_to_diagnostic(
+            text,
+            ParseError::MissingEndDocument {
+                line: 3,
+                column: None,
+            },
+        );
 
         assert_eq!(diagnostic.context.as_deref(), Some("Hello"));
     }

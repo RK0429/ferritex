@@ -2446,6 +2446,84 @@ fn compile_rejects_trailing_content_after_end_document() {
 }
 
 #[test]
+fn compile_letter_class_with_opening_and_closing_succeeds() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("letter.tex");
+    std::fs::write(
+        &tex_file,
+        concat!(
+            "\\documentclass{letter}\n",
+            "\\begin{document}\n",
+            "\\begin{letter}{Recipient\\\\123 Main St.}\n",
+            "\\opening{Dear Recipient,}\n",
+            "Body.\n",
+            "\\closing{Sincerely,}\n",
+            "\\end{letter}\n",
+            "\\end{document}\n",
+        ),
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", "--no-cache", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "letter compile should succeed: stderr={stderr}",
+    );
+    assert!(
+        !stderr.contains("undefined control sequence `\\opening`"),
+        "stderr should not report undefined \\opening: {stderr}",
+    );
+    assert!(
+        !stderr.contains("undefined control sequence `\\closing`"),
+        "stderr should not report undefined \\closing: {stderr}",
+    );
+    assert!(dir.path().join("letter.pdf").exists());
+}
+
+#[test]
+fn compile_article_with_footnote_succeeds() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("article_footnote.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nA footnote\\footnote{note body} mark.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", "--no-cache", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "article with \\footnote should compile cleanly: stderr={stderr}",
+    );
+    assert!(
+        !stderr.contains("undefined control sequence `\\footnote`"),
+        "stderr should not report undefined \\footnote: {stderr}",
+    );
+    let pdf_path = dir.path().join("article_footnote.pdf");
+    assert!(pdf_path.exists());
+
+    let pdf_bytes = std::fs::read(&pdf_path).expect("read generated pdf");
+    assert!(
+        pdf_bytes
+            .windows("note body".len())
+            .any(|window| window == b"note body"),
+        "generated PDF should contain footnote body"
+    );
+}
+
+#[test]
 fn compile_reports_issue_1_diagnostics_and_exits_nonzero() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("broken.tex");
@@ -2465,6 +2543,35 @@ fn compile_reports_issue_1_diagnostics_and_exits_nonzero() {
     assert!(stderr.contains("undefined control sequence `\\nonexistentcommand`"));
     assert!(stderr.contains("unclosed environment `unclosedenv`"));
     assert!(dir.path().join("broken.pdf").exists());
+}
+
+#[test]
+fn compile_reports_undefined_control_sequence_with_column() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("column.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nhello \\xyz\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let filename = tex_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("column.tex");
+
+    assert!(stderr.contains("undefined control sequence `\\xyz`"));
+    assert!(
+        stderr.contains(&format!("{filename}:3:7:")),
+        "stderr did not include line/column location: {stderr}"
+    );
 }
 
 #[test]
