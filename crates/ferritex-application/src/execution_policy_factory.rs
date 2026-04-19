@@ -50,32 +50,19 @@ fn push_read_path_if_needed(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
 }
 
 fn project_root_for_input(input_file: &Path) -> PathBuf {
-    let absolute_input = absolute_input_path(input_file);
-    let fallback = absolute_input
+    // The project root defines the base of the file-access boundary. It is
+    // intentionally restricted to the directory that contains the input file:
+    // widening it via ancestor scans (e.g. searching for `.git`) or current
+    // working directory would let absolute-path `\input{...}` references escape
+    // the advertised workspace/overlay/bundle boundary (GH-37). Callers that
+    // need additional read roots must declare them explicitly via
+    // `--overlay-roots` / `--asset-bundle`.
+    let absolute_input = absolute_normalized_path(input_file);
+    absolute_input
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    if let Some(project_root) = fallback
-        .ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
-    {
-        return project_root.to_path_buf();
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let cwd = normalize_path(&cwd);
-        if fallback.starts_with(&cwd) {
-            return cwd;
-        }
-    }
-
-    fallback
-}
-
-fn absolute_input_path(input_file: &Path) -> PathBuf {
-    absolute_normalized_path(input_file)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn absolute_normalized_path(path: &Path) -> PathBuf {
@@ -153,15 +140,13 @@ mod tests {
     #[test]
     fn disables_shell_escape_by_default() {
         let policy = ExecutionPolicyFactory::create(&runtime_options(ShellEscapeMode::Disabled));
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let expected_read_root = manifest_dir
-            .ancestors()
-            .find(|ancestor| ancestor.join(".git").exists())
-            .map(PathBuf::from)
-            .expect("workspace root with git marker");
+        let expected_read_root = super::absolute_normalized_path(std::path::Path::new("src"));
 
         assert!(!policy.shell_escape_allowed);
-        assert_eq!(policy.allowed_read_paths, vec![expected_read_root]);
+        assert_eq!(
+            policy.allowed_read_paths,
+            vec![expected_read_root, PathBuf::from("build")]
+        );
         assert_eq!(policy.allowed_write_paths, vec![PathBuf::from("build")]);
         assert_eq!(policy.output_dir, PathBuf::from("build"));
         assert_eq!(policy.jobname, "main");
@@ -182,10 +167,15 @@ mod tests {
     }
 
     #[test]
-    fn resolves_project_root_from_git_marker_for_nested_input() {
+    fn ignores_ancestor_git_marker_when_deriving_project_root() {
+        // GH-37 regression: a `.git` marker in an ancestor directory must not
+        // be treated as the project root, since that would widen the policy
+        // boundary past the input's own directory.
         let dir = tempdir().expect("create tempdir");
         let project_root = dir.path().join("project");
+        let chapters_dir = project_root.join("src/chapters");
         fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&chapters_dir).expect("create source tree");
 
         let options = RuntimeOptions {
             input_file: project_root.join("src/chapters/main.tex"),
@@ -205,7 +195,10 @@ mod tests {
 
         let policy = ExecutionPolicyFactory::create(&options);
 
-        assert_eq!(policy.allowed_read_paths, vec![project_root]);
+        assert_eq!(
+            policy.allowed_read_paths,
+            vec![chapters_dir, project_root.join("build")]
+        );
     }
 
     #[test]
@@ -238,11 +231,12 @@ mod tests {
     fn includes_explicit_asset_bundle_in_allowed_read_paths() {
         let dir = tempdir().expect("create tempdir");
         let project_root = dir.path().join("project");
+        let src_dir = project_root.join("src");
         let bundle_root = dir.path().join("bundle");
-        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&src_dir).expect("create source tree");
 
         let options = RuntimeOptions {
-            input_file: project_root.join("src/main.tex"),
+            input_file: src_dir.join("main.tex"),
             output_dir: project_root.join("build"),
             jobname: "main".to_string(),
             parallelism: 1,
@@ -259,19 +253,23 @@ mod tests {
 
         let policy = ExecutionPolicyFactory::create(&options);
 
-        assert_eq!(policy.allowed_read_paths, vec![project_root, bundle_root]);
+        assert_eq!(
+            policy.allowed_read_paths,
+            vec![src_dir, bundle_root, project_root.join("build")]
+        );
     }
 
     #[test]
     fn includes_overlay_roots_between_project_and_bundle() {
         let dir = tempdir().expect("create tempdir");
         let project_root = dir.path().join("project");
+        let src_dir = project_root.join("src");
         let overlay_root = dir.path().join("overlay");
         let bundle_root = dir.path().join("bundle");
-        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&src_dir).expect("create source tree");
 
         let options = RuntimeOptions {
-            input_file: project_root.join("src/main.tex"),
+            input_file: src_dir.join("main.tex"),
             output_dir: project_root.join("build"),
             jobname: "main".to_string(),
             parallelism: 1,
@@ -290,7 +288,12 @@ mod tests {
 
         assert_eq!(
             policy.allowed_read_paths,
-            vec![project_root, overlay_root, bundle_root]
+            vec![
+                src_dir,
+                overlay_root,
+                bundle_root,
+                project_root.join("build")
+            ]
         );
     }
 
@@ -298,12 +301,13 @@ mod tests {
     fn includes_host_font_roots_after_bundle_when_enabled() {
         let dir = tempdir().expect("create tempdir");
         let project_root = dir.path().join("project");
+        let src_dir = project_root.join("src");
         let bundle_root = dir.path().join("bundle");
         let host_root = dir.path().join("host-fonts");
-        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
+        fs::create_dir_all(&src_dir).expect("create source tree");
 
         let options = RuntimeOptions {
-            input_file: project_root.join("src/main.tex"),
+            input_file: src_dir.join("main.tex"),
             output_dir: project_root.join("build"),
             jobname: "main".to_string(),
             parallelism: 1,
@@ -322,7 +326,7 @@ mod tests {
 
         assert_eq!(
             policy.allowed_read_paths,
-            vec![project_root, bundle_root, host_root]
+            vec![src_dir, bundle_root, host_root, project_root.join("build")]
         );
     }
 }

@@ -177,6 +177,98 @@ fn preview_nonexistent_file_exits_without_binding_port_or_printing_url() {
 }
 
 #[test]
+fn compile_denies_absolute_input_outside_workspace_when_ancestor_has_git_marker() {
+    // Regression for GH-37: a `.git` directory in an ancestor of the input
+    // must not widen the file-access boundary past the input's own directory.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let outer = dir.path().join("outer");
+    let workspace = outer.join("workspace");
+    let external_dir = outer.join("external-src");
+    std::fs::create_dir_all(outer.join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_file = external_dir.join("external.tex");
+    std::fs::write(&external_file, "External content that must not be read.\n")
+        .expect("write external tex");
+    let input_file = workspace.join("policy_deny.tex");
+    std::fs::write(
+        &input_file,
+        format!(
+            "\\documentclass{{article}}\n\\begin{{document}}\nBefore.\n\\input{{{}}}\nAfter.\n\\end{{document}}\n",
+            external_file.to_str().expect("utf-8 external path")
+        ),
+    )
+    .expect("write input tex");
+
+    let output = ferritex_bin()
+        .args(["compile", input_file.to_str().expect("utf-8 input path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "absolute \\input outside the workspace boundary must exit 2 (stderr: {})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("input file access denied"),
+        "stderr should report the access denial, got: {stderr}"
+    );
+    assert!(
+        !workspace.join("policy_deny.pdf").exists(),
+        "a PDF must not be produced when access is denied"
+    );
+}
+
+#[test]
+fn compile_denies_absolute_input_outside_workspace_when_cwd_is_ancestor() {
+    // Regression for GH-37: running ferritex from an ancestor directory must
+    // not widen the file-access boundary to that ancestor.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let outer = dir.path().join("outer");
+    let workspace = outer.join("workspace");
+    let external_dir = outer.join("external-src");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_file = external_dir.join("external.tex");
+    std::fs::write(&external_file, "External content that must not be read.\n")
+        .expect("write external tex");
+    let input_file = workspace.join("policy_deny.tex");
+    std::fs::write(
+        &input_file,
+        format!(
+            "\\documentclass{{article}}\n\\begin{{document}}\n\\input{{{}}}\n\\end{{document}}\n",
+            external_file.to_str().expect("utf-8 external path")
+        ),
+    )
+    .expect("write input tex");
+
+    let output = ferritex_bin()
+        .current_dir(&outer)
+        .args(["compile", "workspace/policy_deny.tex"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "running from an ancestor cwd must not grant access to sibling directories (stderr: {})",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("input file access denied"),
+        "stderr should report the access denial, got: {stderr}"
+    );
+    assert!(
+        !workspace.join("policy_deny.pdf").exists(),
+        "a PDF must not be produced when access is denied"
+    );
+}
+
+#[test]
 fn compile_existing_file_writes_pdf_with_document_content() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello.tex");
@@ -1282,7 +1374,9 @@ fn compile_index_sort_at_display_syntax() {
 }
 
 #[test]
-fn compile_resolves_project_root_fallback_from_nested_input() {
+fn compile_resolves_sibling_directory_via_explicit_overlay_root() {
+    // After GH-37 the project root never expands past the input's directory,
+    // so cross-directory `\input` must be declared via `--overlay-roots`.
     let dir = tempfile::tempdir().expect("create tempdir");
     let project_root = dir.path().join("project");
     let src_dir = project_root.join("src");
@@ -1303,11 +1397,21 @@ fn compile_resolves_project_root_fallback_from_nested_input() {
 
     let output = ferritex_bin()
         .current_dir(&project_root)
-        .args(["compile", "src/main.tex"])
+        .args([
+            "compile",
+            "src/main.tex",
+            "--overlay",
+            project_root.to_str().expect("utf-8 project root"),
+        ])
         .output()
         .expect("failed to run ferritex");
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let pdf = std::fs::read_to_string(src_dir.join("main.pdf")).expect("read output pdf");
     assert!(pdf.contains("Project root fallback."));
 }
