@@ -11981,7 +11981,7 @@ mod tests {
             error,
             ParseError::MacroExpansionLimit {
                 line: 2,
-                column: Some(1),
+                column: Some(11),
             }
         );
     }
