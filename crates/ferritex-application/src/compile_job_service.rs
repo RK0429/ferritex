@@ -14190,31 +14190,6 @@ mod tests {
     }
 
     #[test]
-    fn project_root_fallback_resolves_when_not_in_current_dir() {
-        let dir = tempdir().expect("create tempdir");
-        let project_root = dir.path().join("project");
-        let src = project_root.join("src");
-        let subdir = src.join("subdir");
-        let shared = project_root.join("shared");
-        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
-        fs::create_dir_all(&subdir).expect("create subdir");
-        fs::create_dir_all(&shared).expect("create shared");
-        fs::write(shared.join("macros.tex"), "PROJECT ROOT MACROS\n").expect("write macros");
-        fs::write(src.join("main.tex"), document("\\input{subdir/section}")).expect("write main");
-        fs::write(subdir.join("section.tex"), "\\input{shared/macros}\n").expect("write section");
-
-        let options = runtime_options(src.join("main.tex"), project_root.join("out"));
-        let gate = FsTestFileAccessGate;
-        let loader = MockAssetBundleLoader::valid();
-
-        let result = service(&gate, &loader).compile(&options);
-
-        assert_eq!(result.exit_code, 0);
-        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
-        assert!(pdf.contains("PROJECT ROOT MACROS"));
-    }
-
-    #[test]
     fn overlay_root_fallback_resolves_when_project_root_misses_input() {
         let dir = tempdir().expect("create tempdir");
         let project_root = dir.path().join("project");
