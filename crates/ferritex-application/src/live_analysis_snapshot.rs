@@ -214,15 +214,23 @@ impl LiveAnalysisSnapshotFactory {
             "bibitem",
         ));
         let command_definitions = collect_command_definitions(&buffer.text);
-        let mut diagnostics = compile_state
-            .filter(|state| !state.success)
+        let compile_diagnostics = compile_state
             .map(|state| compile_diagnostics_to_analysis(&buffer.text, &state.diagnostics))
             .unwrap_or_default();
-        diagnostics.extend(collect_buffer_diagnostics(
+        let buffer_diagnostics = collect_buffer_diagnostics(
             &self.parser,
             &buffer.text,
             compile_state.is_none(),
-        ));
+        );
+        let buffer_messages: BTreeSet<&str> = buffer_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        let mut diagnostics: Vec<AnalysisDiagnostic> = compile_diagnostics
+            .into_iter()
+            .filter(|diagnostic| !buffer_messages.contains(diagnostic.message.as_str()))
+            .collect();
+        diagnostics.extend(buffer_diagnostics);
         let code_actions = collect_code_actions(&buffer.text);
 
         LiveAnalysisSnapshot {
@@ -1047,6 +1055,59 @@ mod tests {
                 .contains("unclosed environment `equation`")
                 && diagnostic.context.as_deref() == Some("\\begin{equation}")
         }));
+    }
+
+    #[test]
+    fn compile_state_success_surfaces_recoverable_compile_diagnostics() {
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(
+            &buffer(
+                "\\documentclass{article}\n\\begin{document}\n\\notAMacro\n\\end{document}\n",
+            ),
+            Some(&compile_state(
+                true,
+                vec![Diagnostic::new(
+                    Severity::Error,
+                    "undefined control sequence `\\notAMacro`",
+                )
+                .with_line(3)],
+                DocumentState::default(),
+            )),
+        );
+
+        let messages = snapshot
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("undefined control sequence `\\notAMacro`")));
+    }
+
+    #[test]
+    fn compile_state_success_deduplicates_messages_shared_with_buffer_diagnostics() {
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(
+            &buffer(
+                "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n\\end{document}\n",
+            ),
+            Some(&compile_state(
+                true,
+                vec![
+                    Diagnostic::new(Severity::Error, "unclosed environment `equation`")
+                        .with_line(3),
+                ],
+                DocumentState::default(),
+            )),
+        );
+
+        let occurrences = snapshot
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("unclosed environment `equation`"))
+            .count();
+
+        assert_eq!(occurrences, 1);
     }
 
     #[test]

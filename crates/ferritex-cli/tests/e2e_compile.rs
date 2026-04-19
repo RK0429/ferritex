@@ -2972,6 +2972,140 @@ fn lsp_diagnostics_include_compile_errors() {
 }
 
 #[test]
+fn lsp_did_change_surfaces_undefined_control_sequence_diagnostics() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("main.tex");
+    let uri = format!("file://{}", tex_file.to_str().expect("utf-8 path"));
+    let mut child = ferritex_bin()
+        .args(["lsp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex lsp");
+    let mut stdin = child.stdin.take().expect("lsp stdin");
+    let stdout = child.stdout.take().expect("lsp stdout");
+    let mut reader = BufReader::new(stdout);
+
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": format!("file://{}", dir.path().to_str().expect("utf-8 path")),
+                "capabilities": {}
+            }
+        }),
+    );
+    let _initialize = read_lsp_message(&mut reader);
+
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "initialized",
+            "params": {}
+        }),
+    );
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "latex",
+                    "version": 1,
+                    "text": "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n"
+                }
+            }
+        }),
+    );
+
+    let initial_diagnostics = read_lsp_message(&mut reader);
+    assert_eq!(
+        initial_diagnostics["method"],
+        "textDocument/publishDiagnostics"
+    );
+    let initial_error_messages = initial_diagnostics["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .filter(|diagnostic| diagnostic["severity"].as_u64() == Some(1))
+        .filter_map(|diagnostic| diagnostic.get("message").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        initial_error_messages.is_empty(),
+        "expected no errors for valid buffer, got: {initial_error_messages:?}"
+    );
+
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "version": 2
+                },
+                "contentChanges": [
+                    {
+                        "text": "\\documentclass{article}\n\\begin{document}\n\\notAMacro\n\\end{document}\n"
+                    }
+                ]
+            }
+        }),
+    );
+
+    let updated_diagnostics = read_lsp_message(&mut reader);
+    assert_eq!(
+        updated_diagnostics["method"],
+        "textDocument/publishDiagnostics"
+    );
+    let updated_diagnostics_list = updated_diagnostics["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let has_not_a_macro_error = updated_diagnostics_list.iter().any(|diagnostic| {
+        diagnostic["severity"].as_u64() == Some(1)
+            && diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("notAMacro"))
+    });
+    assert!(
+        has_not_a_macro_error,
+        "expected error diagnostic mentioning `notAMacro`, got: {updated_diagnostics_list:?}"
+    );
+
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "shutdown",
+            "params": null
+        }),
+    );
+    let shutdown = read_lsp_message(&mut reader);
+    assert_eq!(shutdown["id"], 2);
+    assert_eq!(shutdown["result"], Value::Null);
+    write_lsp_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": null
+        }),
+    );
+
+    assert!(child.wait().expect("wait lsp").success());
+}
+
+#[test]
 fn lsp_diagnostics_include_source_and_context() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
