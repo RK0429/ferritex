@@ -20,8 +20,12 @@ use ferritex_infra::watcher::PollingFileWatcher;
 
 use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, CompileCommand};
 
-pub fn run_watch(command: &CompileCommand) -> i32 {
+pub fn run_watch_loop<F>(command: &CompileCommand, mut on_compile: F) -> i32
+where
+    F: FnMut(&CompileResult),
+{
     let options = runtime_options_from_command(command);
+    let interaction_mode = options.interaction_mode;
     let policy = ExecutionPolicyFactory::create(&options);
     let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
     let file_access_gate = FsFileAccessGate::from_policy(policy);
@@ -38,7 +42,8 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
         .unwrap_or_else(|| Path::new("."));
 
     let initial_result = scheduler.run(workspace_root, || service.compile(&options));
-    emit_diagnostics(&initial_result.diagnostics);
+    emit_diagnostics(&initial_result.diagnostics, interaction_mode);
+    on_compile(&initial_result);
 
     let watched_paths =
         watched_paths_for_result(&initial_result, &options.input_file, &file_access_gate);
@@ -54,10 +59,10 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
     let mut watcher = match PollingFileWatcher::new(watched_paths) {
         Ok(watcher) => watcher,
         Err(error) => {
-            emit_diagnostic(&watcher_io_diagnostic(
-                &error,
-                "failed to start file watcher",
-            ));
+            emit_diagnostic(
+                &watcher_io_diagnostic(&error, "failed to start file watcher"),
+                interaction_mode,
+            );
             service.flush_cache();
             return 2;
         }
@@ -70,10 +75,13 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
         let changes = match watcher.poll_changes() {
             Ok(changes) => changes,
             Err(error) => {
-                emit_diagnostic(&Diagnostic::new(
-                    Severity::Error,
-                    format!("failed to poll watched files: {error}"),
-                ));
+                emit_diagnostic(
+                    &Diagnostic::new(
+                        Severity::Error,
+                        format!("failed to poll watched files: {error}"),
+                    ),
+                    interaction_mode,
+                );
                 service.flush_cache();
                 return 2;
             }
@@ -85,10 +93,13 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
 
         while let Some(coalesced_changes) = recompile_scheduler.start_next() {
             let hint = coalesced_changes;
+            emit_recompile_start(&hint);
             let result = scheduler.run(workspace_root, || {
                 service.compile_with_changed_paths(&options, &hint)
             });
-            emit_diagnostics(&result.diagnostics);
+            emit_diagnostics(&result.diagnostics, interaction_mode);
+            on_compile(&result);
+            emit_recompile_end(&result);
             recompile_scheduler.finish_current();
 
             let new_watched_paths =
@@ -109,10 +120,10 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
                 tracked_paths = new_watched_paths.clone();
             }
             if let Err(error) = watcher.replace_paths(new_watched_paths) {
-                emit_diagnostic(&watcher_io_diagnostic(
-                    &error,
-                    "failed to refresh watched files",
-                ));
+                emit_diagnostic(
+                    &watcher_io_diagnostic(&error, "failed to refresh watched files"),
+                    interaction_mode,
+                );
                 service.flush_cache();
                 return 2;
             }
@@ -143,6 +154,46 @@ fn watcher_io_diagnostic(error: &io::Error, fallback_context: &str) -> Diagnosti
         Diagnostic::new(Severity::Error, format!("{fallback_context}: {error}"))
     }
 }
+
+fn emit_recompile_start(changes: &[PathBuf]) {
+    let descriptor = describe_changed_paths(changes);
+    eprintln!("recompiling ({descriptor})");
+}
+
+fn emit_recompile_end(result: &CompileResult) {
+    if result.exit_code == 0 {
+        eprintln!("recompile finished");
+    } else {
+        let error_count = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .count();
+        eprintln!(
+            "recompile failed ({} error{})",
+            error_count,
+            if error_count == 1 { "" } else { "s" }
+        );
+    }
+}
+
+fn describe_changed_paths(changes: &[PathBuf]) -> String {
+    const LIMIT: usize = 3;
+    if changes.is_empty() {
+        return String::from("changes detected");
+    }
+    let displayed: Vec<String> = changes
+        .iter()
+        .take(LIMIT)
+        .map(|path| path.display().to_string())
+        .collect();
+    let mut summary = format!("changed: {}", displayed.join(", "));
+    if changes.len() > LIMIT {
+        summary.push_str(&format!(" (+{} more)", changes.len() - LIMIT));
+    }
+    summary
+}
+
 
 fn watched_paths_for_result(
     result: &CompileResult,

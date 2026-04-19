@@ -1,4 +1,7 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -26,6 +29,176 @@ fn ferritex_bin() -> Command {
 fn read_synctex(path: &Path) -> SyncTexData {
     serde_json::from_slice(&std::fs::read(path).expect("read output synctex"))
         .expect("parse output synctex")
+}
+
+fn parse_loopback_document_url(url: &str) -> (String, u16, String) {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .expect("preview document URL should use http");
+    let (host_port, path) = without_scheme
+        .split_once('/')
+        .expect("preview document URL should include a path");
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .expect("preview document URL should include a port");
+    (
+        host.to_string(),
+        port.parse().expect("preview port"),
+        format!("/{path}"),
+    )
+}
+
+fn spawn_stderr_collector<R>(stderr: R) -> thread::JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut captured = String::new();
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).expect("read child stderr");
+            if read == 0 {
+                break;
+            }
+            eprint!("{line}");
+            captured.push_str(&line);
+        }
+
+        captured
+    })
+}
+
+fn spawn_streaming_collector<R>(reader: R) -> (Arc<Mutex<String>>, thread::JoinHandle<()>)
+where
+    R: Read + Send + 'static,
+{
+    let buffer = Arc::new(Mutex::new(String::new()));
+    let buffer_clone = Arc::clone(&buffer);
+    let handle = thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .expect("read streaming child output");
+            if read == 0 {
+                break;
+            }
+            buffer_clone
+                .lock()
+                .expect("streaming collector buffer poisoned")
+                .push_str(&line);
+        }
+    });
+    (buffer, handle)
+}
+
+fn buffer_contains(buffer: &Arc<Mutex<String>>, needle: &str) -> bool {
+    buffer
+        .lock()
+        .expect("streaming collector buffer poisoned")
+        .contains(needle)
+}
+
+fn buffer_snapshot(buffer: &Arc<Mutex<String>>) -> String {
+    buffer
+        .lock()
+        .expect("streaming collector buffer poisoned")
+        .clone()
+}
+
+fn issue_get_request(host: &str, port: u16, path: &str) -> Vec<u8> {
+    let address: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .expect("preview socket address");
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+        .expect("connect to preview server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set preview read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .expect("set preview write timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write preview request");
+    stream.shutdown(Shutdown::Write).expect("shutdown write");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read preview response");
+    response
+}
+
+fn http_response_body(response: &[u8]) -> &[u8] {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("missing HTTP response header delimiter");
+    &response[header_end + 4..]
+}
+
+fn body_hash(body: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn actual_text_payloads<'a>(content: &'a str) -> Vec<&'a str> {
+    let mut payloads = Vec::new();
+    let marker = "/ActualText ";
+    let mut remaining = content;
+
+    while let Some(start) = remaining.find(marker) {
+        let payload_source = &remaining[start + marker.len()..];
+        let Some(first) = payload_source.chars().next() else {
+            break;
+        };
+
+        let payload_len = match first {
+            '(' => {
+                let mut escaped = false;
+                let mut depth = 0usize;
+                let mut end = None;
+                for (offset, ch) in payload_source.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    match ch {
+                        '\\' => escaped = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                end = Some(offset + ch.len_utf8());
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                end.expect("unterminated literal ActualText")
+            }
+            '<' => payload_source
+                .find('>')
+                .map(|index| index + 1)
+                .expect("unterminated hex ActualText"),
+            _ => panic!("unexpected ActualText payload start: {first}"),
+        };
+
+        payloads.push(&payload_source[..payload_len]);
+        remaining = &payload_source[payload_len..];
+    }
+
+    payloads
 }
 
 fn build_minimal_cmr10_tfm() -> Vec<u8> {
@@ -70,43 +243,6 @@ fn build_minimal_cmr10_tfm() -> Vec<u8> {
     bytes.extend_from_slice(&0_i32.to_be_bytes());
 
     bytes
-}
-
-fn spawn_streaming_collector<R>(reader: R) -> (Arc<Mutex<String>>, thread::JoinHandle<()>)
-where
-    R: Read + Send + 'static,
-{
-    let buffer = Arc::new(Mutex::new(String::new()));
-    let buffer_clone = Arc::clone(&buffer);
-    let handle = thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .expect("read streaming child output");
-            if read == 0 {
-                break;
-            }
-            buffer_clone
-                .lock()
-                .expect("lock streaming buffer")
-                .push_str(&line);
-        }
-    });
-    (buffer, handle)
-}
-
-fn buffer_contains(buffer: &Arc<Mutex<String>>, needle: &str) -> bool {
-    buffer
-        .lock()
-        .expect("lock streaming buffer")
-        .contains(needle)
-}
-
-fn buffer_snapshot(buffer: &Arc<Mutex<String>>) -> String {
-    buffer.lock().expect("lock streaming buffer").clone()
 }
 
 #[test]
@@ -403,7 +539,10 @@ fn compile_with_unimplemented_package_emits_warning_and_still_produces_pdf() {
         stderr.contains("package `definitelyunknownpkg` is not implemented"),
         "stderr should contain the unimplemented-package warning, got: {stderr}"
     );
-    assert!(stderr.contains("warning"), "warning severity should be mentioned");
+    assert!(
+        stderr.contains("warning"),
+        "warning severity should be mentioned"
+    );
     assert!(
         stdout.contains("unimpl.pdf"),
         "pdf output should still be produced"
@@ -676,6 +815,12 @@ fn compile_with_synctex_writes_searchable_sidecar_with_float_caption_fragment() 
         .fragments
         .iter()
         .any(|fragment| fragment.text == "Figure 1: Embedded pixel"));
+    assert!(
+        !synctex.pages.is_empty(),
+        "sidecar must expose a populated pages array"
+    );
+    assert!(synctex.pages.iter().any(|entry| entry.page == 1));
+    assert!(synctex.pages.iter().any(|entry| entry.page == 2));
 }
 
 #[test]
@@ -702,6 +847,42 @@ fn compile_renders_inline_and_display_math_without_raw_tex_delimiters() {
     assert!(!pdf.contains("$x^2$"));
     assert!(!pdf.contains("\\frac{a}{b}"));
     assert!(!pdf.contains("\\["));
+}
+
+#[test]
+fn compile_display_math_preserves_unicode_in_actualtext() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("display-math-actualtext.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\[\n  \\int_0^\\infty e^{-x^2} \\, dx = \\frac{\\sqrt{\\pi}}{2}\n\\]\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let pdf =
+        std::fs::read(dir.path().join("display-math-actualtext.pdf")).expect("read output pdf");
+    let content = String::from_utf8_lossy(&pdf);
+    let payloads = actual_text_payloads(&content);
+
+    assert!(
+        payloads.iter().any(|payload| payload.starts_with("<FEFF")),
+        "expected UTF-16BE ActualText payload, got: {payloads:?}"
+    );
+    assert!(
+        payloads.iter().any(|payload| payload.contains("03C0")),
+        "expected ActualText payload to contain UTF-16BE pi, got: {payloads:?}"
+    );
+    assert!(
+        payloads.iter().all(|payload| !payload.contains('?')),
+        "ActualText payloads must not contain '?': {payloads:?}"
+    );
 }
 
 #[test]
@@ -2575,6 +2756,47 @@ fn compile_reports_undefined_control_sequence_with_column() {
 }
 
 #[test]
+fn compile_batchmode_suppresses_stderr_diagnostics() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken.tex");
+    let source = "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\begin{unclosedenv}\ntext\n\\end{document}\n";
+    std::fs::write(&tex_file, source).expect("write input file");
+
+    let nonstop = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--interaction",
+            "nonstopmode",
+        ])
+        .output()
+        .expect("run ferritex nonstopmode");
+    let batch = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--interaction",
+            "batchmode",
+        ])
+        .output()
+        .expect("run ferritex batchmode");
+
+    assert_eq!(nonstop.status.code(), Some(2));
+    assert_eq!(batch.status.code(), Some(2));
+
+    let nonstop_stderr = String::from_utf8_lossy(&nonstop.stderr);
+    let batch_stderr = String::from_utf8_lossy(&batch.stderr);
+    assert!(
+        nonstop_stderr.contains("error:"),
+        "nonstopmode should emit diagnostics to stderr, got: {nonstop_stderr}"
+    );
+    assert!(
+        batch_stderr.trim().is_empty(),
+        "batchmode should suppress diagnostic stderr, got: {batch_stderr}"
+    );
+}
+
+#[test]
 fn compile_with_errors_suppresses_success_summary_on_stdout() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("broken.tex");
@@ -2719,6 +2941,92 @@ fn watch_prints_startup_banner_and_tracked_count_by_default() {
     child.kill().expect("kill watch process");
     child.wait().expect("wait for watch process");
     stderr_handle.join().expect("join stderr collector");
+}
+
+#[test]
+fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["preview", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let stderr = child.stderr.take().expect("preview stderr");
+    let stderr_handle = spawn_stderr_collector(stderr);
+
+    let stdout = child.stdout.take().expect("preview stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut document_url = String::new();
+    stdout
+        .read_line(&mut document_url)
+        .expect("read preview document URL");
+    let mut events_url = String::new();
+    stdout
+        .read_line(&mut events_url)
+        .expect("read preview events URL");
+
+    let document_url = document_url.trim().to_string();
+    let events_url = events_url.trim().to_string();
+    assert!(document_url.starts_with("http://127.0.0.1:"));
+    assert!(events_url.starts_with("ws://127.0.0.1:"));
+    assert!(document_url.ends_with("/document"));
+    assert!(events_url.ends_with("/events"));
+
+    let (host, port, path) = parse_loopback_document_url(&document_url);
+    let mut initial_hash = None;
+    wait_until(
+        || {
+            let response = issue_get_request(&host, port, &path);
+            if !response.starts_with(b"HTTP/1.1 200 OK") {
+                return false;
+            }
+            initial_hash = Some(body_hash(http_response_body(&response)));
+            true
+        },
+        Duration::from_secs(2),
+        "preview should publish the initial PDF",
+    );
+    let initial_hash = initial_hash.expect("initial preview body hash");
+
+    // Ensure mtime advances on filesystems with millisecond granularity.
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nUpdated preview\n\\end{document}\n",
+    )
+    .expect("rewrite input file");
+
+    wait_until(
+        || {
+            let response = issue_get_request(&host, port, &path);
+            response.starts_with(b"HTTP/1.1 200 OK")
+                && body_hash(http_response_body(&response)) != initial_hash
+        },
+        Duration::from_secs(10),
+        "preview should serve an updated PDF after a source change",
+    );
+
+    child.kill().expect("kill preview process");
+    child.wait().expect("wait for preview process");
+    let stderr = stderr_handle.join().expect("join preview stderr collector");
+    assert!(
+        stderr.contains("preview server listening on http://127.0.0.1:")
+            && stderr.contains("(waiting for first successful compile)"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("press Ctrl+C to stop").count(),
+        1,
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -2927,6 +3235,109 @@ fn watch_exits_with_friendly_message_when_watched_directory_is_deleted() {
 }
 
 #[test]
+fn watch_emits_status_logs_for_startup_recompile_and_dependency_updates() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    let appendix = dir.path().join("appendix.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["watch", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex watch");
+    let stdout = child.stdout.take().expect("watch stdout");
+    let stderr = child.stderr.take().expect("watch stderr");
+    let (stdout_buffer, stdout_handle) = spawn_streaming_collector(stdout);
+    let (stderr_buffer, stderr_handle) = spawn_streaming_collector(stderr);
+
+    wait_until(
+        || buffer_contains(&stderr_buffer, "press Ctrl+C to stop"),
+        Duration::from_secs(5),
+        "watch should print the Ctrl+C stop guidance on startup",
+    );
+    let startup_stderr = buffer_snapshot(&stderr_buffer);
+    assert!(
+        startup_stderr.contains("watching"),
+        "stderr should announce the watched file, got: {startup_stderr}"
+    );
+    assert!(
+        startup_stderr.contains(tex_file.to_str().expect("utf-8 path")),
+        "stderr should mention the input file, got: {startup_stderr}"
+    );
+
+    wait_until(
+        || buffer_contains(&stdout_buffer, "hello.pdf"),
+        Duration::from_secs(10),
+        "watch should print the initial compile success summary on stdout",
+    );
+    let initial_stdout = buffer_snapshot(&stdout_buffer);
+    assert!(
+        initial_stdout.contains("(1 page)"),
+        "initial summary should describe the page count, got: {initial_stdout}"
+    );
+    wait_until(
+        || buffer_contains(&stderr_buffer, "tracking 1 file"),
+        Duration::from_secs(5),
+        "watch should report the initial tracked-file count",
+    );
+
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nUpdated\n\\end{document}\n",
+    )
+    .expect("rewrite input file");
+
+    wait_until(
+        || buffer_contains(&stderr_buffer, "recompiling"),
+        Duration::from_secs(10),
+        "watch should announce the start of a recompile",
+    );
+    wait_until(
+        || buffer_contains(&stderr_buffer, "recompile finished"),
+        Duration::from_secs(10),
+        "watch should announce the end of a successful recompile",
+    );
+
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(&appendix, "Appendix v1\n").expect("write appendix");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\input{appendix}\n\\end{document}\n",
+    )
+    .expect("rewrite main with new dependency");
+
+    wait_until(
+        || buffer_contains(&stderr_buffer, "watched dependencies updated"),
+        Duration::from_secs(10),
+        "watch should announce when the watched dependency set changes",
+    );
+
+    child.kill().expect("kill watch process");
+    child.wait().expect("wait for watch process");
+    stdout_handle.join().expect("join stdout collector");
+    stderr_handle.join().expect("join stderr collector");
+
+    let final_stdout = buffer_snapshot(&stdout_buffer);
+    assert!(
+        final_stdout.matches("hello.pdf").count() >= 2,
+        "stdout should include at least the initial and one recompile summary, got: {final_stdout}"
+    );
+    let final_stderr = buffer_snapshot(&stderr_buffer);
+    assert_eq!(
+        final_stderr.matches("press Ctrl+C to stop").count(),
+        1,
+        "press Ctrl+C to stop should appear exactly once, got: {final_stderr}"
+    );
+}
+
+#[test]
 fn lsp_initialize_and_diagnostics_work_over_stdio() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -3114,6 +3525,8 @@ fn lsp_definition_resolves_labels_from_included_files() {
         format!("file://{}", expected_target.to_str().expect("utf-8 path"))
     );
     assert_eq!(definition["result"]["range"]["start"]["line"], 0);
+    assert_eq!(definition["result"]["range"]["end"]["line"], 0);
+    assert_eq!(definition["result"]["range"]["end"]["character"], 20);
 
     write_lsp_message(
         &mut stdin,

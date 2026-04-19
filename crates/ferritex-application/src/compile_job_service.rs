@@ -315,6 +315,15 @@ struct ShellEscapeAdapter<'a> {
 
 impl ShellEscapeHandler for ShellEscapeAdapter<'_> {
     fn execute_write18(&self, command: &str, _line: u32) -> ShellEscapeResult {
+        if let Some(metachar) = find_unsupported_shell_metacharacter(command) {
+            return ShellEscapeResult::Error(format!(
+                "\\write18 command contains unsupported shell metacharacter `{metachar}`: {command}; \
+                 ferritex runs commands through an argv-based gateway and does not interpret \
+                 shell syntax such as redirection (>, <), pipes (|), command separators (;, &), \
+                 or command substitution (`...`). Invoke a prebuilt script or tool instead."
+            ));
+        }
+
         let mut parts = command.split_whitespace();
         let Some(program) = parts.next() else {
             return ShellEscapeResult::Error("empty \\write18 command".to_string());
@@ -328,6 +337,12 @@ impl ShellEscapeHandler for ShellEscapeAdapter<'_> {
             Err(error) => ShellEscapeResult::Error(error),
         }
     }
+}
+
+fn find_unsupported_shell_metacharacter(command: &str) -> Option<char> {
+    command
+        .chars()
+        .find(|c| matches!(c, '>' | '<' | '|' | '&' | ';' | '`'))
 }
 
 struct FileOperationAdapter<'a> {
@@ -5606,6 +5621,7 @@ fn synctex_data_for(document: &TypesetDocument, source_lines: &[SourceLineTrace]
         remap_synctex_file_ids(&mut fallback, &fallback_file_ids);
         synctex.fragments.extend(fallback.fragments);
         synctex.files = merged_files;
+        synctex.recompute_pages();
     } else if !annotator.files.is_empty() {
         synctex.files = annotator.files;
     }
@@ -10596,6 +10612,37 @@ mod tests {
     }
 
     #[test]
+    fn synctex_data_for_populates_pages_for_minimal_document() {
+        let source_lines = vec![ferritex_core::synctex::SourceLineTrace {
+            file: "/tmp/main.tex".to_string(),
+            line: 3,
+            text: "Hello world".to_string(),
+        }];
+        let document = test_typeset_document(vec![TextLine {
+            text: "Hello world".to_string(),
+            x: DimensionValue::zero(),
+            y: points(720),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(10),
+            source_span: None,
+        }]);
+
+        let synctex = super::synctex_data_for(&document, &source_lines);
+
+        assert!(
+            !synctex.pages.is_empty(),
+            "minimal document must still expose a pages array"
+        );
+        assert_eq!(synctex.pages[0].page, 1);
+        assert_eq!(
+            synctex.pages[0].fragment_count as usize,
+            synctex.fragments.len(),
+            "single-page document must account for every fragment"
+        );
+    }
+
+    #[test]
     fn source_span_annotator_marks_wrapped_lines_with_same_span() {
         let source_lines = vec![ferritex_core::synctex::SourceLineTrace {
             file: "/tmp/main.tex".to_string(),
@@ -13338,6 +13385,56 @@ mod tests {
                 vec!["ok".to_string()],
                 expected_working_dir
             )]
+        );
+    }
+
+    #[test]
+    fn write18_rejects_commands_that_use_shell_metacharacters() {
+        // Regression for Issue #15: `\write18{echo x > file}` previously returned
+        // exit 0 with no diagnostic while silently passing `>` and `file` as argv
+        // tokens to `echo`, leaving the user's intended redirection target missing.
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            document("\\write18{echo x > shell-escape-result.txt}\nHello"),
+        )
+        .expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.shell_escape = ShellEscapeMode::Enabled;
+        let loader = MockAssetBundleLoader::valid();
+        let shell_gateway = MockShellCommandGateway::default();
+
+        let result =
+            service_with_shell(&FsTestFileAccessGate, &loader, &shell_gateway).compile(&options);
+
+        assert_ne!(
+            result.exit_code, 0,
+            "compile must fail so the user is not misled into thinking the command ran"
+        );
+        assert!(
+            shell_gateway.commands().is_empty(),
+            "gateway must not be invoked when the command contains shell syntax: {:?}",
+            shell_gateway.commands()
+        );
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message.contains("unsupported shell metacharacter")
+                    && diagnostic.message.contains('>')
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected diagnostic about unsupported shell metacharacter, got: {:?}",
+                    result.diagnostics
+                )
+            });
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(
+            !dir.path().join("shell-escape-result.txt").exists(),
+            "no file should be created when shell syntax is rejected"
         );
     }
 

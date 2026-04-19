@@ -1,19 +1,24 @@
 use std::{
+    io::{self, Write},
+    num::NonZeroUsize,
     path::PathBuf,
     process,
     sync::{Arc, Mutex},
-    thread,
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ferritex_application::compile_job_service::CompileJobService;
+use ferritex_application::compile_job_service::{CompileJobService, CompileResult};
 use ferritex_application::execution_policy_factory::ExecutionPolicyFactory;
-use ferritex_application::ports::{PreviewTransportPort, TransportRevisionEvent};
+use ferritex_application::ports::{
+    PreviewTransportPort, TransportRevisionEvent, TransportViewStateUpdate,
+};
 use ferritex_application::preview_session_service::{
     PreviewSessionService, PreviewTarget, PreviewViewState, PublishDecision, SessionErrorResponse,
     SessionId,
 };
-use ferritex_application::runtime_options::{CompileArgs, CompileInteraction, RuntimeOptions};
+use ferritex_application::runtime_options::{
+    CompileArgs, CompileInteraction, InteractionMode, RuntimeOptions,
+};
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_infra::asset_bundle::AssetBundleLoader;
 use ferritex_infra::fs::FsFileAccessGate;
@@ -66,7 +71,7 @@ struct CompileCommand {
     /// Number of parallel compilation tasks (default: CPU cores). High values (>
     /// available cores) can significantly increase peak RSS on heavy fixtures.
     #[arg(long, value_name = "N")]
-    jobs: Option<usize>,
+    jobs: Option<NonZeroUsize>,
     /// Additional directories to search for TeX files
     #[arg(long = "overlay", value_name = "DIR")]
     overlay_roots: Vec<PathBuf>,
@@ -79,7 +84,11 @@ struct CompileCommand {
     /// Enable reproducible output (deterministic timestamps)
     #[arg(long)]
     reproducible: bool,
-    /// TeX interaction mode
+    /// TeX interaction mode.
+    ///
+    /// `batchmode` suppresses diagnostic output to stderr.
+    /// `nonstopmode`, `scrollmode`, and `errorstopmode` are currently treated
+    /// as equivalent non-interactive continuation modes in ferritex.
     #[arg(long, value_name = "MODE", value_enum)]
     interaction: Option<InteractionArg>,
     /// Generate SyncTeX data for editor synchronization
@@ -117,7 +126,7 @@ impl CompileCommand {
             input_file: self.file.clone(),
             output_dir: self.output_dir.clone(),
             jobname: self.jobname.clone(),
-            jobs: self.jobs,
+            jobs: self.jobs.map(NonZeroUsize::get),
             overlay_roots: self.overlay_roots.clone(),
             no_cache: self.no_cache,
             asset_bundle: self.asset_bundle.clone(),
@@ -167,73 +176,222 @@ fn handle_compile(command: &CompileCommand) -> i32 {
         &shell_command_gateway,
     );
     let result = service.compile(&options);
-    emit_diagnostics(&result.diagnostics);
-    if let Some(output_pdf) = &result.output_pdf {
-        let page_count = result
-            .stable_compile_state
-            .as_ref()
-            .map_or(0, |state| state.page_count);
-        let error_count = result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Error)
-            .count();
-        let warning_count = result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Warning)
-            .count();
-        if error_count == 0 {
-            if warning_count > 0 {
-                println!(
-                    "{} -> {} ({} page{}, {} warning{})",
-                    command.file.display(),
-                    output_pdf.display(),
-                    page_count,
-                    if page_count == 1 { "" } else { "s" },
-                    warning_count,
-                    if warning_count == 1 { "" } else { "s" }
-                );
-            } else {
-                println!(
-                    "{} -> {} ({} page{})",
-                    command.file.display(),
-                    output_pdf.display(),
-                    page_count,
-                    if page_count == 1 { "" } else { "s" }
-                );
-            }
-        }
-    }
+    emit_diagnostics(&result.diagnostics, options.interaction_mode);
+    print_compile_success_summary(command, &result);
     result.exit_code
+}
+
+fn print_compile_success_summary(command: &CompileCommand, result: &CompileResult) {
+    let Some(output_pdf) = &result.output_pdf else {
+        return;
+    };
+    let error_count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .count();
+    if error_count > 0 {
+        return;
+    }
+    let page_count = result
+        .stable_compile_state
+        .as_ref()
+        .map_or(0, |state| state.page_count);
+    let warning_count = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Warning)
+        .count();
+    if warning_count > 0 {
+        println!(
+            "{} -> {} ({} page{}, {} warning{})",
+            command.file.display(),
+            output_pdf.display(),
+            page_count,
+            if page_count == 1 { "" } else { "s" },
+            warning_count,
+            if warning_count == 1 { "" } else { "s" }
+        );
+    } else {
+        println!(
+            "{} -> {} ({} page{})",
+            command.file.display(),
+            output_pdf.display(),
+            page_count,
+            if page_count == 1 { "" } else { "s" }
+        );
+    }
 }
 
 fn handle_watch(command: &CompileCommand) -> i32 {
     eprintln!("watching {}", command.file.display());
     eprintln!("press Ctrl+C to stop");
-    watch_runner::run_watch(command)
+    let command_for_summary = command.clone();
+    watch_runner::run_watch_loop(command, move |result| {
+        print_compile_success_summary(&command_for_summary, result);
+    })
 }
 
 fn handle_preview(command: &CompileCommand) -> i32 {
-    match execute_preview(command) {
-        Ok(preview) => {
-            println!("{}", preview.document_url);
-            println!("{}", preview.events_url);
-            eprintln!(
-                "preview server listening on http://127.0.0.1:{}",
-                preview.server_port
-            );
-            eprintln!("press Ctrl+C to stop");
+    let options = runtime_options_from_command(command);
+    let policy = ExecutionPolicyFactory::create(&options);
+    let Some(_preview_policy) = &policy.preview_publication else {
+        let diagnostics = vec![Diagnostic::new(
+            Severity::Error,
+            "preview is disabled by the execution policy",
+        )
+        .with_file(options.input_file.to_string_lossy().into_owned())
+        .with_suggestion("rerun with preview publication enabled")];
+        emit_diagnostics(&diagnostics, options.interaction_mode);
+        return diagnostics_exit_code(&diagnostics);
+    };
 
-            loop {
-                thread::park();
+    let transport = Arc::new(match LoopbackPreviewTransport::bind() {
+        Ok(transport) => transport,
+        Err(error) => {
+            let diagnostics = vec![Diagnostic::new(
+                Severity::Error,
+                format!("failed to start loopback preview server: {error}"),
+            )
+            .with_file(options.input_file.to_string_lossy().into_owned())
+            .with_suggestion("retry after ensuring loopback TCP ports are available")];
+            emit_diagnostics(&diagnostics, options.interaction_mode);
+            return diagnostics_exit_code(&diagnostics);
+        }
+    });
+    let server_port = transport.port();
+    transport.start_background();
+    eprintln!(
+        "preview server listening on http://127.0.0.1:{server_port} (waiting for first successful compile)"
+    );
+    eprintln!("press Ctrl+C to stop");
+
+    let preview_transport: Arc<dyn PreviewTransportPort> = transport.clone();
+    let session_service = Arc::new(Mutex::new(PreviewSessionService::new(Arc::clone(
+        &preview_transport,
+    ))));
+    let target = PreviewTarget {
+        input_file: options.input_file.clone(),
+        jobname: options.jobname.clone(),
+    };
+
+    let callback_transport = Arc::clone(&transport);
+    let callback_service = Arc::clone(&session_service);
+    let callback_target = target.clone();
+    let callback_policy = policy.clone();
+    let mut session_id: Option<SessionId> = None;
+    let on_compile = move |result: &CompileResult| {
+        if result.exit_code != 0 {
+            return;
+        }
+
+        let Some(output_pdf) = result.output_pdf.as_ref() else {
+            return;
+        };
+
+        let pdf_bytes = match std::fs::read(output_pdf) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("warning: failed to read compiled PDF for preview publish: {error}");
+                return;
             }
+        };
+        let page_count = estimate_pdf_page_count(&pdf_bytes);
+
+        if session_id.is_none() {
+            let bootstrap = {
+                let mut service = callback_service
+                    .lock()
+                    .expect("preview session service poisoned");
+                match service.create_session(&callback_target, &callback_policy) {
+                    Ok(bootstrap) => bootstrap,
+                    Err(error) => {
+                        eprintln!(
+                            "warning: failed to create preview session: {} ({})",
+                            error.error_kind, error.recovery_instruction
+                        );
+                        return;
+                    }
+                }
+            };
+
+            println!("{}", bootstrap.document_url);
+            println!("{}", bootstrap.events_url);
+
+            let svc = Arc::clone(&callback_service);
+            callback_transport.set_view_state_handler(Arc::new(move |session_id, update| {
+                let view_state = PreviewViewState {
+                    page_number: update.page_number,
+                    zoom: update.zoom,
+                    viewport_offset_y: update.viewport_offset_y,
+                };
+                svc.lock()
+                    .expect("preview session service poisoned")
+                    .update_view_state(&SessionId::new(session_id), view_state);
+                eprintln!("{}", format_view_state_diagnostic(session_id, update));
+            }));
+            session_id = Some(bootstrap.session_id);
         }
-        Err(diagnostics) => {
-            emit_diagnostics(&diagnostics);
-            diagnostics_exit_code(&diagnostics)
+
+        let current_session_id = session_id
+            .clone()
+            .expect("preview session should exist before publish");
+
+        let publish_decision = callback_service
+            .lock()
+            .expect("preview session service poisoned")
+            .check_publish(&current_session_id, &callback_target, &callback_policy);
+        if let PublishDecision::Denied(error) = publish_decision {
+            eprintln!(
+                "warning: failed to authorize preview publish: {} ({})",
+                error.error_kind, error.recovery_instruction
+            );
+            return;
         }
-    }
+
+        if callback_service
+            .lock()
+            .expect("preview session service poisoned")
+            .apply_page_fallback(&current_session_id, page_count)
+            .is_none()
+        {
+            eprintln!(
+                "warning: failed to apply preview page fallback for session {}",
+                current_session_id
+            );
+            return;
+        }
+
+        if let Err(error) = callback_transport.publish_pdf(current_session_id.as_str(), &pdf_bytes)
+        {
+            eprintln!("warning: failed to publish preview PDF: {error}");
+            return;
+        }
+
+        let Some(revision) = callback_service
+            .lock()
+            .expect("preview session service poisoned")
+            .advance_revision(&current_session_id, page_count)
+        else {
+            eprintln!(
+                "warning: failed to advance preview revision for session {}",
+                current_session_id
+            );
+            return;
+        };
+
+        if let Err(error) = callback_transport.publish_revision_event(&TransportRevisionEvent {
+            session_id: current_session_id.to_string(),
+            target_input: revision.target.input_file.to_string_lossy().into_owned(),
+            target_jobname: revision.target.jobname,
+            revision: revision.revision,
+            page_count: revision.page_count,
+        }) {
+            eprintln!("warning: failed to publish preview revision event: {error}");
+        }
+    };
+
+    watch_runner::run_watch_loop(command, on_compile)
 }
 
 fn handle_lsp() -> i32 {
@@ -245,16 +403,39 @@ fn runtime_options_from_command(command: &CompileCommand) -> RuntimeOptions {
     RuntimeOptions::from_compile_args(&compile_args)
 }
 
-fn emit_diagnostics(diagnostics: &[Diagnostic]) {
+fn emit_diagnostics(diagnostics: &[Diagnostic], mode: InteractionMode) {
+    let mut stderr = io::stderr().lock();
+    let _ = emit_diagnostics_to(&mut stderr, diagnostics, mode);
+}
+
+fn emit_diagnostics_to<W: Write>(
+    writer: &mut W,
+    diagnostics: &[Diagnostic],
+    mode: InteractionMode,
+) -> io::Result<()> {
     for diagnostic in diagnostics {
-        emit_diagnostic(diagnostic);
+        emit_diagnostic_to(writer, diagnostic, mode)?;
     }
+    Ok(())
 }
 
-fn emit_diagnostic(diagnostic: &Diagnostic) {
-    eprintln!("{diagnostic}");
+fn emit_diagnostic(diagnostic: &Diagnostic, mode: InteractionMode) {
+    let mut stderr = io::stderr().lock();
+    let _ = emit_diagnostic_to(&mut stderr, diagnostic, mode);
 }
 
+fn emit_diagnostic_to<W: Write>(
+    writer: &mut W,
+    diagnostic: &Diagnostic,
+    mode: InteractionMode,
+) -> io::Result<()> {
+    if mode == InteractionMode::Batchmode {
+        return Ok(());
+    }
+    writeln!(writer, "{diagnostic}")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreviewExecution {
     document_url: String,
@@ -262,6 +443,7 @@ struct PreviewExecution {
     server_port: u16,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Diagnostic>> {
     let options = runtime_options_from_command(command);
     let policy = ExecutionPolicyFactory::create(&options);
@@ -396,6 +578,7 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
                     svc.lock()
                         .expect("preview session service poisoned")
                         .update_view_state(&SessionId::new(session_id), view_state);
+                    eprintln!("{}", format_view_state_diagnostic(session_id, update));
                 }));
             }
 
@@ -420,6 +603,13 @@ fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Dia
     }
 }
 
+fn format_view_state_diagnostic(session_id: &str, update: &TransportViewStateUpdate) -> String {
+    format!(
+        "preview view-state received for session {session_id}: page={} zoom={} offset_y={}",
+        update.page_number, update.zoom, update.viewport_offset_y
+    )
+}
+
 fn estimate_pdf_page_count(pdf_bytes: &[u8]) -> usize {
     let content = String::from_utf8_lossy(pdf_bytes);
     let count = content.matches("/Type /Page").count();
@@ -433,6 +623,7 @@ fn estimate_pdf_page_count(pdf_bytes: &[u8]) -> usize {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn diagnostic_for_session_error(error: &SessionErrorResponse) -> Diagnostic {
     Diagnostic::new(
         Severity::Error,
@@ -460,15 +651,16 @@ fn diagnostics_exit_code(diagnostics: &[Diagnostic]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{num::NonZeroUsize, path::PathBuf};
 
     use super::{
-        execute_preview, runtime_options_from_command, Cli, Commands, CompileCommand,
-        InteractionArg,
+        emit_diagnostics_to, execute_preview, format_view_state_diagnostic,
+        runtime_options_from_command, Cli, Commands, CompileCommand, InteractionArg,
     };
     use clap::Parser;
+    use ferritex_application::ports::TransportViewStateUpdate;
     use ferritex_application::runtime_options::{InteractionMode, ShellEscapeMode};
-    use ferritex_core::diagnostics::Severity;
+    use ferritex_core::diagnostics::{Diagnostic, Severity};
     use tempfile::tempdir;
 
     fn compile_command() -> CompileCommand {
@@ -476,7 +668,7 @@ mod tests {
             file: PathBuf::from("chapters/main.tex"),
             output_dir: Some(PathBuf::from("build")),
             jobname: None,
-            jobs: Some(4),
+            jobs: NonZeroUsize::new(4),
             overlay_roots: vec![PathBuf::from("shared"), PathBuf::from("vendor/texmf")],
             no_cache: true,
             asset_bundle: Some(PathBuf::from("bundle")),
@@ -569,7 +761,7 @@ mod tests {
 
         assert_eq!(command.file, PathBuf::from("notes.tex"));
         assert_eq!(command.output_dir, Some(PathBuf::from("out")));
-        assert_eq!(command.jobs, Some(2));
+        assert_eq!(command.jobs, NonZeroUsize::new(2));
         assert!(!command.verbose);
     }
 
@@ -592,7 +784,14 @@ mod tests {
 
         assert_eq!(command.file, PathBuf::from("notes.tex"));
         assert_eq!(command.output_dir, Some(PathBuf::from("out")));
-        assert_eq!(command.jobs, Some(2));
+        assert_eq!(command.jobs, NonZeroUsize::new(2));
+    }
+
+    #[test]
+    fn compile_rejects_zero_jobs() {
+        let result = Cli::try_parse_from(["ferritex", "compile", "book.tex", "--jobs", "0"]);
+
+        assert!(result.is_err(), "--jobs 0 must be rejected");
     }
 
     #[test]
@@ -609,7 +808,7 @@ mod tests {
         command.file = tex_file.clone();
         command.output_dir = Some(dir.path().to_path_buf());
         command.jobname = Some("hello".to_string());
-        command.jobs = Some(1);
+        command.jobs = NonZeroUsize::new(1);
         command.no_cache = false;
         command.asset_bundle = None;
         command.reproducible = false;
@@ -642,7 +841,7 @@ mod tests {
         command.file = tex_file.clone();
         command.output_dir = Some(dir.path().to_path_buf());
         command.jobname = Some("missing".to_string());
-        command.jobs = Some(1);
+        command.jobs = NonZeroUsize::new(1);
         command.no_cache = false;
         command.asset_bundle = None;
         command.reproducible = false;
@@ -665,5 +864,44 @@ mod tests {
             !dir.path().join("missing.pdf").exists(),
             "no output PDF should be produced when the initial compile fails",
         );
+    }
+
+    #[test]
+    fn format_view_state_diagnostic_includes_session_id_and_update_fields() {
+        let update = TransportViewStateUpdate {
+            page_number: 3,
+            zoom: 1.5,
+            viewport_offset_y: 240.25,
+        };
+
+        let diagnostic = format_view_state_diagnostic("preview-session-7", &update);
+
+        assert!(diagnostic.contains("preview-session-7"));
+        assert!(diagnostic.contains("page=3"));
+        assert!(diagnostic.contains("zoom=1.5"));
+        assert!(diagnostic.contains("offset_y=240.25"));
+    }
+
+    #[test]
+    fn emit_diagnostics_to_suppresses_batchmode_output() {
+        let diagnostics = vec![Diagnostic::new(Severity::Error, "broken document")];
+        let mut stderr = Vec::new();
+
+        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Batchmode)
+            .expect("write diagnostics");
+
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn emit_diagnostics_to_emits_non_batchmode_output() {
+        let diagnostics = vec![Diagnostic::new(Severity::Error, "broken document")];
+        let mut stderr = Vec::new();
+
+        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Nonstopmode)
+            .expect("write diagnostics");
+
+        let output = String::from_utf8(stderr).expect("utf-8 stderr");
+        assert!(output.contains("error: broken document"));
     }
 }

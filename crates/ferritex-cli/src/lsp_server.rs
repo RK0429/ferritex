@@ -10,7 +10,7 @@ use ferritex_application::lsp_capability_service::{
     LspCapabilityService, ServerCapabilities, TextDocumentSyncKind,
 };
 use ferritex_application::open_document_store::{OpenDocumentBuffer, OpenDocumentStore};
-use ferritex_application::runtime_options::default_lsp_asset_bundle;
+use ferritex_application::runtime_options::{default_lsp_asset_bundle, InteractionMode};
 use ferritex_application::stable_compile_state::StableCompileState;
 use ferritex_core::diagnostics::{Diagnostic, Severity};
 use ferritex_core::policy::{ExecutionPolicy, PreviewPublicationPolicy};
@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use crate::emit_diagnostic;
 
 const MAX_LSP_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+const LSP_DIAGNOSTIC_MODE: InteractionMode = InteractionMode::Nonstopmode;
 
 pub fn run_lsp() -> i32 {
     let stdin = io::stdin();
@@ -39,10 +40,13 @@ pub fn run_lsp() -> i32 {
             Ok(Some(message)) => message,
             Ok(None) => return if shutdown_requested { 0 } else { 1 },
             Err(error) => {
-                emit_diagnostic(&Diagnostic::new(
-                    Severity::Error,
-                    format!("failed to read LSP message: {error}"),
-                ));
+                emit_diagnostic(
+                    &Diagnostic::new(
+                        Severity::Error,
+                        format!("failed to read LSP message: {error}"),
+                    ),
+                    LSP_DIAGNOSTIC_MODE,
+                );
                 return 2;
             }
         };
@@ -63,10 +67,13 @@ pub fn run_lsp() -> i32 {
                         }
                     });
                     if let Err(error) = write_response(&mut writer, id, result) {
-                        emit_diagnostic(&Diagnostic::new(
-                            Severity::Error,
-                            format!("failed to write initialize response: {error}"),
-                        ));
+                        emit_diagnostic(
+                            &Diagnostic::new(
+                                Severity::Error,
+                                format!("failed to write initialize response: {error}"),
+                            ),
+                            LSP_DIAGNOSTIC_MODE,
+                        );
                         return 2;
                     }
                 }
@@ -76,10 +83,13 @@ pub fn run_lsp() -> i32 {
                 shutdown_requested = true;
                 if let Some(id) = id {
                     if let Err(error) = write_response(&mut writer, id, Value::Null) {
-                        emit_diagnostic(&Diagnostic::new(
-                            Severity::Error,
-                            format!("failed to write shutdown response: {error}"),
-                        ));
+                        emit_diagnostic(
+                            &Diagnostic::new(
+                                Severity::Error,
+                                format!("failed to write shutdown response: {error}"),
+                            ),
+                            LSP_DIAGNOSTIC_MODE,
+                        );
                         return 2;
                     }
                 }
@@ -122,10 +132,13 @@ pub fn run_lsp() -> i32 {
                         &message,
                     );
                     if let Err(error) = write_response(&mut writer, id, result) {
-                        emit_diagnostic(&Diagnostic::new(
-                            Severity::Error,
-                            format!("failed to write completion response: {error}"),
-                        ));
+                        emit_diagnostic(
+                            &Diagnostic::new(
+                                Severity::Error,
+                                format!("failed to write completion response: {error}"),
+                            ),
+                            LSP_DIAGNOSTIC_MODE,
+                        );
                         return 2;
                     }
                 }
@@ -141,10 +154,13 @@ pub fn run_lsp() -> i32 {
                         &message,
                     );
                     if let Err(error) = write_response(&mut writer, id, result) {
-                        emit_diagnostic(&Diagnostic::new(
-                            Severity::Error,
-                            format!("failed to write definition response: {error}"),
-                        ));
+                        emit_diagnostic(
+                            &Diagnostic::new(
+                                Severity::Error,
+                                format!("failed to write definition response: {error}"),
+                            ),
+                            LSP_DIAGNOSTIC_MODE,
+                        );
                         return 2;
                     }
                 }
@@ -160,10 +176,13 @@ pub fn run_lsp() -> i32 {
                         &message,
                     );
                     if let Err(error) = write_response(&mut writer, id, result) {
-                        emit_diagnostic(&Diagnostic::new(
-                            Severity::Error,
-                            format!("failed to write hover response: {error}"),
-                        ));
+                        emit_diagnostic(
+                            &Diagnostic::new(
+                                Severity::Error,
+                                format!("failed to write hover response: {error}"),
+                            ),
+                            LSP_DIAGNOSTIC_MODE,
+                        );
                         return 2;
                     }
                 }
@@ -179,10 +198,13 @@ pub fn run_lsp() -> i32 {
                         &message,
                     );
                     if let Err(error) = write_response(&mut writer, id, result) {
-                        emit_diagnostic(&Diagnostic::new(
-                            Severity::Error,
-                            format!("failed to write code action response: {error}"),
-                        ));
+                        emit_diagnostic(
+                            &Diagnostic::new(
+                                Severity::Error,
+                                format!("failed to write code action response: {error}"),
+                            ),
+                            LSP_DIAGNOSTIC_MODE,
+                        );
                         return 2;
                     }
                 }
@@ -194,10 +216,13 @@ pub fn run_lsp() -> i32 {
                         "message": format!("method `{method}` is not implemented"),
                     });
                     if let Err(error) = write_error(&mut writer, id, error) {
-                        emit_diagnostic(&Diagnostic::new(
-                            Severity::Error,
-                            format!("failed to write error response: {error}"),
-                        ));
+                        emit_diagnostic(
+                            &Diagnostic::new(
+                                Severity::Error,
+                                format!("failed to write error response: {error}"),
+                            ),
+                            LSP_DIAGNOSTIC_MODE,
+                        );
                         return 2;
                     }
                 }
