@@ -18,7 +18,7 @@ TikZ support has been expanded with xcolor-standard named colors (19 total), mm/
 
 Multicol MVP is implemented: `\begin{multicols}{N}` / `\end{multicols}` environment parsing, `\columnbreak` directives, and N-column layout typesetting with automatic column width calculation and side-by-side column placement via `VListItem::MulticolRegion`. Known limitation: a multicol region cannot span page boundaries — the entire region is placed on a single page.
 
-All Must requirements in `docs/requirements.md` are satisfied. `REQ-NF-002` (differential compile median < 100ms) is achieved at 66ms/70ms. Parity evidence across 5 categories (layout-core / navigation / bibliography / embedded-assets / tikz) is fully passing. Cross-platform CI (Linux/macOS/Windows) produces byte-identical output under `--reproducible`. Remaining non-blocker items (REQ-NF-003 memory profiling, REQ-NF-004 full-scale LSP benchmark, REQ-NF-001a pdfLaTeX relative speed) are tracked as future tasks in `docs/planning_report.md`.
+All Must requirements in `docs/requirements.md` are satisfied. `REQ-NF-002` (differential compile median < 100ms) is achieved at 66ms/70ms. `REQ-NF-004` (LSP response latency) is backed by the `FTX-LSP-BENCH-001` warm 100-page trace in `crates/ferritex-cli/tests/bench_lsp_latency.rs::ftx_lsp_bench_001_warm_trace_meets_req_nf_004_thresholds` (release-mode medians: diagnostics 35.69ms / completion 124.88µs / definition 129.25µs, all well under the 500ms / 100ms / 200ms thresholds). Parity evidence across 5 categories (layout-core / navigation / bibliography / embedded-assets / tikz) is fully passing. Cross-platform CI (Linux/macOS/Windows) produces byte-identical output under `--reproducible`. Remaining non-blocker items (REQ-NF-003 memory profiling, REQ-NF-001a pdfLaTeX relative speed) are tracked as future tasks in `docs/planning_report.md`.
 
 ## Quick start
 
@@ -104,15 +104,22 @@ Dependency direction: `cli → application + core + infra`, `application → cor
 
 ## Completion status
 
-All 48 functional requirements (REQ-FUNC-001–048) and 6 of 11 non-functional requirements are fully verified. The remaining 5 non-functional items are non-blockers:
+All 48 functional requirements (REQ-FUNC-001–048) and 7 of 11 non-functional requirements are fully verified. The remaining 4 non-functional items are non-blockers:
 
 | Requirement | Status | Notes |
 |---|---|---|
 | REQ-NF-001 (full compile < 1.0s) | Infra ready | Benchmark harness measures and logs; CI assert deferred to avoid flaky results from runner variance |
 | REQ-NF-001a (50x vs pdfLaTeX) | Managed risk | Tracked in `docs/requirements.md` §5 as open item. Local measurement shows 54.89x (2026-04-05) |
 | REQ-NF-003 (memory < 1 GiB) | Deferred | Should priority. A heavy fixture run at `--jobs 16` observed RSS around 1133 MiB, so `ferritex compile --help` now warns that high parallelism can increase peak RSS |
-| REQ-NF-004 (LSP latency) | Tests pass | Current tests use minimal input; full-scale `FTX-LSP-BENCH-001` benchmark is a future task |
 | REQ-NF-010 (error messages) | Design complete | `Diagnostic` struct covers file/line/message/context/suggestion; exhaustive path coverage is future work |
+
+`REQ-NF-004` (LSP response latency) previously sat on this list as "minimal-input only"; it is now fully backed by the `FTX-LSP-BENCH-001` warm 100-page trace described above. Run it with:
+
+```sh
+cargo test --release -p ferritex-cli --test bench_lsp_latency -- --ignored ftx_lsp_bench_001_warm_trace_meets_req_nf_004_thresholds
+```
+
+The test is gated with `#[ignore]` so the default `cargo test` run stays fast; invoke it explicitly when recording REQ-NF-004 evidence.
 
 Formal verification (proptest, miri, etc.) is not required by the current requirements and is out of scope.
 
