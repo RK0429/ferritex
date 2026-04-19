@@ -221,6 +221,15 @@ struct ExpandedSourceBuilder {
     current_line_origin: Option<(String, u32)>,
 }
 
+#[derive(Debug, Clone)]
+struct NavigationSidecarSpec {
+    extension: &'static str,
+    label: &'static str,
+    command_name: &'static str,
+    requested: bool,
+    contents: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceLineSpan {
     normalized_text: String,
@@ -869,6 +878,74 @@ impl<'a> CompileJobService<'a> {
                 )
                 .with_file(sidecar_path.to_string_lossy().into_owned())
             })
+    }
+
+    fn write_text_sidecar(
+        &self,
+        sidecar_path: &Path,
+        sidecar_label: &str,
+        contents: &[u8],
+    ) -> Option<Diagnostic> {
+        self.file_access_gate
+            .write_file(sidecar_path, contents)
+            .err()
+            .map(|error| {
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!("failed to persist {sidecar_label} sidecar: {error}"),
+                )
+                .with_file(sidecar_path.to_string_lossy().into_owned())
+            })
+    }
+
+    fn write_navigation_sidecars(
+        &self,
+        output_pdf: &Path,
+        document: &ParsedDocument,
+        source_lines: &[SourceLineTrace],
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let sidecars = [
+            NavigationSidecarSpec {
+                extension: "toc",
+                label: "table of contents",
+                command_name: "tableofcontents",
+                requested: document.has_unresolved_toc,
+                contents: format_toc_sidecar(&document.section_entries),
+            },
+            NavigationSidecarSpec {
+                extension: "lof",
+                label: "list of figures",
+                command_name: "listoffigures",
+                requested: document.has_unresolved_lof,
+                contents: format_caption_sidecar("figure", &document.figure_entries),
+            },
+            NavigationSidecarSpec {
+                extension: "lot",
+                label: "list of tables",
+                command_name: "listoftables",
+                requested: document.has_unresolved_lot,
+                contents: format_caption_sidecar("table", &document.table_entries),
+            },
+        ];
+
+        for sidecar in sidecars {
+            if sidecar.contents.is_empty()
+                && !sidecar.requested
+                && !source_lines_use_command(source_lines, sidecar.command_name)
+            {
+                continue;
+            }
+
+            let sidecar_path = output_pdf.with_extension(sidecar.extension);
+            if let Some(diagnostic) =
+                self.write_text_sidecar(&sidecar_path, sidecar.label, sidecar.contents.as_bytes())
+            {
+                diagnostics.push(diagnostic);
+            }
+        }
+
+        diagnostics
     }
 
     pub fn compile(&self, options: &RuntimeOptions) -> CompileResult {
@@ -1690,6 +1767,12 @@ impl<'a> CompileJobService<'a> {
                 stage_timing,
             };
         }
+
+        diagnostics.extend(self.write_navigation_sidecars(
+            &output_pdf,
+            &parsed_document,
+            &source_tree.source_lines,
+        ));
 
         if options.synctex {
             let synctex_path = options
@@ -2723,6 +2806,56 @@ fn source_files_for_lines(source_lines: &[SourceLineTrace]) -> Vec<&str> {
         }
     }
     files
+}
+
+fn sanitize_sidecar_field(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\t' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+fn format_toc_sidecar(entries: &[ferritex_core::parser::api::SectionEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "section\t{}\t{}\t{}\n",
+                entry.level,
+                sanitize_sidecar_field(&entry.number),
+                sanitize_sidecar_field(&entry.title)
+            )
+        })
+        .collect()
+}
+
+fn format_caption_sidecar(
+    kind: &str,
+    entries: &[ferritex_core::parser::api::CaptionEntry],
+) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{kind}\t{}\t{}\n",
+                sanitize_sidecar_field(&entry.number),
+                sanitize_sidecar_field(&entry.caption)
+            )
+        })
+        .collect()
+}
+
+fn source_lines_use_command(source_lines: &[SourceLineTrace], command_name: &str) -> bool {
+    let needle = format!("\\{command_name}");
+    source_lines.iter().any(|line| {
+        let content = line.text.split('%').next().unwrap_or_default();
+        content.match_indices(&needle).any(|(index, _)| {
+            let after = content[index + needle.len()..].chars().next();
+            after.map(|ch| !ch.is_alphabetic()).unwrap_or(true)
+        })
+    })
 }
 
 fn extract_text_for_span(source_lines: &[SourceLineTrace], span: SourceSpan) -> Option<String> {
@@ -3779,6 +3912,7 @@ fn try_partial_typeset_document(
         partition_plan,
         fragments,
         &navigation_state_for_document(document),
+        partition_merge_preserves_openright(document, partition_plan),
     );
     if !merged_matches_reuse_expectations(&merged, partition_plan, &reuse_plan.reuse_fragments) {
         return Err("merged reuse fragments did not preserve cached label/page counts");
@@ -3906,6 +4040,7 @@ fn try_parallel_full_typeset(
         &coalesced_plan,
         fragments,
         &navigation_state_for_document(document),
+        partition_merge_preserves_openright(document, &coalesced_plan),
     ))
 }
 
@@ -4514,6 +4649,18 @@ fn section_partition_continues_from_previous_block(
         last_marker,
         Some(BODY_PAGE_BREAK_MARKER | BODY_CLEAR_PAGE_MARKER | BODY_CLEAR_DOUBLE_PAGE_MARKER)
     )
+}
+
+fn partition_merge_preserves_openright(
+    document: &ParsedDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> bool {
+    document.document_class == "book"
+        && partition_plan.work_units.len() > 1
+        && partition_plan
+            .work_units
+            .iter()
+            .all(|work_unit| work_unit.kind == PartitionKind::Chapter)
 }
 
 fn float_counters_before_body_range(document: &ParsedDocument, body_start: usize) -> FloatCounters {
@@ -12535,6 +12682,56 @@ mod tests {
     }
 
     #[test]
+    fn issue_40_fixture_writes_navigation_sidecars_for_sequential_and_parallel() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ferritex-bench/fixtures/corpus/partition-book/book_with_toc_lot_lof.tex");
+        let loader = MockAssetBundleLoader::valid();
+        let expected_toc = "section\t0\t1\tOverview\nsection\t0\t2\tInterpretation\n";
+        let expected_lof = "figure\t1\tPlaceholder figure for the figure list\n";
+        let expected_lot = "table\t1\tSimple inventory table\n";
+
+        let compile_fixture = |parallelism: usize, output_dir: PathBuf| {
+            let mut options = runtime_options(fixture.clone(), output_dir.clone());
+            options.parallelism = parallelism;
+
+            let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+            assert_eq!(result.exit_code, 0, "{:?}", result.diagnostics);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            assert_eq!(
+                result
+                    .stable_compile_state
+                    .as_ref()
+                    .map(|state| state.page_count),
+                Some(11)
+            );
+            assert_eq!(
+                fs::read_to_string(output_dir.join("main.toc")).expect("read .toc sidecar"),
+                expected_toc
+            );
+            assert_eq!(
+                fs::read_to_string(output_dir.join("main.lof")).expect("read .lof sidecar"),
+                expected_lof
+            );
+            assert_eq!(
+                fs::read_to_string(output_dir.join("main.lot")).expect("read .lot sidecar"),
+                expected_lot
+            );
+
+            fs::read(output_dir.join("main.pdf")).expect("read rendered pdf")
+        };
+
+        let dir = tempdir().expect("create tempdir");
+        let sequential_pdf = compile_fixture(1, dir.path().join("out-sequential"));
+        let parallel_pdf = compile_fixture(4, dir.path().join("out-parallel"));
+
+        assert_eq!(
+            pdf_text_operators(&String::from_utf8_lossy(&parallel_pdf)),
+            pdf_text_operators(&String::from_utf8_lossy(&sequential_pdf))
+        );
+    }
+
+    #[test]
     fn preamble_change_forces_full_rebuild() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -13422,7 +13619,9 @@ mod tests {
             .diagnostics
             .iter()
             .find(|diagnostic| {
-                diagnostic.message.contains("unsupported shell metacharacter")
+                diagnostic
+                    .message
+                    .contains("unsupported shell metacharacter")
                     && diagnostic.message.contains('>')
             })
             .unwrap_or_else(|| {

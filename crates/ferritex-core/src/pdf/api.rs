@@ -1059,7 +1059,11 @@ fn render_page_payloads(
                 .collect::<Vec<_>>()
         });
         let mut ordered_payloads = payloads;
-        ordered_payloads.sort_by(|left, right| left.partition_id.cmp(&right.partition_id));
+        ordered_payloads.sort_by(|left, right| {
+            partition_payload_first_page_index(left)
+                .cmp(&partition_payload_first_page_index(right))
+                .then_with(|| left.partition_id.cmp(&right.partition_id))
+        });
         ordered_payloads
             .into_iter()
             .flat_map(|payload| payload.page_payloads)
@@ -1082,6 +1086,14 @@ fn render_page_payloads(
             .map(pdf_encoding_error)
             .collect(),
     }
+}
+
+fn partition_payload_first_page_index(payload: &PartitionRenderPayload) -> usize {
+    payload
+        .page_payloads
+        .first()
+        .map(|payload| payload.page_payload.page_index)
+        .unwrap_or(usize::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3731,6 +3743,68 @@ mod tests {
     }
 
     #[test]
+    fn render_with_partition_plan_preserves_fallback_frontmatter_order() {
+        let mut document = single_page(&["Frontmatter"]);
+        document.pages.push(page(&["1 Intro", "Chapter 1 body"]));
+        document.pages.push(page(&["2 Results", "Chapter 2 body"]));
+        document.outlines = vec![
+            TypesetOutline {
+                level: 0,
+                title: "1 Intro".to_string(),
+                page_index: 1,
+                y: points(720),
+            },
+            TypesetOutline {
+                level: 0,
+                title: "2 Results".to_string(),
+                page_index: 2,
+                y: points(720),
+            },
+        ];
+        let plan = DocumentPartitionPlan {
+            fallback_partition_id: "document:0000:frontmatter".to_string(),
+            work_units: vec![
+                DocumentWorkUnit {
+                    partition_id: "chapter:0001:1-intro".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 0,
+                        title: "1 Intro".to_string(),
+                    },
+                    title: "1 Intro".to_string(),
+                },
+                DocumentWorkUnit {
+                    partition_id: "chapter:0002:2-results".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 1,
+                        title: "2 Results".to_string(),
+                    },
+                    title: "2 Results".to_string(),
+                },
+            ],
+        };
+        let renderer = PdfRenderer::default();
+
+        let sequential = renderer.render(&document);
+        let partitioned = renderer.render_with_partition_plan(&document, 4, 2, &plan, None);
+
+        assert_eq!(
+            partitioned
+                .page_payloads
+                .iter()
+                .map(|payload| payload.page_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(partitioned.document.bytes, sequential.bytes);
+    }
+
+    #[test]
     fn render_with_partition_plan_reuses_pre_rendered_page_payloads() {
         let mut document = single_page(&["1 Intro", "Page 1 body"]);
         document.pages.push(page(&["Page 2 body before edit"]));
@@ -4578,8 +4652,8 @@ mod tests {
             .position(|window| window == xref_header)
             .expect("rendered PDF must contain an xref section")
             + 1;
-        let xref_body = std::str::from_utf8(&bytes[xref_pos..])
-            .expect("xref section should be ASCII");
+        let xref_body =
+            std::str::from_utf8(&bytes[xref_pos..]).expect("xref section should be ASCII");
         let mut lines = xref_body.lines();
         let header = lines.next().expect("xref header");
         assert_eq!(header, "xref");
@@ -4594,7 +4668,10 @@ mod tests {
             .and_then(|value| value.parse().ok())
             .expect("object count");
         assert_eq!(first_id, 0, "xref subsection should start at object 0");
-        assert!(count >= 2, "PDF must contain at least the catalog and pages");
+        assert!(
+            count >= 2,
+            "PDF must contain at least the catalog and pages"
+        );
 
         // The first entry is the free object (id 0); skip it. For every other
         // declared object id, verify the byte offset actually lands on the
@@ -4614,10 +4691,9 @@ mod tests {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| panic!("unparsable xref entry: {line}"));
             let expected_marker = format!("{object_id} 0 obj");
-            let actual = std::str::from_utf8(
-                &bytes[offset..offset.saturating_add(expected_marker.len())],
-            )
-            .unwrap_or_else(|_| panic!("non-UTF8 bytes at offset {offset}"));
+            let actual =
+                std::str::from_utf8(&bytes[offset..offset.saturating_add(expected_marker.len())])
+                    .unwrap_or_else(|_| panic!("non-UTF8 bytes at offset {offset}"));
             assert_eq!(
                 actual, expected_marker,
                 "xref entry for object {object_id} at offset {offset} should start with {expected_marker:?}"

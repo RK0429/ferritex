@@ -598,6 +598,7 @@ impl PaginationMergeCoordinator {
         partition_plan: &DocumentPartitionPlan,
         mut fragments: BTreeMap<String, DocumentLayoutFragment>,
         base_navigation: &NavigationState,
+        preserve_openright: bool,
     ) -> TypesetDocument {
         let mut pages = Vec::new();
         let mut outlines = Vec::new();
@@ -610,6 +611,16 @@ impl PaginationMergeCoordinator {
                 continue;
             };
             let page_count = fragment.pages.len();
+            if preserve_openright && page_count > 0 && page_offset % 2 == 1 {
+                pages.push(TypesetPage {
+                    lines: Vec::new(),
+                    images: Vec::new(),
+                    page_box: fragment.pages[0].page_box.clone(),
+                    float_placements: Vec::new(),
+                    index_entries: Vec::new(),
+                });
+                page_offset += 1;
+            }
 
             pages.append(&mut fragment.pages);
 
@@ -2594,7 +2605,7 @@ fn append_nodes_segment_to_vlist(
             number,
             display_title,
         } => {
-            if previous_block.is_some() {
+            if previous_block.is_some() || !vlist.is_empty() {
                 vlist.push(VListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
@@ -8117,6 +8128,52 @@ mod tests {
         assert_eq!(merged.author.as_deref(), Some("Ferritex"));
         assert_eq!(merged.navigation.outline_entries.len(), 2);
         assert!(merged.navigation.named_destinations.contains_key("results"));
+    }
+
+    #[test]
+    fn merge_owned_inserts_openright_blank_page_between_book_chapters() {
+        let plan = partition_plan();
+        let fragments = BTreeMap::from([
+            (
+                "chapter:0001:intro".to_string(),
+                fragment(
+                    "chapter:0001:intro",
+                    1,
+                    BTreeMap::from([("intro".to_string(), 0)]),
+                ),
+            ),
+            (
+                "chapter:0002:results".to_string(),
+                fragment(
+                    "chapter:0002:results",
+                    1,
+                    BTreeMap::from([("results".to_string(), 0)]),
+                ),
+            ),
+        ]);
+        let base_navigation = NavigationState::default();
+
+        let merged =
+            PaginationMergeCoordinator.merge_owned(&plan, fragments, &base_navigation, true);
+
+        assert_eq!(merged.pages.len(), 3);
+        assert_eq!(
+            visible_line_texts(&merged.pages[0]),
+            vec!["chapter:0001:intro-page-0"]
+        );
+        assert!(visible_line_texts(&merged.pages[1]).is_empty());
+        assert_eq!(
+            visible_line_texts(&merged.pages[2]),
+            vec!["chapter:0002:results-page-0"]
+        );
+        assert_eq!(
+            merged
+                .named_destinations
+                .iter()
+                .map(|destination| (destination.name.as_str(), destination.page_index))
+                .collect::<Vec<_>>(),
+            vec![("intro", 0), ("results", 2)]
+        );
     }
 
     #[test]
