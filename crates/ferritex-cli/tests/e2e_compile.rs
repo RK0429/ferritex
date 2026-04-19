@@ -3773,6 +3773,29 @@ fn compile_help_warns_about_high_jobs_rss() {
     );
 }
 
+#[test]
+fn lsp_help_documents_jsonrpc_protocol() {
+    let output = ferritex_bin()
+        .args(["lsp", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Content-Length"),
+        "lsp help should describe JSON-RPC framing"
+    );
+    assert!(
+        stdout.contains("initialize"),
+        "lsp help should describe the initialize/initialized handshake"
+    );
+    assert!(
+        stdout.contains("publishDiagnostics"),
+        "lsp help should mention publishDiagnostics notifications"
+    );
+}
+
 fn pdf_page_count(pdf: &str) -> usize {
     let marker = "/Count ";
     let start = pdf.find(marker).expect("pdf page count marker");
