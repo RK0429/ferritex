@@ -42,6 +42,15 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
 
     let watched_paths =
         watched_paths_for_result(&initial_result, &options.input_file, &file_access_gate);
+    emit_watch_status(&format!(
+        "tracking {} file{}",
+        watched_paths.len(),
+        if watched_paths.len() == 1 { "" } else { "s" }
+    ));
+    if command.verbose {
+        emit_watched_paths(&watched_paths);
+    }
+    let mut tracked_paths = watched_paths.clone();
     let mut watcher = match PollingFileWatcher::new(watched_paths) {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -82,11 +91,24 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
             emit_diagnostics(&result.diagnostics);
             recompile_scheduler.finish_current();
 
-            if let Err(error) = watcher.replace_paths(watched_paths_for_result(
-                &result,
-                &options.input_file,
-                &file_access_gate,
-            )) {
+            let new_watched_paths =
+                watched_paths_for_result(&result, &options.input_file, &file_access_gate);
+            if !same_path_set(&tracked_paths, &new_watched_paths) {
+                emit_watch_status(&format!(
+                    "watched dependencies updated (tracking {} file{})",
+                    new_watched_paths.len(),
+                    if new_watched_paths.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+                if command.verbose {
+                    emit_watched_paths(&new_watched_paths);
+                }
+                tracked_paths = new_watched_paths.clone();
+            }
+            if let Err(error) = watcher.replace_paths(new_watched_paths) {
                 emit_diagnostic(&watcher_io_diagnostic(
                     &error,
                     "failed to refresh watched files",
@@ -95,6 +117,16 @@ pub fn run_watch(command: &CompileCommand) -> i32 {
                 return 2;
             }
         }
+    }
+}
+
+fn emit_watch_status(message: &str) {
+    eprintln!("{message}");
+}
+
+fn emit_watched_paths(paths: &[PathBuf]) {
+    for path in paths {
+        eprintln!("watched: {}", path.display());
     }
 }
 
@@ -261,6 +293,16 @@ fn normalize_candidate(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn same_path_set(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let left_set: BTreeSet<&PathBuf> = left.iter().collect();
+    let right_set: BTreeSet<&PathBuf> = right.iter().collect();
+    left_set == right_set
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -300,7 +342,9 @@ mod tests {
         let diagnostic = watcher_io_diagnostic(&error, "failed to refresh watched files");
 
         assert_eq!(diagnostic.severity, Severity::Error);
-        assert!(diagnostic.message.contains("failed to refresh watched files"));
+        assert!(diagnostic
+            .message
+            .contains("failed to refresh watched files"));
         assert!(diagnostic.message.contains("denied by policy"));
         assert!(diagnostic.suggestion.is_none());
     }

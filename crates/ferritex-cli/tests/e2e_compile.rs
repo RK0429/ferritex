@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -69,6 +70,43 @@ fn build_minimal_cmr10_tfm() -> Vec<u8> {
     bytes.extend_from_slice(&0_i32.to_be_bytes());
 
     bytes
+}
+
+fn spawn_streaming_collector<R>(reader: R) -> (Arc<Mutex<String>>, thread::JoinHandle<()>)
+where
+    R: Read + Send + 'static,
+{
+    let buffer = Arc::new(Mutex::new(String::new()));
+    let buffer_clone = Arc::clone(&buffer);
+    let handle = thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .expect("read streaming child output");
+            if read == 0 {
+                break;
+            }
+            buffer_clone
+                .lock()
+                .expect("lock streaming buffer")
+                .push_str(&line);
+        }
+    });
+    (buffer, handle)
+}
+
+fn buffer_contains(buffer: &Arc<Mutex<String>>, needle: &str) -> bool {
+    buffer
+        .lock()
+        .expect("lock streaming buffer")
+        .contains(needle)
+}
+
+fn buffer_snapshot(buffer: &Arc<Mutex<String>>) -> String {
+    buffer.lock().expect("lock streaming buffer").clone()
 }
 
 #[test]
@@ -2291,6 +2329,51 @@ fn watch_writes_initial_pdf_and_recompiles_on_change() {
 }
 
 #[test]
+fn watch_prints_startup_banner_and_tracked_count_by_default() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["watch", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex watch");
+    let (stderr_buf, stderr_handle) =
+        spawn_streaming_collector(child.stderr.take().expect("captured stderr"));
+
+    wait_until(
+        || buffer_contains(&stderr_buf, &format!("watching {}", tex_file.display())),
+        Duration::from_secs(2),
+        "watch should print startup banner",
+    );
+    wait_until(
+        || buffer_contains(&stderr_buf, "press Ctrl+C to stop"),
+        Duration::from_secs(2),
+        "watch should print Ctrl+C hint",
+    );
+    wait_until(
+        || buffer_contains(&stderr_buf, "tracking 1 file"),
+        Duration::from_secs(2),
+        "watch should print tracked file count",
+    );
+    assert!(
+        !buffer_contains(&stderr_buf, "watched: "),
+        "non-verbose watch should not print watched paths: {}",
+        buffer_snapshot(&stderr_buf),
+    );
+
+    child.kill().expect("kill watch process");
+    child.wait().expect("wait for watch process");
+    stderr_handle.join().expect("join stderr collector");
+}
+
+#[test]
 fn watch_refreshes_dependency_set_after_new_input_is_added() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -2358,6 +2441,79 @@ fn watch_refreshes_dependency_set_after_new_input_is_added() {
 
     child.kill().expect("kill watch process");
     child.wait().expect("wait for watch process");
+}
+
+#[test]
+fn watch_verbose_prints_watched_dependency_paths() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("main.tex");
+    let appendix = dir.path().join("appendix.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nInitial\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let main_canonical = tex_file.canonicalize().expect("canonical main");
+    let mut child = ferritex_bin()
+        .args(["watch", "-v", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex watch");
+    let (stderr_buf, stderr_handle) =
+        spawn_streaming_collector(child.stderr.take().expect("captured stderr"));
+
+    wait_until(
+        || {
+            buffer_contains(
+                &stderr_buf,
+                &format!("watched: {}", main_canonical.display()),
+            )
+        },
+        Duration::from_secs(2),
+        "verbose watch should print the initial watched path",
+    );
+
+    let pdf_file = dir.path().join("main.pdf");
+    wait_until(
+        || pdf_file.exists(),
+        Duration::from_secs(2),
+        "watch should emit the initial PDF",
+    );
+
+    std::fs::write(&appendix, "Appendix v1\n").expect("write appendix");
+    let appendix_canonical = appendix.canonicalize().expect("canonical appendix");
+    let appendix_canonical_display = appendix_canonical.display().to_string();
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\input{appendix}\n\\end{document}\n",
+    )
+    .expect("rewrite main");
+
+    wait_until(
+        || {
+            buffer_contains(
+                &stderr_buf,
+                "watched dependencies updated (tracking 2 files)",
+            )
+        },
+        Duration::from_secs(2),
+        "watch should report watched dependency updates",
+    );
+    wait_until(
+        || {
+            let snapshot = buffer_snapshot(&stderr_buf);
+            snapshot.matches("watched: ").count() >= 3
+                && snapshot.contains(&appendix_canonical_display)
+        },
+        Duration::from_secs(2),
+        "verbose watch should print the updated watched paths",
+    );
+
+    child.kill().expect("kill watch process");
+    child.wait().expect("wait for watch process");
+    stderr_handle.join().expect("join stderr collector");
 }
 
 #[test]
