@@ -32,7 +32,7 @@ pub struct PdfDocument {
     pub bytes: Vec<u8>,
     pub page_count: usize,
     pub total_lines: usize,
-    pub warnings: Vec<String>,
+    pub encoding_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,7 +274,7 @@ impl PdfRenderer {
         let math_font_number = math_font_f_number(&rendering_fonts);
         let RenderedPagePayloads {
             page_payloads,
-            warnings,
+            encoding_errors,
         } = render_page_payloads(
             &document.pages,
             &self.page_images,
@@ -534,7 +534,7 @@ impl PdfRenderer {
                 bytes: pdf,
                 page_count,
                 total_lines,
-                warnings,
+                encoding_errors,
             },
             page_payloads,
         }
@@ -583,7 +583,7 @@ struct RenderedPagePayload {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RenderedPagePayloads {
     page_payloads: Vec<PageRenderPayload>,
-    warnings: Vec<String>,
+    encoding_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1046,20 +1046,20 @@ fn render_page_payloads(
             .collect::<Vec<_>>()
     };
 
-    let mut warning_chars = BTreeSet::new();
+    let mut encoding_error_chars = BTreeSet::new();
     let page_payloads = rendered_payloads
         .into_iter()
         .map(|payload| {
-            warning_chars.extend(payload.unencodable_chars);
+            encoding_error_chars.extend(payload.unencodable_chars);
             payload.page_payload
         })
         .collect();
 
     RenderedPagePayloads {
         page_payloads,
-        warnings: warning_chars
+        encoding_errors: encoding_error_chars
             .into_iter()
-            .map(pdf_encoding_warning)
+            .map(pdf_encoding_error)
             .collect(),
     }
 }
@@ -2733,7 +2733,7 @@ struct PdfTextRun {
 
 /// Splits `value` into PDF text runs, routing WinAnsi-representable code points
 /// through the primary font and Greek/math code points through the Symbol font.
-/// Thin space (U+2009) is folded to regular space to avoid spurious warnings
+/// Thin space (U+2009) is folded to regular space to avoid spurious errors
 /// from a codepoint the Symbol font does not cover.
 fn split_into_font_runs(value: &str) -> Vec<PdfTextRun> {
     let mut runs: Vec<PdfTextRun> = Vec::new();
@@ -2793,10 +2793,10 @@ fn split_into_font_runs(value: &str) -> Vec<PdfTextRun> {
 
 /// Collects all characters that remain unrepresentable even after the Symbol
 /// font fallback. These are the only characters that produce user-visible
-/// encoding warnings.
-fn collect_unencodable_chars(value: &str, warning_chars: &mut BTreeSet<char>) {
+/// encoding errors.
+fn collect_unencodable_chars(value: &str, encoding_error_chars: &mut BTreeSet<char>) {
     for run in split_into_font_runs(value) {
-        warning_chars.extend(run.unencodable_chars);
+        encoding_error_chars.extend(run.unencodable_chars);
     }
 }
 
@@ -2846,9 +2846,9 @@ fn emit_text_with_font_runs(
     }
 }
 
-fn pdf_encoding_warning(ch: char) -> String {
+fn pdf_encoding_error(ch: char) -> String {
     format!(
-        "PDF encoding: character '{}' (U+{:04X}) cannot be represented in WinAnsiEncoding and was replaced with '?'",
+        "PDF encoding: character '{}' (U+{:04X}) is not supported by the current font stack (WinAnsi + Symbol) and was replaced with '?'. Ferritex does not yet support non-Latin Unicode code points (e.g. CJK) outside this set.",
         ch,
         u32::from(ch)
     )
@@ -3961,17 +3961,16 @@ mod tests {
     }
 
     #[test]
-    fn render_unencodable_chars_produces_warnings() {
+    fn render_unencodable_chars_produces_errors() {
         // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
-        // triggers the encoding warning.
+        // triggers an explicit encoding error.
         let pdf = PdfRenderer::default().render(&single_page(&["漢 漢"]));
 
-        assert_eq!(
-            pdf.warnings,
-            vec![String::from(
-                "PDF encoding: character '漢' (U+6F22) cannot be represented in WinAnsiEncoding and was replaced with '?'"
-            )]
-        );
+        assert_eq!(pdf.encoding_errors.len(), 1);
+        let error = &pdf.encoding_errors[0];
+        assert!(error.contains("is not supported"), "{error}");
+        assert!(error.contains('漢'), "{error}");
+        assert!(error.contains("U+6F22"), "{error}");
     }
 
     #[test]
@@ -3984,9 +3983,9 @@ mod tests {
 
         // No warning should be emitted for any of these math-mode glyphs.
         assert!(
-            pdf.warnings.is_empty(),
-            "expected no PDF encoding warnings, got: {:?}",
-            pdf.warnings,
+            pdf.encoding_errors.is_empty(),
+            "expected no PDF encoding errors, got: {:?}",
+            pdf.encoding_errors,
         );
 
         // A dedicated Symbol font must be declared and referenced as /F2.

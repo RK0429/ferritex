@@ -300,14 +300,14 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 
 #[test]
 fn compile_with_warnings_prints_summary_including_warning_count() {
-    // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
-    // triggers the encoding warning. (Greek/math glyphs like 'δ' are now
-    // routed through the Symbol font rather than the WinAnsi text path.)
+    // Deliberately reuses the unimplemented-package warning fixture covered by
+    // `compile_with_unimplemented_package_emits_warning_and_still_produces_pdf`
+    // to exercise the CLI warning-summary format on the same warning path.
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("warn.tex");
     std::fs::write(
         &tex_file,
-        "\\documentclass{article}\n\\begin{document}\nHello 漢\n\\end{document}\n",
+        "\\documentclass{article}\n\\usepackage{definitelyunknownpkg}\n\\begin{document}\nHello.\n\\end{document}\n",
     )
     .expect("write input file");
 
@@ -331,6 +331,88 @@ fn compile_with_warnings_prints_summary_including_warning_count() {
         stdout.contains("warning"),
         "summary should mention warnings"
     );
+}
+
+#[test]
+fn compile_with_unsupported_cjk_character_emits_error() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("cjk.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello 漢\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2), "unsupported CJK should exit with code 2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains('漢'),
+        "stderr should include the unsupported character, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("is not supported"),
+        "stderr should include the unsupported-code-point message, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("U+6F22"),
+        "stderr should include the code point, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("->"),
+        "error path should not print a success summary, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("warning"),
+        "summary should not report warnings for an error path, got: {stdout}"
+    );
+    assert!(
+        !dir.path().join("cjk.pdf").exists(),
+        "unsupported CJK should not leave a PDF artifact behind"
+    );
+}
+
+#[test]
+fn compile_with_unimplemented_package_emits_warning_and_still_produces_pdf() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("unimpl.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{definitelyunknownpkg}\n\\begin{document}\nHello.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unimplemented-package warnings should exit 1 (non-fatal)"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("package `definitelyunknownpkg` is not implemented"),
+        "stderr should contain the unimplemented-package warning, got: {stderr}"
+    );
+    assert!(stderr.contains("warning"), "warning severity should be mentioned");
+    assert!(
+        stdout.contains("unimpl.pdf"),
+        "pdf output should still be produced"
+    );
+
+    let pdf_file = dir.path().join("unimpl.pdf");
+    let pdf = std::fs::read_to_string(&pdf_file).expect("read output pdf");
+    assert!(pdf.starts_with("%PDF-1.4"));
+    assert!(pdf.contains("Hello."));
 }
 
 #[test]
