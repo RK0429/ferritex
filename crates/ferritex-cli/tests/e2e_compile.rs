@@ -115,11 +115,14 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 
 #[test]
 fn compile_with_warnings_prints_summary_including_warning_count() {
+    // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
+    // triggers the encoding warning. (Greek/math glyphs like 'δ' are now
+    // routed through the Symbol font rather than the WinAnsi text path.)
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("warn.tex");
     std::fs::write(
         &tex_file,
-        "\\documentclass{article}\n\\begin{document}\nHello δ\n\\end{document}\n",
+        "\\documentclass{article}\n\\begin{document}\nHello 漢\n\\end{document}\n",
     )
     .expect("write input file");
 
