@@ -21,8 +21,8 @@ use crate::synctex::api::SourceLineTrace;
 use super::{
     conditionals::{evaluate_ifnum, tokens_equal, ConditionalState, SkipOutcome},
     package_loading::{
-        load_document_class, load_package, ClassInfo, ClassRegistry, OptionRegistry, PackageInfo,
-        PackageRegistry, StyPackageResolver,
+        is_implemented_package, load_document_class, load_package, ClassInfo, ClassRegistry,
+        OptionRegistry, PackageInfo, PackageRegistry, StyPackageResolver,
     },
     registers::{CompatDimenRegister, CompatIntRegister, RegisterStore, MAX_REGISTER_INDEX},
     CatCode, EnvironmentDef, MacroDef, MacroEngine, Token, TokenKind, Tokenizer,
@@ -85,6 +85,8 @@ const BODY_SMALLCAPS_END: char = '\u{E034}';
 const BODY_UNDERLINE_START: char = '\u{E035}';
 const BODY_UNDERLINE_END: char = '\u{E036}';
 const BODY_LINE_BREAK: char = '\u{E037}';
+pub const BODY_FOOTNOTE_START: char = '\u{E038}';
+pub const BODY_FOOTNOTE_END: char = '\u{E039}';
 const BODY_BOX_PLACEHOLDER_BASE: u32 = 0xE100;
 const EQUATION_ENV_ROW_SEPARATOR: char = '\u{001E}';
 const EQUATION_ENV_FIELD_SEPARATOR: char = '\u{001F}';
@@ -561,50 +563,83 @@ pub enum ParseError {
     #[error("missing \\documentclass declaration")]
     MissingDocumentClass,
     #[error("invalid \\documentclass declaration")]
-    InvalidDocumentClass { line: u32 },
+    InvalidDocumentClass { line: u32, column: Option<u32> },
     #[error("unsupported document class `{class_name}`")]
-    UnsupportedDocumentClass { line: u32, class_name: String },
+    UnsupportedDocumentClass {
+        line: u32,
+        column: Option<u32>,
+        class_name: String,
+    },
     #[error("missing \\begin{{document}}")]
-    MissingBeginDocument { line: u32 },
+    MissingBeginDocument { line: u32, column: Option<u32> },
     #[error("missing \\end{{document}}")]
-    MissingEndDocument { line: u32 },
+    MissingEndDocument { line: u32, column: Option<u32> },
     #[error("unexpected \\end{{document}} before \\begin{{document}}")]
-    UnexpectedEndDocument { line: u32 },
+    UnexpectedEndDocument { line: u32, column: Option<u32> },
     #[error("unexpected content after \\end{{document}}")]
-    TrailingContentAfterEndDocument { line: u32 },
+    TrailingContentAfterEndDocument { line: u32, column: Option<u32> },
     #[error("unexpected closing brace")]
-    UnexpectedClosingBrace { line: u32 },
+    UnexpectedClosingBrace { line: u32, column: Option<u32> },
     #[error("unclosed brace")]
-    UnclosedBrace { line: u32 },
+    UnclosedBrace { line: u32, column: Option<u32> },
     #[error("invalid register index")]
-    InvalidRegisterIndex { line: u32 },
+    InvalidRegisterIndex { line: u32, column: Option<u32> },
     #[error("unclosed conditional")]
-    UnclosedConditional { line: u32 },
+    UnclosedConditional { line: u32, column: Option<u32> },
     #[error("unclosed environment `{name}`")]
-    UnclosedEnvironment { line: u32, name: String },
+    UnclosedEnvironment {
+        line: u32,
+        column: Option<u32>,
+        name: String,
+    },
     #[error("undefined control sequence `\\{name}`")]
-    UndefinedControlSequence { line: u32, name: String },
+    UndefinedControlSequence {
+        line: u32,
+        column: Option<u32>,
+        name: String,
+    },
     #[error("unexpected \\else")]
-    UnexpectedElse { line: u32 },
+    UnexpectedElse { line: u32, column: Option<u32> },
     #[error("unexpected \\fi")]
-    UnexpectedFi { line: u32 },
+    UnexpectedFi { line: u32, column: Option<u32> },
     #[error("division by zero")]
-    DivisionByZero { line: u32 },
+    DivisionByZero { line: u32, column: Option<u32> },
     #[error("macro expansion limit exceeded")]
-    MacroExpansionLimit { line: u32 },
+    MacroExpansionLimit { line: u32, column: Option<u32> },
     #[error("{message}")]
-    TikzDiagnostic { line: u32, message: String },
+    TikzDiagnostic {
+        line: u32,
+        column: Option<u32>,
+        message: String,
+    },
     #[error("\\setmainfont, \\setsansfont, and \\setmonofont require \\usepackage{{fontspec}}")]
-    FontspecNotLoaded { line: u32 },
+    FontspecNotLoaded { line: u32, column: Option<u32> },
     #[error("\\setmainfont, \\setsansfont, and \\setmonofont in document body are not supported; use them in the preamble")]
-    SetmainfontInBody { line: u32 },
+    SetmainfontInBody { line: u32, column: Option<u32> },
     #[error("shell escape is not allowed: \\write18{{{command}}}")]
-    ShellEscapeNotAllowed { line: u32, command: String },
+    ShellEscapeNotAllowed {
+        line: u32,
+        column: Option<u32>,
+        command: String,
+    },
     #[error("{message}")]
-    ShellEscapeError { line: u32, message: String },
+    ShellEscapeError {
+        line: u32,
+        column: Option<u32>,
+        message: String,
+    },
+    #[error(
+        "package `{name}` is not implemented in ferritex; commands from it may not be available"
+    )]
+    UnimplementedPackage {
+        line: u32,
+        column: Option<u32>,
+        name: String,
+    },
     #[error("file access denied: \\{operation} {path}")]
     FileOperationDenied {
         line: u32,
+        column: Option<u32>,
         operation: FileOperationKind,
         path: String,
         reason: String,
@@ -636,28 +671,58 @@ impl ParseError {
     pub const fn line(&self) -> Option<u32> {
         match self {
             Self::EmptyInput | Self::MissingDocumentClass => None,
-            Self::InvalidDocumentClass { line }
+            Self::InvalidDocumentClass { line, .. }
             | Self::UnsupportedDocumentClass { line, .. }
-            | Self::MissingBeginDocument { line }
-            | Self::MissingEndDocument { line }
-            | Self::UnexpectedEndDocument { line }
-            | Self::TrailingContentAfterEndDocument { line }
-            | Self::UnexpectedClosingBrace { line }
-            | Self::UnclosedBrace { line }
-            | Self::InvalidRegisterIndex { line }
-            | Self::UnclosedConditional { line }
+            | Self::MissingBeginDocument { line, .. }
+            | Self::MissingEndDocument { line, .. }
+            | Self::UnexpectedEndDocument { line, .. }
+            | Self::TrailingContentAfterEndDocument { line, .. }
+            | Self::UnexpectedClosingBrace { line, .. }
+            | Self::UnclosedBrace { line, .. }
+            | Self::InvalidRegisterIndex { line, .. }
+            | Self::UnclosedConditional { line, .. }
             | Self::UnclosedEnvironment { line, .. }
             | Self::UndefinedControlSequence { line, .. }
-            | Self::UnexpectedElse { line }
-            | Self::UnexpectedFi { line }
-            | Self::DivisionByZero { line }
-            | Self::MacroExpansionLimit { line }
+            | Self::UnexpectedElse { line, .. }
+            | Self::UnexpectedFi { line, .. }
+            | Self::DivisionByZero { line, .. }
+            | Self::MacroExpansionLimit { line, .. }
             | Self::TikzDiagnostic { line, .. }
-            | Self::FontspecNotLoaded { line }
-            | Self::SetmainfontInBody { line }
+            | Self::FontspecNotLoaded { line, .. }
+            | Self::SetmainfontInBody { line, .. }
             | Self::ShellEscapeNotAllowed { line, .. }
             | Self::ShellEscapeError { line, .. }
+            | Self::UnimplementedPackage { line, .. }
             | Self::FileOperationDenied { line, .. } => Some(*line),
+        }
+    }
+
+    pub const fn column(&self) -> Option<u32> {
+        match self {
+            Self::EmptyInput | Self::MissingDocumentClass => None,
+            Self::InvalidDocumentClass { column, .. }
+            | Self::UnsupportedDocumentClass { column, .. }
+            | Self::MissingBeginDocument { column, .. }
+            | Self::MissingEndDocument { column, .. }
+            | Self::UnexpectedEndDocument { column, .. }
+            | Self::TrailingContentAfterEndDocument { column, .. }
+            | Self::UnexpectedClosingBrace { column, .. }
+            | Self::UnclosedBrace { column, .. }
+            | Self::InvalidRegisterIndex { column, .. }
+            | Self::UnclosedConditional { column, .. }
+            | Self::UnclosedEnvironment { column, .. }
+            | Self::UndefinedControlSequence { column, .. }
+            | Self::UnexpectedElse { column, .. }
+            | Self::UnexpectedFi { column, .. }
+            | Self::DivisionByZero { column, .. }
+            | Self::MacroExpansionLimit { column, .. }
+            | Self::TikzDiagnostic { column, .. }
+            | Self::FontspecNotLoaded { column, .. }
+            | Self::SetmainfontInBody { column, .. }
+            | Self::ShellEscapeNotAllowed { column, .. }
+            | Self::ShellEscapeError { column, .. }
+            | Self::UnimplementedPackage { column, .. }
+            | Self::FileOperationDenied { column, .. } => *column,
         }
     }
 }
@@ -1488,6 +1553,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         {
             self.record_error(ParseError::UndefinedControlSequence {
                 line: token.line,
+                column: Some(token.column),
                 name: name.to_string(),
             });
         }
@@ -1522,20 +1588,21 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         if let Some(line) = self.runtime_group_stack.last().copied() {
-            return Err(ParseError::UnclosedBrace { line });
+            return Err(ParseError::UnclosedBrace { line, column: None });
         }
 
         if let Some(line) = self.semisimple_group_stack.last().copied() {
-            return Err(ParseError::UnclosedBrace { line });
+            return Err(ParseError::UnclosedBrace { line, column: None });
         }
 
         if let Some(line) = self.conditionals.current_open_line() {
-            return Err(ParseError::UnclosedConditional { line });
+            return Err(ParseError::UnclosedConditional { line, column: None });
         }
 
         if let Some(open_environment) = self.environment_stack.last() {
             return Err(ParseError::UnclosedEnvironment {
                 line: open_environment.line,
+                column: None,
                 name: open_environment.name.clone(),
             });
         }
@@ -1543,16 +1610,18 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         if !self.begin_found {
             return Err(ParseError::MissingBeginDocument {
                 line: self.eof_line,
+                column: None,
             });
         }
 
         if let Some(line) = self.first_end_before_begin_line {
-            return Err(ParseError::UnexpectedEndDocument { line });
+            return Err(ParseError::UnexpectedEndDocument { line, column: None });
         }
 
         if !self.end_found {
             return Err(ParseError::MissingEndDocument {
                 line: self.eof_line,
+                column: None,
             });
         }
 
@@ -1605,20 +1674,21 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         if let Some(line) = self.runtime_group_stack.last().copied() {
-            self.record_error(ParseError::UnclosedBrace { line });
+            self.record_error(ParseError::UnclosedBrace { line, column: None });
         }
 
         if let Some(line) = self.semisimple_group_stack.last().copied() {
-            self.record_error(ParseError::UnclosedBrace { line });
+            self.record_error(ParseError::UnclosedBrace { line, column: None });
         }
 
         if let Some(line) = self.conditionals.current_open_line() {
-            self.record_error(ParseError::UnclosedConditional { line });
+            self.record_error(ParseError::UnclosedConditional { line, column: None });
         }
 
         for open_environment in self.environment_stack.clone() {
             self.record_error(ParseError::UnclosedEnvironment {
                 line: open_environment.line,
+                column: None,
                 name: open_environment.name,
             });
         }
@@ -1626,16 +1696,18 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         if !self.begin_found {
             self.record_error(ParseError::MissingBeginDocument {
                 line: self.eof_line,
+                column: None,
             });
         }
 
         if let Some(line) = self.first_end_before_begin_line {
-            self.record_error(ParseError::UnexpectedEndDocument { line });
+            self.record_error(ParseError::UnexpectedEndDocument { line, column: None });
         }
 
         if !self.end_found {
             self.record_error(ParseError::MissingEndDocument {
                 line: self.eof_line,
+                column: None,
             });
         }
 
@@ -1682,15 +1754,15 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         if let Some(line) = self.runtime_group_stack.last().copied() {
-            return Err(ParseError::UnclosedBrace { line });
+            return Err(ParseError::UnclosedBrace { line, column: None });
         }
 
         if let Some(line) = self.semisimple_group_stack.last().copied() {
-            return Err(ParseError::UnclosedBrace { line });
+            return Err(ParseError::UnclosedBrace { line, column: None });
         }
 
         if let Some(line) = self.conditionals.current_open_line() {
-            return Err(ParseError::UnclosedConditional { line });
+            return Err(ParseError::UnclosedConditional { line, column: None });
         }
 
         Ok((self.macro_engine, self.package_registry))
@@ -1784,24 +1856,27 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                                 self.document_class_error =
                                     Some(ParseError::UnsupportedDocumentClass {
                                         line: token.line,
+                                        column: Some(token.column),
                                         class_name: class_name.clone(),
                                     });
                             }
                         }
                         Ok(None) => {
-                            self.document_class_error =
-                                Some(ParseError::InvalidDocumentClass { line: token.line });
+                            self.document_class_error = Some(ParseError::InvalidDocumentClass {
+                                line: token.line,
+                                column: Some(token.column),
+                            });
                         }
-                        Err(ParseError::UnexpectedClosingBrace { line })
-                        | Err(ParseError::UnclosedBrace { line }) => {
-                            return Err(ParseError::InvalidDocumentClass { line });
+                        Err(ParseError::UnexpectedClosingBrace { line, column })
+                        | Err(ParseError::UnclosedBrace { line, column }) => {
+                            return Err(ParseError::InvalidDocumentClass { line, column });
                         }
                         Err(error) => return Err(error),
                     }
                 }
             }
             "usepackage" | "RequirePackage" => {
-                self.parse_package_directive(token.line)?;
+                self.parse_package_directive(token.line, Some(token.column))?;
             }
             "title" => {
                 self.title = self.read_required_braced_tokens()?.map(|tokens| {
@@ -1832,9 +1907,15 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             "makeindex" => {
                 self.state.index_enabled = true;
             }
-            "setmainfont" => self.parse_set_font_command(token.line, FontFamilyRole::Main)?,
-            "setsansfont" => self.parse_set_font_command(token.line, FontFamilyRole::Sans)?,
-            "setmonofont" => self.parse_set_font_command(token.line, FontFamilyRole::Mono)?,
+            "setmainfont" => {
+                self.parse_set_font_command(token.line, Some(token.column), FontFamilyRole::Main)?
+            }
+            "setsansfont" => {
+                self.parse_set_font_command(token.line, Some(token.column), FontFamilyRole::Sans)?
+            }
+            "setmonofont" => {
+                self.parse_set_font_command(token.line, Some(token.column), FontFamilyRole::Mono)?
+            }
             "begin" => {
                 if self.read_environment_name()?.as_deref() == Some("document") {
                     self.begin_found = true;
@@ -1890,7 +1971,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
         match name.as_str() {
             "usepackage" | "RequirePackage" => {
-                self.parse_package_directive(token.line)?;
+                self.parse_package_directive(token.line, Some(token.column))?;
             }
             "NeedsTeXFormat" => {
                 let _ = self.take_global_prefix();
@@ -2264,6 +2345,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                             BODY_UNDERLINE_END,
                         )?;
                     }
+                    "footnote" => {
+                        let _ = self.take_global_prefix();
+                        self.parse_text_style_body_command(BODY_FOOTNOTE_START, BODY_FOOTNOTE_END)?;
+                    }
                     "today" => {
                         let _ = self.take_global_prefix();
                         self.body.push_str(TODAY_PLACEHOLDER);
@@ -2300,7 +2385,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     }
                     "begin" => {
                         let _ = self.take_global_prefix();
-                        self.parse_begin_environment(token.line)?;
+                        self.parse_begin_environment(token.line, Some(token.column))?;
                     }
                     "end" => {
                         let _ = self.take_global_prefix();
@@ -2326,7 +2411,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     }
                     "setmainfont" | "setsansfont" | "setmonofont" => {
                         let _ = self.take_global_prefix();
-                        self.record_error(ParseError::SetmainfontInBody { line: token.line });
+                        self.record_error(ParseError::SetmainfontInBody {
+                            line: token.line,
+                            column: Some(token.column),
+                        });
                         let _ = self.read_required_braced_tokens()?;
                     }
                     _ => {
@@ -2369,6 +2457,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
     fn parse_set_font_command(
         &mut self,
         line: u32,
+        column: Option<u32>,
         role: FontFamilyRole,
     ) -> Result<(), ParseError> {
         let font_tokens = self.read_required_braced_tokens()?;
@@ -2380,7 +2469,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 }
             }
         } else {
-            self.record_error(ParseError::FontspecNotLoaded { line });
+            self.record_error(ParseError::FontspecNotLoaded { line, column });
         }
         Ok(())
     }
@@ -2413,29 +2502,41 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
     }
 
-    fn handle_write18_command(&mut self, line: u32) -> Result<(), ParseError> {
+    fn handle_write18_command(&mut self, line: u32, column: Option<u32>) -> Result<(), ParseError> {
         let command = self
             .read_required_braced_tokens()?
             .map(|tokens| tokens_to_text(&tokens).trim().to_string())
             .unwrap_or_default();
         let Some(handler) = self.shell_escape_handler else {
-            self.record_error(ParseError::ShellEscapeNotAllowed { line, command });
+            self.record_error(ParseError::ShellEscapeNotAllowed {
+                line,
+                column,
+                command,
+            });
             return Ok(());
         };
 
         match handler.execute_write18(&command, line) {
             ShellEscapeResult::Denied => {
-                self.record_error(ParseError::ShellEscapeNotAllowed { line, command });
+                self.record_error(ParseError::ShellEscapeNotAllowed {
+                    line,
+                    column,
+                    command,
+                });
             }
             ShellEscapeResult::Success { .. } => {}
             ShellEscapeResult::Error(message) => {
-                self.record_error(ParseError::ShellEscapeError { line, message });
+                self.record_error(ParseError::ShellEscapeError {
+                    line,
+                    column,
+                    message,
+                });
             }
         }
         Ok(())
     }
 
-    fn try_handle_write18(&mut self, line: u32) -> Result<bool, ParseError> {
+    fn try_handle_write18(&mut self, line: u32, column: Option<u32>) -> Result<bool, ParseError> {
         let Some((mut leading, first)) = self.next_non_space_token_with_leading() else {
             return Ok(false);
         };
@@ -2465,7 +2566,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         if digits == "18" {
-            self.handle_write18_command(line)?;
+            self.handle_write18_command(line, column)?;
             Ok(true)
         } else {
             leading.extend(consumed);
@@ -2477,6 +2578,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
     fn handle_file_operation(
         &mut self,
         line: u32,
+        column: Option<u32>,
         operation: FileOperationKind,
     ) -> Result<(), ParseError> {
         let _ = self.parse_unsigned_integer()?;
@@ -2497,6 +2599,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         if let FileOperationResult::Denied { path, reason } = result {
             self.record_error(ParseError::FileOperationDenied {
                 line,
+                column,
                 operation,
                 path,
                 reason,
@@ -2521,7 +2624,12 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             TokenKind::CharToken {
                 cat: CatCode::EndGroup,
                 ..
-            } => return Err(ParseError::UnexpectedClosingBrace { line: first.line }),
+            } => {
+                return Err(ParseError::UnexpectedClosingBrace {
+                    line: first.line,
+                    column: Some(first.column),
+                });
+            }
             _ => vec![first],
         };
         while let Some(token) = self.next_raw_token() {
@@ -2558,7 +2666,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 let _ = self.take_global_prefix();
                 let _ = self.take_protected_prefix();
                 if self.runtime_group_stack.pop().is_none() {
-                    return Err(ParseError::UnexpectedClosingBrace { line: token.line });
+                    return Err(ParseError::UnexpectedClosingBrace {
+                        line: token.line,
+                        column: Some(token.column),
+                    });
                 }
                 self.macro_engine.pop_group();
                 self.registers.pop_group();
@@ -2719,9 +2830,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 let _ = self.take_global_prefix();
                 if let Some(next) = self.next_significant_token() {
                     match control_sequence_name(&next).as_deref() {
-                        Some("write18") => self.handle_write18_command(next.line)?,
+                        Some("write18") => {
+                            self.handle_write18_command(next.line, Some(next.column))?
+                        }
                         Some("write") => {
-                            if !self.try_handle_write18(next.line)? {
+                            if !self.try_handle_write18(next.line, Some(next.column))? {
                                 self.push_front_token(next);
                             }
                         }
@@ -2732,21 +2845,29 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
             "write18" => {
                 let _ = self.take_global_prefix();
-                self.handle_write18_command(token.line)?;
+                self.handle_write18_command(token.line, Some(token.column))?;
                 Ok(true)
             }
             "write" => {
                 let _ = self.take_global_prefix();
-                self.try_handle_write18(token.line)
+                self.try_handle_write18(token.line, Some(token.column))
             }
             "openin" => {
                 let _ = self.take_global_prefix();
-                self.handle_file_operation(token.line, FileOperationKind::OpenIn)?;
+                self.handle_file_operation(
+                    token.line,
+                    Some(token.column),
+                    FileOperationKind::OpenIn,
+                )?;
                 Ok(true)
             }
             "openout" => {
                 let _ = self.take_global_prefix();
-                self.handle_file_operation(token.line, FileOperationKind::OpenOut)?;
+                self.handle_file_operation(
+                    token.line,
+                    Some(token.column),
+                    FileOperationKind::OpenOut,
+                )?;
                 Ok(true)
             }
             "noexpand" => {
@@ -2771,7 +2892,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             "endgroup" => {
                 let _ = self.take_global_prefix();
                 if self.semisimple_group_stack.pop().is_none() {
-                    return Err(ParseError::UnexpectedClosingBrace { line: token.line });
+                    return Err(ParseError::UnexpectedClosingBrace {
+                        line: token.line,
+                        column: Some(token.column),
+                    });
                 }
                 self.macro_engine.pop_group();
                 self.registers.pop_group();
@@ -3013,7 +3137,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             "else" => {
                 let _ = self.take_global_prefix();
                 if !self.conditionals.process_else() {
-                    return Err(ParseError::UnexpectedElse { line: token.line });
+                    return Err(ParseError::UnexpectedElse {
+                        line: token.line,
+                        column: Some(token.column),
+                    });
                 }
                 if self.conditionals.is_skipping() {
                     self.skip_current_false_branch();
@@ -3038,7 +3165,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             "fi" => {
                 let _ = self.take_global_prefix();
                 if !self.conditionals.process_fi() {
-                    return Err(ParseError::UnexpectedFi { line: token.line });
+                    return Err(ParseError::UnexpectedFi {
+                        line: token.line,
+                        column: Some(token.column),
+                    });
                 }
                 Ok(true)
             }
@@ -3046,7 +3176,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
     }
 
-    fn parse_begin_environment(&mut self, line: u32) -> Result<(), ParseError> {
+    fn parse_begin_environment(
+        &mut self,
+        line: u32,
+        column: Option<u32>,
+    ) -> Result<(), ParseError> {
         let Some(name) = self.read_environment_name()? else {
             self.body.push_str("begin");
             return Ok(());
@@ -3063,7 +3197,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         if is_math_environment(&name) {
-            self.parse_math_environment(&name, line)?;
+            self.parse_math_environment(&name, line, column)?;
             return Ok(());
         }
 
@@ -3128,7 +3262,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
         if name == "tikzpicture" {
             let _ = self.read_optional_bracket_tokens()?;
-            let content = self.read_raw_environment_body(&name, line)?;
+            let content = self.read_raw_environment_body(&name, line, column)?;
             let parse_result = parse_tikzpicture(&content);
             let TikzParseResult { scene, diagnostics } = parse_result;
             for diag in diagnostics {
@@ -3140,7 +3274,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         format!("tikz: {message}")
                     }
                 };
-                self.record_error(ParseError::TikzDiagnostic { line, message });
+                self.record_error(ParseError::TikzDiagnostic {
+                    line,
+                    column,
+                    message,
+                });
             }
             let graphics_box = compile_graphics_scene(scene);
             self.emit_paragraph_break_before_block();
@@ -3820,13 +3958,18 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         Ok(())
     }
 
-    fn parse_math_environment(&mut self, name: &str, line: u32) -> Result<(), ParseError> {
+    fn parse_math_environment(
+        &mut self,
+        name: &str,
+        line: u32,
+        column: Option<u32>,
+    ) -> Result<(), ParseError> {
         if name.starts_with("alignat") {
             let _ = self.read_required_braced_tokens()?;
         }
 
         let content = self
-            .collect_environment_body(name, line)?
+            .collect_environment_body(name, line, column)?
             .replace(r"\begin{split}", "")
             .replace(r"\begin {split}", "")
             .replace(r"\end {split}", "")
@@ -3842,7 +3985,12 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         Ok(())
     }
 
-    fn collect_environment_body(&mut self, name: &str, line: u32) -> Result<String, ParseError> {
+    fn collect_environment_body(
+        &mut self,
+        name: &str,
+        line: u32,
+        column: Option<u32>,
+    ) -> Result<String, ParseError> {
         // NOTE: Tokens are collected raw (without macro expansion) for simplicity.
         // User-defined macros (\newcommand etc.) are not expanded inside math environments.
         // Future waves may introduce expanded token collection here.
@@ -3858,6 +4006,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         ));
                         return Err(ParseError::UnclosedEnvironment {
                             line,
+                            column,
                             name: name.to_string(),
                         });
                     }
@@ -3870,6 +4019,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
         Err(ParseError::UnclosedEnvironment {
             line,
+            column,
             name: name.to_string(),
         })
     }
@@ -4342,9 +4492,9 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
     fn parse_register_index(&mut self, line: u32) -> Result<u16, ParseError> {
         let value = self
             .parse_unsigned_integer()?
-            .ok_or(ParseError::InvalidRegisterIndex { line })?;
+            .ok_or(ParseError::InvalidRegisterIndex { line, column: None })?;
         if value > i32::from(MAX_REGISTER_INDEX) {
-            return Err(ParseError::InvalidRegisterIndex { line });
+            return Err(ParseError::InvalidRegisterIndex { line, column: None });
         }
         Ok(value as u16)
     }
@@ -5053,7 +5203,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 cat: CatCode::EndGroup,
                 ..
             } => {
-                return Err(ParseError::UnexpectedClosingBrace { line: token.line });
+                return Err(ParseError::UnexpectedClosingBrace {
+                    line: token.line,
+                    column: Some(token.column),
+                });
             }
             _ => {
                 self.push_front_token(token);
@@ -5068,7 +5221,18 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         Ok(Some((class_name, options)))
     }
 
-    fn parse_package_directive(&mut self, line: u32) -> Result<(), ParseError> {
+    /// Loads packages requested by `\usepackage` / `\RequirePackage`.
+    ///
+    /// Packages that ferritex does not implement get a non-fatal
+    /// `UnimplementedPackage` warning, emitted once per first load. Warnings
+    /// are suppressed while interpreting a `.sty` source (sty_interpreter_mode)
+    /// so dependency loads inside a recognized package don't surface here;
+    /// user-facing diagnostics come from the top-level `\usepackage` only.
+    fn parse_package_directive(
+        &mut self,
+        line: u32,
+        column: Option<u32>,
+    ) -> Result<(), ParseError> {
         let options = self
             .read_optional_bracket_tokens()?
             .map(|tokens| split_comma_separated_values(&tokens_to_text(&tokens)))
@@ -5082,7 +5246,8 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.current_package_options = options.clone();
                 self.option_registry.clear();
             }
-            let _ = load_package(
+            let implemented = is_implemented_package(&package_name, self.sty_resolver);
+            let newly_loaded = load_package(
                 &package_name,
                 &options,
                 &mut self.package_registry,
@@ -5090,7 +5255,14 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                 self.class_registry.active_class().cloned(),
                 self.sty_resolver,
             )
-            .map_err(|_| ParseError::InvalidDocumentClass { line })?;
+            .map_err(|_| ParseError::InvalidDocumentClass { line, column })?;
+            if newly_loaded && !implemented && !self.sty_interpreter_mode {
+                self.record_error(ParseError::UnimplementedPackage {
+                    line,
+                    column,
+                    name: package_name.clone(),
+                });
+            }
         }
 
         Ok(())
@@ -5928,7 +6100,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
         loop {
             let Some(token) = self.next_raw_token() else {
-                return Err(ParseError::UnclosedBrace { line });
+                return Err(ParseError::UnclosedBrace { line, column: None });
             };
             match token.kind {
                 TokenKind::ControlWord(ref control_word) if control_word == "endcsname" => {
@@ -6139,7 +6311,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
         }
 
-        Err(ParseError::UnclosedBrace { line: open_line })
+        Err(ParseError::UnclosedBrace {
+            line: open_line,
+            column: None,
+        })
     }
 
     fn read_environment_name(&mut self) -> Result<Option<String>, ParseError> {
@@ -6149,7 +6324,12 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             .filter(|name| !name.is_empty()))
     }
 
-    fn read_raw_environment_body(&mut self, name: &str, line: u32) -> Result<String, ParseError> {
+    fn read_raw_environment_body(
+        &mut self,
+        name: &str,
+        line: u32,
+        column: Option<u32>,
+    ) -> Result<String, ParseError> {
         let mut depth = 1usize;
         let mut body_tokens = Vec::new();
 
@@ -6184,6 +6364,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
         Err(ParseError::UnclosedEnvironment {
             line,
+            column,
             name: name.to_string(),
         })
     }
@@ -6200,7 +6381,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             TokenKind::CharToken {
                 cat: CatCode::EndGroup,
                 ..
-            } => Err(ParseError::UnexpectedClosingBrace { line: token.line }),
+            } => Err(ParseError::UnexpectedClosingBrace {
+                line: token.line,
+                column: Some(token.column),
+            }),
             _ => Ok(None),
         }
     }
@@ -6232,7 +6416,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             }
         }
 
-        Err(ParseError::UnclosedBrace { line: open_line })
+        Err(ParseError::UnclosedBrace {
+            line: open_line,
+            column: None,
+        })
     }
 
     fn store_macro_definition(
@@ -6276,7 +6463,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
     fn next_allocated_count(&mut self, line: u32) -> Result<u16, ParseError> {
         if self.alloc_count > u32::from(MAX_REGISTER_INDEX) {
-            return Err(ParseError::InvalidRegisterIndex { line });
+            return Err(ParseError::InvalidRegisterIndex { line, column: None });
         }
 
         let index = self.alloc_count as u16;
@@ -6286,7 +6473,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
 
     fn next_allocated_toks(&mut self, line: u32) -> Result<u16, ParseError> {
         if self.alloc_toks > u32::from(MAX_REGISTER_INDEX) {
-            return Err(ParseError::InvalidRegisterIndex { line });
+            return Err(ParseError::InvalidRegisterIndex { line, column: None });
         }
 
         let index = self.alloc_toks as u16;
@@ -6305,7 +6492,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
             return Ok(None);
         };
 
-        self.record_macro_expansion(token.line)?;
+        self.record_macro_expansion(token.line, Some(token.column))?;
         let args = self.collect_macro_arguments(definition.parameter_count)?;
         Ok(Some(self.macro_engine.expand(&name, &args)))
     }
@@ -6348,7 +6535,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     ..
                 } => {
                     if group_stack.pop().is_none() {
-                        return Err(ParseError::UnexpectedClosingBrace { line: token.line });
+                        return Err(ParseError::UnexpectedClosingBrace {
+                            line: token.line,
+                            column: Some(token.column),
+                        });
                     }
                     first_non_whitespace_line.get_or_insert(token.line);
                 }
@@ -6364,11 +6554,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         if let Some(line) = group_stack.last().copied() {
-            return Err(ParseError::UnclosedBrace { line });
+            return Err(ParseError::UnclosedBrace { line, column: None });
         }
 
         if let Some(line) = first_non_whitespace_line {
-            return Err(ParseError::TrailingContentAfterEndDocument { line });
+            return Err(ParseError::TrailingContentAfterEndDocument { line, column: None });
         }
 
         Ok(())
@@ -6454,7 +6644,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
     }
 
-    fn record_macro_expansion(&mut self, line: u32) -> Result<(), ParseError> {
+    fn record_macro_expansion(&mut self, line: u32, column: Option<u32>) -> Result<(), ParseError> {
         if self.current_token_from_expansion {
             self.consecutive_macro_expansions += 1;
         } else {
@@ -6462,7 +6652,7 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
         }
 
         if self.consecutive_macro_expansions > MAX_CONSECUTIVE_MACRO_EXPANSIONS {
-            return Err(ParseError::MacroExpansionLimit { line });
+            return Err(ParseError::MacroExpansionLimit { line, column });
         }
 
         Ok(())
@@ -6605,7 +6795,7 @@ fn apply_integer_arithmetic(
         }
         ArithmeticOperation::Divide => {
             if operand == 0 {
-                return Err(ParseError::DivisionByZero { line });
+                return Err(ParseError::DivisionByZero { line, column: None });
             }
             Ok(current / operand)
         }
@@ -8796,6 +8986,21 @@ fn encode_body_markers_in_text(text: &str) -> String {
                 encoded.push_str(command);
                 index = command_end;
             }
+            "footnote" => {
+                let brace_start = skip_optional_command_whitespace(text, command_end);
+                if let Some((content, next_index)) = extract_braced_text(text, brace_start) {
+                    let encoded_content = encode_body_markers_in_text(content);
+                    encoded.push(BODY_FOOTNOTE_START);
+                    encoded.push_str(&encoded_content);
+                    encoded.push(BODY_FOOTNOTE_END);
+                    index = next_index;
+                    continue;
+                }
+
+                encoded.push(ch);
+                encoded.push_str(command);
+                index = command_end;
+            }
             "pagebreak" | "newpage" => {
                 encoded.push(BODY_PAGE_BREAK_MARKER);
                 index = command_end;
@@ -9688,8 +9893,8 @@ mod tests {
         replace_body_markers_with_placeholders, CaptionEntry, DocumentLabels, DocumentNode,
         FloatType, FontFamilyRole, IncludeGraphicsOptions, IndexRawEntry, LineTag, MathLine,
         MathNode, MinimalLatexParser, OverUnderKind, PackageInfo, ParseError, ParsedDocument,
-        Parser, ParserDriver, SectionEntry, BODY_MULTICOL_COL_SEP, BODY_MULTICOL_END,
-        BODY_MULTICOL_START, MAX_KERNEL_LOOP_ITERATIONS,
+        Parser, ParserDriver, SectionEntry, BODY_FOOTNOTE_END, BODY_FOOTNOTE_START,
+        BODY_MULTICOL_COL_SEP, BODY_MULTICOL_END, BODY_MULTICOL_START, MAX_KERNEL_LOOP_ITERATIONS,
     };
     use crate::bibliography::api::BibliographyState;
     use crate::compilation::IndexEntry;
@@ -9809,8 +10014,14 @@ mod tests {
         assert_eq!(
             output.errors,
             vec![
-                ParseError::MissingBeginDocument { line: 1 },
-                ParseError::MissingEndDocument { line: 1 },
+                ParseError::MissingBeginDocument {
+                    line: 1,
+                    column: None,
+                },
+                ParseError::MissingEndDocument {
+                    line: 1,
+                    column: None,
+                },
                 ParseError::MissingDocumentClass,
             ]
         );
@@ -9825,7 +10036,10 @@ mod tests {
 
         assert_eq!(
             output.errors,
-            vec![ParseError::UnexpectedClosingBrace { line: 3 }]
+            vec![ParseError::UnexpectedClosingBrace {
+                line: 3,
+                column: Some(2),
+            }]
         );
         assert_eq!(
             output.document,
@@ -9905,9 +10119,10 @@ mod tests {
                 .and_then(|document| document.main_font_name.clone()),
             None
         );
-        assert!(output
-            .errors
-            .contains(&ParseError::FontspecNotLoaded { line: 2 }));
+        assert!(output.errors.contains(&ParseError::FontspecNotLoaded {
+            line: 2,
+            column: Some(1),
+        }));
     }
 
     #[test]
@@ -9923,9 +10138,10 @@ mod tests {
                 .and_then(|document| document.sans_font_name.clone()),
             None
         );
-        assert!(output
-            .errors
-            .contains(&ParseError::FontspecNotLoaded { line: 2 }));
+        assert!(output.errors.contains(&ParseError::FontspecNotLoaded {
+            line: 2,
+            column: Some(1),
+        }));
     }
 
     #[test]
@@ -9941,9 +10157,10 @@ mod tests {
                 .and_then(|document| document.main_font_name.clone()),
             Some("PreambleFont".to_string())
         );
-        assert!(output
-            .errors
-            .contains(&ParseError::SetmainfontInBody { line: 5 }));
+        assert!(output.errors.contains(&ParseError::SetmainfontInBody {
+            line: 5,
+            column: Some(1),
+        }));
     }
 
     #[test]
@@ -9959,9 +10176,10 @@ mod tests {
                 .and_then(|document| document.sans_font_name.clone()),
             Some("PreambleSans".to_string())
         );
-        assert!(output
-            .errors
-            .contains(&ParseError::SetmainfontInBody { line: 5 }));
+        assert!(output.errors.contains(&ParseError::SetmainfontInBody {
+            line: 5,
+            column: Some(1),
+        }));
     }
 
     #[test]
@@ -9984,7 +10202,10 @@ mod tests {
         assert!(output.document.is_none());
         assert_eq!(
             output.errors,
-            vec![ParseError::TrailingContentAfterEndDocument { line: 5 }]
+            vec![ParseError::TrailingContentAfterEndDocument {
+                line: 5,
+                column: None,
+            }]
         );
     }
 
@@ -10583,6 +10804,7 @@ mod tests {
         assert!(output.document.is_some());
         assert!(output.errors.contains(&ParseError::TikzDiagnostic {
             line: 3,
+            column: Some(1),
             message: "tikz: unsupported command `foo`".to_string(),
         }));
     }
@@ -10594,10 +10816,10 @@ mod tests {
         );
 
         assert!(output.document.is_some());
-        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
-            line: 3,
-            command: "echo test".to_string(),
-        }));
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::ShellEscapeNotAllowed { line: 3, command, .. }] if command == "echo test"
+        ));
     }
 
     #[test]
@@ -10605,10 +10827,10 @@ mod tests {
         let output = parse_recovering_with_handlers(r"\immediate\write18{echo test}", None, None);
 
         assert!(output.document.is_some());
-        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
-            line: 3,
-            command: "echo test".to_string(),
-        }));
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::ShellEscapeNotAllowed { line: 3, command, .. }] if command == "echo test"
+        ));
     }
 
     #[test]
@@ -10620,10 +10842,10 @@ mod tests {
         let output = parse_recovering_with_handlers(r"\write18{echo test}", Some(&handler), None);
 
         assert!(output.document.is_some());
-        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
-            line: 3,
-            command: "echo test".to_string(),
-        }));
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::ShellEscapeNotAllowed { line: 3, command, .. }] if command == "echo test"
+        ));
     }
 
     #[test]
@@ -10662,10 +10884,10 @@ mod tests {
         let output = parse_recovering_with_handlers(r"\write 18{echo test}", None, None);
 
         assert!(output.document.is_some());
-        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
-            line: 3,
-            command: "echo test".to_string(),
-        }));
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::ShellEscapeNotAllowed { line: 3, command, .. }] if command == "echo test"
+        ));
     }
 
     #[test]
@@ -10673,10 +10895,10 @@ mod tests {
         let output = parse_recovering_with_handlers(r"\immediate\write 18{echo test}", None, None);
 
         assert!(output.document.is_some());
-        assert!(output.errors.contains(&ParseError::ShellEscapeNotAllowed {
-            line: 3,
-            command: "echo test".to_string(),
-        }));
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::ShellEscapeNotAllowed { line: 3, command, .. }] if command == "echo test"
+        ));
     }
 
     #[test]
@@ -10693,12 +10915,16 @@ mod tests {
             parse_recovering_with_handlers(r"\openin1=/tmp/secret.tex", None, Some(&handler));
 
         assert!(output.document.is_some());
-        assert!(output.errors.contains(&ParseError::FileOperationDenied {
-            line: 3,
-            operation: super::FileOperationKind::OpenIn,
-            path: "/tmp/secret.tex".to_string(),
-            reason: "outside allowed read/write roots".to_string(),
-        }));
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::FileOperationDenied {
+                line: 3,
+                operation: super::FileOperationKind::OpenIn,
+                path,
+                reason,
+                ..
+            }] if path == "/tmp/secret.tex" && reason == "outside allowed read/write roots"
+        ));
     }
 
     #[test]
@@ -10715,12 +10941,16 @@ mod tests {
             parse_recovering_with_handlers(r"\openout1=/tmp/output.tex", None, Some(&handler));
 
         assert!(output.document.is_some());
-        assert!(output.errors.contains(&ParseError::FileOperationDenied {
-            line: 3,
-            operation: super::FileOperationKind::OpenOut,
-            path: "/tmp/output.tex".to_string(),
-            reason: "outside allowed read/write roots".to_string(),
-        }));
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::FileOperationDenied {
+                line: 3,
+                operation: super::FileOperationKind::OpenOut,
+                path,
+                reason,
+                ..
+            }] if path == "/tmp/output.tex" && reason == "outside allowed read/write roots"
+        ));
     }
 
     #[test]
@@ -11195,6 +11425,152 @@ mod tests {
     }
 
     #[test]
+    fn usepackage_emits_warning_for_unimplemented_package_and_continues_compilation() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{amsmath}\n\
+             \\usepackage{definitelyunknownpkg}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        let document = output
+            .document
+            .expect("recoverable parse yields a document");
+        assert!(document.body.contains("Body"));
+        assert!(document
+            .loaded_packages
+            .iter()
+            .any(|package| package.name == "definitelyunknownpkg"));
+
+        let warnings: Vec<_> = output
+            .errors
+            .iter()
+            .filter(|error| matches!(error, ParseError::UnimplementedPackage { .. }))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(matches!(
+            warnings[0],
+            ParseError::UnimplementedPackage {
+                name,
+                line: 3,
+                column: Some(1),
+            } if name == "definitelyunknownpkg"
+        ));
+
+        assert!(!output.errors.iter().any(|error| matches!(
+            error,
+            ParseError::UnimplementedPackage { name, .. } if name == "amsmath"
+        )));
+    }
+
+    #[test]
+    fn usepackage_does_not_duplicate_warning_on_repeated_load() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{unknownpkg}\n\
+             \\usepackage{unknownpkg}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        let warnings: Vec<_> = output
+            .errors
+            .iter()
+            .filter(|error| {
+                matches!(
+                    error,
+                    ParseError::UnimplementedPackage { name, .. } if name == "unknownpkg"
+                )
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn requirepackage_also_emits_warning_for_unimplemented_package() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\RequirePackage{unknownpkg}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert!(matches!(
+            output.errors.as_slice(),
+            [ParseError::UnimplementedPackage {
+                name,
+                line: 2,
+                column: Some(1),
+            }] if name == "unknownpkg"
+        ));
+    }
+
+    #[test]
+    fn usepackage_does_not_warn_for_kernel_integrated_hyperref() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{hyperref}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert!(!output
+            .errors
+            .iter()
+            .any(|error| matches!(error, ParseError::UnimplementedPackage { .. })));
+    }
+
+    #[test]
+    fn usepackage_does_not_warn_for_tikz_and_pgf() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\
+             \\usepackage{tikz}\n\
+             \\usepackage{pgf}\n\
+             \\begin{document}\nBody\n\\end{document}\n",
+        );
+
+        assert!(!output
+            .errors
+            .iter()
+            .any(|error| matches!(error, ParseError::UnimplementedPackage { .. })));
+    }
+
+    #[test]
+    fn usepackage_warning_is_suppressed_inside_sty_interpreter_mode() {
+        use crate::parser::package_loading::{PackageRegistry, StyPackageResolver};
+        use crate::parser::MacroEngine;
+
+        // A .sty that RequirePackages an unknown dependency. Interpreting the
+        // .sty should not surface a top-level UnimplementedPackage warning;
+        // the sty_interpreter_mode guard in parse_package_directive suppresses
+        // diagnostics whose line numbers would point into the .sty source.
+        let resolver_closure = |name: &str| -> Option<String> {
+            match name {
+                "wrappingpkg" => Some(
+                    "\\NeedsTeXFormat{LaTeX2e}\n\
+                         \\ProvidesPackage{wrappingpkg}[2024/01/01]\n\
+                         \\RequirePackage{innerunknownpkg}\n"
+                        .to_string(),
+                ),
+                _ => None,
+            }
+        };
+        let resolver: &StyPackageResolver<'_> = &resolver_closure;
+        let mut registry = PackageRegistry::default();
+        let mut engine = MacroEngine::default();
+
+        crate::parser::package_loading::load_package(
+            "wrappingpkg",
+            &[],
+            &mut registry,
+            &mut engine,
+            None,
+            Some(resolver),
+        )
+        .expect("load wrappingpkg");
+
+        assert!(registry.is_loaded("wrappingpkg"));
+        assert!(registry.is_loaded("innerunknownpkg"));
+    }
+
+    #[test]
     fn usepackage_supports_comma_separated_names_and_requirepackage() {
         let document = MinimalLatexParser
             .parse(
@@ -11250,7 +11626,13 @@ mod tests {
             .parse("\\documentclass{article}\nHello\n")
             .expect_err("parse should fail");
 
-        assert_eq!(error, ParseError::MissingBeginDocument { line: 3 });
+        assert_eq!(
+            error,
+            ParseError::MissingBeginDocument {
+                line: 3,
+                column: None,
+            }
+        );
     }
 
     #[test]
@@ -11259,7 +11641,13 @@ mod tests {
             .parse("\\documentclass{article}\n\\begin{document}\n{text\n\\end{document}\n")
             .expect_err("parse should fail");
 
-        assert_eq!(error, ParseError::UnclosedBrace { line: 3 });
+        assert_eq!(
+            error,
+            ParseError::UnclosedBrace {
+                line: 3,
+                column: None,
+            }
+        );
     }
 
     #[test]
@@ -11279,7 +11667,13 @@ mod tests {
             )
             .expect_err("parse should fail");
 
-        assert_eq!(error, ParseError::UnexpectedEndDocument { line: 2 });
+        assert_eq!(
+            error,
+            ParseError::UnexpectedEndDocument {
+                line: 2,
+                column: None,
+            }
+        );
     }
 
     #[test]
@@ -11292,7 +11686,10 @@ mod tests {
 
         assert_eq!(
             error,
-            ParseError::TrailingContentAfterEndDocument { line: 5 }
+            ParseError::TrailingContentAfterEndDocument {
+                line: 5,
+                column: None,
+            }
         );
     }
 
@@ -11302,7 +11699,13 @@ mod tests {
             .parse("\\documentclass{arti\ncle}\n\\begin{document}\nHello\n\\end{document}\n")
             .expect_err("parse should fail");
 
-        assert_eq!(error, ParseError::InvalidDocumentClass { line: 1 });
+        assert_eq!(
+            error,
+            ParseError::InvalidDocumentClass {
+                line: 1,
+                column: Some(1),
+            }
+        );
     }
 
     #[test]
@@ -11315,6 +11718,7 @@ mod tests {
             error,
             ParseError::UnsupportedDocumentClass {
                 line: 1,
+                column: Some(1),
                 class_name: "revtex4-1".to_string(),
             }
         );
@@ -11330,6 +11734,7 @@ mod tests {
             error,
             ParseError::UnsupportedDocumentClass {
                 line: 1,
+                column: Some(1),
                 class_name: "memoir".to_string(),
             }
         );
@@ -11345,6 +11750,7 @@ mod tests {
             output.errors,
             vec![ParseError::UnsupportedDocumentClass {
                 line: 1,
+                column: Some(1),
                 class_name: "revtex4-1".to_string(),
             }]
         );
@@ -11358,7 +11764,10 @@ mod tests {
 
         assert_eq!(
             output.errors,
-            vec![ParseError::InvalidDocumentClass { line: 1 }]
+            vec![ParseError::InvalidDocumentClass {
+                line: 1,
+                column: Some(1),
+            }]
         );
         assert!(output.document.is_none());
     }
@@ -11373,6 +11782,7 @@ mod tests {
             output.errors,
             vec![ParseError::UnsupportedDocumentClass {
                 line: 1,
+                column: Some(1),
                 class_name: "revtex4-1".to_string(),
             }]
         );
@@ -11385,7 +11795,13 @@ mod tests {
             .parse("\\documentclass{}\n\\begin{document}\nHello\n\\end{document}\n")
             .expect_err("parse should fail");
 
-        assert_eq!(error, ParseError::InvalidDocumentClass { line: 1 });
+        assert_eq!(
+            error,
+            ParseError::InvalidDocumentClass {
+                line: 1,
+                column: Some(1),
+            }
+        );
     }
 
     #[test]
@@ -11561,7 +11977,13 @@ mod tests {
             )
             .expect_err("parse should fail");
 
-        assert_eq!(error, ParseError::MacroExpansionLimit { line: 2 });
+        assert_eq!(
+            error,
+            ParseError::MacroExpansionLimit {
+                line: 2,
+                column: Some(11),
+            }
+        );
     }
 
     #[test]
@@ -11997,7 +12419,13 @@ mod tests {
             .parse("\\documentclass{article}\n\\begin{document}\n\\iftrue open\n\\end{document}\n")
             .expect_err("parse should fail");
 
-        assert_eq!(error, ParseError::UnclosedConditional { line: 3 });
+        assert_eq!(
+            error,
+            ParseError::UnclosedConditional {
+                line: 3,
+                column: None,
+            }
+        );
     }
 
     #[test]
@@ -13045,6 +13473,7 @@ mod tests {
 
         assert!(output.errors.contains(&ParseError::UnclosedEnvironment {
             line: 3,
+            column: None,
             name: "itemize".to_string(),
         }));
         assert!(output.document.is_some());
@@ -13075,8 +13504,25 @@ mod tests {
             .errors
             .contains(&ParseError::UndefinedControlSequence {
                 line: 3,
+                column: Some(1),
                 name: "nonexistentcommand".to_string(),
             }));
+    }
+
+    #[test]
+    fn recovering_reports_undefined_control_sequence_column_in_body() {
+        let output = MinimalLatexParser.parse_recovering(
+            "\\documentclass{article}\n\\begin{document}\nhello \\xyz\n\\end{document}\n",
+        );
+
+        assert!(output.errors.iter().any(|error| matches!(
+            error,
+            ParseError::UndefinedControlSequence {
+                line: 3,
+                column: Some(7),
+                name,
+            } if name == "xyz"
+        )));
     }
 
     #[test]
@@ -13087,8 +13533,89 @@ mod tests {
 
         assert!(output.errors.contains(&ParseError::UnclosedEnvironment {
             line: 3,
+            column: None,
             name: "unclosedenv".to_string(),
         }));
+    }
+
+    #[test]
+    fn letter_class_accepts_opening_and_closing_without_undefined_errors() {
+        let output = MinimalLatexParser.parse_recovering(concat!(
+            "\\documentclass{letter}\n",
+            "\\begin{document}\n",
+            "\\begin{letter}{Recipient\\\\123 Main St.}\n",
+            "\\opening{Dear Recipient,}\n",
+            "Body.\n",
+            "\\closing{Sincerely,}\n",
+            "\\end{letter}\n",
+            "\\end{document}\n",
+        ));
+
+        let undefined = output
+            .errors
+            .iter()
+            .filter_map(|error| match error {
+                ParseError::UndefinedControlSequence { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            undefined.is_empty(),
+            "letter macros should not surface as undefined: {undefined:?}"
+        );
+
+        let body = output
+            .document
+            .as_ref()
+            .expect("letter parses to a document")
+            .body
+            .as_str();
+        assert!(
+            body.contains("Dear Recipient,"),
+            "\\opening argument should pass through to the body: {body:?}",
+        );
+        assert!(
+            body.contains("Sincerely,"),
+            "\\closing argument should pass through to the body: {body:?}",
+        );
+    }
+
+    #[test]
+    fn footnote_in_article_does_not_surface_as_undefined() {
+        let output = MinimalLatexParser.parse_recovering(concat!(
+            "\\documentclass{article}\n",
+            "\\begin{document}\n",
+            "A footnote\\footnote{note body} mark.\n",
+            "\\end{document}\n",
+        ));
+
+        assert!(
+            !output.errors.iter().any(|error| matches!(
+                error,
+                ParseError::UndefinedControlSequence { name, .. } if name == "footnote"
+            )),
+            "\\footnote should resolve to a built-in command: {:?}",
+            output.errors
+        );
+    }
+
+    #[test]
+    fn footnote_in_article_preserves_body_markers() {
+        let document = MinimalLatexParser
+            .parse(concat!(
+                "\\documentclass{article}\n",
+                "\\begin{document}\n",
+                "A footnote\\footnote{note body} mark.\n",
+                "\\end{document}\n",
+            ))
+            .expect("parse document");
+
+        let expected = format!("{BODY_FOOTNOTE_START}note body{BODY_FOOTNOTE_END}");
+        assert!(
+            document.body.contains(&expected),
+            "\\footnote body should survive parser encoding: {:?}",
+            document.body
+        );
     }
 
     #[test]

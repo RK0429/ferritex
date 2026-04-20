@@ -18,7 +18,10 @@ use crate::graphics::api::{
     compile_includegraphics, GraphicAssetResolver, GraphicsBox, GraphicsScene,
 };
 use crate::kernel::api::{DimensionValue, SourceSpan};
-use crate::parser::api::{DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument};
+use crate::parser::api::{
+    DocumentNode, FloatType, FontFamilyRole, IndexRawEntry, ParsedDocument, BODY_FOOTNOTE_END,
+    BODY_FOOTNOTE_START,
+};
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
 const PAGE_WIDTH_PT: i64 = 612;
@@ -595,6 +598,7 @@ impl PaginationMergeCoordinator {
         partition_plan: &DocumentPartitionPlan,
         mut fragments: BTreeMap<String, DocumentLayoutFragment>,
         base_navigation: &NavigationState,
+        preserve_openright: bool,
     ) -> TypesetDocument {
         let mut pages = Vec::new();
         let mut outlines = Vec::new();
@@ -607,6 +611,16 @@ impl PaginationMergeCoordinator {
                 continue;
             };
             let page_count = fragment.pages.len();
+            if preserve_openright && page_count > 0 && page_offset % 2 == 1 {
+                pages.push(TypesetPage {
+                    lines: Vec::new(),
+                    images: Vec::new(),
+                    page_box: fragment.pages[0].page_box.clone(),
+                    float_placements: Vec::new(),
+                    index_entries: Vec::new(),
+                });
+                page_offset += 1;
+            }
 
             pages.append(&mut fragment.pages);
 
@@ -1251,16 +1265,17 @@ fn extract_footnotes_from_node(
 ) -> Option<DocumentNode> {
     match node {
         DocumentNode::Text(content, span) => {
-            if let Some((sanitized, footnote_text)) = split_inline_footnote(&content) {
-                if !footnote_text.is_empty() {
+            let (sanitized, footnote_texts) = split_inline_footnote(&content);
+            if footnote_texts.is_empty() {
+                Some(DocumentNode::Text(content, span))
+            } else {
+                for footnote_text in footnote_texts {
                     footnotes.push(FootnoteEntry {
                         text: footnote_text,
                         source_span: span,
                     });
                 }
                 (!sanitized.is_empty()).then_some(DocumentNode::Text(sanitized, span))
-            } else {
-                Some(DocumentNode::Text(content, span))
             }
         }
         DocumentNode::FontFamily { role, children } => Some(DocumentNode::FontFamily {
@@ -1325,24 +1340,42 @@ fn extract_footnotes_from_children(
         .collect()
 }
 
-fn split_inline_footnote(text: &str) -> Option<(String, String)> {
-    let marker = r"\footnote";
-    let index = text.find(marker)?;
-    let prefix = text[..index].trim_end();
-    let mut suffix = text[index + marker.len()..].trim().to_string();
-    if suffix.is_empty() {
-        return Some((prefix.to_string(), String::new()));
+fn split_inline_footnote(text: &str) -> (String, Vec<String>) {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut footnote_bodies = Vec::new();
+    let mut footnote_index = 0usize;
+    let mut chars = text.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != BODY_FOOTNOTE_START {
+            sanitized.push(ch);
+            continue;
+        }
+
+        let mut footnote_body = String::new();
+        let mut found_end = false;
+        for next in chars.by_ref() {
+            if next == BODY_FOOTNOTE_END {
+                found_end = true;
+                break;
+            }
+            footnote_body.push(next);
+        }
+
+        if found_end {
+            footnote_index += 1;
+            footnote_bodies.push(footnote_body);
+            sanitized.push(FOOTNOTE_MARKER_START);
+            sanitized.push_str(&footnote_index.to_string());
+            sanitized.push(FOOTNOTE_MARKER_END);
+        } else {
+            sanitized.push(BODY_FOOTNOTE_START);
+            sanitized.push_str(&footnote_body);
+            break;
+        }
     }
 
-    let mut paragraph_tail = String::new();
-    if let Some(stripped) = suffix.strip_suffix("..") {
-        suffix = stripped.to_string();
-        paragraph_tail.push('.');
-    }
-
-    let sanitized =
-        format!("{prefix}{FOOTNOTE_MARKER_START}1{FOOTNOTE_MARKER_END}{paragraph_tail}",);
-    Some((sanitized, suffix))
+    (sanitized, footnote_bodies)
 }
 
 pub fn append_footnotes_to_pages(
@@ -2572,7 +2605,7 @@ fn append_nodes_segment_to_vlist(
             number,
             display_title,
         } => {
-            if previous_block.is_some() {
+            if previous_block.is_some() || !vlist.is_empty() {
                 vlist.push(VListItem::Penalty {
                     value: PENALTY_FORCED,
                 });
@@ -4784,9 +4817,9 @@ mod tests {
         GlueComponent, GlueOrder, HBox, HListItem, MinimalTypesetter, PageBox,
         PaginationMergeCoordinator, PlacementSpec, TeXBox, TextLine, TextLineLink,
         TfmWidthProvider, TypesetNamedDestination, TypesetOutline, TypesetPage,
-        TypesetterReusePlan, VBox, VListItem, DEFAULT_BODY_FONT_SIZE_PT, LEFT_MARGIN_PT,
-        LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH, PAGE_HEIGHT_PT, PENALTY_FORBIDDEN,
-        PENALTY_FORCED, TOP_MARGIN_PT,
+        TypesetterReusePlan, VBox, VListItem, DEFAULT_BODY_FONT_SIZE_PT, FOOTNOTE_MARKER_END,
+        FOOTNOTE_MARKER_START, LEFT_MARGIN_PT, LINE_HEIGHT_PT, MAX_LINE_CHARS, MAX_LINE_WIDTH,
+        PAGE_HEIGHT_PT, PENALTY_FORBIDDEN, PENALTY_FORCED, TOP_MARGIN_PT,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::bibliography::api::{parse_bbl, BibliographyState};
@@ -4804,7 +4837,7 @@ mod tests {
     use crate::parser::api::{
         CaptionEntry, DocumentNode, FloatType, IncludeGraphicsOptions, IndexRawEntry, LineTag,
         MathLine, MathNode, MinimalLatexParser, OverUnderKind, ParsedDocument, Parser,
-        SectionEntry,
+        SectionEntry, BODY_FOOTNOTE_END, BODY_FOOTNOTE_START,
     };
     use crate::typesetting::{
         hyphenation::TexPatternHyphenator, knuth_plass::BreakParams, line_breaker,
@@ -7050,6 +7083,62 @@ mod tests {
     }
 
     #[test]
+    fn extract_footnotes_from_nodes_rewrites_inline_markers_and_collects_body() {
+        let (sanitized, footnotes) = super::extract_footnotes_from_nodes(vec![DocumentNode::Text(
+            format!("A footnote{BODY_FOOTNOTE_START}note body{BODY_FOOTNOTE_END} mark."),
+            None,
+        )]);
+
+        assert_eq!(
+            sanitized,
+            vec![DocumentNode::Text(
+                format!("A footnote{FOOTNOTE_MARKER_START}1{FOOTNOTE_MARKER_END} mark."),
+                None,
+            )]
+        );
+        assert_eq!(
+            footnotes,
+            vec![FootnoteEntry {
+                text: "note body".to_string(),
+                source_span: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_from_nodes_collects_multiple_footnotes_from_one_text_node() {
+        let (sanitized, footnotes) = super::extract_footnotes_from_nodes(vec![DocumentNode::Text(
+            format!(
+                "A{BODY_FOOTNOTE_START}first{BODY_FOOTNOTE_END} B{BODY_FOOTNOTE_START}second{BODY_FOOTNOTE_END} C",
+            ),
+            None,
+        )]);
+
+        assert_eq!(
+            sanitized,
+            vec![DocumentNode::Text(
+                format!(
+                    "A{FOOTNOTE_MARKER_START}1{FOOTNOTE_MARKER_END} B{FOOTNOTE_MARKER_START}2{FOOTNOTE_MARKER_END} C",
+                ),
+                None,
+            )]
+        );
+        assert_eq!(
+            footnotes,
+            vec![
+                FootnoteEntry {
+                    text: "first".to_string(),
+                    source_span: None,
+                },
+                FootnoteEntry {
+                    text: "second".to_string(),
+                    source_span: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn append_footnotes_to_pages_starting_at_offsets_positions_from_initial_index() {
         let mut pages = vec![TypesetPage {
             lines: Vec::new(),
@@ -8039,6 +8128,52 @@ mod tests {
         assert_eq!(merged.author.as_deref(), Some("Ferritex"));
         assert_eq!(merged.navigation.outline_entries.len(), 2);
         assert!(merged.navigation.named_destinations.contains_key("results"));
+    }
+
+    #[test]
+    fn merge_owned_inserts_openright_blank_page_between_book_chapters() {
+        let plan = partition_plan();
+        let fragments = BTreeMap::from([
+            (
+                "chapter:0001:intro".to_string(),
+                fragment(
+                    "chapter:0001:intro",
+                    1,
+                    BTreeMap::from([("intro".to_string(), 0)]),
+                ),
+            ),
+            (
+                "chapter:0002:results".to_string(),
+                fragment(
+                    "chapter:0002:results",
+                    1,
+                    BTreeMap::from([("results".to_string(), 0)]),
+                ),
+            ),
+        ]);
+        let base_navigation = NavigationState::default();
+
+        let merged =
+            PaginationMergeCoordinator.merge_owned(&plan, fragments, &base_navigation, true);
+
+        assert_eq!(merged.pages.len(), 3);
+        assert_eq!(
+            visible_line_texts(&merged.pages[0]),
+            vec!["chapter:0001:intro-page-0"]
+        );
+        assert!(visible_line_texts(&merged.pages[1]).is_empty());
+        assert_eq!(
+            visible_line_texts(&merged.pages[2]),
+            vec!["chapter:0002:results-page-0"]
+        );
+        assert_eq!(
+            merged
+                .named_destinations
+                .iter()
+                .map(|destination| (destination.name.as_str(), destination.page_index))
+                .collect::<Vec<_>>(),
+            vec![("intro", 0), ("results", 2)]
+        );
     }
 
     #[test]

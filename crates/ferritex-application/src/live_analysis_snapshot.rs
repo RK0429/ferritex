@@ -205,9 +205,11 @@ impl LiveAnalysisSnapshotFactory {
         buffer: &OpenDocumentBuffer,
         compile_state: Option<&StableCompileState>,
     ) -> LiveAnalysisSnapshot {
-        let mut labels = compile_state_symbol_locations(compile_state, |state| &state.labels);
+        let mut labels =
+            compile_state_symbol_locations(compile_state, "label", |state| &state.labels);
         labels.extend(collect_symbol_locations(&buffer.uri, &buffer.text, "label"));
-        let mut citations = compile_state_symbol_locations(compile_state, |state| &state.citations);
+        let mut citations =
+            compile_state_symbol_locations(compile_state, "bibitem", |state| &state.citations);
         citations.extend(collect_symbol_locations(
             &buffer.uri,
             &buffer.text,
@@ -231,6 +233,7 @@ impl LiveAnalysisSnapshotFactory {
             .filter(|diagnostic| !buffer_messages.contains(diagnostic.message.as_str()))
             .collect();
         diagnostics.extend(buffer_diagnostics);
+        deduplicate_diagnostics(&mut diagnostics);
         let code_actions = collect_code_actions(&buffer.text);
 
         LiveAnalysisSnapshot {
@@ -291,24 +294,23 @@ fn compile_diagnostic_to_analysis(text: &str, diagnostic: &Diagnostic) -> Analys
 }
 
 fn collect_code_actions(text: &str) -> Vec<CodeActionSuggestion> {
-    unclosed_environments(text)
-        .into_iter()
-        .map(|(environment, _)| {
-            let end_position = end_of_document(text);
-            CodeActionSuggestion {
-                title: format!("Insert \\end{{{environment}}}"),
-                edit: TextEdit {
-                    range: TextRange::new(
-                        end_position.line,
-                        end_position.character,
-                        end_position.line,
-                        end_position.character,
-                    ),
-                    new_text: format!("\n\\end{{{environment}}}\n"),
-                },
-            }
-        })
-        .collect()
+    let analysis = analyze_environments(text);
+    let Some((environment, _)) = analysis.unclosed.last() else {
+        return Vec::new();
+    };
+    let end_position = end_of_document(text);
+    vec![CodeActionSuggestion {
+        title: format!("Insert \\end{{{environment}}}"),
+        edit: TextEdit {
+            range: TextRange::new(
+                end_position.line,
+                end_position.character,
+                end_position.line,
+                end_position.character,
+            ),
+            new_text: format!("\n\\end{{{environment}}}\n"),
+        },
+    }]
 }
 
 fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnostic {
@@ -362,8 +364,65 @@ fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnosti
 }
 
 fn environment_diagnostics(text: &str) -> Vec<AnalysisDiagnostic> {
-    let mut diagnostics = Vec::new();
+    let analysis = analyze_environments(text);
+    let mut diagnostics = Vec::with_capacity(analysis.unexpected_ends.len() + 1);
+
+    for unexpected in &analysis.unexpected_ends {
+        diagnostics.push(AnalysisDiagnostic {
+            range: unexpected.range,
+            severity: Severity::Error,
+            message: format!("unexpected \\end{{{}}}", unexpected.environment),
+            context: context_snippet(text, unexpected.line),
+            suggestion: Some(format!(
+                "remove \\end{{{}}} or add the matching \\begin",
+                unexpected.environment
+            )),
+        });
+    }
+
+    if let Some((environment, range)) = analysis.unclosed.last() {
+        diagnostics.push(AnalysisDiagnostic {
+            range: *range,
+            severity: Severity::Error,
+            message: format!("unclosed environment `{environment}`"),
+            context: context_snippet(text, range.start.line),
+            suggestion: Some(format!(
+                "insert \\end{{{environment}}} before the document ends"
+            )),
+        });
+    }
+
+    diagnostics
+}
+
+#[derive(Debug, Default)]
+struct EnvironmentAnalysis {
+    unexpected_ends: Vec<UnexpectedEnd>,
+    /// Environments that were opened but never matched by a `\end{...}`, either
+    /// because an outer `\end{...}` implicitly closed them or because they
+    /// remained open at end-of-file. Ordered by opening position; the last
+    /// entry is the inner-most (deepest) offender.
+    unclosed: Vec<(String, TextRange)>,
+}
+
+#[derive(Debug)]
+struct UnexpectedEnd {
+    environment: String,
+    range: TextRange,
+    line: u32,
+}
+
+/// Scan begin/end environment events and identify unclosed environments.
+///
+/// When `\end{X}` appears but `X` is not on top of the stack, we treat the
+/// closing as implicitly closing every inner environment up to the matching
+/// `\begin{X}`. This avoids cascading "unexpected \end" + "unclosed outer"
+/// diagnostics when the real root cause is a single missing `\end` for the
+/// inner-most environment.
+fn analyze_environments(text: &str) -> EnvironmentAnalysis {
     let mut stack = Vec::<(String, TextRange)>::new();
+    let mut unexpected_ends = Vec::<UnexpectedEnd>::new();
+    let mut implicit_unclosed = Vec::<(String, TextRange)>::new();
 
     for (line_index, line_text) in text.lines().enumerate() {
         let visible = strip_line_comment(line_text);
@@ -398,93 +457,40 @@ fn environment_diagnostics(text: &str) -> Vec<AnalysisDiagnostic> {
 
             if is_begin {
                 stack.push((environment, range));
-                continue;
-            }
-
-            match stack.last() {
-                Some((open_environment, _)) if open_environment == &environment => {
-                    stack.pop();
-                }
-                Some((open_environment, _)) => diagnostics.push(AnalysisDiagnostic {
+            } else if let Some(match_index) =
+                stack.iter().rposition(|(name, _)| name == &environment)
+            {
+                implicit_unclosed.extend(stack.drain(match_index + 1..));
+                stack.pop();
+            } else {
+                unexpected_ends.push(UnexpectedEnd {
+                    environment,
                     range,
-                    severity: Severity::Error,
-                    message: format!(
-                        "unexpected \\end{{{environment}}} while \\begin{{{open_environment}}} is still open"
-                    ),
-                    context: context_snippet(text, line_index as u32),
-                    suggestion: Some(format!(
-                        "close \\begin{{{open_environment}}} before ending {environment}"
-                    )),
-                }),
-                None => diagnostics.push(AnalysisDiagnostic {
-                    range,
-                    severity: Severity::Error,
-                    message: format!("unexpected \\end{{{environment}}}"),
-                    context: context_snippet(text, line_index as u32),
-                    suggestion: Some(format!("remove \\end{{{environment}}} or add the matching \\begin")),
-                }),
+                    line: line_index as u32,
+                });
             }
         }
     }
 
-    diagnostics.extend(
-        unclosed_environments(text)
-            .into_iter()
-            .map(|(environment, range)| AnalysisDiagnostic {
-                range,
-                severity: Severity::Error,
-                message: format!("unclosed environment `{environment}`"),
-                context: context_snippet(text, range.start.line),
-                suggestion: Some(format!(
-                    "insert \\end{{{environment}}} before the document ends"
-                )),
-            }),
-    );
+    let mut unclosed = implicit_unclosed;
+    unclosed.extend(stack);
+    unclosed.sort_by_key(|(_, range)| (range.start.line, range.start.character));
 
-    diagnostics
+    EnvironmentAnalysis {
+        unexpected_ends,
+        unclosed,
+    }
 }
 
-fn unclosed_environments(text: &str) -> Vec<(String, TextRange)> {
-    let mut stack = Vec::<(String, TextRange)>::new();
-
-    for (line_index, line_text) in text.lines().enumerate() {
-        let visible = strip_line_comment(line_text);
-        let mut events = Vec::<(usize, bool, String)>::new();
-        events.extend(
-            find_braced_commands(&visible, "begin")
-                .into_iter()
-                .map(|(start, name)| (start, true, name)),
-        );
-        events.extend(
-            find_braced_commands(&visible, "end")
-                .into_iter()
-                .map(|(start, name)| (start, false, name)),
-        );
-        events.sort_by_key(|(start, _, _)| *start);
-
-        for (start, is_begin, environment) in events {
-            if is_begin {
-                let start_character = byte_to_char_index(&visible, start) as u32;
-                let end_character =
-                    byte_to_char_index(&visible, start + format!("\\begin{{{environment}}}").len())
-                        as u32;
-                stack.push((
-                    environment,
-                    TextRange::new(
-                        line_index as u32,
-                        start_character,
-                        line_index as u32,
-                        end_character,
-                    ),
-                ));
-            } else if matches!(stack.last(), Some((open_environment, _)) if open_environment == &environment)
-            {
-                stack.pop();
-            }
-        }
-    }
-
-    stack
+fn deduplicate_diagnostics(diagnostics: &mut Vec<AnalysisDiagnostic>) {
+    // Keyed by (line, message) rather than also including character, so that
+    // compile-state diagnostics (which report a whole-line range starting at
+    // column 0) still dedup against buffer-side diagnostics that point at the
+    // exact `\begin{...}` column.
+    let mut seen = BTreeSet::new();
+    diagnostics.retain(|diagnostic| {
+        seen.insert((diagnostic.range.start.line, diagnostic.message.clone()))
+    });
 }
 
 fn collect_symbol_locations(
@@ -515,6 +521,7 @@ fn collect_symbol_locations(
 
 fn compile_state_symbol_locations(
     compile_state: Option<&StableCompileState>,
+    command: &str,
     select: impl Fn(&DocumentState) -> &BTreeMap<String, SymbolLocation>,
 ) -> BTreeMap<String, DefinitionLocation> {
     compile_state
@@ -522,15 +529,18 @@ fn compile_state_symbol_locations(
             select(&state.document_state)
                 .iter()
                 .map(|(name, location)| {
+                    let start_line = location.line.saturating_sub(1);
+                    let end_character =
+                        location.column + format!("\\{command}{{{name}}}").chars().count() as u32;
                     (
                         name.clone(),
                         DefinitionLocation {
                             uri: path_to_file_uri(&location.file),
                             range: TextRange::new(
-                                location.line.saturating_sub(1),
+                                start_line,
                                 location.column,
-                                location.line.saturating_sub(1),
-                                location.column,
+                                start_line,
+                                end_character,
                             ),
                         },
                     )
@@ -917,6 +927,150 @@ mod tests {
     }
 
     #[test]
+    fn collapses_cascading_unclosed_diagnostics_to_innermost_offender() {
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(
+            &buffer(
+            "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n\\end{document}\n",
+            ),
+            None,
+        );
+
+        let diagnostics = snapshot.diagnostics();
+
+        let unclosed_messages = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with("unclosed environment"))
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unclosed_messages,
+            vec!["unclosed environment `equation`"],
+            "only the inner-most unclosed environment should be reported"
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unexpected \\end{document}")),
+            "outer \\end{{document}} should not be flagged as unexpected when the root cause is a missing \\end for an inner environment",
+        );
+
+        let code_action_titles = snapshot
+            .code_actions()
+            .iter()
+            .map(|action| action.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            code_action_titles,
+            vec!["Insert \\end{equation}"],
+            "only one quickfix should be offered for the inner-most offender",
+        );
+    }
+
+    #[test]
+    fn collapses_unclosed_diagnostics_with_failed_compile_state() {
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(
+            &buffer(
+            "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n\\end{document}\n",
+            ),
+            Some(&compile_state(
+                false,
+                vec![
+                    Diagnostic::new(Severity::Error, "unclosed environment `equation`")
+                        .with_line(3),
+                ],
+                DocumentState::default(),
+            )),
+        );
+
+        let unclosed_messages = snapshot
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with("unclosed environment"))
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unclosed_messages,
+            vec!["unclosed environment `equation`"],
+            "duplicate unclosed diagnostics from compile + buffer analysis should be deduplicated",
+        );
+    }
+
+    #[test]
+    fn dedup_survives_mismatched_columns_between_compile_and_buffer() {
+        // The `\begin{equation}` is indented, so the buffer-side diagnostic
+        // starts at character 2 whereas compile-state diagnostics span the
+        // whole line (character 0). Dedup must still collapse them.
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(
+            &buffer(
+            "\\documentclass{article}\n\\begin{document}\n  \\begin{equation}\na=b\n\\end{document}\n",
+            ),
+            Some(&compile_state(
+                false,
+                vec![
+                    Diagnostic::new(Severity::Error, "unclosed environment `equation`")
+                        .with_line(3),
+                ],
+                DocumentState::default(),
+            )),
+        );
+
+        let unclosed_count = snapshot
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.message == "unclosed environment `equation`")
+            .count();
+        assert_eq!(
+            unclosed_count, 1,
+            "dedup should apply even when compile and buffer diagnostics differ in column",
+        );
+    }
+
+    #[test]
+    fn collapses_multiple_nested_unclosed_environments_to_deepest() {
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(
+            &buffer(
+                "\\documentclass{article}\n\\begin{document}\n\\begin{itemize}\n\\begin{equation}\na=b\n\\end{document}\n",
+            ),
+            None,
+        );
+
+        let unclosed_messages = snapshot
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with("unclosed environment"))
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unclosed_messages,
+            vec!["unclosed environment `equation`"],
+            "the deepest unclosed environment should win",
+        );
+
+        let code_action_titles = snapshot
+            .code_actions()
+            .iter()
+            .map(|action| action.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(code_action_titles, vec!["Insert \\end{equation}"]);
+    }
+
+    #[test]
+    fn still_reports_truly_unexpected_end_without_matching_begin() {
+        let diagnostics = environment_diagnostics("\\end{itemize}\n\\begin{equation}\na=b\n");
+
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            messages.contains(&"unexpected \\end{itemize}"),
+            "end without matching begin must still be flagged as unexpected",
+        );
+        assert!(messages.contains(&"unclosed environment `equation`"));
+    }
+
+    #[test]
     fn completion_includes_unsaved_labels() {
         let snapshot = LiveAnalysisSnapshotFactory::default().build(
             &buffer(
@@ -1033,8 +1187,13 @@ mod tests {
     fn parse_error_to_diagnostic_includes_context_snippet() {
         let text = "\\documentclass{article}\n\\begin{document}\nHello\n";
 
-        let diagnostic =
-            parse_error_to_diagnostic(text, ParseError::MissingEndDocument { line: 3 });
+        let diagnostic = parse_error_to_diagnostic(
+            text,
+            ParseError::MissingEndDocument {
+                line: 3,
+                column: None,
+            },
+        );
 
         assert_eq!(diagnostic.context.as_deref(), Some("Hello"));
     }
@@ -1204,5 +1363,7 @@ mod tests {
         assert_eq!(definition.uri, "file:///tmp/chapters/figures.tex");
         assert_eq!(definition.range.start.line, 11);
         assert_eq!(definition.range.start.character, 4);
+        assert_eq!(definition.range.end.line, 11);
+        assert_eq!(definition.range.end.character, 24);
     }
 }

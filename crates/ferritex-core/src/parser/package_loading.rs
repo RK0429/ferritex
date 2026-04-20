@@ -324,6 +324,8 @@ pub fn load_document_class(
                 options: options.to_vec(),
             });
             register_base_latex_commands(engine);
+            register_passthrough_command(engine, "opening", 1, 1);
+            register_passthrough_command(engine, "closing", 1, 1);
             Ok(())
         }
         _ => Err(format!("Unknown document class: {name}")),
@@ -446,6 +448,38 @@ fn get_native_extension(name: &str) -> Option<&'static dyn PackageExtension> {
         "multicol" => Some(&MULTICOL_EXTENSION),
         _ => None,
     }
+}
+
+/// Packages that ferritex handles directly in the parser/runtime without a
+/// `PackageExtension` entry (for example via dedicated command handlers).
+///
+/// `tikz`/`pgf` — `\begin{tikzpicture}` is parsed by the kernel directly
+/// (see graphics/tikz.rs), so `\usepackage{tikz}` should not warn.
+/// `hyperref` — `\href`, `\hyperref`, `\url`, `\hypersetup` have dedicated
+/// parser handlers.
+/// `url`/`color` — `\url`, `\color`, `\textcolor`, `\definecolor` have
+/// kernel-level handlers (xcolor extension is a separate, equivalent path).
+fn is_kernel_integrated_package(name: &str) -> bool {
+    matches!(name, "hyperref" | "tikz" | "pgf" | "url" | "color")
+}
+
+/// Returns whether `\usepackage{name}` would resolve to a ferritex-supported
+/// implementation. A package is considered "implemented" if it has a native
+/// extension, is integrated into the parser kernel, or can be interpreted
+/// from a `.sty` source via the supplied resolver.
+///
+/// When this returns `false`, loading the package still succeeds, but its
+/// commands will typically surface as undefined control sequences at use
+/// site. Callers emit a non-fatal warning so users see the gap at preamble
+/// time rather than deep in the document body.
+pub fn is_implemented_package(name: &str, sty_resolver: Option<&StyPackageResolver<'_>>) -> bool {
+    if get_native_extension(name).is_some() {
+        return true;
+    }
+    if is_kernel_integrated_package(name) {
+        return true;
+    }
+    sty_resolver.is_some_and(|resolver| resolver(name).is_some())
 }
 
 fn register_transparent_environment(engine: &mut MacroEngine, name: &str) {
@@ -638,6 +672,19 @@ mod tests {
         assert!(engine.lookup("chapter").is_some());
         assert!(engine.lookup("section").is_some());
         assert!(engine.lookup_environment("itemize").is_some());
+    }
+
+    #[test]
+    fn load_letter_class_registers_letter_specific_commands() {
+        let mut registry = ClassRegistry::default();
+        let mut engine = MacroEngine::default();
+
+        load_document_class("letter", &[], &mut registry, &mut engine).expect("load letter class");
+
+        let opening = engine.lookup("opening").expect("\\opening defined");
+        assert_eq!(opening.parameter_count, 1);
+        let closing = engine.lookup("closing").expect("\\closing defined");
+        assert_eq!(closing.parameter_count, 1);
     }
 
     #[test]

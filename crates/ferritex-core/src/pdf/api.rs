@@ -32,7 +32,7 @@ pub struct PdfDocument {
     pub bytes: Vec<u8>,
     pub page_count: usize,
     pub total_lines: usize,
-    pub warnings: Vec<String>,
+    pub encoding_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,7 +263,7 @@ impl PdfRenderer {
         let total_lines = document.pages.iter().map(|page| page.lines.len()).sum();
         let link_style = &document.navigation.default_link_style;
         let mut pdf = Vec::<u8>::new();
-        let mut offsets = Vec::<usize>::new();
+        let mut offsets = BTreeMap::<usize, usize>::new();
         let page_object_start = 3usize;
         let content_object_start = page_object_start + page_count;
         let annotation_object_start = content_object_start + page_count;
@@ -274,7 +274,7 @@ impl PdfRenderer {
         let math_font_number = math_font_f_number(&rendering_fonts);
         let RenderedPagePayloads {
             page_payloads,
-            warnings,
+            encoding_errors,
         } = render_page_payloads(
             &document.pages,
             &self.page_images,
@@ -340,6 +340,7 @@ impl PdfRenderer {
         append_object(
             &mut pdf,
             &mut offsets,
+            1,
             &format!(
                 "1 0 obj\n<< /Type /Catalog /Pages 2 0 R{catalog_named_destinations}{catalog_outlines} >>\nendobj\n"
             ),
@@ -347,6 +348,7 @@ impl PdfRenderer {
         append_object(
             &mut pdf,
             &mut offsets,
+            2,
             &format!(
                 "2 0 obj\n<< /Type /Pages /Kids [{}] /Count {} >>\nendobj\n",
                 page_kids(page_count, page_object_start),
@@ -385,6 +387,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                page_object_id,
                 &format!(
                     "{page_object_id} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Contents {content_object_id} 0 R /Resources << /Font << {} >>{}{} >>{annots_entry} >>\nendobj\n",
                     points_to_pdf_number(page.page_box.width),
@@ -401,6 +404,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                content_object_id,
                 &format!(
                     "{content_object_id} 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
                     payload.stream.len(),
@@ -429,6 +433,7 @@ impl PdfRenderer {
                 append_object(
                     &mut pdf,
                     &mut offsets,
+                    annotation.object_id,
                     &format!(
                         "{} 0 obj\n<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border {}{} {} >>\nendobj\n",
                         annotation.object_id,
@@ -461,6 +466,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                object_id,
                 &build_named_destination_object(document, page_object_start, object_id),
             );
         }
@@ -471,6 +477,7 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                root_object_id,
                 &format!(
                     "{root_object_id} 0 obj\n<< /Type /Outlines{}{} /Count {} >>\nendobj\n",
                     first_object_id
@@ -487,6 +494,7 @@ impl PdfRenderer {
                 append_object(
                     &mut pdf,
                     &mut offsets,
+                    outline_object.object_id,
                     &format!(
                         "{} 0 obj\n{}\nendobj\n",
                         outline_object.object_id, outline_object.body
@@ -496,8 +504,9 @@ impl PdfRenderer {
         }
 
         for font_object in &font_objects {
-            for object in &font_object.objects {
-                append_object_bytes(&mut pdf, &mut offsets, object);
+            for (index, object) in font_object.objects.iter().enumerate() {
+                let object_id = font_object.dictionary_object_id + index;
+                append_object_bytes(&mut pdf, &mut offsets, object_id, object);
             }
         }
 
@@ -507,20 +516,31 @@ impl PdfRenderer {
             append_object(
                 &mut pdf,
                 &mut offsets,
+                object_id,
                 &format!("{object_id} 0 obj\n{info_dictionary}\nendobj\n"),
             );
         }
 
         let xref_offset = pdf.len();
-        pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len() + 1).as_bytes());
+        let max_object_id = offsets.keys().copied().max().unwrap_or(0);
+        debug_assert_eq!(
+            offsets.len(),
+            max_object_id,
+            "PDF object ids must be contiguous starting at 1"
+        );
+        pdf.extend_from_slice(format!("xref\n0 {}\n", max_object_id + 1).as_bytes());
         pdf.extend_from_slice(b"0000000000 65535 f \n");
-        for offset in &offsets {
+        for object_id in 1..=max_object_id {
+            let offset = offsets
+                .get(&object_id)
+                .copied()
+                .unwrap_or_else(|| panic!("missing xref entry for object {object_id}"));
             pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
         }
         pdf.extend_from_slice(
             format!(
                 "trailer\n<< /Size {} /Root 1 0 R{} >>\nstartxref\n{}\n%%EOF\n",
-                offsets.len() + 1,
+                max_object_id + 1,
                 info_object_id
                     .map(|object_id| format!(" /Info {object_id} 0 R"))
                     .unwrap_or_default(),
@@ -534,7 +554,7 @@ impl PdfRenderer {
                 bytes: pdf,
                 page_count,
                 total_lines,
-                warnings,
+                encoding_errors,
             },
             page_payloads,
         }
@@ -583,7 +603,7 @@ struct RenderedPagePayload {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RenderedPagePayloads {
     page_payloads: Vec<PageRenderPayload>,
-    warnings: Vec<String>,
+    encoding_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1039,29 +1059,41 @@ fn render_page_payloads(
                 .collect::<Vec<_>>()
         });
         let mut ordered_payloads = payloads;
-        ordered_payloads.sort_by(|left, right| left.partition_id.cmp(&right.partition_id));
+        ordered_payloads.sort_by(|left, right| {
+            partition_payload_first_page_index(left)
+                .cmp(&partition_payload_first_page_index(right))
+                .then_with(|| left.partition_id.cmp(&right.partition_id))
+        });
         ordered_payloads
             .into_iter()
             .flat_map(|payload| payload.page_payloads)
             .collect::<Vec<_>>()
     };
 
-    let mut warning_chars = BTreeSet::new();
+    let mut encoding_error_chars = BTreeSet::new();
     let page_payloads = rendered_payloads
         .into_iter()
         .map(|payload| {
-            warning_chars.extend(payload.unencodable_chars);
+            encoding_error_chars.extend(payload.unencodable_chars);
             payload.page_payload
         })
         .collect();
 
     RenderedPagePayloads {
         page_payloads,
-        warnings: warning_chars
+        encoding_errors: encoding_error_chars
             .into_iter()
-            .map(pdf_encoding_warning)
+            .map(pdf_encoding_error)
             .collect(),
     }
+}
+
+fn partition_payload_first_page_index(payload: &PartitionRenderPayload) -> usize {
+    payload
+        .page_payloads
+        .first()
+        .map(|payload| payload.page_payload.page_index)
+        .unwrap_or(usize::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1531,8 +1563,8 @@ fn render_text_line_with_scripts(
     let rendered_text = strip_math_script_markers(&line.text);
 
     stream.push_str(&format!(
-        "/Span <</ActualText ({})>> BDC\n",
-        encode_pdf_text_collecting(&rendered_text, warning_chars)
+        "/Span <</ActualText {}>> BDC\n",
+        encode_pdf_actual_text(&rendered_text)
     ));
 
     for segment in parse_math_script_segments(&line.text) {
@@ -2172,13 +2204,14 @@ fn page_ext_gstate_resources(
 
 fn append_opacity_graphics_state_objects(
     buffer: &mut Vec<u8>,
-    offsets: &mut Vec<usize>,
+    offsets: &mut BTreeMap<usize, usize>,
     object_ids: &BTreeMap<OpacityGraphicsStateKey, usize>,
 ) {
     for (key, object_id) in object_ids {
         append_object(
             buffer,
             offsets,
+            *object_id,
             &format!(
                 "{object_id} 0 obj\n<< /Type /ExtGState /CA {} /ca {} >>\nendobj\n",
                 pdf_real(key.stroke_opacity()),
@@ -2188,8 +2221,12 @@ fn append_opacity_graphics_state_objects(
     }
 }
 
-fn append_image_xobject(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, image: &PdfImageXObject) {
-    offsets.push(buffer.len());
+fn append_image_xobject(
+    buffer: &mut Vec<u8>,
+    offsets: &mut BTreeMap<usize, usize>,
+    image: &PdfImageXObject,
+) {
+    record_object_offset(offsets, image.object_id, buffer.len());
     buffer.extend_from_slice(
         format!(
             "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent {} /Filter /{}{} /Length {} >>\nstream\n",
@@ -2210,10 +2247,10 @@ fn append_image_xobject(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, image: &
 
 fn append_form_xobject(
     buffer: &mut Vec<u8>,
-    offsets: &mut Vec<usize>,
+    offsets: &mut BTreeMap<usize, usize>,
     form_xobject: &PdfFormXObject,
 ) {
-    offsets.push(buffer.len());
+    record_object_offset(offsets, form_xobject.object_id, buffer.len());
     let resources_dict = form_xobject.resources_dict.as_deref().unwrap_or("<< >>");
     buffer.extend_from_slice(
         format!(
@@ -2486,13 +2523,35 @@ fn points(value: i64) -> DimensionValue {
     DimensionValue(value * SCALED_POINTS_PER_POINT)
 }
 
-fn append_object(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, object: &str) {
-    append_object_bytes(buffer, offsets, object.as_bytes());
+fn append_object(
+    buffer: &mut Vec<u8>,
+    offsets: &mut BTreeMap<usize, usize>,
+    object_id: usize,
+    object: &str,
+) {
+    append_object_bytes(buffer, offsets, object_id, object.as_bytes());
 }
 
-fn append_object_bytes(buffer: &mut Vec<u8>, offsets: &mut Vec<usize>, object: &[u8]) {
-    offsets.push(buffer.len());
+fn append_object_bytes(
+    buffer: &mut Vec<u8>,
+    offsets: &mut BTreeMap<usize, usize>,
+    object_id: usize,
+    object: &[u8],
+) {
+    record_object_offset(offsets, object_id, buffer.len());
     buffer.extend_from_slice(object);
+}
+
+fn record_object_offset(
+    offsets: &mut BTreeMap<usize, usize>,
+    object_id: usize,
+    byte_offset: usize,
+) {
+    let previous = offsets.insert(object_id, byte_offset);
+    debug_assert!(
+        previous.is_none(),
+        "duplicate PDF object id {object_id}: previous offset {previous:?}, new offset {byte_offset}"
+    );
 }
 
 fn unicode_to_winansi(ch: char) -> Option<u8> {
@@ -2560,10 +2619,23 @@ fn encode_pdf_text(value: &str) -> PdfTextEncodeResult {
     }
 }
 
-fn encode_pdf_text_collecting(value: &str, warning_chars: &mut BTreeSet<char>) -> String {
-    let result = encode_pdf_text(value);
-    warning_chars.extend(result.unencodable_chars);
-    result.encoded
+fn encode_pdf_actual_text(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| matches!(ch, '\r' | '\n' | '\t') || unicode_to_winansi(ch).is_some())
+    {
+        return format!("({})", encode_pdf_text(value).encoded);
+    }
+
+    let mut encoded = String::from("<FEFF");
+    for ch in value.chars() {
+        let mut code_units = [0u16; 2];
+        for unit in ch.encode_utf16(&mut code_units).iter() {
+            encoded.push_str(&format!("{unit:04X}"));
+        }
+    }
+    encoded.push('>');
+    encoded
 }
 
 /// Maps a Unicode math/Greek codepoint to a byte in the built-in Symbol Type1 font
@@ -2572,60 +2644,60 @@ fn encode_pdf_text_collecting(value: &str, warning_chars: &mut BTreeSet<char>) -
 fn unicode_to_symbol_byte(ch: char) -> Option<u8> {
     match ch {
         // Greek lowercase
-        '\u{03B1}' => Some(0x61), // α
-        '\u{03B2}' => Some(0x62), // β
-        '\u{03B3}' => Some(0x67), // γ
-        '\u{03B4}' => Some(0x64), // δ
+        '\u{03B1}' => Some(0x61),              // α
+        '\u{03B2}' => Some(0x62),              // β
+        '\u{03B3}' => Some(0x67),              // γ
+        '\u{03B4}' => Some(0x64),              // δ
         '\u{03B5}' | '\u{03F5}' => Some(0x65), // ε / ϵ
-        '\u{03B6}' => Some(0x7A), // ζ
-        '\u{03B7}' => Some(0x68), // η
-        '\u{03B8}' => Some(0x71), // θ
-        '\u{03D1}' => Some(0x4A), // ϑ (theta1)
-        '\u{03B9}' => Some(0x69), // ι
-        '\u{03BA}' => Some(0x6B), // κ
-        '\u{03BB}' => Some(0x6C), // λ
-        '\u{03BC}' => Some(0x6D), // μ
-        '\u{03BD}' => Some(0x6E), // ν
-        '\u{03BE}' => Some(0x78), // ξ
-        '\u{03BF}' => Some(0x6F), // ο
-        '\u{03C0}' => Some(0x70), // π
-        '\u{03D6}' => Some(0x76), // ϖ (varpi)
-        '\u{03C1}' => Some(0x72), // ρ
-        '\u{03C3}' => Some(0x73), // σ
-        '\u{03C2}' => Some(0x56), // ς (final sigma) → Symbol's sigma1 at 'V'
-        '\u{03C4}' => Some(0x74), // τ
-        '\u{03C5}' => Some(0x75), // υ
-        '\u{03C6}' => Some(0x66), // φ (phi)
-        '\u{03D5}' => Some(0x6A), // ϕ (phi1 variant)
-        '\u{03C7}' => Some(0x63), // χ
-        '\u{03C8}' => Some(0x79), // ψ
-        '\u{03C9}' => Some(0x77), // ω
+        '\u{03B6}' => Some(0x7A),              // ζ
+        '\u{03B7}' => Some(0x68),              // η
+        '\u{03B8}' => Some(0x71),              // θ
+        '\u{03D1}' => Some(0x4A),              // ϑ (theta1)
+        '\u{03B9}' => Some(0x69),              // ι
+        '\u{03BA}' => Some(0x6B),              // κ
+        '\u{03BB}' => Some(0x6C),              // λ
+        '\u{03BC}' => Some(0x6D),              // μ
+        '\u{03BD}' => Some(0x6E),              // ν
+        '\u{03BE}' => Some(0x78),              // ξ
+        '\u{03BF}' => Some(0x6F),              // ο
+        '\u{03C0}' => Some(0x70),              // π
+        '\u{03D6}' => Some(0x76),              // ϖ (varpi)
+        '\u{03C1}' => Some(0x72),              // ρ
+        '\u{03C3}' => Some(0x73),              // σ
+        '\u{03C2}' => Some(0x56),              // ς (final sigma) → Symbol's sigma1 at 'V'
+        '\u{03C4}' => Some(0x74),              // τ
+        '\u{03C5}' => Some(0x75),              // υ
+        '\u{03C6}' => Some(0x66),              // φ (phi)
+        '\u{03D5}' => Some(0x6A),              // ϕ (phi1 variant)
+        '\u{03C7}' => Some(0x63),              // χ
+        '\u{03C8}' => Some(0x79),              // ψ
+        '\u{03C9}' => Some(0x77),              // ω
 
         // Greek uppercase
-        '\u{0391}' => Some(0x41), // Α
-        '\u{0392}' => Some(0x42), // Β
-        '\u{0393}' => Some(0x47), // Γ
-        '\u{0394}' => Some(0x44), // Δ
-        '\u{0395}' => Some(0x45), // Ε
-        '\u{0396}' => Some(0x5A), // Ζ
-        '\u{0397}' => Some(0x48), // Η
-        '\u{0398}' => Some(0x51), // Θ
-        '\u{0399}' => Some(0x49), // Ι
-        '\u{039A}' => Some(0x4B), // Κ
-        '\u{039B}' => Some(0x4C), // Λ
-        '\u{039C}' => Some(0x4D), // Μ
-        '\u{039D}' => Some(0x4E), // Ν
-        '\u{039E}' => Some(0x58), // Ξ
-        '\u{039F}' => Some(0x4F), // Ο
-        '\u{03A0}' => Some(0x50), // Π
-        '\u{03A1}' => Some(0x52), // Ρ
-        '\u{03A3}' => Some(0x53), // Σ
-        '\u{03A4}' => Some(0x54), // Τ
-        '\u{03A5}' => Some(0x55), // Υ
-        '\u{03D2}' => Some(0xA1), // ϒ (Upsilon1)
-        '\u{03A6}' => Some(0x46), // Φ
-        '\u{03A7}' => Some(0x43), // Χ
-        '\u{03A8}' => Some(0x59), // Ψ
+        '\u{0391}' => Some(0x41),              // Α
+        '\u{0392}' => Some(0x42),              // Β
+        '\u{0393}' => Some(0x47),              // Γ
+        '\u{0394}' => Some(0x44),              // Δ
+        '\u{0395}' => Some(0x45),              // Ε
+        '\u{0396}' => Some(0x5A),              // Ζ
+        '\u{0397}' => Some(0x48),              // Η
+        '\u{0398}' => Some(0x51),              // Θ
+        '\u{0399}' => Some(0x49),              // Ι
+        '\u{039A}' => Some(0x4B),              // Κ
+        '\u{039B}' => Some(0x4C),              // Λ
+        '\u{039C}' => Some(0x4D),              // Μ
+        '\u{039D}' => Some(0x4E),              // Ν
+        '\u{039E}' => Some(0x58),              // Ξ
+        '\u{039F}' => Some(0x4F),              // Ο
+        '\u{03A0}' => Some(0x50),              // Π
+        '\u{03A1}' => Some(0x52),              // Ρ
+        '\u{03A3}' => Some(0x53),              // Σ
+        '\u{03A4}' => Some(0x54),              // Τ
+        '\u{03A5}' => Some(0x55),              // Υ
+        '\u{03D2}' => Some(0xA1),              // ϒ (Upsilon1)
+        '\u{03A6}' => Some(0x46),              // Φ
+        '\u{03A7}' => Some(0x43),              // Χ
+        '\u{03A8}' => Some(0x59),              // Ψ
         '\u{03A9}' | '\u{2126}' => Some(0x57), // Ω / ohm sign
 
         // Math operators and relations
@@ -2733,7 +2805,7 @@ struct PdfTextRun {
 
 /// Splits `value` into PDF text runs, routing WinAnsi-representable code points
 /// through the primary font and Greek/math code points through the Symbol font.
-/// Thin space (U+2009) is folded to regular space to avoid spurious warnings
+/// Thin space (U+2009) is folded to regular space to avoid spurious errors
 /// from a codepoint the Symbol font does not cover.
 fn split_into_font_runs(value: &str) -> Vec<PdfTextRun> {
     let mut runs: Vec<PdfTextRun> = Vec::new();
@@ -2793,10 +2865,10 @@ fn split_into_font_runs(value: &str) -> Vec<PdfTextRun> {
 
 /// Collects all characters that remain unrepresentable even after the Symbol
 /// font fallback. These are the only characters that produce user-visible
-/// encoding warnings.
-fn collect_unencodable_chars(value: &str, warning_chars: &mut BTreeSet<char>) {
+/// encoding errors.
+fn collect_unencodable_chars(value: &str, encoding_error_chars: &mut BTreeSet<char>) {
     for run in split_into_font_runs(value) {
-        warning_chars.extend(run.unencodable_chars);
+        encoding_error_chars.extend(run.unencodable_chars);
     }
 }
 
@@ -2846,9 +2918,9 @@ fn emit_text_with_font_runs(
     }
 }
 
-fn pdf_encoding_warning(ch: char) -> String {
+fn pdf_encoding_error(ch: char) -> String {
     format!(
-        "PDF encoding: character '{}' (U+{:04X}) cannot be represented in WinAnsiEncoding and was replaced with '?'",
+        "PDF encoding: character '{}' (U+{:04X}) is not supported by the current font stack (WinAnsi + Symbol) and was replaced with '?'. Ferritex does not yet support non-Latin Unicode code points (e.g. CJK) outside this set.",
         ch,
         u32::from(ch)
     )
@@ -2859,10 +2931,11 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        encode_pdf_text, opacity_graphics_state_name, render_vector_primitive, resolve_named_color,
-        unicode_to_winansi, FontResource, ImageColorSpace, ImageFilter, OpacityGraphicsStateKey,
-        PageRenderPayload, PdfFormXObject, PdfImageXObject, PdfLinkAnnotation, PdfLinkTarget,
-        PdfRenderer, PlacedFormXObject, PlacedImage,
+        encode_pdf_actual_text, encode_pdf_text, opacity_graphics_state_name,
+        render_vector_primitive, resolve_named_color, unicode_to_winansi, FontResource,
+        ImageColorSpace, ImageFilter, OpacityGraphicsStateKey, PageRenderPayload, PdfFormXObject,
+        PdfImageXObject, PdfLinkAnnotation, PdfLinkTarget, PdfRenderer, PlacedFormXObject,
+        PlacedImage,
     };
     use crate::assets::api::{AssetHandle, LogicalAssetId};
     use crate::compilation::{
@@ -2927,6 +3000,56 @@ mod tests {
         let mut document = single_page(lines);
         document.pages[0].images = images;
         document
+    }
+
+    fn actual_text_payloads<'a>(content: &'a str) -> Vec<&'a str> {
+        let mut payloads = Vec::new();
+        let marker = "/ActualText ";
+        let mut remaining = content;
+
+        while let Some(start) = remaining.find(marker) {
+            let payload_source = &remaining[start + marker.len()..];
+            let Some(first) = payload_source.chars().next() else {
+                break;
+            };
+
+            let payload_len = match first {
+                '(' => {
+                    let mut escaped = false;
+                    let mut depth = 0usize;
+                    let mut end = None;
+                    for (offset, ch) in payload_source.char_indices() {
+                        if escaped {
+                            escaped = false;
+                            continue;
+                        }
+                        match ch {
+                            '\\' => escaped = true,
+                            '(' => depth += 1,
+                            ')' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    end = Some(offset + ch.len_utf8());
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    end.expect("unterminated literal ActualText")
+                }
+                '<' => payload_source
+                    .find('>')
+                    .map(|index| index + 1)
+                    .expect("unterminated hex ActualText"),
+                _ => panic!("unexpected ActualText payload start: {first}"),
+            };
+
+            payloads.push(&payload_source[..payload_len]);
+            remaining = &payload_source[payload_len..];
+        }
+
+        payloads
     }
 
     fn raster_scene() -> GraphicsScene {
@@ -3620,6 +3743,68 @@ mod tests {
     }
 
     #[test]
+    fn render_with_partition_plan_preserves_fallback_frontmatter_order() {
+        let mut document = single_page(&["Frontmatter"]);
+        document.pages.push(page(&["1 Intro", "Chapter 1 body"]));
+        document.pages.push(page(&["2 Results", "Chapter 2 body"]));
+        document.outlines = vec![
+            TypesetOutline {
+                level: 0,
+                title: "1 Intro".to_string(),
+                page_index: 1,
+                y: points(720),
+            },
+            TypesetOutline {
+                level: 0,
+                title: "2 Results".to_string(),
+                page_index: 2,
+                y: points(720),
+            },
+        ];
+        let plan = DocumentPartitionPlan {
+            fallback_partition_id: "document:0000:frontmatter".to_string(),
+            work_units: vec![
+                DocumentWorkUnit {
+                    partition_id: "chapter:0001:1-intro".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 0,
+                        title: "1 Intro".to_string(),
+                    },
+                    title: "1 Intro".to_string(),
+                },
+                DocumentWorkUnit {
+                    partition_id: "chapter:0002:2-results".to_string(),
+                    kind: PartitionKind::Chapter,
+                    locator: PartitionLocator {
+                        entry_file: "book.tex".into(),
+                        level: 0,
+                        ordinal: 1,
+                        title: "2 Results".to_string(),
+                    },
+                    title: "2 Results".to_string(),
+                },
+            ],
+        };
+        let renderer = PdfRenderer::default();
+
+        let sequential = renderer.render(&document);
+        let partitioned = renderer.render_with_partition_plan(&document, 4, 2, &plan, None);
+
+        assert_eq!(
+            partitioned
+                .page_payloads
+                .iter()
+                .map(|payload| payload.page_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(partitioned.document.bytes, sequential.bytes);
+    }
+
+    #[test]
     fn render_with_partition_plan_reuses_pre_rendered_page_payloads() {
         let mut document = single_page(&["1 Intro", "Page 1 body"]);
         document.pages.push(page(&["Page 2 body before edit"]));
@@ -3921,6 +4106,14 @@ mod tests {
     }
 
     #[test]
+    fn encode_pdf_actual_text_ascii_uses_literal_string() {
+        assert_eq!(
+            encode_pdf_actual_text("Inline x2 y1 note3"),
+            "(Inline x2 y1 note3)"
+        );
+    }
+
+    #[test]
     fn encode_pdf_text_winansi_mappable() {
         let result = encode_pdf_text("• · —");
 
@@ -3961,16 +4154,47 @@ mod tests {
     }
 
     #[test]
-    fn render_unencodable_chars_produces_warnings() {
+    fn render_unencodable_chars_produces_errors() {
         // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
-        // triggers the encoding warning.
+        // triggers an explicit encoding error.
         let pdf = PdfRenderer::default().render(&single_page(&["漢 漢"]));
 
-        assert_eq!(
-            pdf.warnings,
-            vec![String::from(
-                "PDF encoding: character '漢' (U+6F22) cannot be represented in WinAnsiEncoding and was replaced with '?'"
-            )]
+        assert_eq!(pdf.encoding_errors.len(), 1);
+        let error = &pdf.encoding_errors[0];
+        assert!(error.contains("is not supported"), "{error}");
+        assert!(error.contains('漢'), "{error}");
+        assert!(error.contains("U+6F22"), "{error}");
+    }
+
+    #[test]
+    fn renders_script_lines_with_unicode_actual_text_as_utf16be_hex() {
+        let scripted = format!(
+            "α {}π{} ∫",
+            crate::typesetting::math_layout::SUPERSCRIPT_START_MARKER,
+            crate::typesetting::math_layout::SUPERSCRIPT_END_MARKER,
+        );
+        let mut document = single_page(&[]);
+        document.pages[0].lines = vec![TextLine {
+            text: scripted,
+            x: DimensionValue::zero(),
+            y: points(720),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(10),
+            source_span: None,
+        }];
+
+        let pdf = PdfRenderer::default().render(&document);
+        let content = String::from_utf8_lossy(&pdf.bytes);
+        let payloads = actual_text_payloads(&content);
+
+        assert!(
+            payloads.contains(&"<FEFF03B1002003C00020222B>"),
+            "expected UTF-16BE ActualText payload, got: {payloads:?}"
+        );
+        assert!(
+            payloads.iter().all(|payload| !payload.contains('?')),
+            "ActualText payloads must not contain '?': {payloads:?}"
         );
     }
 
@@ -3984,15 +4208,13 @@ mod tests {
 
         // No warning should be emitted for any of these math-mode glyphs.
         assert!(
-            pdf.warnings.is_empty(),
-            "expected no PDF encoding warnings, got: {:?}",
-            pdf.warnings,
+            pdf.encoding_errors.is_empty(),
+            "expected no PDF encoding errors, got: {:?}",
+            pdf.encoding_errors,
         );
 
         // A dedicated Symbol font must be declared and referenced as /F2.
-        assert!(content.contains(
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"
-        ));
+        assert!(content.contains("<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
         assert!(content.contains("/F2 "));
 
         // Math-mode glyphs should be rendered through the Symbol font rather
@@ -4022,8 +4244,7 @@ mod tests {
         // Default resources carry Helvetica as F1 plus the always-appended
         // Symbol math font as F2.
         assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>"));
-        assert!(content
-            .contains("<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
+        assert!(content.contains("<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
     }
 
     #[test]
@@ -4256,14 +4477,12 @@ mod tests {
         // F1 = Helvetica (1 object: 5), F2 = embedded TrueType (3 consecutive
         // objects starting at 6: dict/descriptor/fontfile), F3 = Symbol math
         // font (always appended at 9).
-        assert!(content
-            .contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 9 0 R >> >>"));
+        assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 9 0 R >> >>"));
         assert!(content.contains(
             "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
         ));
         assert!(content.contains("6 0 obj\n<< /Type /Font /Subtype /TrueType"));
-        assert!(content
-            .contains("9 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
+        assert!(content.contains("9 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
     }
 
     #[test]
@@ -4348,6 +4567,138 @@ mod tests {
 
         assert!(subsetted_font_data.len() < 10);
         assert!(content.contains("/Length1 4"));
+    }
+
+    #[test]
+    fn xref_entries_point_to_object_markers_with_mixed_indirect_objects() {
+        // Regression for issue #23: PDFs containing images, form XObjects,
+        // outlines, and named destinations were written with object IDs that
+        // did not match the write order, leaving xref offsets pointing at the
+        // wrong bytes. This exercises the full set and verifies the xref
+        // table actually reaches each `{id} 0 obj` marker.
+        let mut document = single_page_with_images(
+            &["Body"],
+            vec![
+                TypesetImage {
+                    scene: raster_scene(),
+                    x: points(72),
+                    y: points(600),
+                    display_width: points(100),
+                    display_height: points(100),
+                },
+                TypesetImage {
+                    scene: pdf_scene(),
+                    x: points(72),
+                    y: points(480),
+                    display_width: points(100),
+                    display_height: points(50),
+                },
+            ],
+        );
+        document.outlines = vec![TypesetOutline {
+            level: 0,
+            title: "Heading".to_string(),
+            page_index: 0,
+            y: points(720),
+        }];
+        document.named_destinations = vec![TypesetNamedDestination {
+            name: "heading".to_string(),
+            page_index: 0,
+            y: points(720),
+        }];
+
+        let renderer = PdfRenderer::default()
+            .with_images(
+                vec![PdfImageXObject {
+                    object_id: 0,
+                    width: 1,
+                    height: 1,
+                    color_space: ImageColorSpace::DeviceRGB,
+                    bits_per_component: 8,
+                    data: vec![120, 156, 99, 248, 207, 192, 0, 0, 3, 1, 1, 0],
+                    filter: ImageFilter::FlateDecode,
+                }],
+                vec![vec![PlacedImage {
+                    xobject_index: 0,
+                    x: points(72),
+                    y: points(600),
+                    display_width: points(100),
+                    display_height: points(100),
+                }]],
+            )
+            .with_form_xobjects(
+                vec![PdfFormXObject {
+                    object_id: 0,
+                    media_box: [0.0, 0.0, 200.0, 100.0],
+                    data: b"0 0 m\n200 100 l\nS".to_vec(),
+                    resources_dict: Some("<< /ProcSet [/PDF] >>".to_string()),
+                }],
+                vec![vec![PlacedFormXObject {
+                    xobject_index: 0,
+                    x: points(72),
+                    y: points(480),
+                    display_width: points(100),
+                    display_height: points(50),
+                }]],
+            );
+
+        let pdf = renderer.render(&document);
+        let bytes = pdf.bytes.as_slice();
+
+        // Locate the xref section header at the start of a line.
+        let xref_header = b"\nxref\n";
+        let xref_pos = bytes
+            .windows(xref_header.len())
+            .position(|window| window == xref_header)
+            .expect("rendered PDF must contain an xref section")
+            + 1;
+        let xref_body =
+            std::str::from_utf8(&bytes[xref_pos..]).expect("xref section should be ASCII");
+        let mut lines = xref_body.lines();
+        let header = lines.next().expect("xref header");
+        assert_eq!(header, "xref");
+        let subsection = lines.next().expect("xref subsection header");
+        let mut parts = subsection.split_whitespace();
+        let first_id: usize = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("first object id");
+        let count: usize = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("object count");
+        assert_eq!(first_id, 0, "xref subsection should start at object 0");
+        assert!(
+            count >= 2,
+            "PDF must contain at least the catalog and pages"
+        );
+
+        // The first entry is the free object (id 0); skip it. For every other
+        // declared object id, verify the byte offset actually lands on the
+        // `{id} 0 obj` marker.
+        let free_entry = lines.next().expect("free entry line");
+        assert!(
+            free_entry.starts_with("0000000000"),
+            "free entry must point at offset 0: {free_entry}"
+        );
+        for object_id in 1..count {
+            let line = lines
+                .next()
+                .unwrap_or_else(|| panic!("missing xref entry for object {object_id}"));
+            let offset: usize = line
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("unparsable xref entry: {line}"));
+            let expected_marker = format!("{object_id} 0 obj");
+            let actual =
+                std::str::from_utf8(&bytes[offset..offset.saturating_add(expected_marker.len())])
+                    .unwrap_or_else(|_| panic!("non-UTF8 bytes at offset {offset}"));
+            assert_eq!(
+                actual, expected_marker,
+                "xref entry for object {object_id} at offset {offset} should start with {expected_marker:?}"
+            );
+        }
     }
 
     fn embedded_font_resource() -> FontResource {

@@ -922,7 +922,7 @@
   - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）。高並列では heavy fixture で peak RSS が 1 GiB を超え `REQ-NF-003` と衝突しうるため、メモリ制約が厳しい環境では値を抑制することを推奨
   - `--no-cache`: キャッシュを無効化しフルコンパイル
   - `--asset-bundle <ref>`: 使用する Ferritex Asset Bundle の指定。`<ref>` はファイルパスまたは組み込みバンドル識別子
-  - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`）
+  - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`, `errorstopmode`）。`batchmode` は CLI diagnostics の `stderr` 出力を抑制し、`nonstopmode` / `scrollmode` / `errorstopmode` は ferritex の非対話実行では同等の継続モードとして扱う
   - `--synctex`: SyncTeX データの生成有無
   - `--trace-font-tasks`: `REQ-FUNC-033` の検証に使う `FontTaskTrace` を `stderr` に出力する
     - incremental cache が hit した場合でも、検証用に `fontTaskId="font-load-cache-hit"` / `fontAsset="builtin:font-cache-hit"` のセンチネル `FontTaskTrace` を `stderr` に 1 件 emit する。このセンチネルは `--trace-font-tasks` フラグが warm 経路でも機能していることを示す presence marker であり、`REQ-FUNC-033` の overlap 受け入れ基準（独立タスク 2 件以上の並走）には寄与しない。overlap は `--no-cache` を指定した cold 経路で検証する
@@ -932,6 +932,7 @@
 - **受け入れ基準**:
   - Given `--output-dir build` を指定, When コンパイル, Then `build/` ディレクトリに PDF が生成される
   - Given `--jobs 1` を指定, When コンパイル, Then シングルスレッドで実行される
+  - Given `--interaction batchmode` を指定して diagnostics を伴うコンパイルを実行, When CLI が診断を報告, Then `stderr` への diagnostic 出力は抑制される
 - **優先度**: Must
 - **出典**: ユーザー明示
 

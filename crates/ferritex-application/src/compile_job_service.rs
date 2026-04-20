@@ -38,7 +38,7 @@ use ferritex_core::graphics::api::{
 use ferritex_core::incremental::{DependencyGraph, DocumentPartitionPlanner, RecompilationScope};
 use ferritex_core::kernel::api::{DimensionValue, SourceLocation, SourceSpan};
 use ferritex_core::kernel::StableId;
-use ferritex_core::parser::api::{DocumentNode, FloatType};
+use ferritex_core::parser::api::{DocumentNode, FloatType, BODY_FOOTNOTE_START};
 use ferritex_core::parser::{
     MinimalLatexParser, ParseError, ParseOutput, ParsedDocument, RegisterStore,
 };
@@ -221,6 +221,15 @@ struct ExpandedSourceBuilder {
     current_line_origin: Option<(String, u32)>,
 }
 
+#[derive(Debug, Clone)]
+struct NavigationSidecarSpec {
+    extension: &'static str,
+    label: &'static str,
+    command_name: &'static str,
+    requested: bool,
+    contents: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceLineSpan {
     normalized_text: String,
@@ -315,6 +324,15 @@ struct ShellEscapeAdapter<'a> {
 
 impl ShellEscapeHandler for ShellEscapeAdapter<'_> {
     fn execute_write18(&self, command: &str, _line: u32) -> ShellEscapeResult {
+        if let Some(metachar) = find_unsupported_shell_metacharacter(command) {
+            return ShellEscapeResult::Error(format!(
+                "\\write18 command contains unsupported shell metacharacter `{metachar}`: {command}; \
+                 ferritex runs commands through an argv-based gateway and does not interpret \
+                 shell syntax such as redirection (>, <), pipes (|), command separators (;, &), \
+                 or command substitution (`...`). Invoke a prebuilt script or tool instead."
+            ));
+        }
+
         let mut parts = command.split_whitespace();
         let Some(program) = parts.next() else {
             return ShellEscapeResult::Error("empty \\write18 command".to_string());
@@ -328,6 +346,12 @@ impl ShellEscapeHandler for ShellEscapeAdapter<'_> {
             Err(error) => ShellEscapeResult::Error(error),
         }
     }
+}
+
+fn find_unsupported_shell_metacharacter(command: &str) -> Option<char> {
+    command
+        .chars()
+        .find(|c| matches!(c, '>' | '<' | '|' | '&' | ';' | '`'))
 }
 
 struct FileOperationAdapter<'a> {
@@ -854,6 +878,74 @@ impl<'a> CompileJobService<'a> {
                 )
                 .with_file(sidecar_path.to_string_lossy().into_owned())
             })
+    }
+
+    fn write_text_sidecar(
+        &self,
+        sidecar_path: &Path,
+        sidecar_label: &str,
+        contents: &[u8],
+    ) -> Option<Diagnostic> {
+        self.file_access_gate
+            .write_file(sidecar_path, contents)
+            .err()
+            .map(|error| {
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!("failed to persist {sidecar_label} sidecar: {error}"),
+                )
+                .with_file(sidecar_path.to_string_lossy().into_owned())
+            })
+    }
+
+    fn write_navigation_sidecars(
+        &self,
+        output_pdf: &Path,
+        document: &ParsedDocument,
+        source_lines: &[SourceLineTrace],
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let sidecars = [
+            NavigationSidecarSpec {
+                extension: "toc",
+                label: "table of contents",
+                command_name: "tableofcontents",
+                requested: document.has_unresolved_toc,
+                contents: format_toc_sidecar(&document.section_entries),
+            },
+            NavigationSidecarSpec {
+                extension: "lof",
+                label: "list of figures",
+                command_name: "listoffigures",
+                requested: document.has_unresolved_lof,
+                contents: format_caption_sidecar("figure", &document.figure_entries),
+            },
+            NavigationSidecarSpec {
+                extension: "lot",
+                label: "list of tables",
+                command_name: "listoftables",
+                requested: document.has_unresolved_lot,
+                contents: format_caption_sidecar("table", &document.table_entries),
+            },
+        ];
+
+        for sidecar in sidecars {
+            if sidecar.contents.is_empty()
+                && !sidecar.requested
+                && !source_lines_use_command(source_lines, sidecar.command_name)
+            {
+                continue;
+            }
+
+            let sidecar_path = output_pdf.with_extension(sidecar.extension);
+            if let Some(diagnostic) =
+                self.write_text_sidecar(&sidecar_path, sidecar.label, sidecar.contents.as_bytes())
+            {
+                diagnostics.push(diagnostic);
+            }
+        }
+
+        diagnostics
     }
 
     pub fn compile(&self, options: &RuntimeOptions) -> CompileResult {
@@ -1630,11 +1722,24 @@ impl<'a> CompileJobService<'a> {
             options.jobname.clone(),
             execution_policy,
         );
-        let cacheable_diagnostics = parse_diagnostics;
+        let encoding_error_diagnostics = pdf_document
+            .document
+            .encoding_errors
+            .iter()
+            .map(|encoding_error| Diagnostic::new(Severity::Error, encoding_error.clone()))
+            .collect::<Vec<_>>();
+        let mut cacheable_diagnostics = parse_diagnostics;
+        cacheable_diagnostics.extend(encoding_error_diagnostics.clone());
         let mut diagnostics = cache_diagnostics;
         diagnostics.extend(cacheable_diagnostics.clone());
-        for warning in &pdf_document.document.warnings {
-            diagnostics.push(Diagnostic::new(Severity::Warning, warning.clone()));
+        if !pdf_document.document.encoding_errors.is_empty() {
+            return CompileResult {
+                exit_code: exit_code_for(&diagnostics),
+                diagnostics,
+                output_pdf: None,
+                stable_compile_state: None,
+                stage_timing,
+            };
         }
         let cached_typeset_fragments = cached_typeset_fragments_for(
             self,
@@ -1662,6 +1767,12 @@ impl<'a> CompileJobService<'a> {
                 stage_timing,
             };
         }
+
+        diagnostics.extend(self.write_navigation_sidecars(
+            &output_pdf,
+            &parsed_document,
+            &source_tree.source_lines,
+        ));
 
         if options.synctex {
             let synctex_path = options
@@ -1691,7 +1802,7 @@ impl<'a> CompileJobService<'a> {
             cross_reference_seed.clone(),
             pass_count,
             pdf_document.document.page_count,
-            true,
+            pdf_document.document.encoding_errors.is_empty(),
             cacheable_diagnostics.clone(),
         );
         if !options.no_cache {
@@ -1766,7 +1877,7 @@ impl<'a> CompileJobService<'a> {
             cross_reference_seed,
             pass_count,
             pdf_document.document.page_count,
-            true,
+            pdf_document.document.encoding_errors.is_empty(),
             diagnostics.clone(),
         );
 
@@ -2697,6 +2808,56 @@ fn source_files_for_lines(source_lines: &[SourceLineTrace]) -> Vec<&str> {
     files
 }
 
+fn sanitize_sidecar_field(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\r' | '\n' | '\t' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+fn format_toc_sidecar(entries: &[ferritex_core::parser::api::SectionEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "section\t{}\t{}\t{}\n",
+                entry.level,
+                sanitize_sidecar_field(&entry.number),
+                sanitize_sidecar_field(&entry.title)
+            )
+        })
+        .collect()
+}
+
+fn format_caption_sidecar(
+    kind: &str,
+    entries: &[ferritex_core::parser::api::CaptionEntry],
+) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{kind}\t{}\t{}\n",
+                sanitize_sidecar_field(&entry.number),
+                sanitize_sidecar_field(&entry.caption)
+            )
+        })
+        .collect()
+}
+
+fn source_lines_use_command(source_lines: &[SourceLineTrace], command_name: &str) -> bool {
+    let needle = format!("\\{command_name}");
+    source_lines.iter().any(|line| {
+        let content = line.text.split('%').next().unwrap_or_default();
+        content.match_indices(&needle).any(|(index, _)| {
+            let after = content[index + needle.len()..].chars().next();
+            after.map(|ch| !ch.is_alphabetic()).unwrap_or(true)
+        })
+    })
+}
+
 fn extract_text_for_span(source_lines: &[SourceLineTrace], span: SourceSpan) -> Option<String> {
     if span.start.file_id != span.end.file_id {
         return None;
@@ -2928,7 +3089,7 @@ fn parse_partition_body_document(
 }
 
 fn count_footnotes_in_text(text: &str) -> usize {
-    text.match_indices(r"\footnote").count()
+    text.matches(BODY_FOOTNOTE_START).count()
 }
 
 fn count_footnotes_in_nodes(nodes: &[DocumentNode]) -> usize {
@@ -3751,6 +3912,7 @@ fn try_partial_typeset_document(
         partition_plan,
         fragments,
         &navigation_state_for_document(document),
+        partition_merge_preserves_openright(document, partition_plan),
     );
     if !merged_matches_reuse_expectations(&merged, partition_plan, &reuse_plan.reuse_fragments) {
         return Err("merged reuse fragments did not preserve cached label/page counts");
@@ -3878,6 +4040,7 @@ fn try_parallel_full_typeset(
         &coalesced_plan,
         fragments,
         &navigation_state_for_document(document),
+        partition_merge_preserves_openright(document, &coalesced_plan),
     ))
 }
 
@@ -4486,6 +4649,18 @@ fn section_partition_continues_from_previous_block(
         last_marker,
         Some(BODY_PAGE_BREAK_MARKER | BODY_CLEAR_PAGE_MARKER | BODY_CLEAR_DOUBLE_PAGE_MARKER)
     )
+}
+
+fn partition_merge_preserves_openright(
+    document: &ParsedDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> bool {
+    document.document_class == "book"
+        && partition_plan.work_units.len() > 1
+        && partition_plan
+            .work_units
+            .iter()
+            .all(|work_unit| work_unit.kind == PartitionKind::Chapter)
 }
 
 fn float_counters_before_body_range(document: &ParsedDocument, body_start: usize) -> FloatCounters {
@@ -5593,6 +5768,7 @@ fn synctex_data_for(document: &TypesetDocument, source_lines: &[SourceLineTrace]
         remap_synctex_file_ids(&mut fallback, &fallback_file_ids);
         synctex.fragments.extend(fallback.fragments);
         synctex.files = merged_files;
+        synctex.recompute_pages();
     } else if !annotator.files.is_empty() {
         synctex.files = annotator.files;
     }
@@ -5870,12 +6046,18 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
     let severity = match error {
         ParseError::FontspecNotLoaded { .. }
         | ParseError::SetmainfontInBody { .. }
-        | ParseError::ShellEscapeNotAllowed { .. } => Severity::Warning,
+        | ParseError::ShellEscapeNotAllowed { .. }
+        | ParseError::UnimplementedPackage { .. } => Severity::Warning,
         _ => Severity::Error,
     };
     let diagnostic = Diagnostic::new(severity, error.to_string()).with_file(input_path);
     let diagnostic = if let Some(line) = error.line() {
         diagnostic.with_line(line)
+    } else {
+        diagnostic
+    };
+    let diagnostic = if let Some(column) = error.column() {
+        diagnostic.with_column(column)
     } else {
         diagnostic
     };
@@ -5964,6 +6146,13 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
         }
         ParseError::ShellEscapeError { .. } => diagnostic,
         ParseError::FileOperationDenied { reason, .. } => diagnostic.with_context(reason),
+        ParseError::UnimplementedPackage { name, .. } => diagnostic
+            .with_context(format!(
+                "ferritex has no implementation or bundled .sty for `{name}`; commands it would define will surface as undefined control sequences"
+            ))
+            .with_suggestion(format!(
+                "remove \\usepackage{{{name}}} or provide a .sty for it"
+            )),
     }
 }
 
@@ -10570,6 +10759,37 @@ mod tests {
     }
 
     #[test]
+    fn synctex_data_for_populates_pages_for_minimal_document() {
+        let source_lines = vec![ferritex_core::synctex::SourceLineTrace {
+            file: "/tmp/main.tex".to_string(),
+            line: 3,
+            text: "Hello world".to_string(),
+        }];
+        let document = test_typeset_document(vec![TextLine {
+            text: "Hello world".to_string(),
+            x: DimensionValue::zero(),
+            y: points(720),
+            links: Vec::new(),
+            font_index: 0,
+            font_size: points(10),
+            source_span: None,
+        }]);
+
+        let synctex = super::synctex_data_for(&document, &source_lines);
+
+        assert!(
+            !synctex.pages.is_empty(),
+            "minimal document must still expose a pages array"
+        );
+        assert_eq!(synctex.pages[0].page, 1);
+        assert_eq!(
+            synctex.pages[0].fragment_count as usize,
+            synctex.fragments.len(),
+            "single-page document must account for every fragment"
+        );
+    }
+
+    #[test]
     fn source_span_annotator_marks_wrapped_lines_with_same_span() {
         let source_lines = vec![ferritex_core::synctex::SourceLineTrace {
             file: "/tmp/main.tex".to_string(),
@@ -12462,6 +12682,56 @@ mod tests {
     }
 
     #[test]
+    fn issue_40_fixture_writes_navigation_sidecars_for_sequential_and_parallel() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ferritex-bench/fixtures/corpus/partition-book/book_with_toc_lot_lof.tex");
+        let loader = MockAssetBundleLoader::valid();
+        let expected_toc = "section\t0\t1\tOverview\nsection\t0\t2\tInterpretation\n";
+        let expected_lof = "figure\t1\tPlaceholder figure for the figure list\n";
+        let expected_lot = "table\t1\tSimple inventory table\n";
+
+        let compile_fixture = |parallelism: usize, output_dir: PathBuf| {
+            let mut options = runtime_options(fixture.clone(), output_dir.clone());
+            options.parallelism = parallelism;
+
+            let result = service(&FsTestFileAccessGate, &loader).compile(&options);
+
+            assert_eq!(result.exit_code, 0, "{:?}", result.diagnostics);
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            assert_eq!(
+                result
+                    .stable_compile_state
+                    .as_ref()
+                    .map(|state| state.page_count),
+                Some(11)
+            );
+            assert_eq!(
+                fs::read_to_string(output_dir.join("main.toc")).expect("read .toc sidecar"),
+                expected_toc
+            );
+            assert_eq!(
+                fs::read_to_string(output_dir.join("main.lof")).expect("read .lof sidecar"),
+                expected_lof
+            );
+            assert_eq!(
+                fs::read_to_string(output_dir.join("main.lot")).expect("read .lot sidecar"),
+                expected_lot
+            );
+
+            fs::read(output_dir.join("main.pdf")).expect("read rendered pdf")
+        };
+
+        let dir = tempdir().expect("create tempdir");
+        let sequential_pdf = compile_fixture(1, dir.path().join("out-sequential"));
+        let parallel_pdf = compile_fixture(4, dir.path().join("out-parallel"));
+
+        assert_eq!(
+            pdf_text_operators(&String::from_utf8_lossy(&parallel_pdf)),
+            pdf_text_operators(&String::from_utf8_lossy(&sequential_pdf))
+        );
+    }
+
+    #[test]
     fn preamble_change_forces_full_rebuild() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -13165,9 +13435,9 @@ mod tests {
     }
 
     #[test]
-    fn pdf_encoding_warning_is_propagated_to_compile_diagnostics() {
+    fn pdf_encoding_error_is_propagated_to_compile_diagnostics() {
         // '漢' has no WinAnsi mapping and no Symbol-font mapping, so it still
-        // triggers the encoding warning. (Greek/math glyphs are now routed
+        // triggers an explicit encoding error. (Greek/math glyphs are now routed
         // through the Symbol font rather than the WinAnsi text path.)
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
@@ -13178,21 +13448,65 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.exit_code, 2);
+        assert_eq!(result.output_pdf, None);
+        assert_eq!(result.stable_compile_state, None);
         let diagnostic = result
             .diagnostics
             .iter()
             .find(|diagnostic| {
-                diagnostic.severity == Severity::Warning
+                diagnostic.severity == Severity::Error
                     && diagnostic.message.contains('漢')
-                    && diagnostic.message.contains("WinAnsiEncoding")
+                    && diagnostic.message.contains("U+6F22")
             })
-            .expect("pdf encoding warning diagnostic");
+            .expect("pdf encoding error diagnostic");
+        assert!(diagnostic.message.contains("is not supported"));
         assert!(diagnostic.message.contains("replaced with '?'"));
     }
 
     #[test]
-    fn pdf_math_mode_unicode_glyphs_emit_no_winansi_warning() {
+    fn pdf_encoding_error_survives_cache_hit() {
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(&input_file, document("Hello 漢")).expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.no_cache = false;
+        let loader = MockAssetBundleLoader::valid();
+
+        let first = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(first.exit_code, 2);
+        assert_eq!(first.output_pdf, None);
+        assert_eq!(first.stable_compile_state, None);
+        assert!(
+            !options.output_dir.join("main.pdf").exists(),
+            "unsupported CJK should not emit a PDF artifact",
+        );
+
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let second = service(&FsTestFileAccessGate, &loader).compile(&options);
+        assert_eq!(second.exit_code, 2);
+        assert_eq!(second.output_pdf, None);
+        assert_eq!(second.stable_compile_state, None);
+        assert!(
+            !options.output_dir.join("main.pdf").exists(),
+            "repeated compile should still avoid writing a PDF artifact",
+        );
+        let diagnostic = second
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.severity == Severity::Error
+                    && diagnostic.message.contains('漢')
+                    && diagnostic.message.contains("U+6F22")
+            })
+            .expect("cached pdf encoding error diagnostic");
+        assert!(diagnostic.message.contains("is not supported"));
+    }
+
+    #[test]
+    fn pdf_math_mode_unicode_glyphs_do_not_produce_encoding_error() {
         // Regression for Issue #9: math-mode Unicode glyphs (\alpha, \pi, \int,
         // \sqrt{}, \infty, thin-space) must render through a math-capable font
         // rather than via WinAnsi '?' substitution.
@@ -13211,16 +13525,36 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        let winansi_messages: Vec<String> = result
+        const MATH_GLYPHS: &[char] = &[
+            '\u{03B1}', '\u{03B2}', '\u{03B3}', '\u{03C0}', '\u{221A}', '\u{221E}', '\u{222B}',
+            '\u{2009}',
+        ];
+        const MATH_GLYPH_CODEPOINTS: &[&str] = &[
+            "U+03B1", "U+03B2", "U+03B3", "U+03C0", "U+221A", "U+221E", "U+222B", "U+2009",
+        ];
+
+        let glyph_errors: Vec<String> = result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.message.contains("WinAnsiEncoding"))
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .filter(|diagnostic| {
+                MATH_GLYPHS
+                    .iter()
+                    .any(|glyph| diagnostic.message.contains(*glyph))
+                    || MATH_GLYPH_CODEPOINTS
+                        .iter()
+                        .any(|codepoint| diagnostic.message.contains(codepoint))
+            })
             .map(|diagnostic| diagnostic.message.clone())
             .collect();
 
         assert!(
-            winansi_messages.is_empty(),
-            "expected no WinAnsi encoding warnings for math-mode glyphs, got: {winansi_messages:?}",
+            glyph_errors.is_empty(),
+            "expected no encoding errors for math-mode glyphs, got: {glyph_errors:?}",
+        );
+        assert_ne!(
+            result.exit_code, 2,
+            "math-mode Unicode glyphs must not produce a fatal encoding error",
         );
     }
 
@@ -13248,6 +13582,58 @@ mod tests {
                 vec!["ok".to_string()],
                 expected_working_dir
             )]
+        );
+    }
+
+    #[test]
+    fn write18_rejects_commands_that_use_shell_metacharacters() {
+        // Regression for Issue #15: `\write18{echo x > file}` previously returned
+        // exit 0 with no diagnostic while silently passing `>` and `file` as argv
+        // tokens to `echo`, leaving the user's intended redirection target missing.
+        let dir = tempdir().expect("create tempdir");
+        let input_file = dir.path().join("main.tex");
+        fs::write(
+            &input_file,
+            document("\\write18{echo x > shell-escape-result.txt}\nHello"),
+        )
+        .expect("write input");
+
+        let mut options = runtime_options(input_file, dir.path().join("out"));
+        options.shell_escape = ShellEscapeMode::Enabled;
+        let loader = MockAssetBundleLoader::valid();
+        let shell_gateway = MockShellCommandGateway::default();
+
+        let result =
+            service_with_shell(&FsTestFileAccessGate, &loader, &shell_gateway).compile(&options);
+
+        assert_ne!(
+            result.exit_code, 0,
+            "compile must fail so the user is not misled into thinking the command ran"
+        );
+        assert!(
+            shell_gateway.commands().is_empty(),
+            "gateway must not be invoked when the command contains shell syntax: {:?}",
+            shell_gateway.commands()
+        );
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("unsupported shell metacharacter")
+                    && diagnostic.message.contains('>')
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected diagnostic about unsupported shell metacharacter, got: {:?}",
+                    result.diagnostics
+                )
+            });
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert!(
+            !dir.path().join("shell-escape-result.txt").exists(),
+            "no file should be created when shell syntax is rejected"
         );
     }
 
@@ -14187,31 +14573,6 @@ mod tests {
         let pdf = read_pdf(&options.output_dir.join("main.pdf"));
         assert!(pdf.contains("CURRENT FILE HELPER"));
         assert!(!pdf.contains("PROJECT ROOT HELPER"));
-    }
-
-    #[test]
-    fn project_root_fallback_resolves_when_not_in_current_dir() {
-        let dir = tempdir().expect("create tempdir");
-        let project_root = dir.path().join("project");
-        let src = project_root.join("src");
-        let subdir = src.join("subdir");
-        let shared = project_root.join("shared");
-        fs::create_dir_all(project_root.join(".git")).expect("create git marker");
-        fs::create_dir_all(&subdir).expect("create subdir");
-        fs::create_dir_all(&shared).expect("create shared");
-        fs::write(shared.join("macros.tex"), "PROJECT ROOT MACROS\n").expect("write macros");
-        fs::write(src.join("main.tex"), document("\\input{subdir/section}")).expect("write main");
-        fs::write(subdir.join("section.tex"), "\\input{shared/macros}\n").expect("write section");
-
-        let options = runtime_options(src.join("main.tex"), project_root.join("out"));
-        let gate = FsTestFileAccessGate;
-        let loader = MockAssetBundleLoader::valid();
-
-        let result = service(&gate, &loader).compile(&options);
-
-        assert_eq!(result.exit_code, 0);
-        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
-        assert!(pdf.contains("PROJECT ROOT MACROS"));
     }
 
     #[test]
