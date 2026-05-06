@@ -39,4 +39,5 @@
 
 - `\pdfcompresslevel=0` is required so the page content streams stay uncompressed and the parity harness can inspect `BT`/`ET` text operators without decompression.
 - `\pdfobjcompresslevel=0` keeps indirect objects readable without object-stream decompression.
-- `multipage_prose.pdf` and `report_with_toc.pdf` had their first `/Pages` `/Count` entry patched after pdfLaTeX generation so the current parity extractor reads the actual total page count from multi-page references.
+- `multipage_prose.pdf` had its first `/Pages` `/Count` entry patched after pdfLaTeX generation so the current parity extractor reads the actual total page count from the multi-page reference.
+- `report_with_toc.pdf` was regenerated from the current fixture on 2026-05-06 after the stale patched `/Pages` `/Count` entry no longer matched pdfLaTeX's 1-page output.
