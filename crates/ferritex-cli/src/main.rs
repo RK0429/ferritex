@@ -182,6 +182,9 @@ fn handle_compile(command: &CompileCommand) -> i32 {
 }
 
 fn print_compile_success_summary(command: &CompileCommand, result: &CompileResult) {
+    if result.exit_code == 2 {
+        return;
+    }
     let Some(output_pdf) = &result.output_pdf else {
         return;
     };

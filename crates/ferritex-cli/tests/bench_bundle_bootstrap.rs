@@ -1119,7 +1119,7 @@ fn bundle_corrupted_manifest_reports_diagnostic() {
         &report.failures[0],
         BenchFailure::CompileError { message, .. }
             if message.contains("invalid manifest")
-                && message.contains("help: verify the asset bundle path and version")
+                && message.contains("suggestion: verify the asset bundle path and version")
     ));
 }
 
