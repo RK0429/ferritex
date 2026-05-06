@@ -162,7 +162,7 @@ fn emit_recompile_start(changes: &[PathBuf]) {
 
 fn emit_recompile_end(result: &CompileResult) {
     if result.exit_code == 0 {
-        eprintln!("recompile finished");
+        eprintln!("recompiled output");
     } else {
         let error_count = result
             .diagnostics
@@ -193,7 +193,6 @@ fn describe_changed_paths(changes: &[PathBuf]) -> String {
     }
     summary
 }
-
 
 fn watched_paths_for_result(
     result: &CompileResult,

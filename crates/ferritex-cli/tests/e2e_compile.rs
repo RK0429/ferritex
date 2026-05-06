@@ -3311,7 +3311,7 @@ fn watch_emits_status_logs_for_startup_recompile_and_dependency_updates() {
         "watch should announce the start of a recompile",
     );
     wait_until(
-        || buffer_contains(&stderr_buffer, "recompile finished"),
+        || buffer_contains(&stderr_buffer, "recompiled output"),
         Duration::from_secs(10),
         "watch should announce the end of a successful recompile",
     );
