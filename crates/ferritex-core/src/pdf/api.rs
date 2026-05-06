@@ -270,8 +270,8 @@ impl PdfRenderer {
         let mut image_objects = self.images.clone();
         let mut form_xobjects = self.form_xobjects.clone();
         let page_partition_ids = page_partition_ids_for_plan(document, partition_plan);
-        let rendering_fonts = fonts_with_math_font(&self.fonts);
-        let math_font_number = math_font_f_number(&rendering_fonts);
+        let rendering_fonts = fonts_for_document(&self.fonts, document);
+        let math_font_number = math_font_f_number(&rendering_fonts).unwrap_or(1);
         let RenderedPagePayloads {
             page_payloads,
             encoding_errors,
@@ -720,27 +720,55 @@ fn default_font_resources() -> Vec<FontResource> {
 }
 
 /// Returns a rendering-ready copy of `fonts` with the built-in Symbol font
-/// appended (if absent). The Symbol font is always available so that math-mode
-/// Unicode glyphs never have to fall through the WinAnsi text path.
-fn fonts_with_math_font(fonts: &[FontResource]) -> Vec<FontResource> {
+/// appended only when the document contains glyphs that require it.
+fn fonts_for_document(fonts: &[FontResource], document: &TypesetDocument) -> Vec<FontResource> {
+    fonts_with_optional_math_font(fonts, document_uses_symbol_font(document))
+}
+
+fn fonts_with_optional_math_font(
+    fonts: &[FontResource],
+    include_symbol: bool,
+) -> Vec<FontResource> {
     let mut rendering_fonts = fonts.to_vec();
-    if !rendering_fonts
-        .iter()
-        .any(|font| matches!(font, FontResource::SymbolBuiltin))
+    if include_symbol
+        && !rendering_fonts
+            .iter()
+            .any(|font| matches!(font, FontResource::SymbolBuiltin))
     {
         rendering_fonts.push(FontResource::SymbolBuiltin);
     }
     rendering_fonts
 }
 
-/// Returns the PDF `/Fn` number (1-based) that points at the Symbol font in
-/// the rendering-ready fonts array produced by [`fonts_with_math_font`].
-fn math_font_f_number(rendering_fonts: &[FontResource]) -> usize {
+fn document_uses_symbol_font(document: &TypesetDocument) -> bool {
+    document.pages.iter().any(|page| {
+        page.lines.iter().any(line_uses_symbol_font)
+            || page
+                .float_placements
+                .iter()
+                .flat_map(resolve_float_lines)
+                .any(|line| line_uses_symbol_font(&line))
+    })
+}
+
+fn line_uses_symbol_font(line: &TextLine) -> bool {
+    text_uses_symbol_font(&strip_math_script_markers(&line.text))
+}
+
+fn text_uses_symbol_font(value: &str) -> bool {
+    value.chars().any(|ch| {
+        !matches!(ch, '\r' | '\n' | '\t' | '\u{2009}')
+            && unicode_to_winansi(ch).is_none()
+            && unicode_to_symbol_byte(ch).is_some()
+    })
+}
+
+/// Returns the PDF `/Fn` number (1-based) that points at the Symbol font.
+fn math_font_f_number(rendering_fonts: &[FontResource]) -> Option<usize> {
     rendering_fonts
         .iter()
         .position(|font| matches!(font, FontResource::SymbolBuiltin))
         .map(|index| index + 1)
-        .expect("rendering fonts always contain the Symbol font")
 }
 
 fn build_font_objects(fonts: &[FontResource], start_object_id: usize) -> Vec<FontObjectSet> {
@@ -4241,10 +4269,8 @@ mod tests {
         assert!(content.contains(
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
         ));
-        // Default resources carry Helvetica as F1 plus the always-appended
-        // Symbol math font as F2.
-        assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>"));
-        assert!(content.contains("<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
+        assert!(content.contains("/Resources << /Font << /F1 5 0 R >> >>"));
+        assert!(!content.contains("<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
     }
 
     #[test]
@@ -4475,14 +4501,13 @@ mod tests {
         let content = String::from_utf8_lossy(&pdf.bytes);
 
         // F1 = Helvetica (1 object: 5), F2 = embedded TrueType (3 consecutive
-        // objects starting at 6: dict/descriptor/fontfile), F3 = Symbol math
-        // font (always appended at 9).
-        assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 9 0 R >> >>"));
+        // objects starting at 6: dict/descriptor/fontfile).
+        assert!(content.contains("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>"));
         assert!(content.contains(
             "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
         ));
         assert!(content.contains("6 0 obj\n<< /Type /Font /Subtype /TrueType"));
-        assert!(content.contains("9 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
+        assert!(!content.contains("<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>"));
     }
 
     #[test]
