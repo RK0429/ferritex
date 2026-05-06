@@ -14104,6 +14104,7 @@ mod tests {
         let pdf = read_pdf(&output_dir.join("main.pdf"));
         assert!(pdf.contains("/BaseFont /FERRTX+CMR10"));
         assert!(pdf.contains("/BaseFont /FERRTX+CMBX12"));
+        assert!(!pdf.contains("/BaseFont /Symbol"));
     }
 
     #[test]
