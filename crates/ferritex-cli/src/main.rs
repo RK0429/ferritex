@@ -47,7 +47,7 @@ After the first successful compile, ferritex prints a loopback HTTP document URL
     )]
     Preview(CompileCommand),
     /// Watch for changes and recompile automatically
-    Watch(CompileCommand),
+    Watch(WatchCommand),
     /// Start the Language Server Protocol server
     #[command(
         long_about = "Start the Language Server Protocol server over stdio transport.
@@ -99,9 +99,6 @@ struct CompileCommand {
     /// Generate SyncTeX data for editor synchronization
     #[arg(long)]
     synctex: bool,
-    /// Print each watched file path in addition to the tracked count (watch only; ignored elsewhere)
-    #[arg(short = 'v', long)]
-    verbose: bool,
     /// Emit font task tracing to stderr
     #[arg(long)]
     trace_font_tasks: bool,
@@ -111,6 +108,15 @@ struct CompileCommand {
     /// Disable shell escape (overrides --shell-escape)
     #[arg(long)]
     no_shell_escape: bool,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct WatchCommand {
+    #[command(flatten)]
+    compile: CompileCommand,
+    /// Print each watched file path in addition to the tracked count
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -231,10 +237,10 @@ fn print_compile_success_summary(command: &CompileCommand, result: &CompileResul
     }
 }
 
-fn handle_watch(command: &CompileCommand) -> i32 {
-    eprintln!("watching {}", command.file.display());
+fn handle_watch(command: &WatchCommand) -> i32 {
+    eprintln!("watching {}", command.compile.file.display());
     eprintln!("press Ctrl+C to stop");
-    let command_for_summary = command.clone();
+    let command_for_summary = command.compile.clone();
     watch_runner::run_watch_loop(command, move |result| {
         print_compile_success_summary(&command_for_summary, result);
     })
@@ -399,7 +405,11 @@ fn handle_preview(command: &CompileCommand) -> i32 {
         }
     };
 
-    watch_runner::run_watch_loop(command, on_compile)
+    let watch_command = WatchCommand {
+        compile: command.clone(),
+        verbose: false,
+    };
+    watch_runner::run_watch_loop(&watch_command, on_compile)
 }
 
 fn handle_lsp() -> i32 {
@@ -683,7 +693,6 @@ mod tests {
             reproducible: false,
             interaction: Some(InteractionArg::Batchmode),
             synctex: true,
-            verbose: false,
             trace_font_tasks: true,
             shell_escape: true,
             no_shell_escape: false,
@@ -767,10 +776,32 @@ mod tests {
             panic!("expected watch subcommand");
         };
 
-        assert_eq!(command.file, PathBuf::from("notes.tex"));
-        assert_eq!(command.output_dir, Some(PathBuf::from("out")));
-        assert_eq!(command.jobs, NonZeroUsize::new(2));
+        assert_eq!(command.compile.file, PathBuf::from("notes.tex"));
+        assert_eq!(command.compile.output_dir, Some(PathBuf::from("out")));
+        assert_eq!(command.compile.jobs, NonZeroUsize::new(2));
         assert!(!command.verbose);
+    }
+
+    #[test]
+    fn watch_accepts_verbose_flag() {
+        let cli = Cli::try_parse_from(["ferritex", "watch", "notes.tex", "--verbose"])
+            .expect("parse CLI");
+
+        let Commands::Watch(command) = cli.command else {
+            panic!("expected watch subcommand");
+        };
+
+        assert_eq!(command.compile.file, PathBuf::from("notes.tex"));
+        assert!(command.verbose);
+    }
+
+    #[test]
+    fn compile_and_preview_reject_watch_verbose_flag() {
+        let compile = Cli::try_parse_from(["ferritex", "compile", "notes.tex", "--verbose"]);
+        let preview = Cli::try_parse_from(["ferritex", "preview", "notes.tex", "--verbose"]);
+
+        assert!(compile.is_err(), "compile must not accept watch --verbose");
+        assert!(preview.is_err(), "preview must not accept watch --verbose");
     }
 
     #[test]
@@ -859,8 +890,7 @@ mod tests {
         command.shell_escape = false;
         command.no_shell_escape = true;
 
-        let diagnostics =
-            execute_preview(&command).expect_err("expected initial compile to fail");
+        let diagnostics = execute_preview(&command).expect_err("expected initial compile to fail");
 
         assert!(
             diagnostics

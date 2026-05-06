@@ -257,7 +257,7 @@ graph LR
 | --- | --- |
 | `CompileJobService` | 各入口で正規化済みの `RuntimeOptions` を受け取り、`compile` / `watch` / `lsp` 共通の use case を起動する。`RuntimeOptions.traceFontTasks=true` の場合はフォント処理ステージに `FontTaskTrace` の `stderr` 出力を有効化する |
 | `WorkspaceJobScheduler` | workspace ごとの active job 排他制御と compile / preview publish 順序保証を担う |
-| `RecompileScheduler` | watch 専用に変更イベントを coalesce し、`PendingChangeQueue` と watch set refresh を管理する |
+| `RecompileScheduler` | watch 専用に変更イベントを coalesce し、`PendingChangeQueue` と watch set refresh を管理する。watch 入口の `verbose` 指定は adapter 側で watched path 表示にだけ使い、compile / preview の CLI surface や `RuntimeOptions` には混ぜない |
 | `LiveAnalysisSnapshotFactory` | `OpenDocumentBuffer` と最新の成功した `CommitBarrier` 完了時点で確定した Stable Compile State から LSP 専用の immutable projection を構築する |
 | `LspCapabilityService` | `initialize` 応答で advertise する `textDocumentSync` / `completionProvider` / `codeActionProvider` と `definitionProvider` / `hoverProvider` などの optional provider を構築し、push diagnostics を含む LSP 配線を担う |
 | `PreviewSessionService` | preview session の発行・再発行・失効、`Preview Adapter` へ返す bootstrap payload の決定、`PreviewTarget` owner 管理、閲覧位置保存、PDF 更新通知、`ExecutionPolicy.previewPublication` に照らした publish 可否判定と再適用を行う。bootstrap では session 解決と payload 決定のみを行い、policy 判定は publish phase で実施する |

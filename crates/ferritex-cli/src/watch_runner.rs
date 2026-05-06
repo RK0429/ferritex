@@ -18,13 +18,13 @@ use ferritex_infra::fs::FsFileAccessGate;
 use ferritex_infra::shell::ShellCommandGateway;
 use ferritex_infra::watcher::PollingFileWatcher;
 
-use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, CompileCommand};
+use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, WatchCommand};
 
-pub fn run_watch_loop<F>(command: &CompileCommand, mut on_compile: F) -> i32
+pub fn run_watch_loop<F>(command: &WatchCommand, mut on_compile: F) -> i32
 where
     F: FnMut(&CompileResult),
 {
-    let options = runtime_options_from_command(command);
+    let options = runtime_options_from_command(&command.compile);
     let interaction_mode = options.interaction_mode;
     let policy = ExecutionPolicyFactory::create(&options);
     let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
