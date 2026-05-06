@@ -2411,6 +2411,9 @@ mod tests {
             .iter()
             .all(|case| case.name.starts_with("corpus-navigation-features-")));
         assert!(cases.iter().all(|case| case.input_fixture.exists()));
+        assert!(cases
+            .iter()
+            .any(|case| case.name == "corpus-navigation-features-custom_metadata"));
     }
 
     #[test]
