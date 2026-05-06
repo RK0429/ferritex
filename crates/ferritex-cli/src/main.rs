@@ -40,12 +40,17 @@ enum Commands {
     /// Compile a LaTeX document to PDF
     Compile(CompileCommand),
     /// Compile and start a live preview server
+    #[command(
+        long_about = "Compile the input document and publish it through a loopback preview transport.
+
+After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session."
+    )]
     Preview(CompileCommand),
     /// Watch for changes and recompile automatically
     Watch(CompileCommand),
     /// Start the Language Server Protocol server
     #[command(
-        long_about = "Start the Language Server Protocol server over stdio.
+        long_about = "Start the Language Server Protocol server over stdio transport.
 
 The server speaks JSON-RPC 2.0 using `Content-Length: <N>\\r\\n\\r\\n<N bytes of UTF-8 JSON>` framing.
 Oversize or malformed frames are treated as fatal session errors and terminate the session.
