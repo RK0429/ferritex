@@ -2353,6 +2353,10 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                         let _ = self.take_global_prefix();
                         self.body.push_str(TODAY_PLACEHOLDER);
                     }
+                    "TeX" | "LaTeX" => {
+                        let _ = self.take_global_prefix();
+                        self.body.push_str(&name);
+                    }
                     "vspace" | "hspace" => {
                         let _ = self.take_global_prefix();
                         let _ = self.consume_optional_star();
@@ -10674,6 +10678,37 @@ mod tests {
             )]
         );
         assert_ne!(nodes, vec![DocumentNode::Text(r"\today".to_string(), None)]);
+    }
+
+    #[test]
+    fn logo_macros_produce_text_without_undefined_diagnostics() {
+        let output = MinimalLatexParser.parse_recovering(concat!(
+            "\\documentclass{article}\n",
+            "\\begin{document}\n",
+            "\\TeX{} and \\LaTeX{} and \\LaTeX\n",
+            "\\end{document}\n",
+        ));
+
+        let undefined = output
+            .errors
+            .iter()
+            .filter_map(|error| match error {
+                ParseError::UndefinedControlSequence { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            undefined.is_empty(),
+            "logo macros should not surface as undefined: {undefined:?}"
+        );
+
+        assert_eq!(
+            output.document.expect("document should parse").body_nodes(),
+            vec![DocumentNode::Text(
+                "TeX and LaTeX and LaTeX".to_string(),
+                None
+            )]
+        );
     }
 
     #[test]
