@@ -246,6 +246,27 @@ fn print_compile_success_summary(
     }
 }
 
+fn print_preview_initial_compile_success_summary(command: &CompileCommand, result: &CompileResult) {
+    if result.exit_code != 0 {
+        return;
+    }
+    let Some(output_pdf) = &result.output_pdf else {
+        return;
+    };
+    let page_count = result
+        .stable_compile_state
+        .as_ref()
+        .map_or(0, |state| state.page_count);
+    println!(
+        "{} -> {} ({} page{}, {} ms)",
+        command.file.display(),
+        output_pdf.display(),
+        page_count,
+        if page_count == 1 { "" } else { "s" },
+        result.stage_timing.total().as_millis()
+    );
+}
+
 fn handle_watch(command: &WatchCommand) -> i32 {
     eprintln!("watching {}", command.compile.file.display());
     eprintln!("press Ctrl+C to stop");
@@ -365,6 +386,7 @@ fn handle_preview(command: &CompileCommand) -> i32 {
 
             println!("{}", bootstrap.document_url);
             println!("{}", bootstrap.events_url);
+            print_preview_initial_compile_success_summary(command, result);
 
             let svc = Arc::clone(&callback_service);
             callback_transport.set_view_state_handler(Arc::new(move |session_id, update| {

@@ -3123,11 +3123,28 @@ fn preview_reuses_successful_initial_compile_when_starting_watch_loop() {
     stdout
         .read_line(&mut events_url)
         .expect("read preview events URL");
+    let mut success_summary = String::new();
+    stdout
+        .read_line(&mut success_summary)
+        .expect("read preview initial compile success summary");
 
     let document_url = document_url.trim().to_string();
     let events_url = events_url.trim().to_string();
+    let success_summary = success_summary.trim().to_string();
     assert!(document_url.starts_with("http://127.0.0.1:"));
     assert!(events_url.starts_with("ws://127.0.0.1:"));
+    assert!(
+        success_summary.contains(tex_file.to_str().expect("utf-8 path")),
+        "summary should mention the input file, got: {success_summary}"
+    );
+    assert!(
+        success_summary.contains("hello.pdf"),
+        "summary should mention the generated PDF path, got: {success_summary}"
+    );
+    assert!(
+        success_summary.contains("(1 page, ") && success_summary.ends_with(" ms)"),
+        "summary should include page count and elapsed milliseconds, got: {success_summary}"
+    );
 
     wait_until(
         || buffer_contains(&stderr_buf, "tracking 1 file"),
