@@ -24,6 +24,28 @@ pub fn run_watch_loop<F>(command: &WatchCommand, mut on_compile: F) -> i32
 where
     F: FnMut(&CompileResult),
 {
+    run_watch_loop_inner(command, None, &mut on_compile)
+}
+
+pub fn run_watch_loop_after_initial_compile<F>(
+    command: &WatchCommand,
+    initial_result: CompileResult,
+    mut on_compile: F,
+) -> i32
+where
+    F: FnMut(&CompileResult),
+{
+    run_watch_loop_inner(command, Some(initial_result), &mut on_compile)
+}
+
+fn run_watch_loop_inner<F>(
+    command: &WatchCommand,
+    initial_result: Option<CompileResult>,
+    on_compile: &mut F,
+) -> i32
+where
+    F: FnMut(&CompileResult),
+{
     let options = runtime_options_from_command(&command.compile);
     let interaction_mode = options.interaction_mode;
     let policy = ExecutionPolicyFactory::create(&options);
@@ -41,9 +63,15 @@ where
         .parent()
         .unwrap_or_else(|| Path::new("."));
 
-    let initial_result = scheduler.run(workspace_root, || service.compile(&options));
-    emit_diagnostics(&initial_result.diagnostics, interaction_mode);
-    on_compile(&initial_result);
+    let initial_result = match initial_result {
+        Some(initial_result) => initial_result,
+        None => {
+            let result = scheduler.run(workspace_root, || service.compile(&options));
+            emit_diagnostics(&result.diagnostics, interaction_mode);
+            on_compile(&result);
+            result
+        }
+    };
 
     let watched_paths =
         watched_paths_for_result(&initial_result, &options.input_file, &file_access_gate);

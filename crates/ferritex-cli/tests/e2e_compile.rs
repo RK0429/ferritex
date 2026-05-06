@@ -3083,6 +3083,80 @@ fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
 }
 
 #[test]
+fn preview_reuses_successful_initial_compile_when_starting_watch_loop() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    let marker_file = dir.path().join("compile-count.txt");
+    let script_file = dir.path().join("record-compile.sh");
+    std::fs::write(&script_file, "#!/bin/sh\nprintf 'compile\\n' >> \"$1\"\n")
+        .expect("write shell escape helper");
+    std::fs::write(
+        &tex_file,
+        format!(
+            "\\documentclass{{article}}\n\\begin{{document}}\n\\write18{{/bin/sh {} {}}}\nHello\n\\end{{document}}\n",
+            script_file.display(),
+            marker_file.display()
+        ),
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args([
+            "preview",
+            "--shell-escape",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let stderr = child.stderr.take().expect("preview stderr");
+    let (stderr_buf, stderr_handle) = spawn_streaming_collector(stderr);
+
+    let stdout = child.stdout.take().expect("preview stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut document_url = String::new();
+    stdout
+        .read_line(&mut document_url)
+        .expect("read preview document URL");
+    let mut events_url = String::new();
+    stdout
+        .read_line(&mut events_url)
+        .expect("read preview events URL");
+
+    let document_url = document_url.trim().to_string();
+    let events_url = events_url.trim().to_string();
+    assert!(document_url.starts_with("http://127.0.0.1:"));
+    assert!(events_url.starts_with("ws://127.0.0.1:"));
+
+    wait_until(
+        || buffer_contains(&stderr_buf, "tracking 1 file"),
+        Duration::from_secs(5),
+        "preview should start the watch loop after the initial publish",
+    );
+
+    let compile_count = std::fs::read_to_string(&marker_file)
+        .expect("read shell escape compile marker")
+        .lines()
+        .count();
+    assert_eq!(
+        compile_count, 1,
+        "preview must not run the successful initial compile twice before watching starts",
+    );
+
+    let (host, port, path) = parse_loopback_document_url(&document_url);
+    wait_until(
+        || issue_get_request(&host, port, &path).starts_with(b"HTTP/1.1 200 OK"),
+        Duration::from_secs(2),
+        "preview should publish the initial PDF",
+    );
+
+    child.kill().expect("kill preview process");
+    child.wait().expect("wait for preview process");
+    stderr_handle.join().expect("join preview stderr collector");
+}
+
+#[test]
 fn watch_refreshes_dependency_set_after_new_input_is_added() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
