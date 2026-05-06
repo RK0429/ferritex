@@ -2403,14 +2403,32 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
                     }
                     "tableofcontents" => {
                         let _ = self.take_global_prefix();
+                        if let Some(expansion) =
+                            self.expand_defined_control_sequence_token(&token)?
+                        {
+                            self.push_front_tokens(expansion);
+                            return Ok(false);
+                        }
                         self.parse_table_of_contents();
                     }
                     "listoffigures" => {
                         let _ = self.take_global_prefix();
+                        if let Some(expansion) =
+                            self.expand_defined_control_sequence_token(&token)?
+                        {
+                            self.push_front_tokens(expansion);
+                            return Ok(false);
+                        }
                         self.parse_list_of_figures();
                     }
                     "listoftables" => {
                         let _ = self.take_global_prefix();
+                        if let Some(expansion) =
+                            self.expand_defined_control_sequence_token(&token)?
+                        {
+                            self.push_front_tokens(expansion);
+                            return Ok(false);
+                        }
                         self.parse_list_of_tables();
                     }
                     "setmainfont" | "setsansfont" | "setmonofont" => {
@@ -8148,6 +8166,14 @@ fn replace_body_markers_with_placeholders(body: &str) -> (String, Vec<DocumentNo
                 text.push(placeholder);
                 index = next_index;
             }
+            BODY_FOOTNOTE_START => {
+                let (content, next_index) =
+                    extract_single_marker_content(body, index, BODY_FOOTNOTE_END);
+                text.push(BODY_FOOTNOTE_START);
+                text.push_str(content);
+                text.push(BODY_FOOTNOTE_END);
+                index = next_index;
+            }
             BODY_MULTICOL_START => {
                 let (content, next_index) =
                     extract_single_marker_content(body, index, BODY_MULTICOL_END);
@@ -12595,6 +12621,32 @@ mod tests {
         assert!(!document.body.contains("secnumdepth"));
         assert!(!document.body.contains("tocdepth"));
         assert!(!document.body.contains('5'));
+    }
+
+    #[test]
+    fn user_defined_tableofcontents_overrides_builtin_toc() {
+        let document = parse_source(
+            "\\documentclass{report}\n\\def\\tableofcontents{}\n\\begin{document}\n\\tableofcontents\n\\chapter{Results}\n\\end{document}\n",
+        );
+
+        assert_eq!(document.body, "1 Results");
+        assert_eq!(
+            document.body_nodes(),
+            vec![DocumentNode::Text("1 Results".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn body_nodes_preserve_footnote_markers_for_typesetting_extraction() {
+        let document = parse_document("A footnote\\footnote{note body} mark.");
+
+        assert_eq!(
+            document.body_nodes(),
+            vec![DocumentNode::Text(
+                format!("A footnote{BODY_FOOTNOTE_START}note body{BODY_FOOTNOTE_END} mark."),
+                None,
+            )]
+        );
     }
 
     #[test]

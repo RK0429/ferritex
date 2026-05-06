@@ -1674,6 +1674,7 @@ fn extract_line_positions_from_stream(stream: &[u8]) -> Vec<i64> {
     let mut operands = Vec::new();
     let mut current_y = None;
     let mut leading = 0.0f64;
+    let mut script_rise_y = None;
 
     while let Some(token) = tokenizer.next() {
         match token {
@@ -1682,30 +1683,43 @@ fn extract_line_positions_from_stream(stream: &[u8]) -> Vec<i64> {
                 operands.clear();
                 current_y = None;
                 leading = 0.0;
+                script_rise_y = None;
             }
             ContentToken::Operator("ET") => {
                 in_text = false;
                 operands.clear();
                 current_y = None;
                 leading = 0.0;
+                script_rise_y = None;
             }
             ContentToken::Number(value) if in_text => operands.push(value),
             ContentToken::Operator(operator) if in_text => {
                 match operator {
                     "Td" => {
                         if let Some(dy) = operands.iter().next_back().copied() {
-                            current_y = Some(current_y.unwrap_or(0.0) + dy);
+                            let previous_y = current_y;
+                            let next_y = current_y.unwrap_or(0.0) + dy;
+                            current_y = Some(next_y);
+                            if previous_y.is_some() && dy > 0.0 && dy <= 5.0 {
+                                script_rise_y = Some(next_y);
+                            } else if script_rise_y.is_some() && dy < 0.0 && dy.abs() <= 5.0 {
+                                script_rise_y = None;
+                            } else {
+                                script_rise_y = None;
+                            }
                         }
                     }
                     "TD" => {
                         if let Some(dy) = operands.iter().next_back().copied() {
                             current_y = Some(current_y.unwrap_or(0.0) + dy);
                             leading = -dy;
+                            script_rise_y = None;
                         }
                     }
                     "Tm" => {
                         if let Some(y) = operands.iter().next_back().copied() {
                             current_y = Some(y);
+                            script_rise_y = None;
                         }
                     }
                     "TL" => {
@@ -1715,14 +1729,18 @@ fn extract_line_positions_from_stream(stream: &[u8]) -> Vec<i64> {
                     }
                     "T*" => {
                         current_y = Some(current_y.unwrap_or(0.0) - leading);
+                        script_rise_y = None;
                     }
                     "Tj" | "TJ" => {
                         if let Some(y) = current_y {
-                            positions.insert(y.round() as i64);
+                            if script_rise_y != Some(y) {
+                                positions.insert(y.round() as i64);
+                            }
                         }
                     }
                     "'" | "\"" => {
                         current_y = Some(current_y.unwrap_or(0.0) - leading);
+                        script_rise_y = None;
                         if let Some(y) = current_y {
                             positions.insert(y.round() as i64);
                         }
@@ -3910,6 +3928,14 @@ mod tests {
     const NESTED_PAGE_TREE_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 4 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [5 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Pages /Kids [6 0 R 7 0 R] /Count 2 >>\nendobj\n4 0 obj\n<< /Type /Pages /Kids [2 0 R 3 0 R] /Count 3 >>\nendobj\n5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>\nendobj\n6 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 200 100] >>\nendobj\n7 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 200 100] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
     const LINE_POSITIONS_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 102 >>\nstream\nBT\n/F1 12 Tf\n72 720 Td\n(Hello) Tj\n0 -18 Td\n(World) Tj\n1 0 0 1 72 650 Tm\n(Again) Tj\nET\nendstream\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
     const TWO_PAGE_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>\nendobj\n4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>\nendobj\n5 0 obj\n<< /Length 37 >>\nstream\nBT\n/F1 12 Tf\n72 720 Td\n(Page1) Tj\nET\nendstream\nendobj\n6 0 obj\n<< /Length 37 >>\nstream\nBT\n/F1 12 Tf\n72 700 Td\n(Page2) Tj\nET\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
+
+    fn minimal_pdf_with_stream(stream: &str) -> String {
+        format!(
+            "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n",
+            stream.len(),
+            stream
+        )
+    }
     const NAVIGATION_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines 7 0 R /Dests 11 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [5 0 R 6 0 R] /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 19 >>\nstream\nBT\n(Hello) Tj\nET\nendstream\nendobj\n5 0 obj\n<< /Type /Annot /Subtype /Link /A << /S /GoTo /D /intro >> >>\nendobj\n6 0 obj\n<< /Type /Annot /Subtype /Link /Dest /deep >>\nendobj\n7 0 obj\n<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 2 >>\nendobj\n8 0 obj\n<< /Title (Chapter 1) /Parent 7 0 R /First 9 0 R /Last 9 0 R /Dest /intro >>\nendobj\n9 0 obj\n<< /Title (Section 1) /Parent 8 0 R /Dest /deep >>\nendobj\n11 0 obj\n<< /Doc-Start [3 0 R /Fit] /page.1 [3 0 R /Fit] /section*.1 [3 0 R /Fit] /intro [3 0 R /Fit] /deep [3 0 R /Fit] >>\nendobj\n12 0 obj\n<< /Title (Navigation Test) /Author <416c696365> >>\nendobj\ntrailer\n<< /Root 1 0 R /Info 12 0 R >>\n%%EOF\n";
     const NAMES_TREE_NAVIGATION_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names << /Dests 11 0 R >> >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 19 >>\nstream\nBT\n(Hello) Tj\nET\nendstream\nendobj\n11 0 obj\n<< /Kids [12 0 R 13 0 R] >>\nendobj\n12 0 obj\n<< /Names [(Doc-Start) [3 0 R /Fit] (page.1) [3 0 R /Fit] (intro) [3 0 R /Fit]] >>\nendobj\n13 0 obj\n<< /Names [(section*.1) [3 0 R /Fit] (deep) [3 0 R /Fit]] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
     const STRUCTURAL_ALIAS_NAVIGATION_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names << /Dests 11 0 R >> >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 19 >>\nstream\nBT\n(Hello) Tj\nET\nendstream\nendobj\n11 0 obj\n<< /Names [(sec:intro) [3 0 R /Fit] (section:1 Intro) [3 0 R /Fit] (sec:scope) [3 0 R /Fit] (section:1.1 Scope) [3 0 R /Fit] (bib:knuth) [3 0 R /Fit]] >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
@@ -4062,6 +4088,17 @@ mod tests {
         let positions = extract_line_y_positions(LINE_POSITIONS_PDF).unwrap();
 
         assert_eq!(positions, vec![vec![650, 702, 720]]);
+    }
+
+    #[test]
+    fn extract_line_y_positions_ignores_inline_script_rise() {
+        let pdf = minimal_pdf_with_stream(
+            "BT\n/F1 10 Tf\n72 707 Td\n(Base) Tj\n93.934 3.615 Td\n(2) Tj\n6.683 -3.615 Td\n(rest) Tj\n0 -24 Td\n(next) Tj\nET",
+        );
+
+        let positions = extract_line_y_positions(pdf.as_bytes()).unwrap();
+
+        assert_eq!(positions, vec![vec![683, 707]]);
     }
 
     #[test]
