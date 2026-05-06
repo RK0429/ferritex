@@ -83,7 +83,7 @@ struct CompileCommand {
     /// Disable compilation cache
     #[arg(long)]
     no_cache: bool,
-    /// Path to a pre-built asset bundle
+    /// Path to a pre-built asset bundle. Without this option, compile uses built-in/host asset fallback.
     #[arg(long, value_name = "PATH")]
     asset_bundle: Option<PathBuf>,
     /// Enable reproducible output (deterministic timestamps)
@@ -188,11 +188,15 @@ fn handle_compile(command: &CompileCommand) -> i32 {
     );
     let result = service.compile(&options);
     emit_diagnostics(&result.diagnostics, options.interaction_mode);
-    print_compile_success_summary(command, &result);
+    print_compile_success_summary(command, &result, true);
     result.exit_code
 }
 
-fn print_compile_success_summary(command: &CompileCommand, result: &CompileResult) {
+fn print_compile_success_summary(
+    command: &CompileCommand,
+    result: &CompileResult,
+    print_asset_bundle_fallback_warning: bool,
+) {
     if result.exit_code == 2 {
         return;
     }
@@ -235,6 +239,11 @@ fn print_compile_success_summary(command: &CompileCommand, result: &CompileResul
             if page_count == 1 { "" } else { "s" }
         );
     }
+    if print_asset_bundle_fallback_warning && command.asset_bundle.is_none() {
+        println!(
+            "warning: no asset bundle specified; using built-in/host asset fallback. Pass --asset-bundle <PATH> to use the release asset bundle."
+        );
+    }
 }
 
 fn handle_watch(command: &WatchCommand) -> i32 {
@@ -242,7 +251,7 @@ fn handle_watch(command: &WatchCommand) -> i32 {
     eprintln!("press Ctrl+C to stop");
     let command_for_summary = command.compile.clone();
     watch_runner::run_watch_loop(command, move |result| {
-        print_compile_success_summary(&command_for_summary, result);
+        print_compile_success_summary(&command_for_summary, result, false);
     })
 }
 

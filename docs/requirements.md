@@ -921,7 +921,7 @@
   - `--jobname <name>`: ジョブ名（出力ファイル名）の指定。`Runtime Options.jobname` に正規化され、same-job 判定と出力命名の共通語彙として使う
   - `--jobs <N>`: 並列処理のスレッド数（デフォルト: CPU コア数）。高並列では heavy fixture で peak RSS が 1 GiB を超え `REQ-NF-003` と衝突しうるため、メモリ制約が厳しい環境では値を抑制することを推奨
   - `--no-cache`: キャッシュを無効化しフルコンパイル
-  - `--asset-bundle <ref>`: 使用する Ferritex Asset Bundle の指定。`<ref>` はファイルパスまたは組み込みバンドル識別子
+  - `--asset-bundle <ref>`: 使用する Ferritex Asset Bundle の指定。`<ref>` はファイルパスまたは組み込みバンドル識別子。未指定の `compile` は開発用途の built-in / host asset fallback を使い、bundle 指定時と出力が異なりうることを成功時メッセージまたは help で明示する
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`, `errorstopmode`）。`batchmode` は CLI diagnostics の `stderr` 出力を抑制し、`nonstopmode` / `scrollmode` / `errorstopmode` は ferritex の非対話実行では同等の継続モードとして扱う
   - `--synctex`: SyncTeX データの生成有無
   - `--trace-font-tasks`: `REQ-FUNC-033` の検証に使う `FontTaskTrace` を `stderr` に出力する
