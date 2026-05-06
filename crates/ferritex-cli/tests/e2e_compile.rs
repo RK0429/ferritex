@@ -426,12 +426,54 @@ fn compile_existing_file_writes_pdf_with_document_content() {
     assert!(stdout.contains(tex_file.to_str().expect("utf-8 path")));
     assert!(stdout.contains("hello.pdf"));
     assert!(stdout.contains("(1 page)"));
+    assert!(
+        stdout.contains("no asset bundle specified"),
+        "compile without --asset-bundle should surface fallback risk, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("--asset-bundle"),
+        "fallback warning should tell users how to opt into bundle-backed assets, got: {stdout}"
+    );
 
     let pdf_file = dir.path().join("hello.pdf");
     let pdf = std::fs::read_to_string(&pdf_file).expect("read output pdf");
     assert!(pdf.starts_with("%PDF-1.4"));
     assert!(pdf.contains("Hello, Ferritex!"));
     assert!(!pdf.contains("Ferritex placeholder PDF"));
+}
+
+#[test]
+fn compile_with_asset_bundle_does_not_print_fallback_warning() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    let bundle_dir = expanded_asset_bundle_fixture();
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello, bundled Ferritex!\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--asset-bundle",
+            bundle_dir.path().to_str().expect("utf-8 bundle path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("no asset bundle specified"),
+        "explicit --asset-bundle must not print fallback warning, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("no asset bundle specified"),
+        "explicit --asset-bundle must not print fallback warning to stderr, got: {stderr}"
+    );
 }
 
 #[test]
@@ -3340,6 +3382,10 @@ fn watch_emits_status_logs_for_startup_recompile_and_dependency_updates() {
         final_stdout.matches("hello.pdf").count() >= 2,
         "stdout should include at least the initial and one recompile summary, got: {final_stdout}"
     );
+    assert!(
+        !final_stdout.contains("no asset bundle specified"),
+        "watch should not print compile-only asset fallback warning, got: {final_stdout}"
+    );
     let final_stderr = buffer_snapshot(&stderr_buffer);
     assert_eq!(
         final_stderr.matches("press Ctrl+C to stop").count(),
@@ -4601,6 +4647,10 @@ fn compile_help_shows_option_descriptions() {
     assert!(
         stdout.contains("Output directory"),
         "compile help should describe --output-dir"
+    );
+    assert!(
+        stdout.contains("built-in/host asset fallback"),
+        "compile help should explain --asset-bundle omission fallback, got: {stdout}"
     );
 }
 

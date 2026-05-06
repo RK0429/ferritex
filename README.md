@@ -47,6 +47,10 @@ tar -xzf tmp/FTX-ASSET-BUNDLE-001.tar.gz -C tmp/bundle
 # Compile with the asset bundle (recommended)
 cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUNDLE-001
 
+# Omitting --asset-bundle is supported for development, but ferritex will warn
+# that it is using built-in/host asset fallback and output may differ from the
+# release asset bundle path.
+
 # Reproducible mode disables host-font fallback for deterministic output
 cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUNDLE-001 --reproducible
 
