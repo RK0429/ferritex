@@ -32,6 +32,7 @@ pub enum DocumentLookupResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopbackRequest<'a> {
     GetDocument(&'a str),
+    HeadDocument(&'a str),
     GetEvents(&'a str),
 }
 
@@ -229,7 +230,15 @@ impl LoopbackPreviewTransport {
         match Self::parse_loopback_request(&request_line) {
             Ok(LoopbackRequest::GetDocument(session_id)) => {
                 let response = match self.serve_document(session_id) {
-                    DocumentLookupResult::Found(document) => Self::ok_response(document),
+                    DocumentLookupResult::Found(document) => Self::ok_response(document, true),
+                    DocumentLookupResult::Invalidated => Self::gone_response(session_id),
+                    DocumentLookupResult::Unknown => NOT_FOUND_RESPONSE.to_vec(),
+                };
+                Self::write_response(&mut stream, &response)?;
+            }
+            Ok(LoopbackRequest::HeadDocument(session_id)) => {
+                let response = match self.serve_document(session_id) {
+                    DocumentLookupResult::Found(document) => Self::ok_response(document, false),
                     DocumentLookupResult::Invalidated => Self::gone_response(session_id),
                     DocumentLookupResult::Unknown => NOT_FOUND_RESPONSE.to_vec(),
                 };
@@ -336,8 +345,12 @@ impl LoopbackPreviewTransport {
             return Err(());
         };
         if let Some(session_id) = session_path.strip_suffix("/document") {
-            if method == "GET" && !session_id.is_empty() {
-                return Ok(LoopbackRequest::GetDocument(session_id));
+            if !session_id.is_empty() {
+                return match method {
+                    "GET" => Ok(LoopbackRequest::GetDocument(session_id)),
+                    "HEAD" => Ok(LoopbackRequest::HeadDocument(session_id)),
+                    _ => Err(()),
+                };
             }
             return Err(());
         }
@@ -351,14 +364,16 @@ impl LoopbackPreviewTransport {
         Err(())
     }
 
-    fn ok_response(document: PreviewDocumentResponse) -> Vec<u8> {
+    fn ok_response(document: PreviewDocumentResponse, include_body: bool) -> Vec<u8> {
         let mut response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nCache-Control: {}\r\nContent-Length: {}\r\n\r\n",
             document.cache_control,
             document.bytes.len()
         )
         .into_bytes();
-        response.extend_from_slice(&document.bytes);
+        if include_body {
+            response.extend_from_slice(&document.bytes);
+        }
         response
     }
 
@@ -1136,6 +1151,35 @@ mod tests {
     }
 
     #[test]
+    fn serve_returns_pdf_headers_for_head_request() {
+        let transport =
+            Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
+        let pdf = b"%PDF-1.4\nhello\n";
+
+        transport
+            .publish_pdf("preview-session-1", pdf)
+            .expect("publish pdf");
+        transport.start_background();
+
+        let response = issue_request(
+            transport.port(),
+            "HEAD",
+            "/preview/preview-session-1/document",
+        );
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response
+            .windows("Content-Type: application/pdf".len())
+            .any(|window| window == b"Content-Type: application/pdf"));
+        assert!(response
+            .windows("Content-Length: 15".len())
+            .any(|window| window == b"Content-Length: 15"));
+
+        let (_, body) = split_http_response(&response);
+        assert!(body.is_empty());
+    }
+
+    #[test]
     fn serve_returns_404_for_unknown_session() {
         let transport =
             Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
@@ -1625,11 +1669,15 @@ mod tests {
     }
 
     fn issue_get_request(port: u16, path: &str) -> Vec<u8> {
+        issue_request(port, "GET", path)
+    }
+
+    fn issue_request(port: u16, method: &str, path: &str) -> Vec<u8> {
         let mut stream =
             TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback preview server");
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
         )
         .expect("write request");
         stream.shutdown(Shutdown::Write).expect("shutdown write");
