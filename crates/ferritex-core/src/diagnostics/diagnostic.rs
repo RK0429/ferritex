@@ -79,25 +79,31 @@ impl Diagnostic {
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:", self.severity)?;
+        if let Some(file) = &self.file {
+            write!(f, "{file}")?;
+            write!(f, ":{}", self.line.unwrap_or(1))?;
+            if let Some(column) = self.column {
+                write!(f, ":{column}")?;
+            }
+            write!(f, ": {}: {}", self.severity, self.message)?;
+        } else {
+            write!(f, "{}:", self.severity)?;
 
-        match (&self.file, self.line, self.column) {
-            (Some(file), Some(line), Some(column)) => write!(f, " {file}:{line}:{column}:")?,
-            (Some(file), Some(line), None) => write!(f, " {file}:{line}:")?,
-            (Some(file), None, _) => write!(f, " {file}:")?,
-            (None, Some(line), Some(column)) => write!(f, " line {line}:{column}:")?,
-            (None, Some(line), None) => write!(f, " line {line}:")?,
-            (None, None, _) => {}
+            match (self.line, self.column) {
+                (Some(line), Some(column)) => write!(f, " line {line}:{column}:")?,
+                (Some(line), None) => write!(f, " line {line}:")?,
+                (None, _) => {}
+            }
+
+            write!(f, " {}", self.message)?;
         }
-
-        write!(f, " {}", self.message)?;
 
         if let Some(context) = &self.context {
             write!(f, "\n  context: {context}")?;
         }
 
         if let Some(suggestion) = &self.suggestion {
-            write!(f, "\n  help: {suggestion}")?;
+            write!(f, "\n  suggestion: {suggestion}")?;
         }
 
         Ok(())
@@ -131,9 +137,20 @@ mod tests {
 
         let rendered = diagnostic.to_string();
 
-        assert!(rendered.contains("warning: main.tex:12: deprecated command"));
+        assert!(rendered.contains("main.tex:12: warning: deprecated command"));
         assert!(rendered.contains("context: inside bibliography block"));
-        assert!(rendered.contains("help: replace with the newer form"));
+        assert!(rendered.contains("suggestion: replace with the newer form"));
+    }
+
+    #[test]
+    fn display_uses_line_one_fallback_when_file_has_no_line() {
+        let rendered = Diagnostic::new(Severity::Error, "bundle not found")
+            .with_file("missing-bundle")
+            .with_suggestion("verify the asset bundle path and version")
+            .to_string();
+
+        assert!(rendered.contains("missing-bundle:1: error: bundle not found"));
+        assert!(rendered.contains("suggestion: verify the asset bundle path and version"));
     }
 
     #[test]
@@ -148,8 +165,8 @@ mod tests {
             .with_line(3)
             .to_string();
 
-        assert!(with_column.contains("error: E3.tex:3:14: undefined control sequence"));
-        assert!(without_column.contains("error: E3.tex:3: undefined control sequence"));
+        assert!(with_column.contains("E3.tex:3:14: error: undefined control sequence"));
+        assert!(without_column.contains("E3.tex:3: error: undefined control sequence"));
         assert!(!without_column.contains("E3.tex:3:14:"));
     }
 }

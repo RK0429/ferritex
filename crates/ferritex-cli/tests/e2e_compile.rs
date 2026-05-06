@@ -740,8 +740,9 @@ fn compile_includegraphics_reports_invalid_pdf_input() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid PDF input for \\includegraphics"));
-    assert!(stderr
-        .contains("help: use an unencrypted single-page PDF whose first page defines /MediaBox"));
+    assert!(stderr.contains(
+        "suggestion: use an unencrypted single-page PDF whose first page defines /MediaBox"
+    ));
 }
 
 #[test]
@@ -2387,7 +2388,7 @@ fn compile_with_corrupted_manifest_reports_diagnostic() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid manifest"));
-    assert!(stderr.contains("help: verify the asset bundle path and version"));
+    assert!(stderr.contains("suggestion: verify the asset bundle path and version"));
 }
 
 #[test]
@@ -2427,7 +2428,7 @@ fn compile_with_incompatible_bundle_version_reports_diagnostic() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("version incompatible"));
     assert!(stderr.contains("required 99.0.0"));
-    assert!(stderr.contains("help: verify the asset bundle path and version"));
+    assert!(stderr.contains("suggestion: verify the asset bundle path and version"));
 }
 
 #[test]
@@ -2456,7 +2457,7 @@ fn compile_with_missing_asset_index_reports_diagnostic() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("asset index not found"));
-    assert!(stderr.contains("help: verify the asset bundle path and version"));
+    assert!(stderr.contains("suggestion: verify the asset bundle path and version"));
 }
 
 #[test]
@@ -2495,7 +2496,7 @@ fn compile_with_unsupported_format_version_reports_diagnostic() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported bundle format version"));
-    assert!(stderr.contains("help: verify the asset bundle path and version"));
+    assert!(stderr.contains("suggestion: verify the asset bundle path and version"));
 }
 
 #[test]
@@ -2535,7 +2536,7 @@ fn compile_with_corrupted_bundle_format_produces_no_pdf() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsupported bundle format version"));
-    assert!(stderr.contains("help: verify the asset bundle path and version"));
+    assert!(stderr.contains("suggestion: verify the asset bundle path and version"));
     assert!(!pdf_file.exists(), "corrupted bundle must not emit a PDF");
 }
 
@@ -2750,8 +2751,10 @@ fn compile_reports_undefined_control_sequence_with_column() {
 
     assert!(stderr.contains("undefined control sequence `\\xyz`"));
     assert!(
-        stderr.contains(&format!("{filename}:3:7:")),
-        "stderr did not include line/column location: {stderr}"
+        stderr.contains(&format!(
+            "{filename}:3:7: error: undefined control sequence `\\xyz`"
+        )),
+        "stderr did not use file-first line/column diagnostic format: {stderr}"
     );
 }
 
@@ -2815,9 +2818,10 @@ fn compile_with_errors_suppresses_success_summary_on_stdout() {
     assert!(dir.path().join("broken.pdf").exists());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("->"));
-    assert!(!stdout.contains(".pdf"));
-    assert!(!stdout.contains("page"));
+    assert!(
+        stdout.trim().is_empty(),
+        "exit-code-2 compile failure must not print success summary on stdout, got: {stdout}"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("undefined control sequence"));
@@ -2844,8 +2848,15 @@ fn compile_with_missing_asset_bundle_reports_validation_error() {
 
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("bundle not found"));
-    assert!(stderr.contains("help: verify the asset bundle path and version"));
+    let bundle_path = dir.path().join("missing-bundle");
+    assert!(
+        stderr.contains(&format!(
+            "{}:1: error: bundle not found",
+            bundle_path.display()
+        )),
+        "stderr did not use file-first line fallback diagnostic format: {stderr}"
+    );
+    assert!(stderr.contains("suggestion: verify the asset bundle path and version"));
 }
 
 #[test]
@@ -3221,8 +3232,8 @@ fn watch_exits_with_friendly_message_when_watched_directory_is_deleted() {
         "stderr should explain that the watched path is gone: {stderr_buf}",
     );
     assert!(
-        stderr_buf.contains("help:"),
-        "stderr should include a help line guiding the user: {stderr_buf}",
+        stderr_buf.contains("suggestion:"),
+        "stderr should include a suggestion line guiding the user: {stderr_buf}",
     );
     assert!(
         stderr_buf.contains("rerun `ferritex watch`"),
