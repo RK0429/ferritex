@@ -4625,6 +4625,50 @@ fn compile_help_warns_about_high_jobs_rss() {
 }
 
 #[test]
+fn compile_and_preview_help_hide_watch_verbose_flag() {
+    let compile = ferritex_bin()
+        .args(["compile", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+    let preview = ferritex_bin()
+        .args(["preview", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(compile.status.success());
+    assert!(preview.status.success());
+    let compile_stdout = String::from_utf8_lossy(&compile.stdout);
+    let preview_stdout = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        !compile_stdout.contains("--verbose"),
+        "compile help must not show watch-only --verbose"
+    );
+    assert!(
+        !preview_stdout.contains("--verbose"),
+        "preview help must not show watch-only --verbose"
+    );
+}
+
+#[test]
+fn watch_help_shows_verbose_flag() {
+    let output = ferritex_bin()
+        .args(["watch", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--verbose"),
+        "watch help should show --verbose"
+    );
+    assert!(
+        stdout.contains("watched file path"),
+        "watch help should describe --verbose"
+    );
+}
+
+#[test]
 fn preview_help_documents_loopback_transport_urls() {
     let output = ferritex_bin()
         .args(["preview", "--help"])

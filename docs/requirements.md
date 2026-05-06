@@ -939,10 +939,11 @@
 #### REQ-FUNC-044: ウォッチモード
 
 - **説明**: ファイル監視と自動再コンパイルを CLI から利用可能にする
-- **入力**: `ferritex watch <file.tex>`。コンパイル結果に影響する CLI オプションは `REQ-FUNC-043` と同じく `--output-dir`, `--jobname`, `--jobs`, `--no-cache`, `--asset-bundle`, `--interaction`, `--synctex`, `--trace-font-tasks`, `--shell-escape` / `--no-shell-escape` を受け付ける
+- **入力**: `ferritex watch <file.tex>`。コンパイル結果に影響する CLI オプションは `REQ-FUNC-043` と同じく `--output-dir`, `--jobname`, `--jobs`, `--no-cache`, `--asset-bundle`, `--interaction`, `--synctex`, `--trace-font-tasks`, `--shell-escape` / `--no-shell-escape` を受け付ける。watch の観測専用オプションとして `-v` / `--verbose` を受け付け、compile / preview の help には表示しない
 - **処理**:
   - ファイル監視（REQ-FUNC-038）の開始
   - `REQ-FUNC-043` と同じ compile-affecting option 群を `Runtime Options` へ正規化して watch 実行へ引き継ぐ
+  - `-v` / `--verbose` 指定時は、watch 対象ファイル数に加えて各 watched path を表示する。この指定は `Runtime Options` には含めない
   - 変更検知時の差分コンパイル連携（REQ-FUNC-039）
   - Ctrl+C によるグレースフル停止
 - **出力**: 継続的な PDF 更新
