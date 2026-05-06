@@ -269,6 +269,31 @@ fn handle_preview(command: &CompileCommand) -> i32 {
         return diagnostics_exit_code(&diagnostics);
     };
 
+    let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
+    let file_access_gate = FsFileAccessGate::from_policy(policy.clone());
+    let asset_bundle_loader = AssetBundleLoader;
+    let service = CompileJobService::new(
+        &file_access_gate,
+        &asset_bundle_loader,
+        &shell_command_gateway,
+    );
+    let initial_result = service.compile(&options);
+    emit_diagnostics(&initial_result.diagnostics, options.interaction_mode);
+    if initial_result.exit_code != 0 {
+        return initial_result.exit_code;
+    }
+    if initial_result.output_pdf.is_none() {
+        let diagnostics = vec![Diagnostic::new(
+            Severity::Error,
+            "compile succeeded without producing a PDF artifact",
+        )
+        .with_file(options.input_file.to_string_lossy().into_owned())
+        .with_suggestion("inspect the compile pipeline and retry the preview command")];
+        emit_diagnostics(&diagnostics, options.interaction_mode);
+        return diagnostics_exit_code(&diagnostics);
+    }
+
+    // Initial compile succeeded; safe to bind the loopback port now.
     let transport = Arc::new(match LoopbackPreviewTransport::bind() {
         Ok(transport) => transport,
         Err(error) => {
@@ -303,7 +328,7 @@ fn handle_preview(command: &CompileCommand) -> i32 {
     let callback_target = target.clone();
     let callback_policy = policy.clone();
     let mut session_id: Option<SessionId> = None;
-    let on_compile = move |result: &CompileResult| {
+    let mut on_compile = move |result: &CompileResult| {
         if result.exit_code != 0 {
             return;
         }
@@ -414,11 +439,13 @@ fn handle_preview(command: &CompileCommand) -> i32 {
         }
     };
 
+    on_compile(&initial_result);
+
     let watch_command = WatchCommand {
         compile: command.clone(),
         verbose: false,
     };
-    watch_runner::run_watch_loop(&watch_command, on_compile)
+    watch_runner::run_watch_loop_after_initial_compile(&watch_command, initial_result, on_compile)
 }
 
 fn handle_lsp() -> i32 {
