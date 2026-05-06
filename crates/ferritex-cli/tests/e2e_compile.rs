@@ -4625,6 +4625,25 @@ fn compile_help_warns_about_high_jobs_rss() {
 }
 
 #[test]
+fn preview_help_documents_loopback_transport_urls() {
+    let output = ferritex_bin()
+        .args(["preview", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("loopback HTTP document URL"),
+        "preview help should mention the loopback HTTP document URL"
+    );
+    assert!(
+        stdout.contains("WebSocket event URL"),
+        "preview help should mention the WebSocket event URL"
+    );
+}
+
+#[test]
 fn lsp_help_documents_jsonrpc_protocol() {
     let output = ferritex_bin()
         .args(["lsp", "--help"])
@@ -4636,6 +4655,10 @@ fn lsp_help_documents_jsonrpc_protocol() {
     assert!(
         stdout.contains("Content-Length"),
         "lsp help should describe JSON-RPC framing"
+    );
+    assert!(
+        stdout.contains("stdio transport"),
+        "lsp help should explicitly mention stdio transport"
     );
     assert!(
         stdout.contains("initialize"),
