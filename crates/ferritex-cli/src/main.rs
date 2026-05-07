@@ -298,8 +298,14 @@ fn handle_preview(command: &CompileCommand) -> i32 {
         &asset_bundle_loader,
         &shell_command_gateway,
     );
+    watch_runner::start_shutdown_signal_management();
     let initial_result = service.compile(&options);
     emit_diagnostics(&initial_result.diagnostics, options.interaction_mode);
+    if watch_runner::shutdown_requested() {
+        watch_runner::emit_shutdown_complete();
+        service.flush_cache();
+        return 0;
+    }
     if initial_result.exit_code != 0 {
         return initial_result.exit_code;
     }
@@ -330,6 +336,11 @@ fn handle_preview(command: &CompileCommand) -> i32 {
     });
     let server_port = transport.port();
     transport.start_background();
+    if watch_runner::shutdown_requested() {
+        watch_runner::emit_shutdown_complete();
+        service.flush_cache();
+        return 0;
+    }
     eprintln!(
         "preview server listening on http://127.0.0.1:{server_port} (waiting for first successful compile)"
     );
@@ -462,6 +473,11 @@ fn handle_preview(command: &CompileCommand) -> i32 {
     };
 
     on_compile(&initial_result);
+    if watch_runner::shutdown_requested() {
+        watch_runner::emit_shutdown_complete();
+        service.flush_cache();
+        return 0;
+    }
 
     let watch_command = WatchCommand {
         compile: command.clone(),

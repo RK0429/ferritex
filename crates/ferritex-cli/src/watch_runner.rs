@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -20,11 +21,15 @@ use ferritex_infra::watcher::PollingFileWatcher;
 
 use crate::{emit_diagnostic, emit_diagnostics, runtime_options_from_command, WatchCommand};
 
+const SHUTDOWN_COMPLETE_LOG: &str = "shutdown complete (exit=0)";
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 pub fn run_watch_loop<F>(command: &WatchCommand, mut on_compile: F) -> i32
 where
     F: FnMut(&CompileResult),
 {
-    run_watch_loop_inner(command, None, &mut on_compile)
+    run_watch_loop_inner(command, None, true, &mut on_compile)
 }
 
 pub fn run_watch_loop_after_initial_compile<F>(
@@ -35,17 +40,22 @@ pub fn run_watch_loop_after_initial_compile<F>(
 where
     F: FnMut(&CompileResult),
 {
-    run_watch_loop_inner(command, Some(initial_result), &mut on_compile)
+    run_watch_loop_inner(command, Some(initial_result), false, &mut on_compile)
 }
 
 fn run_watch_loop_inner<F>(
     command: &WatchCommand,
     initial_result: Option<CompileResult>,
+    install_shutdown_handler: bool,
     on_compile: &mut F,
 ) -> i32
 where
     F: FnMut(&CompileResult),
 {
+    if install_shutdown_handler {
+        start_shutdown_signal_management();
+    }
+
     let options = runtime_options_from_command(&command.compile);
     let interaction_mode = options.interaction_mode;
     let policy = ExecutionPolicyFactory::create(&options);
@@ -72,6 +82,11 @@ where
             result
         }
     };
+    if shutdown_requested() {
+        emit_shutdown_complete();
+        service.flush_cache();
+        return 0;
+    }
 
     let watched_paths =
         watched_paths_for_result(&initial_result, &options.input_file, &file_access_gate);
@@ -99,6 +114,11 @@ where
         RecompileScheduler::with_settle_window(Duration::from_millis(150));
 
     loop {
+        if shutdown_requested() {
+            emit_shutdown_complete();
+            service.flush_cache();
+            return 0;
+        }
         thread::sleep(Duration::from_millis(100));
         let changes = match watcher.poll_changes() {
             Ok(changes) => changes,
@@ -157,6 +177,36 @@ where
             }
         }
     }
+}
+
+pub(crate) fn start_shutdown_signal_management() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+
+    #[cfg(unix)]
+    unsafe {
+        signal(SIGINT, handle_sigint as usize);
+    }
+}
+
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+pub(crate) fn emit_shutdown_complete() {
+    emit_watch_status(SHUTDOWN_COMPLETE_LOG);
+}
+
+#[cfg(unix)]
+const SIGINT: std::os::raw::c_int = 2;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signum: std::os::raw::c_int, handler: usize) -> usize;
+}
+
+#[cfg(unix)]
+extern "C" fn handle_sigint(_: std::os::raw::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 fn emit_watch_status(message: &str) {
