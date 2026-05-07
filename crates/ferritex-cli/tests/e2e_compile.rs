@@ -2996,6 +2996,54 @@ fn watch_prints_startup_banner_and_tracked_count_by_default() {
     stderr_handle.join().expect("join stderr collector");
 }
 
+#[cfg(unix)]
+#[test]
+fn watch_sigint_exits_zero_and_logs_normal_shutdown() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("main.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["watch", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex watch");
+    let (stderr_buf, stderr_handle) =
+        spawn_streaming_collector(child.stderr.take().expect("captured stderr"));
+
+    wait_until(
+        || buffer_contains(&stderr_buf, "tracking 1 file"),
+        Duration::from_secs(5),
+        "watch should enter the polling loop before SIGINT",
+    );
+
+    send_sigint(&mut child);
+    let exit_status =
+        wait_for_exit(&mut child, Duration::from_secs(5)).expect("watch should exit after SIGINT");
+    stderr_handle.join().expect("join stderr collector");
+    let stderr = buffer_snapshot(&stderr_buf);
+
+    assert_eq!(
+        exit_status.code(),
+        Some(0),
+        "SIGINT should be handled as an intentional watch shutdown: {stderr}",
+    );
+    assert!(
+        stderr.contains("shutdown complete") && stderr.contains("exit=0"),
+        "stderr should contain an explicit normal shutdown line with exit=0: {stderr}",
+    );
+    assert_eq!(
+        stderr.matches("shutdown complete").count(),
+        1,
+        "normal shutdown should be logged exactly once: {stderr}",
+    );
+}
+
 #[test]
 fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -3079,6 +3127,134 @@ fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
         stderr.matches("press Ctrl+C to stop").count(),
         1,
         "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_sigint_exits_zero_and_logs_normal_shutdown() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["preview", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let (stderr_buf, stderr_handle) =
+        spawn_streaming_collector(child.stderr.take().expect("captured stderr"));
+
+    let stdout = child.stdout.take().expect("preview stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut document_url = String::new();
+    stdout
+        .read_line(&mut document_url)
+        .expect("read preview document URL");
+    let mut events_url = String::new();
+    stdout
+        .read_line(&mut events_url)
+        .expect("read preview events URL");
+
+    assert!(document_url.trim().starts_with("http://127.0.0.1:"));
+    assert!(events_url.trim().starts_with("ws://127.0.0.1:"));
+    wait_until(
+        || buffer_contains(&stderr_buf, "tracking 1 file"),
+        Duration::from_secs(5),
+        "preview should enter the watch loop before SIGINT",
+    );
+
+    send_sigint(&mut child);
+    let exit_status = wait_for_exit(&mut child, Duration::from_secs(5))
+        .expect("preview should exit after SIGINT");
+    stderr_handle.join().expect("join stderr collector");
+    let stderr = buffer_snapshot(&stderr_buf);
+
+    assert_eq!(
+        exit_status.code(),
+        Some(0),
+        "SIGINT should be handled as an intentional preview shutdown: {stderr}",
+    );
+    assert!(
+        stderr.contains("shutdown complete") && stderr.contains("exit=0"),
+        "stderr should contain an explicit normal shutdown line with exit=0: {stderr}",
+    );
+    assert_eq!(
+        stderr.matches("shutdown complete").count(),
+        1,
+        "normal shutdown should be logged exactly once: {stderr}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn preview_sigint_during_initial_compile_exits_zero_and_logs_normal_shutdown() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    let marker_file = dir.path().join("initial-compile-started.txt");
+    let script_file = dir.path().join("slow-compile.sh");
+    std::fs::write(
+        &script_file,
+        "#!/bin/sh\nprintf 'started\\n' > \"$1\"\nsleep 2\n",
+    )
+    .expect("write slow shell escape helper");
+    std::fs::write(
+        &tex_file,
+        format!(
+            "\\documentclass{{article}}\n\\begin{{document}}\n\\write18{{/bin/sh {} {}}}\nHello\n\\end{{document}}\n",
+            script_file.display(),
+            marker_file.display()
+        ),
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args([
+            "preview",
+            "--shell-escape",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let (stderr_buf, stderr_handle) =
+        spawn_streaming_collector(child.stderr.take().expect("captured stderr"));
+
+    wait_until(
+        || marker_file.exists(),
+        Duration::from_secs(5),
+        "preview initial compile should reach the slow shell escape helper",
+    );
+
+    send_sigint(&mut child);
+    let exit_status = wait_for_exit(&mut child, Duration::from_secs(10))
+        .expect("preview should exit after initial-compile SIGINT");
+    stderr_handle.join().expect("join stderr collector");
+    let stderr = buffer_snapshot(&stderr_buf);
+
+    assert_eq!(
+        exit_status.code(),
+        Some(0),
+        "SIGINT during preview initial compile should be handled as shutdown: {stderr}",
+    );
+    assert!(
+        stderr.contains("shutdown complete") && stderr.contains("exit=0"),
+        "stderr should contain an explicit normal shutdown line with exit=0: {stderr}",
+    );
+    assert_eq!(
+        stderr.matches("shutdown complete").count(),
+        1,
+        "normal shutdown should be logged exactly once: {stderr}",
+    );
+    assert!(
+        !stderr.contains("tracking 1 file"),
+        "test must send SIGINT before preview reaches the watch loop: {stderr}",
     );
 }
 
@@ -4891,6 +5067,15 @@ fn wait_for_exit(
     let _ = child.kill();
     let _ = child.wait();
     None
+}
+
+#[cfg(unix)]
+fn send_sigint(child: &mut std::process::Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT to child process");
+    assert!(status.success(), "kill -INT should succeed: {status}");
 }
 
 fn write_lsp_message(writer: &mut impl Write, value: &Value) {
