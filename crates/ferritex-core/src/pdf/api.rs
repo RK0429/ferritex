@@ -12,10 +12,8 @@ use crate::graphics::api::{
 use crate::kernel::api::DimensionValue;
 use crate::typesetting::api::{
     FloatPlacement, TextLine, TypesetDocument, TypesetOutline, TypesetPage, FOOTNOTE_MARKER_END,
-    FOOTNOTE_MARKER_START,
-};
-use crate::typesetting::math_layout::{
-    SUBSCRIPT_END_MARKER, SUBSCRIPT_START_MARKER, SUPERSCRIPT_END_MARKER, SUPERSCRIPT_START_MARKER,
+    FOOTNOTE_MARKER_START, SUBSCRIPT_END_MARKER, SUBSCRIPT_START_MARKER, SUPERSCRIPT_END_MARKER,
+    SUPERSCRIPT_START_MARKER,
 };
 
 const SCALED_POINTS_PER_POINT: i64 = 65_536;
@@ -3279,10 +3277,10 @@ mod tests {
     fn renders_script_lines_with_text_rise_and_actual_text() {
         let superscripted = format!(
             "Inline x{}2{} y{}1{} note{}3{}",
-            crate::typesetting::math_layout::SUPERSCRIPT_START_MARKER,
-            crate::typesetting::math_layout::SUPERSCRIPT_END_MARKER,
-            crate::typesetting::math_layout::SUBSCRIPT_START_MARKER,
-            crate::typesetting::math_layout::SUBSCRIPT_END_MARKER,
+            crate::typesetting::api::SUPERSCRIPT_START_MARKER,
+            crate::typesetting::api::SUPERSCRIPT_END_MARKER,
+            crate::typesetting::api::SUBSCRIPT_START_MARKER,
+            crate::typesetting::api::SUBSCRIPT_END_MARKER,
             crate::typesetting::api::FOOTNOTE_MARKER_START,
             crate::typesetting::api::FOOTNOTE_MARKER_END,
         );
@@ -4198,8 +4196,8 @@ mod tests {
     fn renders_script_lines_with_unicode_actual_text_as_utf16be_hex() {
         let scripted = format!(
             "α {}π{} ∫",
-            crate::typesetting::math_layout::SUPERSCRIPT_START_MARKER,
-            crate::typesetting::math_layout::SUPERSCRIPT_END_MARKER,
+            crate::typesetting::api::SUPERSCRIPT_START_MARKER,
+            crate::typesetting::api::SUPERSCRIPT_END_MARKER,
         );
         let mut document = single_page(&[]);
         document.pages[0].lines = vec![TextLine {
