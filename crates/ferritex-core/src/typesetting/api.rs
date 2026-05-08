@@ -43,6 +43,9 @@ const MAX_LINE_WIDTH: DimensionValue =
 const DEFAULT_BODY_FONT_SIZE_PT: i64 = 12;
 pub const FOOTNOTE_MARKER_START: char = '\u{e210}';
 pub const FOOTNOTE_MARKER_END: char = '\u{e211}';
+pub use math_layout::{
+    SUBSCRIPT_END_MARKER, SUBSCRIPT_START_MARKER, SUPERSCRIPT_END_MARKER, SUPERSCRIPT_START_MARKER,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassLayout {
