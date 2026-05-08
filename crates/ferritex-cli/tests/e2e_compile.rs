@@ -294,6 +294,10 @@ fn preview_nonexistent_file_exits_without_binding_port_or_printing_url() {
         !stdout_buf.contains("http://localhost:"),
         "stdout must not print a localhost preview URL when bootstrap compile fails: {stdout_buf}",
     );
+    assert!(
+        !stdout_buf.contains("ws://127.0.0.1:"),
+        "stdout must not print a preview events URL when bootstrap compile fails: {stdout_buf}",
+    );
 
     let mut stderr_buf = String::new();
     child
