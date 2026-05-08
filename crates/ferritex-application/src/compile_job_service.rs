@@ -4677,7 +4677,7 @@ fn float_counters_before_body_range(document: &ParsedDocument, body_start: usize
 fn should_force_parallel_full_typeset_collision() -> bool {
     #[cfg(test)]
     {
-        return FORCE_PARALLEL_FULL_TYPESET_COLLISION.load(std::sync::atomic::Ordering::SeqCst);
+        FORCE_PARALLEL_FULL_TYPESET_COLLISION.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     #[cfg(not(test))]
@@ -8876,22 +8876,25 @@ mod tests {
                 .unwrap_or(0),
         )];
 
-        lines.extend(details.iter().filter_map(|detail| {
-            (detail.reuse_type != PartitionTypesetReuseType::Cached).then(|| {
-                format!(
-                    "partition={} reuse={:?} suffix={}/{} fallback={:?} elapsed_us={}",
-                    detail.partition_id,
-                    detail.reuse_type,
-                    detail.suffix_block_count,
-                    detail.total_block_count,
-                    detail.fallback_reason,
-                    detail
-                        .elapsed
-                        .map(|elapsed| elapsed.as_micros())
-                        .unwrap_or_default(),
-                )
-            })
-        }));
+        lines.extend(
+            details
+                .iter()
+                .filter(|detail| detail.reuse_type != PartitionTypesetReuseType::Cached)
+                .map(|detail| {
+                    format!(
+                        "partition={} reuse={:?} suffix={}/{} fallback={:?} elapsed_us={}",
+                        detail.partition_id,
+                        detail.reuse_type,
+                        detail.suffix_block_count,
+                        detail.total_block_count,
+                        detail.fallback_reason,
+                        detail
+                            .elapsed
+                            .map(|elapsed| elapsed.as_micros())
+                            .unwrap_or_default(),
+                    )
+                }),
+        );
         lines
     }
 
@@ -10618,26 +10621,20 @@ mod tests {
         let synctex = super::synctex_data_for(&document, &source_lines);
 
         assert_eq!(synctex.files, vec![main_file, chapter_file]);
-        assert!(
-            synctex
-                .forward_search(SourceLocation {
-                    file_id: 1,
-                    line: 7,
-                    column: 1,
-                })
-                .len()
-                >= 1
-        );
-        assert!(
-            synctex
-                .forward_search(SourceLocation {
-                    file_id: 0,
-                    line: 3,
-                    column: 1,
-                })
-                .len()
-                >= 1
-        );
+        assert!(!synctex
+            .forward_search(SourceLocation {
+                file_id: 1,
+                line: 7,
+                column: 1,
+            })
+            .is_empty());
+        assert!(!synctex
+            .forward_search(SourceLocation {
+                file_id: 0,
+                line: 3,
+                column: 1,
+            })
+            .is_empty());
         assert!(synctex
             .forward_search(SourceLocation {
                 file_id: 0,
@@ -11136,8 +11133,7 @@ mod tests {
         let warmup = service(&FsTestFileAccessGate, &loader).compile(&options);
         assert_eq!(warmup.exit_code, 0);
 
-        let expanded_paragraph = std::iter::repeat("Expanded body text for page growth.")
-            .take(1_600)
+        let expanded_paragraph = std::iter::repeat_n("Expanded body text for page growth.", 1_600)
             .collect::<Vec<_>>()
             .join(" ");
         fs::write(
@@ -13729,9 +13725,9 @@ mod tests {
         let input_file = dir.path().join("main.tex");
         fs::write(
             &input_file,
-            document(&format!(
-                "See page \\pageref{{sec:later}}.\n\\newpage\n\\section{{Later}}\\label{{sec:later}}\nDone."
-            )),
+            document(
+                "See page \\pageref{sec:later}.\n\\newpage\n\\section{Later}\\label{sec:later}\nDone.",
+            ),
         )
         .expect("write input");
 

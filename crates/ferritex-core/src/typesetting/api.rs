@@ -4724,7 +4724,7 @@ fn append_word_to_line(
     let separator_width = if current_line.is_empty() {
         DimensionValue::zero()
     } else {
-        pending_glue_width.take().unwrap_or(DimensionValue::zero())
+        pending_glue_width.take().unwrap_or_default()
     };
 
     if !current_line.is_empty()

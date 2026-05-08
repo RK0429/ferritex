@@ -339,7 +339,7 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
 #[test]
 fn partition_bench_multisecond_speedup_evidence() {
     let has_benchmark_precondition =
-        std::thread::available_parallelism().map_or(false, |n| n.get() >= 4);
+        std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4);
     if !has_benchmark_precondition {
         eprintln!(
             "[REQ-FUNC-032 SKIPPED] multi-second partition speedup proof requires >= 4 cores; this machine has fewer"
@@ -555,7 +555,7 @@ fn partition_bench_docs_protocol_median_and_timing_proof() {
     );
 
     let has_benchmark_precondition =
-        std::thread::available_parallelism().map_or(false, |n| n.get() >= 4);
+        std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4);
     if has_benchmark_precondition {
         assert!(
             !report.comparisons.is_empty(),

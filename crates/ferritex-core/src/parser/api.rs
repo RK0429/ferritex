@@ -1944,11 +1944,11 @@ impl<'a, 'resolver> ParserDriver<'a, 'resolver> {
     fn skip_to_end_document(&mut self) {
         while let Some(token) = self.next_raw_token() {
             if let Some(name) = control_sequence_name(&token) {
-                if name == "end" {
-                    if self.read_environment_name().ok().flatten().as_deref() == Some("document") {
-                        self.end_found = true;
-                        break;
-                    }
+                if name == "end"
+                    && self.read_environment_name().ok().flatten().as_deref() == Some("document")
+                {
+                    self.end_found = true;
+                    break;
                 }
             }
         }

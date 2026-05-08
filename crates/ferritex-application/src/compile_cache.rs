@@ -239,6 +239,7 @@ pub struct BackgroundCacheWriter {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum CacheStoreMessage {
     Work(CacheStoreWork),
     Flush(std::sync::mpsc::Sender<()>),
@@ -312,6 +313,12 @@ impl BackgroundCacheWriter {
                 "failed to flush background compile cache writer because the worker stopped unexpectedly"
             );
         }
+    }
+}
+
+impl Default for BackgroundCacheWriter {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -520,6 +527,7 @@ impl<'a> CompileCache<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn store_background(
         &self,
         dependency_graph: &DependencyGraph,
@@ -649,6 +657,7 @@ impl<'a> CompileCache<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn store_with_page_payloads(
         &self,
         dependency_graph: &DependencyGraph,
@@ -2761,7 +2770,10 @@ mod tests {
 
         let writes_after_second_store = gate.writes();
         let second_store_writes = &writes_after_second_store[initial_writes.len()..];
-        assert_eq!(second_store_writes, &[cache.metadata_path.clone()]);
+        assert_eq!(
+            second_store_writes,
+            std::slice::from_ref(&cache.metadata_path)
+        );
 
         let updated_fragments = BTreeMap::from([
             (

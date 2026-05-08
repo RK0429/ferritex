@@ -480,7 +480,7 @@ fn full_bench_docs_protocol_median_and_timing_proof() {
     let (seq_median, par_median) = run_full_bench_protocol(cases, "full bench docs protocol");
 
     let has_benchmark_precondition =
-        std::thread::available_parallelism().map_or(false, |n| n.get() >= 4);
+        std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4);
     if has_benchmark_precondition {
         assert!(
             par_median < seq_median,

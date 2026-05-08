@@ -1702,8 +1702,6 @@ fn extract_line_positions_from_stream(stream: &[u8]) -> Vec<i64> {
                             current_y = Some(next_y);
                             if previous_y.is_some() && dy > 0.0 && dy <= 5.0 {
                                 script_rise_y = Some(next_y);
-                            } else if script_rise_y.is_some() && dy < 0.0 && dy.abs() <= 5.0 {
-                                script_rise_y = None;
                             } else {
                                 script_rise_y = None;
                             }
@@ -3950,7 +3948,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let contents = if streams.len() == 1 {
-            format!("4 0 R")
+            "4 0 R".to_string()
         } else {
             format!("[{content_refs}]")
         };
