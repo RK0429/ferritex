@@ -175,7 +175,7 @@ impl LiveAnalysisSnapshot {
                 range: definition,
             })
             .or_else(|| {
-                static_hover_doc(&command).map(|_| DefinitionLocation {
+                static_hover_doc(&command, line_text, range).map(|_| DefinitionLocation {
                     uri: self.uri.clone(),
                     range: to_document_range(position.line, range),
                 })
@@ -185,7 +185,7 @@ impl LiveAnalysisSnapshot {
     pub fn hover(&self, position: TextPosition) -> Option<HoverInfo> {
         let line_text = nth_line(&self.text, position.line as usize)?;
         let (command, range) = command_token_at(line_text, position.character as usize)?;
-        let markdown = static_hover_doc(&command)?;
+        let markdown = static_hover_doc(&command, line_text, range)?;
 
         Some(HoverInfo {
             range: to_document_range(position.line, range),
@@ -705,9 +705,9 @@ fn environment_candidates() -> Vec<&'static str> {
     ]
 }
 
-fn static_hover_doc(command: &str) -> Option<&'static str> {
+fn static_hover_doc(command: &str, line_text: &str, range: TextRange) -> Option<&'static str> {
     match command {
-        "frac" => {
+        "frac" if is_inline_math_context(line_text, range.start.character as usize) => {
             Some("`\\frac{numerator}{denominator}` inserts a fraction.\n\nExample: `\\frac{a}{b}`.")
         }
         "includegraphics" => {
@@ -721,6 +721,33 @@ fn static_hover_doc(command: &str) -> Option<&'static str> {
         "end" => Some("`\\end{environment}` closes an environment."),
         _ => None,
     }
+}
+
+fn is_inline_math_context(line: &str, character: usize) -> bool {
+    let prefix = line_prefix(line, character);
+    let mut escaped = false;
+    let mut in_math = false;
+
+    for ch in prefix.chars() {
+        if escaped {
+            if ch == '(' || ch == '[' {
+                in_math = true;
+            }
+            if ch == ')' || ch == ']' {
+                in_math = false;
+            }
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '$' => in_math = !in_math,
+            _ => {}
+        }
+    }
+
+    in_math
 }
 
 fn braced_argument_at(line: &str, character: usize, trigger: &str) -> Option<(String, TextRange)> {
@@ -1111,7 +1138,9 @@ mod tests {
     #[test]
     fn hover_returns_static_command_docs() {
         let snapshot = LiveAnalysisSnapshotFactory::default().build(
-            &buffer("\\documentclass{article}\n\\begin{document}\n\\frac{a}{b}\n\\end{document}\n"),
+            &buffer(
+                "\\documentclass{article}\n\\begin{document}\n$\\frac{a}{b}$\n\\end{document}\n",
+            ),
             None,
         );
 
@@ -1123,6 +1152,31 @@ mod tests {
             .expect("hover information");
 
         assert!(hover.markdown.contains("\\frac"));
+    }
+
+    #[test]
+    fn hover_does_not_advertise_frac_outside_math_context() {
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(
+            &buffer("\\documentclass{article}\n\\begin{document}\nFormula: \\frac{a}{b}\n\\end{document}\n"),
+            Some(&compile_state(
+                false,
+                vec![
+                    Diagnostic::new(Severity::Error, "undefined control sequence `\\frac`")
+                        .with_line(3),
+                ],
+                DocumentState::default(),
+            )),
+        );
+
+        assert!(snapshot.diagnostics().iter().any(|diagnostic| diagnostic
+            .message
+            .contains("undefined control sequence `\\frac`")));
+        assert!(snapshot
+            .hover(TextPosition {
+                line: 2,
+                character: 11,
+            })
+            .is_none());
     }
 
     #[test]
