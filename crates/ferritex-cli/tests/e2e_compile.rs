@@ -151,7 +151,7 @@ fn body_hash(body: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn actual_text_payloads<'a>(content: &'a str) -> Vec<&'a str> {
+fn actual_text_payloads(content: &str) -> Vec<&str> {
     let mut payloads = Vec::new();
     let marker = "/ActualText ";
     let mut remaining = content;
@@ -1612,9 +1612,7 @@ fn compile_resolves_pageref_across_page_boundaries() {
     let tex_file = dir.path().join("pageref.tex");
     std::fs::write(
         &tex_file,
-        format!(
-            "\\documentclass{{article}}\n\\begin{{document}}\nSee page \\pageref{{sec:later}}.\n\\newpage\n\\section{{Later}}\\label{{sec:later}}\nDone.\n\\end{{document}}\n"
-        ),
+        "\\documentclass{article}\n\\begin{document}\nSee page \\pageref{sec:later}.\n\\newpage\n\\section{Later}\\label{sec:later}\nDone.\n\\end{document}\n",
     )
     .expect("write input file");
 

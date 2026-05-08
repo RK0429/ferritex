@@ -842,6 +842,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockCompileBackend {
         outputs: Arc<Mutex<VecDeque<Result<CompileOutput, String>>>>,
+        #[allow(clippy::type_complexity)]
         calls: Arc<Mutex<Vec<(PathBuf, Option<PathBuf>, u32, bool, bool)>>>,
     }
 

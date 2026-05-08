@@ -1440,7 +1440,7 @@ fn render_text_lines(
     let mut warning_chars = BTreeSet::new();
     let mut current_font = first_line.font_index;
     let mut current_font_size = first_line.font_size;
-    let first_x = LEFT_MARGIN_PT as i64 * SCALED_POINTS_PER_POINT + first_line.x.0;
+    let first_x = LEFT_MARGIN_PT * SCALED_POINTS_PER_POINT + first_line.x.0;
     stream.push_str(&format!(
         "{} {} Td\n",
         points_to_pdf_number(DimensionValue(first_x)),
@@ -3030,7 +3030,7 @@ mod tests {
         document
     }
 
-    fn actual_text_payloads<'a>(content: &'a str) -> Vec<&'a str> {
+    fn actual_text_payloads(content: &str) -> Vec<&str> {
         let mut payloads = Vec::new();
         let marker = "/ActualText ";
         let mut remaining = content;

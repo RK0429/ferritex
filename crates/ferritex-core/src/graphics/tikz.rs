@@ -212,7 +212,7 @@ fn expand_foreach_list(list: &str, diagnostics: &mut Vec<TikzDiagnostic>) -> Opt
 
     match entries.as_slice() {
         [] => Some(Vec::new()),
-        entries if !entries.iter().any(|entry| *entry == "...") => {
+        entries if !entries.contains(&"...") => {
             Some(entries.iter().map(|entry| entry.to_string()).collect())
         }
         [start, "...", end] => {
@@ -1636,10 +1636,7 @@ impl<'a> Cursor<'a> {
         let spec = if let Some(group) = self.parse_parenthesized_group() {
             group
         } else {
-            match self.parse_optional_bracket_group()? {
-                Some(group) => group,
-                None => return None,
-            }
+            self.parse_optional_bracket_group()??
         };
 
         let mut start_angle = None;
