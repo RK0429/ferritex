@@ -264,6 +264,7 @@ fn print_compile_json_result(command: &SharedCompileCommand, result: &CompileRes
             "syncTexPath": result.output_pdf.as_ref().and_then(|path| {
                 command.synctex.then(|| compile_synctex_path(path).to_string_lossy().into_owned())
             }),
+            "sidecarPaths": result.output_pdf.as_ref().map(|path| compile_existing_sidecar_paths(path)).unwrap_or_default(),
             "pageCount": page_count,
         },
         "summary": summary,
@@ -432,6 +433,10 @@ fn print_compile_artifact_paths(command: &SharedCompileCommand, output_pdf: &std
     if command.synctex {
         print!(" synctex={}", compile_synctex_path(output_pdf).display());
     }
+    let sidecar_paths = compile_existing_sidecar_paths(output_pdf);
+    if !sidecar_paths.is_empty() {
+        print!(" sidecars={}", sidecar_paths.join(","));
+    }
     println!();
 }
 
@@ -444,6 +449,24 @@ fn compile_cache_dir(output_pdf: &std::path::Path) -> PathBuf {
 
 fn compile_synctex_path(output_pdf: &std::path::Path) -> PathBuf {
     output_pdf.with_extension("synctex")
+}
+
+fn compile_existing_sidecar_paths(output_pdf: &std::path::Path) -> Vec<String> {
+    let mut paths = ["toc", "lof", "lot", "aux", "bbl", "synctex"]
+        .into_iter()
+        .map(|extension| output_pdf.with_extension(extension))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+
+    let bibliography_metadata = output_pdf.with_extension("bbl.ferritex.json");
+    if bibliography_metadata.exists() {
+        paths.push(bibliography_metadata);
+    }
+
+    paths
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 fn emit_batchmode_failure_summary(result: &CompileResult, mode: InteractionMode) {

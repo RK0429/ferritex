@@ -578,6 +578,10 @@ fn compile_success_stdout_surfaces_stateful_artifact_paths() {
         stdout.contains(&format!("synctex={}", synctex_path.display())),
         "stdout should surface SyncTeX path, got: {stdout}"
     );
+    assert!(
+        stdout.contains(&format!("sidecars={}", synctex_path.display())),
+        "stdout should surface SyncTeX in sidecar paths, got: {stdout}"
+    );
 }
 
 #[test]
@@ -625,6 +629,13 @@ fn compile_format_json_emits_machine_readable_success_result() {
         .expect("cache dir")
         .ends_with(".ferritex-cache"));
     assert_eq!(value["output"]["syncTexPath"], Value::Null);
+    assert_eq!(
+        value["output"]["sidecarPaths"]
+            .as_array()
+            .expect("sidecar paths array")
+            .len(),
+        0
+    );
     assert_eq!(value["output"]["pageCount"], 1);
     assert!(value["summary"]["elapsedMicros"].is_u64());
     assert!(value["summary"]["stageTotalMicros"].is_u64());
@@ -692,6 +703,14 @@ fn compile_format_json_with_synctex_reports_sidecar_path() {
             .as_str()
             .expect("synctex path"),
         synctex_path.to_string_lossy()
+    );
+    assert!(
+        value["output"]["sidecarPaths"]
+            .as_array()
+            .expect("sidecar paths array")
+            .iter()
+            .any(|path| path.as_str() == Some(synctex_path.to_string_lossy().as_ref())),
+        "sidecarPaths should include SyncTeX path: {value}"
     );
 }
 
@@ -1933,6 +1952,49 @@ fn compile_renders_lists_of_figures_and_tables_from_second_pass_entries() {
     assert!(pdf.match_indices("Figure 1: Embedded pixel").count() >= 2);
     assert!(pdf.match_indices("Table 1: Metrics").count() >= 2);
     assert!(!pdf.contains("??"));
+}
+
+#[test]
+fn compile_success_stdout_surfaces_navigation_sidecar_paths() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("nav_lists.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\n\\tableofcontents\n\\listoffigures\n\\listoftables\n\\section{Intro}\n\\begin{figure}\\caption{Embedded pixel}\\end{figure}\n\\begin{table}\\caption{Metrics}\\end{table}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args(["compile", tex_file.to_str().expect("utf-8 path")])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let toc_path = dir.path().join("nav_lists.toc");
+    let lof_path = dir.path().join("nav_lists.lof");
+    let lot_path = dir.path().join("nav_lists.lot");
+
+    assert!(toc_path.exists(), "TOC sidecar should exist");
+    assert!(lof_path.exists(), "LOF sidecar should exist");
+    assert!(lot_path.exists(), "LOT sidecar should exist");
+    assert!(
+        stdout.contains(&format!("sidecars={}", toc_path.display())),
+        "stdout should surface sidecar list, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&lof_path.to_string_lossy().to_string()),
+        "stdout should surface LOF sidecar path, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&lot_path.to_string_lossy().to_string()),
+        "stdout should surface LOT sidecar path, got: {stdout}"
+    );
 }
 
 #[test]
