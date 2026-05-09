@@ -3930,6 +3930,87 @@ fn preview_events_websocket_emits_initial_and_updated_revision_events() {
     stderr_handle.join().expect("join preview stderr collector");
 }
 
+#[test]
+fn preview_events_websocket_emits_later_revision_after_late_connect() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["preview", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let stderr = child.stderr.take().expect("preview stderr");
+    let (stderr_buf, stderr_handle) = spawn_streaming_collector(stderr);
+
+    let stdout = child.stdout.take().expect("preview stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut document_url = String::new();
+    stdout
+        .read_line(&mut document_url)
+        .expect("read preview document URL");
+    let mut events_url = String::new();
+    stdout
+        .read_line(&mut events_url)
+        .expect("read preview events URL");
+
+    let events_url = events_url.trim().to_string();
+    let (events_host, events_port, events_path) = parse_loopback_events_url(&events_url);
+
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nFirst update\n\\end{document}\n",
+    )
+    .expect("rewrite input file");
+
+    wait_until(
+        || buffer_contains(&stderr_buf, "recompiled output"),
+        Duration::from_secs(10),
+        "preview should complete the first recompile before websocket connects",
+    );
+
+    let mut events_stream = open_preview_events_websocket(&events_host, events_port, &events_path);
+    let mut connected_event = read_preview_revision_event(&mut events_stream);
+    assert_eq!(connected_event["type"], "revision");
+    if connected_event["revision"].as_u64() == Some(1) {
+        connected_event = read_preview_revision_event(&mut events_stream);
+        assert_eq!(connected_event["type"], "revision");
+    }
+    let connected_revision = connected_event["revision"]
+        .as_u64()
+        .expect("connected revision number");
+    assert!(
+        connected_revision >= 2,
+        "late connection should observe the already-published recompile revision: {connected_event}"
+    );
+
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nSecond update\n\\end{document}\n",
+    )
+    .expect("rewrite input file again");
+
+    let later_event = read_preview_revision_event(&mut events_stream);
+    assert_eq!(later_event["type"], "revision");
+    assert!(
+        later_event["revision"].as_u64().expect("later revision number") > connected_revision,
+        "later event should advance after websocket connection: first={connected_event}, later={later_event}"
+    );
+    assert_eq!(later_event["page_count"], 1);
+
+    child.kill().expect("kill preview process");
+    child.wait().expect("wait for preview process");
+    stderr_handle.join().expect("join preview stderr collector");
+}
+
 #[cfg(unix)]
 #[test]
 fn preview_sigint_exits_zero_and_logs_normal_shutdown() {
