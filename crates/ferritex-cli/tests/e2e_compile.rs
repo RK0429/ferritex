@@ -571,12 +571,137 @@ fn compile_format_json_emits_machine_readable_success_result() {
         .expect("pdf path")
         .ends_with("hello_json.pdf"));
     assert_eq!(value["output"]["pageCount"], 1);
+    assert!(value["summary"]["elapsedMicros"].is_u64());
+    assert!(value["summary"]["stageTotalMicros"].is_u64());
+    assert!(
+        value["summary"]["elapsedMicros"]
+            .as_u64()
+            .expect("elapsed micros")
+            >= value["summary"]["stageTotalMicros"]
+                .as_u64()
+                .expect("stage total micros")
+    );
+    assert_eq!(value["summary"]["cache"]["status"], "miss");
+    assert!(value["summary"]["stageTimingsMicros"]["cacheLoad"].is_u64());
+    assert!(value["summary"]["stageTimingsMicros"]["sourceTreeLoad"].is_u64());
+    assert!(value["summary"]["stageTimingsMicros"]["parse"].is_u64());
+    assert!(value["summary"]["stageTimingsMicros"]["typeset"].is_u64());
+    assert!(value["summary"]["stageTimingsMicros"]["pdfRender"].is_u64());
+    assert!(value["summary"]["stageTimingsMicros"]["cacheStore"].is_u64());
+    assert!(value["summary"]["passCount"].is_u64());
     assert_eq!(
         value["diagnostics"]
             .as_array()
             .expect("diagnostics array")
             .len(),
         0
+    );
+}
+
+#[test]
+fn compile_format_json_reports_disabled_cache_summary_for_no_cache() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello_json_no_cache.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello, no cache!\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--no-cache",
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("parse json stdout");
+    assert_eq!(value["summary"]["cache"]["status"], "disabled");
+    assert_eq!(
+        value["summary"]["stageTimingsMicros"]["cacheLoad"],
+        Value::Null
+    );
+    assert_eq!(
+        value["summary"]["stageTimingsMicros"]["cacheStore"],
+        Value::Null
+    );
+    assert!(value["summary"]["stageTimingsMicros"]["sourceTreeLoad"].is_u64());
+    assert!(value["summary"]["elapsedMicros"].is_u64());
+    assert!(value["summary"]["stageTotalMicros"].is_u64());
+}
+
+#[test]
+fn compile_format_json_reports_warm_cache_hit_summary() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello_json_cache.tex");
+    let output_dir = dir.path().join("build");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello, JSON cache!\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let first = ferritex_bin()
+        .args([
+            "compile",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_value: Value =
+        serde_json::from_slice(&first.stdout).expect("parse first json stdout");
+    assert_eq!(first_value["summary"]["cache"]["status"], "miss");
+
+    let second = ferritex_bin()
+        .args([
+            "compile",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_value: Value =
+        serde_json::from_slice(&second.stdout).expect("parse second json stdout");
+    assert_eq!(second_value["summary"]["cache"]["status"], "hit");
+    assert!(second_value["summary"]["elapsedMicros"].is_u64());
+    assert!(second_value["summary"]["stageTotalMicros"].is_u64());
+    assert!(second_value["summary"]["stageTimingsMicros"]["cacheLoad"].is_u64());
+    assert_eq!(
+        second_value["summary"]["stageTimingsMicros"]["sourceTreeLoad"],
+        Value::Null
+    );
+    assert_eq!(
+        second_value["summary"]["stageTimingsMicros"]["cacheStore"],
+        Value::Null
     );
 }
 
@@ -792,7 +917,11 @@ fn compile_with_unsupported_cjk_character_emits_error() {
         .output()
         .expect("failed to run ferritex");
 
-    assert_eq!(output.status.code(), Some(2), "unsupported CJK should exit with code 2");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unsupported CJK should exit with code 2"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -3022,7 +3151,11 @@ fn compile_letter_class_with_opening_and_closing_succeeds() {
     .expect("write input file");
 
     let output = ferritex_bin()
-        .args(["compile", "--no-cache", tex_file.to_str().expect("utf-8 path")])
+        .args([
+            "compile",
+            "--no-cache",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
         .output()
         .expect("failed to run ferritex");
 
@@ -3054,7 +3187,11 @@ fn compile_article_with_footnote_succeeds() {
     .expect("write input file");
 
     let output = ferritex_bin()
-        .args(["compile", "--no-cache", tex_file.to_str().expect("utf-8 path")])
+        .args([
+            "compile",
+            "--no-cache",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
         .output()
         .expect("failed to run ferritex");
 
