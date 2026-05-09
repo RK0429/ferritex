@@ -5870,6 +5870,38 @@ fn lsp_help_documents_jsonrpc_protocol() {
     );
 }
 
+#[test]
+fn lsp_malformed_input_reports_framing_recovery_hint() {
+    let mut child = ferritex_bin()
+        .args(["lsp"])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex lsp");
+    let mut stdin = child.stdin.take().expect("lsp stdin");
+
+    stdin
+        .write_all(b"Content-Length: 1\r\n\r\n{")
+        .expect("write malformed LSP input");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait ferritex lsp");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read LSP Content-Length framed JSON-RPC message"),
+        "stderr should identify the failed LSP framing/parsing step, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Content-Length: <N>"),
+        "stderr should point to the required Content-Length framing contract, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("ferritex lsp --help") && stderr.contains("README.md"),
+        "stderr should describe the recovery path through help/README, got: {stderr}"
+    );
+}
+
 fn pdf_page_count(pdf: &str) -> usize {
     let marker = "/Count ";
     let start = pdf.find(marker).expect("pdf page count marker");
