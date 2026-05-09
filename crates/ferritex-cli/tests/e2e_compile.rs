@@ -48,6 +48,23 @@ fn parse_loopback_document_url(url: &str) -> (String, u16, String) {
     )
 }
 
+fn parse_loopback_events_url(url: &str) -> (String, u16, String) {
+    let without_scheme = url
+        .strip_prefix("ws://")
+        .expect("preview events URL should use ws");
+    let (host_port, path) = without_scheme
+        .split_once('/')
+        .expect("preview events URL should include a path");
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .expect("preview events URL should include a port");
+    (
+        host.to_string(),
+        port.parse().expect("preview events port"),
+        format!("/{path}"),
+    )
+}
+
 fn spawn_stderr_collector<R>(stderr: R) -> thread::JoinHandle<String>
 where
     R: Read + Send + 'static,
@@ -135,6 +152,73 @@ fn issue_get_request(host: &str, port: u16, path: &str) -> Vec<u8> {
         .read_to_end(&mut response)
         .expect("read preview response");
     response
+}
+
+fn open_preview_events_websocket(host: &str, port: u16, path: &str) -> TcpStream {
+    let address: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .expect("preview events socket address");
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+        .expect("connect to preview events websocket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set preview events read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .expect("set preview events write timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    )
+    .expect("write preview events websocket handshake");
+
+    let mut response = Vec::new();
+    let mut chunk = [0; 1024];
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .expect("read preview events websocket handshake");
+        response.extend_from_slice(&chunk[..read]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    assert!(
+        response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"),
+        "preview events websocket handshake failed: {}",
+        String::from_utf8_lossy(&response)
+    );
+    stream
+}
+
+fn read_preview_revision_event(stream: &mut TcpStream) -> Value {
+    let mut head = [0u8; 2];
+    stream
+        .read_exact(&mut head)
+        .expect("read preview events frame head");
+    assert_eq!(head[0] & 0x0F, 1, "expected text websocket frame");
+    assert_eq!(head[1] & 0x80, 0, "server websocket frame must be unmasked");
+    let len1 = (head[1] & 0x7F) as usize;
+    let payload_len = if len1 < 126 {
+        len1
+    } else if len1 == 126 {
+        let mut bytes = [0u8; 2];
+        stream
+            .read_exact(&mut bytes)
+            .expect("read preview events len16");
+        u16::from_be_bytes(bytes) as usize
+    } else {
+        let mut bytes = [0u8; 8];
+        stream
+            .read_exact(&mut bytes)
+            .expect("read preview events len64");
+        usize::try_from(u64::from_be_bytes(bytes)).expect("preview events payload too large")
+    };
+    let mut payload = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .expect("read preview events payload");
+    serde_json::from_slice(&payload).expect("parse preview revision event")
 }
 
 fn http_response_body(response: &[u8]) -> &[u8] {
@@ -3341,6 +3425,78 @@ fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
         1,
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn preview_events_websocket_emits_initial_and_updated_revision_events() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["preview", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let stderr = child.stderr.take().expect("preview stderr");
+    let stderr_handle = spawn_stderr_collector(stderr);
+
+    let stdout = child.stdout.take().expect("preview stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut document_url = String::new();
+    stdout
+        .read_line(&mut document_url)
+        .expect("read preview document URL");
+    let mut events_url = String::new();
+    stdout
+        .read_line(&mut events_url)
+        .expect("read preview events URL");
+
+    let document_url = document_url.trim().to_string();
+    let events_url = events_url.trim().to_string();
+    let (document_host, document_port, document_path) = parse_loopback_document_url(&document_url);
+    let (events_host, events_port, events_path) = parse_loopback_events_url(&events_url);
+    let mut events_stream = open_preview_events_websocket(&events_host, events_port, &events_path);
+
+    let initial_event = read_preview_revision_event(&mut events_stream);
+    assert_eq!(initial_event["type"], "revision");
+    assert_eq!(initial_event["revision"], 1);
+    assert_eq!(initial_event["page_count"], 1);
+
+    let initial_response = issue_get_request(&document_host, document_port, &document_path);
+    assert!(initial_response.starts_with(b"HTTP/1.1 200 OK"));
+    let initial_hash = body_hash(http_response_body(&initial_response));
+
+    thread::sleep(Duration::from_millis(20));
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nUpdated preview\n\\end{document}\n",
+    )
+    .expect("rewrite input file");
+
+    let updated_event = read_preview_revision_event(&mut events_stream);
+    assert_eq!(updated_event["type"], "revision");
+    assert_eq!(updated_event["revision"], 2);
+    assert_eq!(updated_event["page_count"], 1);
+
+    wait_until(
+        || {
+            let response = issue_get_request(&document_host, document_port, &document_path);
+            response.starts_with(b"HTTP/1.1 200 OK")
+                && body_hash(http_response_body(&response)) != initial_hash
+        },
+        Duration::from_secs(10),
+        "preview should serve an updated PDF after a revision event",
+    );
+
+    child.kill().expect("kill preview process");
+    child.wait().expect("wait for preview process");
+    stderr_handle.join().expect("join preview stderr collector");
 }
 
 #[cfg(unix)]
