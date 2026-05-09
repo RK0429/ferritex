@@ -422,7 +422,7 @@ runtime path のトップレベル crate はレイヤ境界として使い、`fe
 
 - **計測対象**: 3 OS での PDF 出力一致
 - **閾値**: Host Font Catalog overlay 無効時、メタデータ差分を除きバイト同一
-- **計測方法**: CI matrix で同一入力を処理し、正規化後の PDF ハッシュを比較する
+- **計測方法**: CI matrix で同一入力を処理し、正規化後の PDF ハッシュを比較する。`scripts/compare_cross_platform_hashes.sh` は入力された hash file の比較器であり、ローカルで合成した `hashes-linux.txt` / `hashes-macos.txt` / `hashes-windows.txt` を渡した場合は parser / comparator 挙動の確認に限られ、実 cross-platform 決定性の証拠にはならない
 - **違反時のアクション**: Asset Bundle / font resolution / metadata injection の差分を切り分ける
 
 ### 10.10 pdfLaTeX 互換性 (`REQ-NF-007`)

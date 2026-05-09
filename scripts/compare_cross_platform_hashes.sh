@@ -67,6 +67,7 @@ for fixture in $FIXTURES; do
 done
 
 echo "Summary: matches=$MATCHED_COUNT mismatches=$MISMATCHED_COUNT total=4"
+echo "Note: this script only compares the hash files provided in HASH_DIR; local synthesized hashes validate parser/comparator behavior only, not real cross-platform determinism." >&2
 
 if [ "$MISMATCHED_COUNT" -ne 0 ]; then
     exit 1
