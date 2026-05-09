@@ -219,11 +219,8 @@ impl LiveAnalysisSnapshotFactory {
         let compile_diagnostics = compile_state
             .map(|state| compile_diagnostics_to_analysis(&buffer.text, &state.diagnostics))
             .unwrap_or_default();
-        let buffer_diagnostics = collect_buffer_diagnostics(
-            &self.parser,
-            &buffer.text,
-            compile_state.is_none(),
-        );
+        let buffer_diagnostics =
+            collect_buffer_diagnostics(&self.parser, &buffer.text, compile_state.is_none());
         let buffer_messages: BTreeSet<&str> = buffer_diagnostics
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -298,7 +295,7 @@ fn collect_code_actions(text: &str) -> Vec<CodeActionSuggestion> {
     let Some((environment, _)) = analysis.unclosed.last() else {
         return Vec::new();
     };
-    let end_position = end_of_document(text);
+    let end_position = end_document_start(text).unwrap_or_else(|| end_of_document(text));
     vec![CodeActionSuggestion {
         title: format!("Insert \\end{{{environment}}}"),
         edit: TextEdit {
@@ -311,6 +308,21 @@ fn collect_code_actions(text: &str) -> Vec<CodeActionSuggestion> {
             new_text: format!("\n\\end{{{environment}}}\n"),
         },
     }]
+}
+
+fn end_document_start(text: &str) -> Option<TextPosition> {
+    for (line_index, line_text) in text.lines().enumerate() {
+        let visible = strip_line_comment(line_text);
+        for (start, environment) in find_braced_commands(&visible, "end") {
+            if environment == "document" {
+                return Some(TextPosition {
+                    line: line_index as u32,
+                    character: byte_to_char_index(&visible, start) as u32,
+                });
+            }
+        }
+    }
+    None
 }
 
 fn parse_error_to_diagnostic(text: &str, error: ParseError) -> AnalysisDiagnostic {
@@ -895,7 +907,7 @@ mod tests {
 
     use super::{
         compile_diagnostic_to_analysis, environment_diagnostics, parse_error_to_diagnostic,
-        CompletionKind, LiveAnalysisSnapshotFactory, TextPosition,
+        CompletionKind, LiveAnalysisSnapshotFactory, TextEdit, TextPosition,
     };
     use crate::open_document_store::OpenDocumentBuffer;
     use crate::stable_compile_state::StableCompileState;
@@ -935,22 +947,111 @@ mod tests {
         }
     }
 
+    fn apply_edit(text: &str, edit: &TextEdit) -> String {
+        assert_eq!(edit.range.start, edit.range.end);
+        let mut edited = String::new();
+        for (line_index, line_text) in text.lines().enumerate() {
+            if line_index > 0 {
+                edited.push('\n');
+            }
+            if line_index as u32 == edit.range.start.line {
+                let byte_index =
+                    super::char_to_byte_index(line_text, edit.range.start.character as usize);
+                edited.push_str(&line_text[..byte_index]);
+                edited.push_str(&edit.new_text);
+                edited.push_str(&line_text[byte_index..]);
+            } else {
+                edited.push_str(line_text);
+            }
+        }
+        if text.ends_with('\n') {
+            edited.push('\n');
+        }
+        edited
+    }
+
     #[test]
     fn reports_unclosed_environment_and_quick_fix() {
-        let snapshot = LiveAnalysisSnapshotFactory::default().build(
-            &buffer(
-            "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n\\end{document}\n",
-            ),
-            None,
-        );
+        let text =
+            "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n\\end{document}\n";
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(&buffer(text), None);
 
         assert!(snapshot.diagnostics().iter().any(|diagnostic| diagnostic
             .message
             .contains("unclosed environment `equation`")));
-        assert!(snapshot
+        let action = snapshot
             .code_actions()
             .iter()
-            .any(|action| action.title.contains("\\end{equation}")));
+            .find(|action| action.title.contains("\\end{equation}"))
+            .expect("quickfix should insert the missing equation end");
+        assert_eq!(
+            action.edit.range,
+            super::TextRange::new(4, 0, 4, 0),
+            "quickfix should insert before the existing \\end{{document}}"
+        );
+
+        let edited = apply_edit(text, &action.edit);
+        let fixed_snapshot = LiveAnalysisSnapshotFactory::default().build(&buffer(&edited), None);
+        assert!(
+            !fixed_snapshot
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("unclosed environment `equation`")),
+            "applying the quickfix should clear the target diagnostic"
+        );
+        assert!(
+            !fixed_snapshot
+                .diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.severity == Severity::Error),
+            "applying the quickfix should not introduce fatal diagnostics"
+        );
+    }
+
+    #[test]
+    fn quick_fix_ignores_commented_out_end_document() {
+        let text = "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n% \\end{document}\n\\end{document}\n";
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(&buffer(text), None);
+
+        let action = snapshot
+            .code_actions()
+            .iter()
+            .find(|action| action.title.contains("\\end{equation}"))
+            .expect("quickfix should insert the missing equation end");
+
+        assert_eq!(
+            super::end_document_start(text),
+            Some(TextPosition {
+                line: 5,
+                character: 0
+            })
+        );
+        assert_eq!(
+            action.edit.range,
+            super::TextRange::new(5, 0, 5, 0),
+            "commented-out \\end{{document}} should not be used as the insertion point"
+        );
+    }
+
+    #[test]
+    fn quick_fix_falls_back_to_eof_without_end_document() {
+        let text = "\\documentclass{article}\n\\begin{document}\n\\begin{equation}\na=b\n";
+        let snapshot = LiveAnalysisSnapshotFactory::default().build(&buffer(text), None);
+
+        let action = snapshot
+            .code_actions()
+            .iter()
+            .find(|action| action.title.contains("\\end{equation}"))
+            .expect("quickfix should insert the missing equation end");
+
+        assert_eq!(super::end_document_start(text), None);
+        assert_eq!(
+            action.edit.range,
+            super::TextRange::new(3, 3, 3, 3),
+            "without a real \\end{{document}}, quickfix should keep EOF insertion"
+        );
     }
 
     #[test]
@@ -1273,16 +1374,13 @@ mod tests {
     #[test]
     fn compile_state_success_surfaces_recoverable_compile_diagnostics() {
         let snapshot = LiveAnalysisSnapshotFactory::default().build(
-            &buffer(
-                "\\documentclass{article}\n\\begin{document}\n\\notAMacro\n\\end{document}\n",
-            ),
+            &buffer("\\documentclass{article}\n\\begin{document}\n\\notAMacro\n\\end{document}\n"),
             Some(&compile_state(
                 true,
-                vec![Diagnostic::new(
-                    Severity::Error,
-                    "undefined control sequence `\\notAMacro`",
-                )
-                .with_line(3)],
+                vec![
+                    Diagnostic::new(Severity::Error, "undefined control sequence `\\notAMacro`")
+                        .with_line(3),
+                ],
                 DocumentState::default(),
             )),
         );
@@ -1317,7 +1415,11 @@ mod tests {
         let occurrences = snapshot
             .diagnostics()
             .iter()
-            .filter(|diagnostic| diagnostic.message.contains("unclosed environment `equation`"))
+            .filter(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("unclosed environment `equation`")
+            })
             .count();
 
         assert_eq!(occurrences, 1);
