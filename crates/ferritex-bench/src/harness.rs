@@ -483,6 +483,8 @@ pub enum BenchFailure {
     },
     #[error("compile error for {case_name}: {message}")]
     CompileError { case_name: String, message: String },
+    #[error("environment blocked for {case_name}: {message}")]
+    EnvironmentBlocked { case_name: String, message: String },
     #[error("missing fixture: {}", path.display())]
     MissingFixture { path: PathBuf },
 }
@@ -586,10 +588,7 @@ impl BenchHarness {
                     case.reproducible,
                     case.no_cache,
                 )
-                .map_err(|message| BenchFailure::CompileError {
-                    case_name: case.name.clone(),
-                    message,
-                })?;
+                .map_err(|message| classify_compile_failure(&case.name, message))?;
         }
 
         let mut timings = Vec::with_capacity(self.config.measured_runs as usize);
@@ -603,10 +602,7 @@ impl BenchHarness {
                     case.reproducible,
                     case.no_cache,
                 )
-                .map_err(|message| BenchFailure::CompileError {
-                    case_name: case.name.clone(),
-                    message,
-                })?;
+                .map_err(|message| classify_compile_failure(&case.name, message))?;
 
             timings.push(BenchTiming {
                 duration: output.duration,
@@ -671,6 +667,26 @@ impl BenchHarness {
             })
         }
     }
+}
+
+fn classify_compile_failure(case_name: &str, message: String) -> BenchFailure {
+    if is_environment_blocked_message(&message) {
+        BenchFailure::EnvironmentBlocked {
+            case_name: case_name.to_string(),
+            message,
+        }
+    } else {
+        BenchFailure::CompileError {
+            case_name: case_name.to_string(),
+            message,
+        }
+    }
+}
+
+fn is_environment_blocked_message(message: &str) -> bool {
+    message.contains("os error 28")
+        || message.contains("No space left on device")
+        || message.contains("ENOSPC")
 }
 
 pub struct CliCompileBackend {
@@ -1197,6 +1213,41 @@ mod tests {
         assert!(matches!(
             failure,
             BenchFailure::OutputMismatch { case_name, .. } if case_name == "mismatch"
+        ));
+    }
+
+    #[test]
+    fn test_enospc_compile_error_is_environment_blocked() {
+        let case = sample_case(
+            "disk-full",
+            "minimal_article.tex",
+            BenchProfile::PartitionBench,
+            1,
+        );
+        let backend = MockCompileBackend::with_outputs(vec![Err(
+            "failed to read output PDF chapters_crossref.pdf: No space left on device (os error 28)"
+                .to_string(),
+        )]);
+        let harness = BenchHarness::new(
+            vec![case.clone()],
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: true,
+            },
+        )
+        .with_backend(backend);
+
+        let failure = harness
+            .run_case(&case)
+            .expect_err("ENOSPC should be classified separately");
+
+        assert!(matches!(
+            failure,
+            BenchFailure::EnvironmentBlocked { case_name, message }
+                if case_name == "disk-full"
+                    && message.contains("os error 28")
+                    && message.contains("chapters_crossref.pdf")
         ));
     }
 
