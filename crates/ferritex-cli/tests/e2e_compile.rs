@@ -5678,8 +5678,16 @@ fn compile_help_shows_option_descriptions() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
+        stdout.contains("Usage:"),
+        "compile help should show usage"
+    );
+    assert!(
         stdout.contains("--output-dir"),
         "compile help should show --output-dir"
+    );
+    assert!(
+        stdout.contains("--interaction"),
+        "compile help should show --interaction"
     );
     assert!(
         stdout.contains("Output directory"),
