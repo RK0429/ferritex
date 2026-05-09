@@ -622,6 +622,93 @@ fn compile_format_json_includes_diagnostics_for_failure_result() {
 }
 
 #[test]
+fn compile_format_json_batchmode_keeps_failure_structured_on_stdout() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken_json_batchmode.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--interaction",
+            "batchmode",
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("parse json stdout");
+    assert_eq!(value["schemaVersion"], "ferritex.compileResult.v1");
+    assert_eq!(value["command"], "compile");
+    assert_eq!(value["classification"], "error");
+    assert_eq!(value["exitCode"], 2);
+    assert_eq!(value["success"], false);
+    let diagnostics = value["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["severity"] == "Error"
+                && diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("\\nonexistentcommand"))
+        }),
+        "json diagnostics should include the undefined command error, got: {diagnostics:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("ferritex compile failed"),
+        "json batchmode failure must not receive the human summary on stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn compile_batchmode_failure_emits_minimal_diagnostic_summary() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken_batchmode.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--interaction",
+            "batchmode",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        !output.stdout.is_empty() || !output.stderr.is_empty(),
+        "batchmode failure must expose a diagnostic channel"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ferritex compile failed"),
+        "stderr should include a minimal failure summary, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("\\nonexistentcommand"),
+        "summary should include the primary diagnostic locator/message, got: {stderr}"
+    );
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "summary should be one line, got: {stderr}"
+    );
+}
+
+#[test]
 fn compile_with_asset_bundle_does_not_print_fallback_warning() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello.tex");
@@ -3085,8 +3172,17 @@ fn compile_batchmode_suppresses_stderr_diagnostics() {
         "nonstopmode should emit diagnostics to stderr, got: {nonstop_stderr}"
     );
     assert!(
-        batch_stderr.trim().is_empty(),
-        "batchmode should suppress diagnostic stderr, got: {batch_stderr}"
+        batch_stderr.contains("ferritex compile failed"),
+        "batchmode should emit the minimal failure summary, got: {batch_stderr}"
+    );
+    assert!(
+        batch_stderr.contains("\\nonexistentcommand"),
+        "batchmode summary should include the primary diagnostic, got: {batch_stderr}"
+    );
+    assert_eq!(
+        batch_stderr.lines().count(),
+        1,
+        "batchmode should suppress normal detailed diagnostics and keep one summary line, got: {batch_stderr}"
     );
 }
 

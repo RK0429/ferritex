@@ -110,7 +110,8 @@ struct SharedCompileCommand {
     reproducible: bool,
     /// TeX interaction mode.
     ///
-    /// `batchmode` suppresses diagnostic output to stderr.
+    /// `batchmode` suppresses normal diagnostic output to stderr, but failed
+    /// text compiles still emit a one-line failure summary for automation.
     /// `nonstopmode`, `scrollmode`, and `errorstopmode` are currently treated
     /// as equivalent non-interactive continuation modes in ferritex.
     #[arg(long, value_name = "MODE", value_enum)]
@@ -229,6 +230,7 @@ fn handle_compile(command: &CompileCommand) -> i32 {
     emit_diagnostics(&result.diagnostics, options.interaction_mode);
     match command.format {
         CompileOutputFormat::Text => {
+            emit_batchmode_failure_summary(&result, options.interaction_mode);
             print_compile_success_summary(&command.shared, &result, true)
         }
         CompileOutputFormat::Json => print_compile_json_result(&result),
@@ -332,6 +334,44 @@ fn print_compile_success_summary(
             "warning: no asset bundle specified; using built-in/host asset fallback. Pass --asset-bundle <PATH> to use the release asset bundle."
         );
     }
+}
+
+fn emit_batchmode_failure_summary(result: &CompileResult, mode: InteractionMode) {
+    if mode != InteractionMode::Batchmode || compile_result_classification(result) != "error" {
+        return;
+    }
+
+    let summary = result
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.severity == Severity::Error)
+        .or_else(|| result.diagnostics.first())
+        .map_or_else(
+            || {
+                format!(
+                    "ferritex compile failed with exit code {}",
+                    result.exit_code
+                )
+            },
+            |diagnostic| {
+                format!(
+                    "ferritex compile failed: {}",
+                    diagnostic_primary_line(diagnostic)
+                )
+            },
+        );
+    eprintln!("{summary}");
+}
+
+fn diagnostic_primary_line(diagnostic: &Diagnostic) -> String {
+    diagnostic
+        .to_string()
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .unwrap_or("diagnostic unavailable")
+        .to_string()
 }
 
 fn print_preview_initial_compile_success_summary(
