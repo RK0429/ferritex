@@ -842,6 +842,28 @@ impl<'a> CompileJobService<'a> {
         }
     }
 
+    fn write_bibliography_aux(
+        &self,
+        bibliography_context: &BibliographyContext,
+        project_root: &Path,
+        output_dir: &Path,
+        jobname: &str,
+    ) -> Option<Diagnostic> {
+        let aux_contents = bibliography_context.bibtex_aux_contents(project_root, output_dir)?;
+        let aux_path = output_dir.join(format!("{jobname}.aux"));
+        self.file_access_gate
+            .write_file(&aux_path, aux_contents.as_bytes())
+            .err()
+            .map(|error| {
+                Diagnostic::new(
+                    Severity::Warning,
+                    format!("failed to persist bibliography aux file: {error}"),
+                )
+                .with_file(aux_path.to_string_lossy().into_owned())
+                .with_suggestion("verify the output directory")
+            })
+    }
+
     fn write_bibliography_sidecar(
         &self,
         bbl_path: &Path,
@@ -880,6 +902,67 @@ impl<'a> CompileJobService<'a> {
                 )
                 .with_file(sidecar_path.to_string_lossy().into_owned())
             })
+    }
+
+    fn materialize_loaded_bibliography_artifacts(
+        &self,
+        loaded_bibliography_state: &LoadedBibliographyState,
+        bibliography_context: &BibliographyContext,
+        project_root: &Path,
+        overlay_roots: &[PathBuf],
+        output_dir: &Path,
+        jobname: &str,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let output_bbl = output_dir.join(format!("{jobname}.bbl"));
+
+        if loaded_bibliography_state.path != output_bbl {
+            match self
+                .file_access_gate
+                .read_file(&loaded_bibliography_state.path)
+            {
+                Ok(bytes) => {
+                    if let Err(error) = self.file_access_gate.write_file(&output_bbl, &bytes) {
+                        diagnostics.push(
+                            Diagnostic::new(
+                                Severity::Warning,
+                                format!("failed to persist bibliography .bbl artifact: {error}"),
+                            )
+                            .with_file(output_bbl.to_string_lossy().into_owned()),
+                        );
+                        return diagnostics;
+                    }
+                }
+                Err(error) => {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            format!("failed to read bibliography .bbl artifact: {error}"),
+                        )
+                        .with_file(
+                            loaded_bibliography_state
+                                .path
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                    );
+                    return diagnostics;
+                }
+            }
+        }
+
+        if let (Some(input_fingerprint), Some(toolchain)) = (
+            bibliography_context.current_fingerprint(project_root, overlay_roots),
+            bibliography_context.toolchain(),
+        ) {
+            if let Some(diagnostic) =
+                self.write_bibliography_sidecar(&output_bbl, &input_fingerprint, toolchain)
+            {
+                diagnostics.push(diagnostic);
+            }
+        }
+
+        diagnostics
     }
 
     fn write_text_sidecar(
@@ -1210,6 +1293,28 @@ impl<'a> CompileJobService<'a> {
                 (loaded_bibliography_state.is_none() && bibliography_context.has_citations())
                     .then_some(BibliographyDiagnostic::MissingBbl)
             });
+        if !(bibliography_issue.is_some() && execution_policy.shell_escape_allowed) {
+            if let Some(diagnostic) = self.write_bibliography_aux(
+                &bibliography_context,
+                &project_root,
+                &options.output_dir,
+                &options.jobname,
+            ) {
+                bibliography_diagnostics.push(diagnostic);
+            }
+        }
+        if bibliography_issue.is_none() {
+            if let Some(loaded) = &loaded_bibliography_state {
+                bibliography_diagnostics.extend(self.materialize_loaded_bibliography_artifacts(
+                    loaded,
+                    &bibliography_context,
+                    &project_root,
+                    &options.overlay_roots,
+                    &options.output_dir,
+                    &options.jobname,
+                ));
+            }
+        }
         if bibliography_issue.is_some() && execution_policy.shell_escape_allowed {
             if let Some(diagnostic) = self.try_generate_bibliography(
                 &bibliography_context,

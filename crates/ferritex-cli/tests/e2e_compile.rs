@@ -709,6 +709,55 @@ fn compile_with_trace_font_tasks_emits_trace_on_warm_cache_hit() {
 }
 
 #[test]
+fn issue_82_compile_emits_aux_and_bibliography_artifacts_for_adjacent_bbl() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("issue82.tex");
+    let output_dir = dir.path().join("out");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nSee \\cite{key}.\n\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n",
+    )
+    .expect("write input file");
+    std::fs::write(
+        dir.path().join("refs.bib"),
+        "@book{key,\n  title = {Issue 82 Reference}\n}\n",
+    )
+    .expect("write bib file");
+    std::fs::write(
+        dir.path().join("issue82.bbl"),
+        "\\begin{thebibliography}{99}\n\\bibitem{key} Issue 82 Reference\n\\end{thebibliography}\n",
+    )
+    .expect("write adjacent bbl");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let aux = std::fs::read_to_string(output_dir.join("issue82.aux")).expect("read aux");
+    assert!(aux.contains("\\citation{key}"));
+    assert!(aux.contains("\\bibstyle{plain}"));
+    assert!(aux.contains("\\bibdata{../refs}"));
+    let output_bbl = std::fs::read_to_string(output_dir.join("issue82.bbl")).expect("read bbl");
+    assert!(output_bbl.contains("Issue 82 Reference"));
+    let sidecar = std::fs::read_to_string(output_dir.join("issue82.bbl.ferritex.json"))
+        .expect("read sidecar");
+    assert!(sidecar.contains("\"toolchain\": \"bibtex\""));
+    assert!(sidecar.contains("\"inputFingerprint\""));
+}
+
+#[test]
 fn compile_includegraphics_embeds_image_xobject_into_pdf() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("image.tex");
