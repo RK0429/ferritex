@@ -7799,6 +7799,7 @@ fn emit_font_task_trace(
     eprintln!(
         "{}",
         json!({
+            "schemaVersion": "ferritex.fontTaskTrace.v1",
             "fontTaskId": font_task_id,
             "fontAsset": font_asset,
             "startedAt": started_at,

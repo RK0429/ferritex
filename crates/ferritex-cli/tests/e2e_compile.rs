@@ -714,11 +714,22 @@ fn compile_with_trace_font_tasks_emits_font_task_trace_to_stderr() {
     assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("\"fontTaskId\""));
+    assert!(stderr.contains("\"schemaVersion\""));
     assert!(stderr.contains("\"fontAsset\""));
     assert!(stderr.contains("\"startedAt\""));
     assert!(stderr.contains("\"finishedAt\""));
     assert!(stderr.contains("\"workerId\""));
     assert!(!stderr.contains("error:"));
+
+    for line in stderr.lines() {
+        let value: Value = serde_json::from_str(line).expect("trace line should be valid JSON");
+        assert_eq!(value["schemaVersion"], "ferritex.fontTaskTrace.v1");
+        assert!(value["fontTaskId"].is_string());
+        assert!(value["fontAsset"].is_string());
+        assert!(value["startedAt"].is_u64());
+        assert!(value["finishedAt"].is_u64());
+        assert!(value["workerId"].is_u64());
+    }
 }
 
 #[test]
@@ -5120,6 +5131,10 @@ fn compile_help_shows_option_descriptions() {
     assert!(
         stdout.contains("built-in/host asset fallback"),
         "compile help should explain --asset-bundle omission fallback, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("ferritex.fontTaskTrace.v1"),
+        "compile help should document the public trace font task schema, got: {stdout}"
     );
 }
 
