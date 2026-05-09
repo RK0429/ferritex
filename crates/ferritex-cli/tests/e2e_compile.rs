@@ -531,6 +531,56 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 }
 
 #[test]
+fn compile_success_stdout_surfaces_stateful_artifact_paths() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let output_dir = dir.path().join("out");
+    let tex_file = dir.path().join("artifact_paths.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello, artifacts!\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+            "--synctex",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pdf_path = output_dir.join("artifact_paths.pdf");
+    let cache_dir = output_dir.join(".ferritex-cache");
+    let synctex_path = output_dir.join("artifact_paths.synctex");
+
+    assert!(pdf_path.exists(), "PDF artifact should exist");
+    assert!(cache_dir.exists(), "cache artifact directory should exist");
+    assert!(synctex_path.exists(), "SyncTeX sidecar should exist");
+    assert!(
+        stdout.contains(&format!("pdf={}", pdf_path.display())),
+        "stdout should surface PDF path, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("cache={}", cache_dir.display())),
+        "stdout should surface cache path, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("synctex={}", synctex_path.display())),
+        "stdout should surface SyncTeX path, got: {stdout}"
+    );
+}
+
+#[test]
 fn compile_format_json_emits_machine_readable_success_result() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello_json.tex");
@@ -570,6 +620,11 @@ fn compile_format_json_emits_machine_readable_success_result() {
         .as_str()
         .expect("pdf path")
         .ends_with("hello_json.pdf"));
+    assert!(value["output"]["cacheDir"]
+        .as_str()
+        .expect("cache dir")
+        .ends_with(".ferritex-cache"));
+    assert_eq!(value["output"]["syncTexPath"], Value::Null);
     assert_eq!(value["output"]["pageCount"], 1);
     assert!(value["summary"]["elapsedMicros"].is_u64());
     assert!(value["summary"]["stageTotalMicros"].is_u64());
@@ -595,6 +650,48 @@ fn compile_format_json_emits_machine_readable_success_result() {
             .expect("diagnostics array")
             .len(),
         0
+    );
+}
+
+#[test]
+fn compile_format_json_with_synctex_reports_sidecar_path() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let output_dir = dir.path().join("out");
+    let tex_file = dir.path().join("hello_json_synctex.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello, JSON SyncTeX!\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--output-dir",
+            output_dir.to_str().expect("utf-8 output dir"),
+            "--synctex",
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("parse json stdout");
+    let synctex_path = output_dir.join("hello_json_synctex.synctex");
+
+    assert!(synctex_path.exists(), "SyncTeX sidecar should exist");
+    assert_eq!(
+        value["output"]["syncTexPath"]
+            .as_str()
+            .expect("synctex path"),
+        synctex_path.to_string_lossy()
     );
 }
 
@@ -626,6 +723,7 @@ fn compile_format_json_reports_disabled_cache_summary_for_no_cache() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("parse json stdout");
+    assert_eq!(value["output"]["cacheDir"], Value::Null);
     assert_eq!(value["summary"]["cache"]["status"], "disabled");
     assert_eq!(
         value["summary"]["stageTimingsMicros"]["cacheLoad"],

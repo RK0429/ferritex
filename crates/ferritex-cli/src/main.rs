@@ -31,6 +31,8 @@ use ferritex_infra::shell::ShellCommandGateway;
 mod lsp_server;
 mod watch_runner;
 
+const CACHE_DIR_NAME: &str = ".ferritex-cache";
+
 #[derive(Debug, Parser)]
 #[command(name = "ferritex", version, about = "A Rust-native LaTeX compiler")]
 struct Cli {
@@ -236,12 +238,12 @@ fn handle_compile(command: &CompileCommand) -> i32 {
             emit_batchmode_failure_summary(&result, options.interaction_mode);
             print_compile_success_summary(&command.shared, &result, true)
         }
-        CompileOutputFormat::Json => print_compile_json_result(&result),
+        CompileOutputFormat::Json => print_compile_json_result(&command.shared, &result),
     }
     result.exit_code
 }
 
-fn print_compile_json_result(result: &CompileResult) {
+fn print_compile_json_result(command: &SharedCompileCommand, result: &CompileResult) {
     let page_count = result
         .stable_compile_state
         .as_ref()
@@ -256,6 +258,12 @@ fn print_compile_json_result(result: &CompileResult) {
         "success": classification != "error",
         "output": {
             "pdfPath": result.output_pdf.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            "cacheDir": result.output_pdf.as_ref().and_then(|path| {
+                (!command.no_cache).then(|| compile_cache_dir(path).to_string_lossy().into_owned())
+            }),
+            "syncTexPath": result.output_pdf.as_ref().and_then(|path| {
+                command.synctex.then(|| compile_synctex_path(path).to_string_lossy().into_owned())
+            }),
             "pageCount": page_count,
         },
         "summary": summary,
@@ -408,11 +416,34 @@ fn print_compile_success_summary(
             if page_count == 1 { "" } else { "s" }
         );
     }
+    print_compile_artifact_paths(command, output_pdf);
     if print_asset_bundle_fallback_warning && command.asset_bundle.is_none() {
         println!(
             "warning: no asset bundle specified; using built-in/host asset fallback. Pass --asset-bundle <PATH> to use the release asset bundle."
         );
     }
+}
+
+fn print_compile_artifact_paths(command: &SharedCompileCommand, output_pdf: &std::path::Path) {
+    print!("artifacts: pdf={}", output_pdf.display());
+    if !command.no_cache {
+        print!(" cache={}", compile_cache_dir(output_pdf).display());
+    }
+    if command.synctex {
+        print!(" synctex={}", compile_synctex_path(output_pdf).display());
+    }
+    println!();
+}
+
+fn compile_cache_dir(output_pdf: &std::path::Path) -> PathBuf {
+    output_pdf.parent().map_or_else(
+        || PathBuf::from(CACHE_DIR_NAME),
+        |parent| parent.join(CACHE_DIR_NAME),
+    )
+}
+
+fn compile_synctex_path(output_pdf: &std::path::Path) -> PathBuf {
+    output_pdf.with_extension("synctex")
 }
 
 fn emit_batchmode_failure_summary(result: &CompileResult, mode: InteractionMode) {
