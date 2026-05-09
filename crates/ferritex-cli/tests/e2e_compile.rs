@@ -5144,6 +5144,37 @@ fn compile_help_warns_about_high_jobs_rss() {
 }
 
 #[test]
+fn compile_help_documents_file_cache_temp_and_network_side_effects() {
+    let output = ferritex_bin()
+        .args(["compile", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("writes generated artifacts to --output-dir"),
+        "compile help should document default write roots, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("<jobname>.pdf") && stdout.contains("<jobname>.synctex"),
+        "compile help should document generated files and sidecars, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("<output-dir>/.ferritex-cache unless --no-cache is set"),
+        "compile help should document cache behavior, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("system temp directory"),
+        "compile help should document temp materialization, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("does not open network listeners"),
+        "compile help should document network behavior, got: {stdout}"
+    );
+}
+
+#[test]
 fn compile_and_preview_help_hide_watch_verbose_flag() {
     let compile = ferritex_bin()
         .args(["compile", "--help"])
@@ -5200,6 +5231,33 @@ fn watch_help_shows_verbose_flag() {
 }
 
 #[test]
+fn watch_help_documents_repeated_compile_side_effects() {
+    let output = ferritex_bin()
+        .args(["watch", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("same write roots, generated artifacts, sidecars, cache directory"),
+        "watch help should document compile side effects, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("initial build and each recompile"),
+        "watch help should document repeated side effects, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("input file's directory when --output-dir is omitted"),
+        "watch help should document default write root, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("does not open network listeners"),
+        "watch help should document network behavior, got: {stdout}"
+    );
+}
+
+#[test]
 fn preview_help_documents_loopback_transport_urls() {
     let output = ferritex_bin()
         .args(["preview", "--help"])
@@ -5215,6 +5273,33 @@ fn preview_help_documents_loopback_transport_urls() {
     assert!(
         stdout.contains("WebSocket event URL"),
         "preview help should mention the WebSocket event URL"
+    );
+}
+
+#[test]
+fn preview_help_documents_compile_side_effects_and_loopback_scope() {
+    let output = ferritex_bin()
+        .args(["preview", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("same write roots, generated artifacts, sidecars, cache directory"),
+        "preview help should document compile side effects, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("temp materialization as compile"),
+        "preview help should document temp materialization, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("binds a loopback-only listener on 127.0.0.1"),
+        "preview help should document loopback network behavior, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("does not publish to external network interfaces"),
+        "preview help should document external network behavior, got: {stdout}"
     );
 }
 
