@@ -229,6 +229,36 @@ fn http_response_body(response: &[u8]) -> &[u8] {
     &response[header_end + 4..]
 }
 
+fn assert_preview_document_probe_response(response: &[u8]) -> u64 {
+    assert!(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "preview document probe should receive HTTP 200, got: {}",
+        String::from_utf8_lossy(response)
+    );
+    assert!(
+        response
+            .windows("Content-Type: application/pdf".len())
+            .any(|window| window == b"Content-Type: application/pdf"),
+        "preview document probe should preserve PDF content-type evidence: {}",
+        String::from_utf8_lossy(response)
+    );
+    assert!(
+        response
+            .windows("Cache-Control: no-store, no-cache, must-revalidate".len())
+            .any(|window| window == b"Cache-Control: no-store, no-cache, must-revalidate"),
+        "preview document probe should preserve no-store cache evidence: {}",
+        String::from_utf8_lossy(response)
+    );
+
+    let body = http_response_body(response);
+    assert!(
+        body.starts_with(b"%PDF-"),
+        "preview document probe should preserve PDF body evidence: {}",
+        String::from_utf8_lossy(response)
+    );
+    body_hash(body)
+}
+
 fn body_hash(body: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     body.hash(&mut hasher);
@@ -3784,11 +3814,11 @@ fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
     wait_until(
         || {
             let response = issue_get_request(&host, port, &path);
-            if !response.starts_with(b"HTTP/1.1 200 OK") {
-                return false;
+            if response.starts_with(b"HTTP/1.1 200 OK") {
+                initial_hash = Some(assert_preview_document_probe_response(&response));
+                return true;
             }
-            initial_hash = Some(body_hash(http_response_body(&response)));
-            true
+            false
         },
         Duration::from_secs(2),
         "preview should publish the initial PDF",
@@ -3807,7 +3837,7 @@ fn preview_recompiles_and_serves_updated_pdf_on_source_change() {
         || {
             let response = issue_get_request(&host, port, &path);
             response.starts_with(b"HTTP/1.1 200 OK")
-                && body_hash(http_response_body(&response)) != initial_hash
+                && assert_preview_document_probe_response(&response) != initial_hash
         },
         Duration::from_secs(10),
         "preview should serve an updated PDF after a source change",
