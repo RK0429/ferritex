@@ -71,6 +71,26 @@ cargo run --release -- preview hello.tex   # live preview: recompiles on source 
 cargo run --release -- lsp                 # starts an LSP server over stdio
 ```
 
+### 5. Reproduce bounded performance evidence
+
+The release binary exposes a bounded performance evidence workflow that runs a
+small embedded deterministic smoke fixture through the current `ferritex`
+executable and writes both machine-readable JSON and a text report. It does
+not require a source checkout or `ferritex-bench` fixtures at runtime:
+
+```sh
+cargo run --release -- perf-evidence --output-dir artifacts/perf-evidence
+```
+
+Artifacts:
+
+- `artifacts/perf-evidence/ferritex-perf-evidence.json`
+- `artifacts/perf-evidence/ferritex-perf-evidence.txt`
+
+The default run uses 0 warmup runs and 1 measured run. Increase the bound
+explicitly when collecting local evidence, for example
+`--warmup-runs 1 --measured-runs 5`.
+
 ## LSP (Language Server Protocol)
 
 `ferritex lsp` starts a Language Server Protocol server over stdio. It speaks JSON-RPC 2.0, so each message must use `Content-Length: <N>\r\n\r\n<N bytes of UTF-8 JSON>` framing. Oversize or malformed frames are treated as fatal session errors and end the current session.
@@ -109,7 +129,7 @@ Minimal `publishDiagnostics` notification payload:
 | `ferritex-infra` | OS/FS/network adapters (file access gate, shell command gateway, asset bundle loader, loopback preview transport, polling watcher) |
 | `ferritex-bench` | Benchmark harness scaffold for `FTX-BENCH-001`, partition parallelism, and bundle bootstrap smoke |
 
-Dependency direction: `cli → application + core + infra`, `application → core`, `infra → application + core`.
+Dependency direction: `cli → application + core + infra`, `application → core`, `infra → application + core`. `ferritex-bench` remains outside the runtime dependency path.
 
 ## Completion status
 
