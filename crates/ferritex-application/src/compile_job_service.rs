@@ -67,7 +67,7 @@ use serde_json::json;
 use crate::compile_cache::{
     fingerprint_bytes, BackgroundCacheWriter, BlockCheckpoint, BlockCheckpointData,
     BlockLayoutState, CachedPagePayload, CachedSourceSubtree, CachedTypesetFragment, CompileCache,
-    PendingFloat, WarmPartitionCache,
+    PendingFloat, WarmPartitionCache, CACHE_DIR_NAME,
 };
 use crate::execution_policy_factory::ExecutionPolicyFactory;
 use crate::ports::{AssetBundleLoaderPort, ShellCommandGatewayPort};
@@ -1201,6 +1201,21 @@ impl<'a> CompileJobService<'a> {
                     );
                 }
                 let diagnostics = cached_artifact.stable_compile_state.diagnostics.clone();
+                if has_error_diagnostics(&diagnostics) {
+                    let mut diagnostics = diagnostics;
+                    remove_failed_compile_artifacts(
+                        &cached_artifact.output_pdf,
+                        &options.output_dir,
+                        &mut diagnostics,
+                    );
+                    return CompileResult {
+                        exit_code: exit_code_for(&diagnostics),
+                        diagnostics,
+                        output_pdf: None,
+                        stable_compile_state: None,
+                        stage_timing,
+                    };
+                }
                 let warm_cache = lookup.into_warm_cache();
                 *self
                     .warm_partition_cache
@@ -1259,6 +1274,7 @@ impl<'a> CompileJobService<'a> {
                 stage_timing.source_tree_load = Some(source_tree_load_start.elapsed());
                 let mut diagnostics = cache_diagnostics;
                 diagnostics.push(diagnostic);
+                remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
 
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -1663,6 +1679,7 @@ impl<'a> CompileJobService<'a> {
         if font_resolution_fatal {
             let mut diagnostics = cache_diagnostics.clone();
             diagnostics.extend(parse_diagnostics.clone());
+            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -1717,6 +1734,7 @@ impl<'a> CompileJobService<'a> {
                 );
                 let mut diagnostics = cache_diagnostics.clone();
                 diagnostics.extend(parse_diagnostics.clone());
+                remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
 
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -1752,7 +1770,7 @@ impl<'a> CompileJobService<'a> {
         if has_fatal_parse_error {
             let mut diagnostics = cache_diagnostics.clone();
             diagnostics.extend(parse_diagnostics.clone());
-            remove_stale_output_pdf(&output_pdf, &mut diagnostics);
+            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -1770,6 +1788,7 @@ impl<'a> CompileJobService<'a> {
             let mut diagnostics = cache_diagnostics.clone();
             diagnostics.extend(parse_diagnostics.clone());
             diagnostics.extend(graphics_diagnostics);
+            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -1795,6 +1814,7 @@ impl<'a> CompileJobService<'a> {
                 let mut diagnostics = cache_diagnostics.clone();
                 diagnostics.extend(parse_diagnostics.clone());
                 diagnostics.push(diagnostic);
+                remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
 
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -1854,6 +1874,17 @@ impl<'a> CompileJobService<'a> {
         let mut diagnostics = cache_diagnostics;
         diagnostics.extend(cacheable_diagnostics.clone());
         if !pdf_document.document.encoding_errors.is_empty() {
+            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+            return CompileResult {
+                exit_code: exit_code_for(&diagnostics),
+                diagnostics,
+                output_pdf: None,
+                stable_compile_state: None,
+                stage_timing,
+            };
+        }
+        if has_error_diagnostics(&diagnostics) {
+            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -6335,6 +6366,21 @@ fn is_fatal_parse_error(error: &ParseError) -> bool {
     matches!(error, ParseError::ShellEscapeError { .. })
 }
 
+fn has_error_diagnostics(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+}
+
+fn remove_failed_compile_artifacts(
+    output_pdf: &Path,
+    output_dir: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    remove_stale_output_pdf(output_pdf, diagnostics);
+    remove_compile_cache_artifacts(output_dir, diagnostics);
+}
+
 fn remove_stale_output_pdf(output_pdf: &Path, diagnostics: &mut Vec<Diagnostic>) {
     match std::fs::remove_file(output_pdf) {
         Ok(()) => {}
@@ -6346,6 +6392,22 @@ fn remove_stale_output_pdf(output_pdf: &Path, diagnostics: &mut Vec<Diagnostic>)
             )
             .with_file(output_pdf.to_string_lossy().into_owned())
             .with_context("fatal compile errors must not leave a stale PDF artifact"),
+        ),
+    }
+}
+
+fn remove_compile_cache_artifacts(output_dir: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    let cache_dir = output_dir.join(CACHE_DIR_NAME);
+    match std::fs::remove_dir_all(&cache_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => diagnostics.push(
+            Diagnostic::new(
+                Severity::Error,
+                format!("failed to remove compile cache artifacts: {error}"),
+            )
+            .with_file(cache_dir.to_string_lossy().into_owned())
+            .with_context("fatal compile errors must not leave cache artifacts"),
         ),
     }
 }
@@ -13271,7 +13333,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_pdf_and_reports_recoverable_parse_diagnostics() {
+    fn error_parse_diagnostics_do_not_commit_pdf_artifacts() {
         let dir = tempdir().expect("create tempdir");
         let input_file = dir.path().join("main.tex");
         let options = runtime_options(input_file, dir.path().join("out"));
@@ -13288,22 +13350,14 @@ mod tests {
         let result = service(&gate, &loader).compile(&options);
 
         assert_eq!(result.exit_code, 2);
-        assert_eq!(result.output_pdf, Some(options.output_dir.join("main.pdf")));
+        assert_eq!(result.output_pdf, None);
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].message, "unexpected closing brace");
         assert_eq!(result.diagnostics[0].line, Some(3));
-        let stable_state = result
-            .stable_compile_state
-            .as_ref()
-            .expect("stable compile state");
-        assert!(stable_state.success);
-        assert_eq!(stable_state.page_count, 1);
-        assert_eq!(stable_state.diagnostics, result.diagnostics);
+        assert_eq!(result.stable_compile_state, None);
 
         let writes = gate.writes.lock().expect("lock writes");
-        assert_eq!(writes.len(), 1);
-        let pdf = String::from_utf8_lossy(&writes[0].1);
-        assert!(pdf.contains("AB"));
+        assert!(writes.is_empty(), "error compile must not write artifacts");
     }
 
     #[test]
@@ -14575,14 +14629,8 @@ mod tests {
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].message, "unclosed brace");
         assert_eq!(result.diagnostics[0].line, Some(3));
-        assert_eq!(result.output_pdf, Some(options.output_dir.join("main.pdf")));
-        let stable_state = result
-            .stable_compile_state
-            .as_ref()
-            .expect("stable compile state");
-        assert!(stable_state.success);
-        assert_eq!(stable_state.page_count, 1);
-        assert_eq!(stable_state.diagnostics, result.diagnostics);
+        assert_eq!(result.output_pdf, None);
+        assert_eq!(result.stable_compile_state, None);
     }
 
     #[test]
