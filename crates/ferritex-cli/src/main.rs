@@ -2,9 +2,9 @@ use std::{
     io::{self, Write},
     num::NonZeroUsize,
     path::PathBuf,
-    process,
+    process::{self, Command},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -32,6 +32,10 @@ mod lsp_server;
 mod watch_runner;
 
 const CACHE_DIR_NAME: &str = ".ferritex-cache";
+const PERF_EVIDENCE_FIXTURE_NAME: &str = "perf-evidence-smoke.tex";
+const PERF_EVIDENCE_RUN_DIR_NAME: &str = "run";
+const PERF_EVIDENCE_STDIO_LIMIT: usize = 4096;
+const PERF_EVIDENCE_FIXTURE: &str = "\\documentclass{article}\n\\begin{document}\nFerritex release binary performance evidence.\n\\section{Smoke}\nDeterministic bounded fixture.\n\\end{document}\n";
 
 #[derive(Debug, Parser)]
 #[command(name = "ferritex", version, about = "A Rust-native LaTeX compiler")]
@@ -76,6 +80,14 @@ Diagnostics are delivered through `textDocument/publishDiagnostics` notification
 See README.md for a minimal publishDiagnostics example."
     )]
     Lsp,
+    /// Run a bounded release-binary performance evidence workflow
+    #[command(
+        long_about = "Run a bounded performance evidence workflow through the ferritex release binary and write JSON plus text report artifacts.
+
+The workflow writes an embedded deterministic smoke fixture under --output-dir and invokes the current ferritex executable as the compile backend, so it exercises the same binary surface users run after `cargo build --release` without requiring a source checkout. The default run is intentionally bounded: one smoke compile, no warmup, and one measured run.",
+        after_help = "Examples:\n  ferritex perf-evidence --output-dir artifacts/perf-evidence\n  cargo run --release -- perf-evidence --output-dir artifacts/perf-evidence"
+    )]
+    PerfEvidence(PerfEvidenceCommand),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -142,6 +154,19 @@ struct WatchCommand {
     /// Print each watched file path in addition to the tracked count
     #[arg(short = 'v', long)]
     verbose: bool,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct PerfEvidenceCommand {
+    /// Directory where ferritex-perf-evidence.json and ferritex-perf-evidence.txt are written
+    #[arg(long, value_name = "DIR")]
+    output_dir: PathBuf,
+    /// Warmup runs per case
+    #[arg(long, default_value_t = 0)]
+    warmup_runs: u32,
+    /// Measured runs per case
+    #[arg(long, default_value_t = 1)]
+    measured_runs: u32,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -217,6 +242,209 @@ fn run(cli: Cli) -> i32 {
         Commands::Preview(command) => handle_preview(&command),
         Commands::Watch(command) => handle_watch(&command),
         Commands::Lsp => handle_lsp(),
+        Commands::PerfEvidence(command) => handle_perf_evidence(&command),
+    }
+}
+
+fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
+    if command.measured_runs == 0 {
+        eprintln!("--measured-runs must be greater than 0");
+        return 2;
+    }
+
+    let binary_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("failed to resolve current ferritex executable: {error}");
+            return 2;
+        }
+    };
+
+    if let Err(error) = std::fs::create_dir_all(&command.output_dir) {
+        eprintln!(
+            "failed to create performance evidence output directory {}: {error}",
+            command.output_dir.display()
+        );
+        return 2;
+    }
+    let fixture_path = command.output_dir.join(PERF_EVIDENCE_FIXTURE_NAME);
+    if let Err(error) = std::fs::write(&fixture_path, PERF_EVIDENCE_FIXTURE) {
+        eprintln!(
+            "failed to write performance evidence fixture {}: {error}",
+            fixture_path.display()
+        );
+        return 2;
+    }
+
+    let mut failures = Vec::new();
+    let mut measured_runs = Vec::new();
+    for run_index in 0..(command.warmup_runs + command.measured_runs) {
+        let run_kind = if run_index < command.warmup_runs {
+            "warmup"
+        } else {
+            "measured"
+        };
+        let run_dir = command
+            .output_dir
+            .join(PERF_EVIDENCE_RUN_DIR_NAME)
+            .join(format!("{run_kind}-{run_index}"));
+        if let Err(error) = std::fs::create_dir_all(&run_dir) {
+            eprintln!(
+                "failed to create performance evidence run directory {}: {error}",
+                run_dir.display()
+            );
+            return 2;
+        }
+
+        let started = Instant::now();
+        let output = match Command::new(&binary_path)
+            .arg("compile")
+            .arg("--format")
+            .arg("json")
+            .arg("--no-cache")
+            .arg("--reproducible")
+            .arg("--output-dir")
+            .arg(&run_dir)
+            .arg(&fixture_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("failed to run ferritex compile child process: {error}");
+                return 2;
+            }
+        };
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        if run_kind == "measured" {
+            measured_runs.push(serde_json::json!({
+                "index": measured_runs.len(),
+                "duration_ms": duration_ms,
+                "success": output.status.success(),
+                "exit_code": output.status.code(),
+                "output_dir": run_dir,
+                "pdf_path": run_dir.join("perf-evidence-smoke.pdf"),
+                "stdout": bounded_utf8(&output.stdout, PERF_EVIDENCE_STDIO_LIMIT),
+                "stderr": bounded_utf8(&output.stderr, PERF_EVIDENCE_STDIO_LIMIT),
+            }));
+        }
+        if !output.status.success() {
+            failures.push(serde_json::json!({
+                "run_kind": run_kind,
+                "run_index": run_index,
+                "exit_code": output.status.code(),
+                "stdout": bounded_utf8(&output.stdout, PERF_EVIDENCE_STDIO_LIMIT),
+                "stderr": bounded_utf8(&output.stderr, PERF_EVIDENCE_STDIO_LIMIT),
+            }));
+        }
+    }
+
+    let successful_durations = measured_runs
+        .iter()
+        .filter(|run| run["success"].as_bool() == Some(true))
+        .filter_map(|run| run["duration_ms"].as_f64())
+        .collect::<Vec<_>>();
+    let median_duration_ms = median_f64(&successful_durations);
+    let report = serde_json::json!({
+        "schema_version": "ferritex.perfEvidence.v1",
+        "fixture": {
+            "source": "embedded",
+            "path": fixture_path,
+        },
+        "command": {
+            "binary": binary_path,
+            "args": [
+                "compile",
+                "--format", "json",
+                "--no-cache",
+                "--reproducible",
+                "--output-dir", "<run-dir>",
+                PERF_EVIDENCE_FIXTURE_NAME,
+            ],
+        },
+        "config": {
+            "warmup_runs": command.warmup_runs,
+            "measured_runs": command.measured_runs,
+        },
+        "results": measured_runs,
+        "summary": {
+            "successful_measured_runs": successful_durations.len(),
+            "median_duration_ms": median_duration_ms,
+        },
+        "failures": failures,
+    });
+
+    let json_path = command.output_dir.join("ferritex-perf-evidence.json");
+    let json = match serde_json::to_string_pretty(&report) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("failed to serialize performance evidence JSON: {error}");
+            return 2;
+        }
+    };
+    if let Err(error) = std::fs::write(&json_path, json) {
+        eprintln!(
+            "failed to write performance evidence JSON {}: {error}",
+            json_path.display()
+        );
+        return 2;
+    }
+
+    let report_path = command.output_dir.join("ferritex-perf-evidence.txt");
+    let text_report = format!(
+        "ferritex performance evidence\nfixture: embedded\nmeasured runs: {}\nsuccessful measured runs: {}\nmedian duration ms: {}\nfailures: {}\n",
+        command.measured_runs,
+        successful_durations.len(),
+        median_duration_ms
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        report["failures"].as_array().map(Vec::len).unwrap_or(0)
+    );
+    if let Err(error) = std::fs::write(&report_path, text_report) {
+        eprintln!(
+            "failed to write performance evidence report {}: {error}",
+            report_path.display()
+        );
+        return 2;
+    }
+
+    println!(
+        "performance evidence artifacts: json={} report={}",
+        json_path.display(),
+        report_path.display()
+    );
+
+    if report["failures"].as_array().is_some_and(Vec::is_empty) {
+        0
+    } else {
+        1
+    }
+}
+
+fn bounded_utf8(bytes: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= limit {
+        text.into_owned()
+    } else {
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...[truncated]", &text[..end])
+    }
+}
+
+fn median_f64(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        Some((sorted[mid - 1] + sorted[mid]) / 2.0)
+    } else {
+        Some(sorted[mid])
     }
 }
 
