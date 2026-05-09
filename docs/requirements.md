@@ -905,7 +905,7 @@
   - `--output-dir` 未指定時は `primaryInput` の親ディレクトリを既定 `artifactRoot` とし、同ディレクトリを current job の output root として `ExecutionPolicy` に組み込む
   - 進捗表示（ページ数、処理中ファイル名）
   - 終了コード: 0（成功）、1（警告あり成功）、2（エラー）
-- **出力**: PDF ファイル、コンパイルログ
+- **出力**: PDF ファイル、コンパイルログ。`--format json` 指定時は標準出力に versioned compile result object（`schemaVersion`, `command`, `classification`, `exitCode`, `success`, `output.pdfPath`, `output.pageCount`, `diagnostics`）を 1 件だけ出力し、人間向け成功サマリは出力しない。
 - **受け入れ基準**:
   - Given 有効な LaTeX ファイル, When `ferritex compile main.tex` を実行, Then カレントディレクトリに `main.pdf` が生成される
   - Given コンパイルエラーを含むファイル, When コンパイル実行, Then エラー箇所（ファイル名:行番号）とメッセージが表示され終了コード 2 で終了する
@@ -923,6 +923,7 @@
   - `--no-cache`: キャッシュを無効化しフルコンパイル
   - `--asset-bundle <ref>`: 使用する Ferritex Asset Bundle の指定。`<ref>` はファイルパスまたは組み込みバンドル識別子。未指定の `compile` は開発用途の built-in / host asset fallback を使い、bundle 指定時と出力が異なりうることを成功時メッセージまたは help で明示する
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`, `errorstopmode`）。`batchmode` は CLI diagnostics の `stderr` 出力を抑制し、`nonstopmode` / `scrollmode` / `errorstopmode` は ferritex の非対話実行では同等の継続モードとして扱う
+  - `--format <text|json>`: CLI 結果の標準出力形式。既定の `text` は従来の人間向け成功サマリを維持し、`json` は自動化向けの versioned compile result object を出力する
   - `--synctex`: SyncTeX データの生成有無
   - `--trace-font-tasks`: `REQ-FUNC-033` の検証に使う `FontTaskTrace` を `stderr` に出力する
     - incremental cache が hit した場合でも、検証用に `fontTaskId="font-load-cache-hit"` / `fontAsset="builtin:font-cache-hit"` のセンチネル `FontTaskTrace` を `stderr` に 1 件 emit する。このセンチネルは `--trace-font-tasks` フラグが warm 経路でも機能していることを示す presence marker であり、`REQ-FUNC-033` の overlap 受け入れ基準（独立タスク 2 件以上の並走）には寄与しない。overlap は `--no-cache` を指定した cold 経路で検証する

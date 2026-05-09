@@ -45,7 +45,7 @@ enum Commands {
 
 After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session."
     )]
-    Preview(CompileCommand),
+    Preview(SharedCompileCommand),
     /// Watch for changes and recompile automatically
     Watch(WatchCommand),
     /// Start the Language Server Protocol server
@@ -65,6 +65,15 @@ See README.md for a minimal publishDiagnostics example."
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 struct CompileCommand {
+    #[command(flatten)]
+    shared: SharedCompileCommand,
+    /// Output format for compile results
+    #[arg(long, value_enum, default_value_t = CompileOutputFormat::Text)]
+    format: CompileOutputFormat,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct SharedCompileCommand {
     /// Input LaTeX file to compile
     file: PathBuf,
     /// Output directory for generated files
@@ -113,7 +122,7 @@ struct CompileCommand {
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 struct WatchCommand {
     #[command(flatten)]
-    compile: CompileCommand,
+    compile: SharedCompileCommand,
     /// Print each watched file path in addition to the tracked count
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -131,7 +140,27 @@ enum InteractionArg {
     Errorstopmode,
 }
 
-impl CompileCommand {
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum CompileOutputFormat {
+    Text,
+    Json,
+}
+
+impl std::ops::Deref for CompileCommand {
+    type Target = SharedCompileCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
+impl std::ops::DerefMut for CompileCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shared
+    }
+}
+
+impl SharedCompileCommand {
     fn to_compile_args(&self) -> CompileArgs {
         CompileArgs {
             input_file: self.file.clone(),
@@ -176,7 +205,7 @@ fn run(cli: Cli) -> i32 {
 }
 
 fn handle_compile(command: &CompileCommand) -> i32 {
-    let options = runtime_options_from_command(command);
+    let options = runtime_options_from_command(&command.shared);
     let policy = ExecutionPolicyFactory::create(&options);
     let shell_command_gateway = ShellCommandGateway::from_policy(&policy);
     let file_access_gate = FsFileAccessGate::from_policy(policy);
@@ -188,12 +217,61 @@ fn handle_compile(command: &CompileCommand) -> i32 {
     );
     let result = service.compile(&options);
     emit_diagnostics(&result.diagnostics, options.interaction_mode);
-    print_compile_success_summary(command, &result, true);
+    match command.format {
+        CompileOutputFormat::Text => {
+            print_compile_success_summary(&command.shared, &result, true)
+        }
+        CompileOutputFormat::Json => print_compile_json_result(&result),
+    }
     result.exit_code
 }
 
+fn print_compile_json_result(result: &CompileResult) {
+    let page_count = result
+        .stable_compile_state
+        .as_ref()
+        .map(|state| state.page_count);
+    let classification = compile_result_classification(result);
+    let payload = serde_json::json!({
+        "schemaVersion": "ferritex.compileResult.v1",
+        "command": "compile",
+        "classification": classification,
+        "exitCode": result.exit_code,
+        "success": classification != "error",
+        "output": {
+            "pdfPath": result.output_pdf.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            "pageCount": page_count,
+        },
+        "diagnostics": result.diagnostics,
+    });
+
+    let mut stdout = io::stdout().lock();
+    let _ = serde_json::to_writer(&mut stdout, &payload);
+    let _ = writeln!(stdout);
+}
+
+fn compile_result_classification(result: &CompileResult) -> &'static str {
+    if result.exit_code == 2
+        || result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        "error"
+    } else if result.exit_code == 1
+        || result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Warning)
+    {
+        "warning"
+    } else {
+        "success"
+    }
+}
+
 fn print_compile_success_summary(
-    command: &CompileCommand,
+    command: &SharedCompileCommand,
     result: &CompileResult,
     print_asset_bundle_fallback_warning: bool,
 ) {
@@ -246,7 +324,10 @@ fn print_compile_success_summary(
     }
 }
 
-fn print_preview_initial_compile_success_summary(command: &CompileCommand, result: &CompileResult) {
+fn print_preview_initial_compile_success_summary(
+    command: &SharedCompileCommand,
+    result: &CompileResult,
+) {
     if result.exit_code != 0 {
         return;
     }
@@ -276,7 +357,7 @@ fn handle_watch(command: &WatchCommand) -> i32 {
     })
 }
 
-fn handle_preview(command: &CompileCommand) -> i32 {
+fn handle_preview(command: &SharedCompileCommand) -> i32 {
     let options = runtime_options_from_command(command);
     let policy = ExecutionPolicyFactory::create(&options);
     let Some(_preview_policy) = &policy.preview_publication else {
@@ -490,7 +571,7 @@ fn handle_lsp() -> i32 {
     lsp_server::run_lsp()
 }
 
-fn runtime_options_from_command(command: &CompileCommand) -> RuntimeOptions {
+fn runtime_options_from_command(command: &SharedCompileCommand) -> RuntimeOptions {
     let compile_args = command.to_compile_args();
     RuntimeOptions::from_compile_args(&compile_args)
 }
@@ -536,7 +617,7 @@ struct PreviewExecution {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn execute_preview(command: &CompileCommand) -> Result<PreviewExecution, Vec<Diagnostic>> {
+fn execute_preview(command: &SharedCompileCommand) -> Result<PreviewExecution, Vec<Diagnostic>> {
     let options = runtime_options_from_command(command);
     let policy = ExecutionPolicyFactory::create(&options);
     let Some(_preview_policy) = &policy.preview_publication else {
@@ -747,7 +828,8 @@ mod tests {
 
     use super::{
         emit_diagnostics_to, execute_preview, format_view_state_diagnostic,
-        runtime_options_from_command, Cli, Commands, CompileCommand, InteractionArg,
+        runtime_options_from_command, Cli, Commands, CompileOutputFormat, InteractionArg,
+        SharedCompileCommand,
     };
     use clap::Parser;
     use ferritex_application::ports::TransportViewStateUpdate;
@@ -755,8 +837,8 @@ mod tests {
     use ferritex_core::diagnostics::{Diagnostic, Severity};
     use tempfile::tempdir;
 
-    fn compile_command() -> CompileCommand {
-        CompileCommand {
+    fn compile_command() -> SharedCompileCommand {
+        SharedCompileCommand {
             file: PathBuf::from("chapters/main.tex"),
             output_dir: Some(PathBuf::from("build")),
             jobname: None,
@@ -812,6 +894,8 @@ mod tests {
             "--reproducible",
             "--interaction",
             "scrollmode",
+            "--format",
+            "json",
             "--shell-escape",
             "--no-shell-escape",
         ])
@@ -829,6 +913,7 @@ mod tests {
         );
         assert!(command.reproducible);
         assert_eq!(command.interaction, Some(InteractionArg::Scrollmode));
+        assert_eq!(command.format, CompileOutputFormat::Json);
         assert!(command.shell_escape);
         assert!(command.no_shell_escape);
     }
@@ -876,6 +961,16 @@ mod tests {
 
         assert!(compile.is_err(), "compile must not accept watch --verbose");
         assert!(preview.is_err(), "preview must not accept watch --verbose");
+    }
+
+    #[test]
+    fn preview_and_watch_reject_compile_format_flag() {
+        let preview =
+            Cli::try_parse_from(["ferritex", "preview", "notes.tex", "--format", "json"]);
+        let watch = Cli::try_parse_from(["ferritex", "watch", "notes.tex", "--format", "json"]);
+
+        assert!(preview.is_err(), "preview must not accept compile --format");
+        assert!(watch.is_err(), "watch must not accept compile --format");
     }
 
     #[test]
