@@ -1,9 +1,12 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::Duration,
+    time::SystemTime,
 };
 
 use serde::Serialize;
@@ -13,6 +16,7 @@ pub trait CompileBackend: Send + Sync {
     fn compile(
         &self,
         input: &Path,
+        output_dir: &Path,
         asset_bundle: Option<&Path>,
         jobs: u32,
         reproducible: bool,
@@ -382,6 +386,8 @@ pub struct BenchTiming {
     #[serde(with = "duration_ms")]
     pub duration: Duration,
     pub output_hash: Option<String>,
+    #[serde(skip)]
+    pub output_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -579,10 +585,14 @@ impl BenchHarness {
             self.ensure_fixture(bundle)?;
         }
 
+        let output_dir = IsolatedOutputDir::create(case.input_fixture.as_path())
+            .map_err(|message| classify_compile_failure(&case.name, message))?;
+
         for _ in 0..self.config.warmup_runs {
             self.backend
                 .compile(
                     case.input_fixture.as_path(),
+                    output_dir.path(),
                     case.asset_bundle.as_deref(),
                     case.jobs,
                     case.reproducible,
@@ -597,6 +607,7 @@ impl BenchHarness {
                 .backend
                 .compile(
                     case.input_fixture.as_path(),
+                    output_dir.path(),
                     case.asset_bundle.as_deref(),
                     case.jobs,
                     case.reproducible,
@@ -607,6 +618,7 @@ impl BenchHarness {
             timings.push(BenchTiming {
                 duration: output.duration,
                 output_hash: Some(normalize_output_hash(&output.output_bytes)),
+                output_bytes: output.output_bytes,
             });
         }
 
@@ -703,14 +715,17 @@ impl CompileBackend for CliCompileBackend {
     fn compile(
         &self,
         input: &Path,
+        output_dir: &Path,
         asset_bundle: Option<&Path>,
         jobs: u32,
         reproducible: bool,
         no_cache: bool,
     ) -> Result<CompileOutput, String> {
         let start = std::time::Instant::now();
+        let jobname = compile_jobname(input);
         let mut cmd = std::process::Command::new(&self.binary_path);
         cmd.arg("compile").arg(input);
+        cmd.arg("--output-dir").arg(output_dir);
         if let Some(bundle) = asset_bundle {
             cmd.args(["--asset-bundle", &bundle.to_string_lossy()]);
         }
@@ -734,7 +749,7 @@ impl CompileBackend for CliCompileBackend {
             ));
         }
 
-        let pdf_path = input.with_extension("pdf");
+        let pdf_path = output_dir.join(format!("{jobname}.pdf"));
         let output_bytes = std::fs::read(&pdf_path)
             .map_err(|e| format!("failed to read output PDF {}: {e}", pdf_path.display()))?;
         Ok(CompileOutput {
@@ -744,12 +759,84 @@ impl CompileBackend for CliCompileBackend {
     }
 }
 
+struct IsolatedOutputDir {
+    path: PathBuf,
+}
+
+impl IsolatedOutputDir {
+    fn create(input: &Path) -> Result<Self, String> {
+        let stem = compile_jobname(input);
+        let base = std::env::temp_dir().join("ferritex-bench");
+        fs::create_dir_all(&base).map_err(|error| {
+            format!(
+                "failed to create isolated output root {}: {error}",
+                base.display()
+            )
+        })?;
+
+        let process_id = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        for _ in 0..100 {
+            let sequence = ISOLATED_OUTPUT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("{stem}-{process_id}-{nanos}-{sequence}"));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "failed to create isolated output directory {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+
+        Err(format!(
+            "failed to create unique isolated output directory for {}",
+            input.display()
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for IsolatedOutputDir {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            if error.kind() != ErrorKind::NotFound {
+                eprintln!(
+                    "failed to remove isolated output directory {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
+static ISOLATED_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn compile_jobname(input: &Path) -> String {
+    input
+        .file_stem()
+        .or_else(|| input.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "texput".to_string())
+}
+
 struct UnconfiguredBackend;
 
 impl CompileBackend for UnconfiguredBackend {
     fn compile(
         &self,
         _input: &Path,
+        _output_dir: &Path,
         _asset_bundle: Option<&Path>,
         _jobs: u32,
         _reproducible: bool,
@@ -843,8 +930,8 @@ mod tests {
         corpus_partition_book_cases, corpus_partition_book_parity_cases,
         corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, full_bench_cases,
         full_bench_strict_cases, stress_bench_cases, BenchCase, BenchComparison, BenchFailure,
-        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CompileBackend,
-        CompileOutput,
+        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CliCompileBackend,
+        CompileBackend, CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -859,7 +946,7 @@ mod tests {
     struct MockCompileBackend {
         outputs: Arc<Mutex<VecDeque<Result<CompileOutput, String>>>>,
         #[allow(clippy::type_complexity)]
-        calls: Arc<Mutex<Vec<(PathBuf, Option<PathBuf>, u32, bool, bool)>>>,
+        calls: Arc<Mutex<Vec<(PathBuf, PathBuf, Option<PathBuf>, u32, bool, bool)>>>,
     }
 
     impl MockCompileBackend {
@@ -879,6 +966,7 @@ mod tests {
         fn compile(
             &self,
             input: &Path,
+            output_dir: &Path,
             asset_bundle: Option<&Path>,
             jobs: u32,
             reproducible: bool,
@@ -886,6 +974,7 @@ mod tests {
         ) -> Result<CompileOutput, String> {
             self.calls.lock().expect("calls lock").push((
                 input.to_path_buf(),
+                output_dir.to_path_buf(),
                 asset_bundle.map(Path::to_path_buf),
                 jobs,
                 reproducible,
@@ -994,6 +1083,7 @@ mod tests {
         fn compile(
             &self,
             input: &Path,
+            output_dir: &Path,
             asset_bundle: Option<&Path>,
             jobs: u32,
             _reproducible: bool,
@@ -1003,18 +1093,11 @@ mod tests {
             let loader = NoopAssetBundleLoader;
             let service = CompileJobService::new(&gate, &loader, &NOOP_SHELL_COMMAND_GATEWAY);
             let start = std::time::Instant::now();
+            let jobname = super::compile_jobname(input);
             let options = RuntimeOptions {
                 input_file: input.to_path_buf(),
-                output_dir: input
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from(".")),
-                jobname: input
-                    .file_stem()
-                    .or_else(|| input.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "texput".to_string()),
+                output_dir: output_dir.to_path_buf(),
+                jobname: jobname.clone(),
                 parallelism: jobs as usize,
                 overlay_roots: Vec::new(),
                 no_cache: true,
@@ -1042,12 +1125,19 @@ mod tests {
                 ));
             }
 
-            let output_pdf = result.output_pdf.ok_or_else(|| {
-                format!(
-                    "compile succeeded without output PDF for {}",
-                    input.display()
-                )
-            })?;
+            let output_pdf = output_dir.join(format!("{jobname}.pdf"));
+            if result.output_pdf.as_deref() != Some(output_pdf.as_path()) {
+                return Err(format!(
+                    "compile succeeded with unexpected output PDF for {}: expected {}, got {}",
+                    input.display(),
+                    output_pdf.display(),
+                    result
+                        .output_pdf
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                ));
+            }
             let output_bytes = fs::read(&output_pdf).map_err(|error| {
                 format!(
                     "failed to read output PDF {}: {error}",
@@ -1114,6 +1204,167 @@ mod tests {
         }
     }
 
+    fn assert_no_fixture_sidecars(input: &Path) {
+        for ext in &[
+            "pdf",
+            "toc",
+            "lof",
+            "lot",
+            "aux",
+            "synctex",
+            "bbl",
+            "bbl.ferritex.json",
+        ] {
+            let sidecar = input.with_extension(ext);
+            assert!(
+                !sidecar.exists(),
+                "fixture sidecar should not exist: {}",
+                sidecar.display()
+            );
+        }
+        let cache_dir = input
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".ferritex-cache");
+        assert!(
+            !cache_dir.exists(),
+            "fixture cache directory should not exist: {}",
+            cache_dir.display()
+        );
+    }
+
+    fn compile_service_output(case: &BenchCase) -> Vec<u8> {
+        let output_dir = tempdir().expect("isolated output dir should be created");
+        ServiceCompileBackend
+            .compile(
+                &case.input_fixture,
+                output_dir.path(),
+                case.asset_bundle.as_deref(),
+                case.jobs,
+                case.reproducible,
+                case.no_cache,
+            )
+            .unwrap_or_else(|error| panic!("{} should compile successfully: {error}", case.name))
+            .output_bytes
+    }
+
+    #[test]
+    fn test_service_bench_run_does_not_write_fixture_sidecars() {
+        let fixture_base = fixtures_root();
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let base_case = BenchCase {
+            name: "sidecar-isolation-service".to_string(),
+            profile: BenchProfile::CorpusCompat,
+            input_fixture: fixture_base
+                .join("corpus")
+                .join("partition-book")
+                .join("book_with_toc_lot_lof.tex"),
+            asset_bundle: None,
+            jobs: 1,
+            reproducible: false,
+            no_cache: false,
+        };
+        let case = stage_cases_in_tempdir(&[base_case], temp_dir.path())
+            .into_iter()
+            .next()
+            .expect("staged case should exist");
+        let harness = BenchHarness::new(
+            vec![case.clone()],
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(ServiceCompileBackend);
+
+        let report = harness.run();
+
+        assert!(
+            report.failures.is_empty(),
+            "sidecar isolation compile should succeed: {:?}",
+            report.failures
+        );
+        assert_eq!(report.results.len(), 1);
+        assert_no_fixture_sidecars(&case.input_fixture);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cli_backend_passes_isolated_output_dir_and_avoids_fixture_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let input = temp_dir.path().join("main.tex");
+        fs::write(
+            &input,
+            "\\documentclass{article}\\begin{document}x\\end{document}",
+        )
+        .expect("write input fixture");
+        let fake_ferritex = temp_dir.path().join("fake-ferritex");
+        fs::write(
+            &fake_ferritex,
+            r#"#!/bin/sh
+set -eu
+input=""
+outdir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    compile)
+      shift
+      ;;
+    --output-dir|--jobs|--asset-bundle)
+      if [ "$#" -lt 2 ]; then
+        exit 2
+      fi
+      if [ "$1" = "--output-dir" ]; then
+        outdir="$2"
+      fi
+      shift 2
+      ;;
+    --reproducible|--no-cache)
+      shift
+      ;;
+    --*)
+      shift
+      ;;
+    *)
+      input="$1"
+      shift
+      ;;
+  esac
+done
+if [ -z "$input" ]; then
+  exit 3
+fi
+if [ -z "$outdir" ]; then
+  outdir=$(dirname "$input")
+fi
+stem=$(basename "$input" .tex)
+mkdir -p "$outdir"
+printf 'fake pdf' > "$outdir/$stem.pdf"
+for ext in toc lof lot aux synctex; do
+  printf 'sidecar' > "$outdir/$stem.$ext"
+done
+"#,
+        )
+        .expect("write fake ferritex");
+        let mut permissions = fs::metadata(&fake_ferritex)
+            .expect("fake ferritex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_ferritex, permissions).expect("make fake ferritex executable");
+        let backend = CliCompileBackend::new(fake_ferritex);
+        let output_dir = tempdir().expect("isolated output dir should be created");
+
+        let output = backend
+            .compile(&input, output_dir.path(), None, 1, false, false)
+            .expect("fake CLI compile should succeed");
+
+        assert_eq!(output.output_bytes, b"fake pdf");
+        assert_no_fixture_sidecars(&input);
+    }
+
     #[test]
     fn test_single_case_timing() {
         let case = sample_case(
@@ -1143,6 +1394,14 @@ mod tests {
         assert_eq!(result.timings[0].duration, Duration::from_millis(12));
         assert_eq!(result.timings[1].duration, Duration::from_millis(18));
         assert_eq!(backend.call_count(), 3);
+        let calls = backend.calls.lock().expect("calls lock");
+        let output_dir = calls[0].1.clone();
+        assert!(calls.iter().all(|call| call.1 == output_dir));
+        assert!(
+            !output_dir.exists(),
+            "case output directory should be cleaned after run_case: {}",
+            output_dir.display()
+        );
     }
 
     #[test]
@@ -1576,14 +1835,14 @@ mod tests {
         assert_eq!(report.results.len(), 2);
 
         let calls = backend.calls.lock().expect("calls lock");
-        let jobs_values: Vec<u32> = calls.iter().map(|(_, _, jobs, _, _)| *jobs).collect();
+        let jobs_values: Vec<u32> = calls.iter().map(|(_, _, _, jobs, _, _)| *jobs).collect();
         let reproducible_values: Vec<bool> = calls
             .iter()
-            .map(|(_, _, _, reproducible, _)| *reproducible)
+            .map(|(_, _, _, _, reproducible, _)| *reproducible)
             .collect();
         let no_cache_values: Vec<bool> = calls
             .iter()
-            .map(|(_, _, _, _, no_cache)| *no_cache)
+            .map(|(_, _, _, _, _, no_cache)| *no_cache)
             .collect();
         assert_eq!(jobs_values, vec![1, 1, 4, 4]);
         assert_eq!(reproducible_values, vec![false, false, false, false]);
@@ -1625,10 +1884,12 @@ mod tests {
             .next()
             .expect("staged case should exist");
         let backend = ServiceCompileBackend;
+        let output_dir = tempdir().expect("isolated output dir should be created");
 
         let output = backend
             .compile(
                 &case.input_fixture,
+                output_dir.path(),
                 case.asset_bundle.as_deref(),
                 case.jobs,
                 case.reproducible,
@@ -1663,10 +1924,12 @@ mod tests {
             .next()
             .expect("staged case should exist");
         let backend = ServiceCompileBackend;
+        let output_dir = tempdir().expect("isolated output dir should be created");
 
         let output = backend
             .compile(
                 &case.input_fixture,
+                output_dir.path(),
                 case.asset_bundle.as_deref(),
                 case.jobs,
                 case.reproducible,
@@ -1759,7 +2022,6 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .expect("fixture stem should be utf-8")
                 .to_string();
-            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
             let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
 
             if !reference_pdf_path.exists() {
@@ -1774,12 +2036,7 @@ mod tests {
                 continue;
             }
 
-            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read ferritex PDF {}: {error}",
-                    ferritex_pdf_path.display()
-                )
-            });
+            let ferritex_pdf = compile_service_output(case);
             let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
                 panic!(
                     "failed to read reference PDF {}: {error}",
@@ -1894,7 +2151,6 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .expect("fixture stem should be utf-8")
                 .to_string();
-            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
             let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
 
             if !reference_pdf_path.exists() {
@@ -1909,12 +2165,7 @@ mod tests {
                 continue;
             }
 
-            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read ferritex PDF {}: {error}",
-                    ferritex_pdf_path.display()
-                )
-            });
+            let ferritex_pdf = compile_service_output(case);
             let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
                 panic!(
                     "failed to read reference PDF {}: {error}",
@@ -2033,7 +2284,6 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .expect("fixture stem should be utf-8")
                 .to_string();
-            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
             let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
 
             if !reference_pdf_path.exists() {
@@ -2048,12 +2298,7 @@ mod tests {
                 continue;
             }
 
-            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read ferritex PDF {}: {error}",
-                    ferritex_pdf_path.display()
-                )
-            });
+            let ferritex_pdf = compile_service_output(case);
             let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
                 panic!(
                     "failed to read reference PDF {}: {error}",
@@ -2167,7 +2412,6 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .expect("fixture stem should be utf-8")
                 .to_string();
-            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
             let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
 
             if !reference_pdf_path.exists() {
@@ -2182,12 +2426,7 @@ mod tests {
                 continue;
             }
 
-            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read ferritex PDF {}: {error}",
-                    ferritex_pdf_path.display()
-                )
-            });
+            let ferritex_pdf = compile_service_output(case);
             let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
                 panic!(
                     "failed to read reference PDF {}: {error}",
@@ -2299,7 +2538,6 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .expect("fixture stem should be utf-8")
                 .to_string();
-            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
             let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
 
             if !reference_pdf_path.exists() {
@@ -2314,12 +2552,7 @@ mod tests {
                 continue;
             }
 
-            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read ferritex PDF {}: {error}",
-                    ferritex_pdf_path.display()
-                )
-            });
+            let ferritex_pdf = compile_service_output(case);
             let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
                 panic!(
                     "failed to read reference PDF {}: {error}",
@@ -2549,9 +2782,11 @@ mod tests {
         assert!(cases.len() >= 2);
 
         for case in cases {
+            let output_dir = tempdir().expect("isolated output dir should be created");
             let output = backend
                 .compile(
                     &case.input_fixture,
+                    output_dir.path(),
                     case.asset_bundle.as_deref(),
                     case.jobs,
                     case.reproducible,
@@ -2824,7 +3059,6 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .expect("fixture stem should be utf-8")
                 .to_string();
-            let ferritex_pdf_path = case.input_fixture.with_extension("pdf");
             let reference_pdf_path = reference_dir.join(format!("{document_name}.pdf"));
 
             if !reference_pdf_path.exists() {
@@ -2839,12 +3073,7 @@ mod tests {
                 continue;
             }
 
-            let ferritex_pdf = fs::read(&ferritex_pdf_path).unwrap_or_else(|error| {
-                panic!(
-                    "failed to read ferritex PDF {}: {error}",
-                    ferritex_pdf_path.display()
-                )
-            });
+            let ferritex_pdf = compile_service_output(case);
             let reference_pdf = fs::read(&reference_pdf_path).unwrap_or_else(|error| {
                 panic!(
                     "failed to read reference PDF {}: {error}",
@@ -3253,6 +3482,7 @@ mod tests {
         BenchTiming {
             duration: Duration::from_millis(duration_ms),
             output_hash: Some(hash.to_string()),
+            output_bytes: Vec::new(),
         }
     }
 }

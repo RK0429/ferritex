@@ -11,7 +11,7 @@ use ferritex_bench::{
     format_bibliography_parity_summary, format_embedded_assets_parity_summary,
     format_navigation_parity_summary, format_parity_summary, format_tikz_parity_summary,
     full_bench_cases, full_bench_strict_cases, stress_bench_cases, BenchCase, BenchHarness,
-    BenchProfile, BenchRunConfig, BibliographyParityResult, CliCompileBackend,
+    BenchProfile, BenchReport, BenchRunConfig, BibliographyParityResult, CliCompileBackend,
     EmbeddedAssetsParityResult, NavigationParityResult, ParityResult, TikzParityResult,
 };
 
@@ -202,6 +202,16 @@ fn reference_pdf_path(bench_fixtures: &Path, subset: &str, case: &BenchCase) -> 
         .and_then(|stem| stem.to_str())
         .expect("fixture should have UTF-8 stem");
     bench_fixtures.join(format!("corpus/{subset}/reference/{stem}.pdf"))
+}
+
+fn output_bytes_for_case<'a>(report: &'a BenchReport, case: &BenchCase) -> &'a [u8] {
+    report
+        .results
+        .iter()
+        .find(|result| result.case.name == case.name)
+        .and_then(|result| result.timings.last())
+        .map(|timing| timing.output_bytes.as_slice())
+        .unwrap_or_else(|| panic!("missing measured output bytes for {}", case.name))
 }
 
 const MATH_EQUATIONS_REGRESSION_BASELINE_DOCUMENT_DIFF_RATE: f64 = 0.286;
@@ -399,12 +409,10 @@ fn full_bench_produces_at_least_100_pages() {
         report.failures
     );
 
-    let pdf_path = case.input_fixture.with_extension("pdf");
-    let pdf_bytes = std::fs::read(&pdf_path)
-        .unwrap_or_else(|e| panic!("read output PDF {}: {e}", pdf_path.display()));
-    let pdf_text = String::from_utf8_lossy(&pdf_bytes);
+    let pdf_bytes = output_bytes_for_case(&report, &case);
+    let pdf_text = String::from_utf8_lossy(pdf_bytes);
     let extracted = extract_pdf_text(&pdf_text);
-    let page_count = count_pdf_pages(&pdf_bytes);
+    let page_count = count_pdf_pages(pdf_bytes);
 
     assert!(
         extracted.contains("Benchmark") || pdf_text.contains("Benchmark"),
@@ -815,10 +823,7 @@ fn full_bench_parity_evidence() {
 
     let mut layout_results = Vec::<ParityResult>::with_capacity(layout_cases.len());
     for case in &layout_cases {
-        let output_pdf_path = case.input_fixture.with_extension("pdf");
-        let output_pdf = std::fs::read(&output_pdf_path).unwrap_or_else(|error| {
-            panic!("read output PDF {}: {error}", output_pdf_path.display())
-        });
+        let output_pdf = output_bytes_for_case(&report, case);
         let reference_pdf_path = reference_pdf_path(&bench_fixtures, "layout-core", case);
         if !reference_pdf_path.exists() {
             eprintln!(
@@ -844,7 +849,7 @@ fn full_bench_parity_evidence() {
             )
         });
 
-        match compute_parity_score(&output_pdf, &reference_pdf) {
+        match compute_parity_score(output_pdf, &reference_pdf) {
             Ok(score) => {
                 eprintln!(
                     "[REQ-NF-007 PARITY] category=layout-core case={} document_diff_rate={:.3} pages={}/{} pass={}",
@@ -881,10 +886,7 @@ fn full_bench_parity_evidence() {
     let mut navigation_results =
         Vec::<NavigationParityResult>::with_capacity(navigation_cases.len());
     for case in &navigation_cases {
-        let output_pdf_path = case.input_fixture.with_extension("pdf");
-        let output_pdf = std::fs::read(&output_pdf_path).unwrap_or_else(|error| {
-            panic!("read output PDF {}: {error}", output_pdf_path.display())
-        });
+        let output_pdf = output_bytes_for_case(&report, case);
         let reference_pdf_path = reference_pdf_path(&bench_fixtures, "navigation-features", case);
         if !reference_pdf_path.exists() {
             eprintln!(
@@ -910,7 +912,7 @@ fn full_bench_parity_evidence() {
             )
         });
 
-        match compute_navigation_parity_score(&output_pdf, &reference_pdf) {
+        match compute_navigation_parity_score(output_pdf, &reference_pdf) {
             Ok(score) => {
                 eprintln!(
                     "[REQ-NF-007 PARITY] category=navigation case={} pass={} annots={} dests={} outlines={} title={} author={}",
@@ -949,10 +951,7 @@ fn full_bench_parity_evidence() {
     let mut bibliography_results =
         Vec::<BibliographyParityResult>::with_capacity(bibliography_cases.len());
     for case in &bibliography_cases {
-        let output_pdf_path = case.input_fixture.with_extension("pdf");
-        let output_pdf = std::fs::read(&output_pdf_path).unwrap_or_else(|error| {
-            panic!("read output PDF {}: {error}", output_pdf_path.display())
-        });
+        let output_pdf = output_bytes_for_case(&report, case);
         let reference_pdf_path = reference_pdf_path(&bench_fixtures, "bibliography", case);
         if !reference_pdf_path.exists() {
             eprintln!(
@@ -978,7 +977,7 @@ fn full_bench_parity_evidence() {
             )
         });
 
-        match compute_bibliography_parity_score(&output_pdf, &reference_pdf) {
+        match compute_bibliography_parity_score(output_pdf, &reference_pdf) {
             Ok(score) => {
                 eprintln!(
                     "[REQ-NF-007 PARITY] category=bibliography case={} pass={} entries={} labels={}",
@@ -1014,10 +1013,7 @@ fn full_bench_parity_evidence() {
     let mut embedded_results =
         Vec::<EmbeddedAssetsParityResult>::with_capacity(embedded_cases.len());
     for case in &embedded_cases {
-        let output_pdf_path = case.input_fixture.with_extension("pdf");
-        let output_pdf = std::fs::read(&output_pdf_path).unwrap_or_else(|error| {
-            panic!("read output PDF {}: {error}", output_pdf_path.display())
-        });
+        let output_pdf = output_bytes_for_case(&report, case);
         let reference_pdf_path = reference_pdf_path(&bench_fixtures, "embedded-assets", case);
         if !reference_pdf_path.exists() {
             eprintln!(
@@ -1043,7 +1039,7 @@ fn full_bench_parity_evidence() {
             )
         });
 
-        match compute_embedded_assets_parity_score(&output_pdf, &reference_pdf) {
+        match compute_embedded_assets_parity_score(output_pdf, &reference_pdf) {
             Ok(score) => {
                 eprintln!(
                     "[REQ-NF-007 PARITY] category=embedded-assets case={} pass={} fonts={} images={} forms={} pages={}",
@@ -1085,10 +1081,7 @@ fn full_bench_parity_evidence() {
         ("tikz/nested-style-transform-clip-arrow", &tikz_nested_cases),
     ] {
         for case in cases {
-            let output_pdf_path = case.input_fixture.with_extension("pdf");
-            let output_pdf = std::fs::read(&output_pdf_path).unwrap_or_else(|error| {
-                panic!("read output PDF {}: {error}", output_pdf_path.display())
-            });
+            let output_pdf = output_bytes_for_case(&report, case);
             let reference_pdf_path = reference_pdf_path(&bench_fixtures, subset, case);
             if !reference_pdf_path.exists() {
                 eprintln!(
@@ -1114,7 +1107,7 @@ fn full_bench_parity_evidence() {
                 )
             });
 
-            match compute_tikz_parity_score(&output_pdf, &reference_pdf) {
+            match compute_tikz_parity_score(output_pdf, &reference_pdf) {
                 Ok(score) => {
                     eprintln!(
                         "[REQ-NF-007 PARITY] category=tikz case={} match_ratio={:.3} matched={} mismatched={} pass={}",
@@ -1198,9 +1191,7 @@ fn math_equations_parity_regression() {
         "math_equations regression should compile exactly one case"
     );
 
-    let output_pdf_path = case.input_fixture.with_extension("pdf");
-    let output_pdf = std::fs::read(&output_pdf_path)
-        .unwrap_or_else(|error| panic!("read output PDF {}: {error}", output_pdf_path.display()));
+    let output_pdf = output_bytes_for_case(&report, &case);
     let reference_pdf_path = reference_pdf_path(&bench_fixtures, "layout-core", &case);
     let reference_pdf = std::fs::read(&reference_pdf_path).unwrap_or_else(|error| {
         panic!(
@@ -1208,10 +1199,10 @@ fn math_equations_parity_regression() {
             reference_pdf_path.display()
         )
     });
-    let score = compute_parity_score(&output_pdf, &reference_pdf).unwrap_or_else(|error| {
+    let score = compute_parity_score(output_pdf, &reference_pdf).unwrap_or_else(|error| {
         panic!(
             "compute parity score for {} vs {}: {error}",
-            output_pdf_path.display(),
+            case.name,
             reference_pdf_path.display()
         )
     });

@@ -7,7 +7,7 @@ use ferritex_bench::{
     bench_fixtures_root, bundle_bootstrap_cases, bundle_package_loading_cases,
     bundle_reproducible_cases, corpus_bibliography_cases, corpus_embedded_assets_cases,
     corpus_navigation_cases, partition_bench_cases, BenchCase, BenchFailure, BenchHarness,
-    BenchProfile, BenchRunConfig, CliCompileBackend,
+    BenchProfile, BenchReport, BenchRunConfig, CliCompileBackend,
 };
 
 fn ferritex_bin() -> PathBuf {
@@ -25,6 +25,16 @@ fn extract_pdf_text(pdf_bytes: &[u8]) -> String {
                 .and_then(|line| line.strip_prefix('('))
         })
         .collect()
+}
+
+fn output_bytes_for_case<'a>(report: &'a BenchReport, case: &BenchCase) -> &'a [u8] {
+    report
+        .results
+        .iter()
+        .find(|result| result.case.name == case.name)
+        .and_then(|result| result.timings.last())
+        .map(|timing| timing.output_bytes.as_slice())
+        .unwrap_or_else(|| panic!("missing measured output bytes for {}", case.name))
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) {
@@ -222,10 +232,8 @@ fn bundle_package_loading_compiles_and_verifies_content() {
     );
 
     for case in &cases {
-        let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_bytes = std::fs::read(&pdf_path)
-            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
-        let pdf_text = extract_pdf_text(&pdf_bytes);
+        let pdf_bytes = output_bytes_for_case(&report, case);
+        let pdf_text = extract_pdf_text(pdf_bytes);
 
         match case.name.as_str() {
             "bundle-pkg-compat_options" => {
@@ -680,10 +688,8 @@ fn corpus_navigation_compiles_and_verifies_content() {
     );
 
     for case in &cases {
-        let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_bytes = std::fs::read(&pdf_path)
-            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
-        let pdf_content = String::from_utf8_lossy(&pdf_bytes);
+        let pdf_bytes = output_bytes_for_case(&report, case);
+        let pdf_content = String::from_utf8_lossy(pdf_bytes);
 
         match case.name.as_str() {
             "corpus-navigation-features-external_links" => {
@@ -788,9 +794,7 @@ fn corpus_embedded_assets_compiles_and_verifies_content() {
     );
 
     for case in &cases {
-        let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_bytes = std::fs::read(&pdf_path)
-            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+        let pdf_bytes = output_bytes_for_case(&report, case);
 
         match case.name.as_str() {
             "corpus-embedded-assets-png_embed" => {
@@ -871,10 +875,8 @@ fn corpus_bibliography_compiles_and_verifies_content() {
     );
 
     for case in &cases {
-        let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_bytes = std::fs::read(&pdf_path)
-            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
-        let pdf_text = extract_pdf_text(&pdf_bytes);
+        let pdf_bytes = output_bytes_for_case(&report, case);
+        let pdf_text = extract_pdf_text(pdf_bytes);
 
         match case.name.as_str() {
             "corpus-bibliography-single_cite" => {
@@ -965,9 +967,7 @@ fn bundle_only_reproducible_corpus_proof() {
     assert!(report.results.iter().all(|result| result.case.reproducible));
 
     for case in &cases {
-        let pdf_path = case.input_fixture.with_extension("pdf");
-        let pdf_bytes = std::fs::read(&pdf_path)
-            .unwrap_or_else(|e| panic!("failed to read output PDF {}: {e}", pdf_path.display()));
+        let pdf_bytes = output_bytes_for_case(&report, case);
         assert!(
             !pdf_bytes.is_empty(),
             "reproducible bundle proof should produce a non-empty PDF for {}",
@@ -1064,12 +1064,9 @@ fn bundle_archive_smoke_proof() {
         .into_iter()));
 
     for case in &cases {
-        let pdf_path = case.input_fixture.with_extension("pdf");
-        let metadata = std::fs::metadata(&pdf_path).unwrap_or_else(|error| {
-            panic!("failed to stat output PDF {}: {error}", pdf_path.display())
-        });
+        let pdf_bytes = output_bytes_for_case(&report, case);
         assert!(
-            metadata.len() > 0,
+            !pdf_bytes.is_empty(),
             "bundle archive smoke proof should produce a non-empty PDF for {}",
             case.name
         );
@@ -1143,11 +1140,7 @@ fn bundle_archive_path_compiles_without_manual_extraction() {
         report.results[0].case.asset_bundle.as_deref(),
         Some(archive_path.as_path())
     );
-    let pdf_path = temp_input.with_extension("pdf");
-    let metadata = std::fs::metadata(&pdf_path).unwrap_or_else(|error| {
-        panic!("failed to stat output PDF {}: {error}", pdf_path.display())
-    });
-    assert!(metadata.len() > 0);
+    assert!(!output_bytes_for_case(&report, &case).is_empty());
 }
 
 #[test]
@@ -1265,9 +1258,8 @@ fn bundle_package_resolution_prefers_project_local_over_bundle() {
         "bundle package priority compilation failed: {:?}",
         report.failures
     );
-    let pdf_bytes = std::fs::read(case.input_fixture.with_extension("pdf"))
-        .expect("read package priority output PDF");
-    let pdf_text = extract_pdf_text(&pdf_bytes);
+    let pdf_bytes = output_bytes_for_case(&report, &case);
+    let pdf_text = extract_pdf_text(pdf_bytes);
 
     assert!(
         pdf_text.contains("PROJECT:project-local-priority"),
