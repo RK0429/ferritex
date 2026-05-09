@@ -743,7 +743,7 @@ fn compile_with_asset_bundle_does_not_print_fallback_warning() {
 }
 
 #[test]
-fn compile_with_warnings_prints_summary_including_warning_count() {
+fn compile_with_warnings_exits_success_and_prints_summary_including_warning_count() {
     // Deliberately reuses the unimplemented-package warning fixture covered by
     // `compile_with_unimplemented_package_emits_warning_and_still_produces_pdf`
     // to exercise the CLI warning-summary format on the same warning path.
@@ -762,8 +762,8 @@ fn compile_with_warnings_prints_summary_including_warning_count() {
 
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "warnings should exit with code 1"
+        Some(0),
+        "warning-only successful compile should exit with code 0"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -838,8 +838,8 @@ fn compile_with_unimplemented_package_emits_warning_and_still_produces_pdf() {
 
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "unimplemented-package warnings should exit 1 (non-fatal)"
+        Some(0),
+        "unimplemented-package warning-only compile should exit 0"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

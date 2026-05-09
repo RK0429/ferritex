@@ -6425,11 +6425,6 @@ fn exit_code_for(diagnostics: &[Diagnostic]) -> i32 {
         .any(|diagnostic| diagnostic.severity == Severity::Error)
     {
         2
-    } else if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == Severity::Warning)
-    {
-        1
     } else {
         0
     }
@@ -13580,7 +13575,7 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.exit_code, 0);
         let stale = result
             .diagnostics
             .iter()
@@ -13626,7 +13621,7 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.exit_code, 0);
         let stale = result
             .diagnostics
             .iter()
@@ -13744,7 +13739,7 @@ mod tests {
         let result =
             service_with_shell(&FsTestFileAccessGate, &loader, &shell_gateway).compile(&options);
 
-        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.exit_code, 0);
         assert!(shell_gateway.commands().is_empty());
         let diagnostic = result
             .diagnostics
@@ -13979,7 +13974,7 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.exit_code, 0);
         assert!(result.output_pdf.is_some());
         assert_eq!(result.diagnostics.len(), 2);
         assert!(result
@@ -14014,7 +14009,7 @@ mod tests {
 
         let result = service(&FsTestFileAccessGate, &loader).compile(&options);
 
-        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.exit_code, 0);
         assert!(result
             .diagnostics
             .iter()
