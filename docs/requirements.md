@@ -142,7 +142,7 @@
 | Preview Session Service | `Preview Session` の発行・再発行・失効を管理し、`POST /preview/session` から受けた `Preview Target` を同一 process / 同一 target の既存 session に解決する。`Execution Policy.previewPublication` に照らして許可された publish だけを `Preview Transport` へ委譲する調停役 |
 | Preview Transport | loopback のみへ bind し、session ごとの document / events endpoint を提供する preview 配信契約。session bootstrap は別責務とし、`Preview Session Service` が決定した `sessionId` / `documentUrl` / `eventsUrl` に基づいて `GET /preview/{sessionId}/document` で PDF 本体、`WS /preview/{sessionId}/events` で `Preview Revision` 更新通知と view-state 更新を扱う |
 | Page Render Plan | 1 ページ分の `PageBox`、placed destination、リンク注釈計画、`GraphicsScene`、SyncTeX 用 source trace を束ねた PDF 射影入力 |
-| FontTaskTrace | フォント処理並列化の計測用 trace レコード。`fontTaskId`、`fontAsset`、`startedAt`、`finishedAt`、`workerId` を持ち、`stderr` へ出力して overlap 判定に使う |
+| FontTaskTrace | フォント処理並列化の計測用 trace レコード。`--trace-font-tasks` 指定時に `stderr` へ 1 行 1 JSON object の NDJSON として出力する public automation output で、`schemaVersion="ferritex.fontTaskTrace.v1"`、`fontTaskId`、`fontAsset`、`startedAt`、`finishedAt`、`workerId` を持ち、overlap 判定に使う。`ferritex.fontTaskTrace.v1` では additive field 追加は許容するが、既存 field 名・型・意味を破壊する変更は新 schemaVersion で行う |
 | Open Document Buffer | エディタが保持する未保存変更を含む最新のテキスト状態。LSP の診断・補完・定義ジャンプ・hover は保存済みファイルよりこれを優先して参照する |
 | Stable Compile State | 最新の成功した `CommitBarrier` 完了時点で確定した `CompilationSession` / `DocumentState` の frozen read-only projection。worker-local な未 commit 状態や失敗 pass の部分結果を含まない |
 | Live Analysis Snapshot | `Open Document Buffer` と Stable Compile State（command/environment registry、label/citation 状態など）を合成した LSP 用の解析スナップショット |
@@ -741,7 +741,7 @@
 - **入力**: 使用フォントのリスト
 - **処理**:
   - 各フォントのファイル読み込み・パース・サブセット化を独立したタスクとして並列実行
-  - 計測用 trace を有効にした場合は `fontTaskId`, `fontAsset`, `startedAt`, `finishedAt`, `workerId` を含む `FontTaskTrace` を `stderr` に出力し、overlap 判定に使えるようにする
+  - 計測用 trace を有効にした場合は `schemaVersion="ferritex.fontTaskTrace.v1"`, `fontTaskId`, `fontAsset`, `startedAt`, `finishedAt`, `workerId` を含む public NDJSON `FontTaskTrace` を `stderr` に出力し、overlap 判定に使えるようにする
 - **出力**: 並列処理されたフォントデータ
 - **受け入れ基準**:
   - Given 10種類以上のフォントを使用する文書と `--jobs=4`, When 計測用 trace を有効にしてコンパイル, Then font load / subset の独立タスクが少なくとも 2 件以上 overlap し、出力は `--jobs=1` と同一になる
@@ -925,7 +925,7 @@
   - `--interaction <mode>`: インタラクションモード（`nonstopmode`, `batchmode`, `scrollmode`, `errorstopmode`）。`batchmode` は CLI diagnostics の `stderr` 出力を抑制し、`nonstopmode` / `scrollmode` / `errorstopmode` は ferritex の非対話実行では同等の継続モードとして扱う
   - `--format <text|json>`: CLI 結果の標準出力形式。既定の `text` は従来の人間向け成功サマリを維持し、`json` は自動化向けの versioned compile result object を出力する
   - `--synctex`: SyncTeX データの生成有無
-  - `--trace-font-tasks`: `REQ-FUNC-033` の検証に使う `FontTaskTrace` を `stderr` に出力する
+  - `--trace-font-tasks`: `REQ-FUNC-033` の検証に使う public automation output として、`schemaVersion="ferritex.fontTaskTrace.v1"` を持つ `FontTaskTrace` NDJSON を `stderr` に出力する
     - incremental cache が hit した場合でも、検証用に `fontTaskId="font-load-cache-hit"` / `fontAsset="builtin:font-cache-hit"` のセンチネル `FontTaskTrace` を `stderr` に 1 件 emit する。このセンチネルは `--trace-font-tasks` フラグが warm 経路でも機能していることを示す presence marker であり、`REQ-FUNC-033` の overlap 受け入れ基準（独立タスク 2 件以上の並走）には寄与しない。overlap は `--no-cache` を指定した cold 経路で検証する
   - `--shell-escape` / `--no-shell-escape`: 外部コマンド実行の許可
   - compile / watch / LSP の各入口で受け取った指定は `primaryInput`, `artifactRoot`, `jobname`, `parallelism`, `reuseCache`, `assetBundleRef`, `interactionMode`, `synctex`, `traceFontTasks`, `shellEscapeAllowed` から成る共通の `Runtime Options` に正規化され、それを基に同一の `Execution Policy` を構築する
@@ -1155,6 +1155,7 @@
 
 | バージョン | 日付         | 変更内容 | 変更者             |
 | ----- | ---------- | ---- | --------------- |
+| 0.1.45 | 2026-05-10 | `--trace-font-tasks` を public automation output として明記し、`FontTaskTrace` NDJSON schemaVersion `ferritex.fontTaskTrace.v1` と field 安定性境界を追加 | Codex |
 | 0.1.44 | 2026-04-19 | `REQ-FUNC-043` の `--trace-font-tasks` に incremental warm-cache hit 時でも `font-load-cache-hit` センチネル trace を `stderr` に 1 件 emit する契約を追加し、`REQ-FUNC-033` overlap 判定との関係（presence marker であり overlap には寄与しない旨）を明記 | Codex |
 | 0.1.43 | 2026-04-04 | `REQ-FUNC-032` に multi-second no-cache evidence と pipelined VList build + sequential pagination の strict-proof 対応方針を追記 | Codex |
 | 0.1.42 | 2026-04-04 | `REQ-FUNC-032` に実装メモを追加。出力等価性確認済み・bounded no-regression evidence 確立済み・strict speedup 条件の sub-1s 構造的限界と適用済み最適化を記録 | Claude Opus 4.6 |

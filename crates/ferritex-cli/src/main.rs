@@ -118,7 +118,7 @@ struct SharedCompileCommand {
     /// Generate SyncTeX data for editor synchronization
     #[arg(long)]
     synctex: bool,
-    /// Emit font task tracing to stderr
+    /// Emit public font task trace NDJSON to stderr using schemaVersion ferritex.fontTaskTrace.v1
     #[arg(long)]
     trace_font_tasks: bool,
     /// Enable shell escape for \write18 commands
