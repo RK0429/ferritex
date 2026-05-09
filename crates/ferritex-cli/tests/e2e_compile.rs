@@ -5175,6 +5175,25 @@ fn compile_help_documents_file_cache_temp_and_network_side_effects() {
 }
 
 #[test]
+fn compile_help_shows_minimal_runnable_example() {
+    let output = ferritex_bin()
+        .args(["compile", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Examples:"),
+        "compile help should include an examples section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("ferritex compile document.tex"),
+        "compile help should include a minimal runnable invocation, got: {stdout}"
+    );
+}
+
+#[test]
 fn compile_and_preview_help_hide_watch_verbose_flag() {
     let compile = ferritex_bin()
         .args(["compile", "--help"])
@@ -5273,6 +5292,25 @@ fn preview_help_documents_loopback_transport_urls() {
     assert!(
         stdout.contains("WebSocket event URL"),
         "preview help should mention the WebSocket event URL"
+    );
+}
+
+#[test]
+fn preview_help_shows_minimal_runnable_example() {
+    let output = ferritex_bin()
+        .args(["preview", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Examples:"),
+        "preview help should include an examples section, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("ferritex preview document.tex"),
+        "preview help should include a minimal runnable invocation, got: {stdout}"
     );
 }
 

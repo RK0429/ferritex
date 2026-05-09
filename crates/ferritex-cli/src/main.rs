@@ -38,15 +38,19 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Compile a LaTeX document to PDF
-    #[command(long_about = "Compile a LaTeX document to PDF.
+    #[command(
+        long_about = "Compile a LaTeX document to PDF.
 
-Side effects: writes generated artifacts to --output-dir, or to the input file's directory when --output-dir is omitted. The main PDF is <jobname>.pdf, where --jobname defaults to the input file stem. Depending on document features and flags, ferritex can also write sidecars such as <jobname>.toc, <jobname>.lof, <jobname>.lot, <jobname>.aux, <jobname>.bbl, <jobname>.bbl.ferritex.json, and <jobname>.synctex. Compilation cache records are stored under <output-dir>/.ferritex-cache unless --no-cache is set. Built-in asset bundles may be materialized in the system temp directory. The compile command does not open network listeners.")]
+Side effects: writes generated artifacts to --output-dir, or to the input file's directory when --output-dir is omitted. The main PDF is <jobname>.pdf, where --jobname defaults to the input file stem. Depending on document features and flags, ferritex can also write sidecars such as <jobname>.toc, <jobname>.lof, <jobname>.lot, <jobname>.aux, <jobname>.bbl, <jobname>.bbl.ferritex.json, and <jobname>.synctex. Compilation cache records are stored under <output-dir>/.ferritex-cache unless --no-cache is set. Built-in asset bundles may be materialized in the system temp directory. The compile command does not open network listeners.",
+        after_help = "Examples:\n  ferritex compile document.tex"
+    )]
     Compile(CompileCommand),
     /// Compile and start a live preview server
     #[command(
         long_about = "Compile the input document and publish it through a loopback preview transport.
 
-Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile. After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session. Preview binds a loopback-only listener on 127.0.0.1 and does not publish to external network interfaces."
+Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile. After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session. Preview binds a loopback-only listener on 127.0.0.1 and does not publish to external network interfaces.",
+        after_help = "Examples:\n  ferritex preview document.tex"
     )]
     Preview(SharedCompileCommand),
     /// Watch for changes and recompile automatically
