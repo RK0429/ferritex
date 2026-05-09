@@ -431,6 +431,18 @@ impl LoopbackPreviewTransport {
         );
         Self::write_response(&mut stream, response.as_bytes())?;
 
+        let local_addr = stream.local_addr().ok();
+        let peer_addr = stream.peer_addr().ok();
+        let mut subscribers = self.event_subscribers.lock().map_err(|_| {
+            "failed to acquire preview transport event subscribers lock".to_string()
+        })?;
+        subscribers.entry(session_id.to_string()).or_default().push(
+            stream
+                .try_clone()
+                .map_err(|error| format!("failed to clone websocket subscriber: {error}"))?,
+        );
+        drop(subscribers);
+
         let pending_events = {
             let mut pending_events = self.pending_events.lock().map_err(|_| {
                 "failed to acquire preview transport pending events lock".to_string()
@@ -444,18 +456,6 @@ impl LoopbackPreviewTransport {
                 .map_err(|error| format!("failed to write preview websocket frame: {error}"))?;
         }
 
-        let mut subscribers = self.event_subscribers.lock().map_err(|_| {
-            "failed to acquire preview transport event subscribers lock".to_string()
-        })?;
-        subscribers.entry(session_id.to_string()).or_default().push(
-            stream
-                .try_clone()
-                .map_err(|error| format!("failed to clone websocket subscriber: {error}"))?,
-        );
-        drop(subscribers);
-
-        let local_addr = stream.local_addr().ok();
-        let peer_addr = stream.peer_addr().ok();
         loop {
             let (opcode, payload) = match ws_read_frame(&mut stream) {
                 Ok(frame) => frame,
