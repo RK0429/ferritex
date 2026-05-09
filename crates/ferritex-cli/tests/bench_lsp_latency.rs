@@ -360,11 +360,9 @@ fn stage_lsp_bench_001_fixture() -> (tempfile::TempDir, PathBuf, String) {
 fn run_warm_full_compile(tex_file: &Path) {
     // Warm-state step 1 per FTX-LSP-BENCH-001: run one full compile without
     // --no-cache to materialize the asset bundle, font cache, and on-disk
-    // compile cache before the LSP server opens the same document. A
-    // warning-only exit (code 1) is tolerated because the built-in basic
-    // bundle used by `ferritex lsp` emits a WinAnsiEncoding warning for
-    // the `∑` glyph in the fixture; the subsequent LSP measurement is the
-    // actual REQ-NF-004 signal.
+    // compile cache before the LSP server opens the same document.
+    // The subsequent LSP measurement is the actual REQ-NF-004 signal; this
+    // warm-up only needs to reject fatal compile errors.
     let output = Command::new(ferritex_bin())
         .arg("compile")
         .arg(tex_file)
@@ -372,7 +370,7 @@ fn run_warm_full_compile(tex_file: &Path) {
         .expect("run ferritex compile for warm state");
     let exit_code = output.status.code().unwrap_or(-1);
     assert!(
-        exit_code == 0 || exit_code == 1,
+        exit_code == 0,
         "warm-state ferritex compile failed (exit={exit_code}): stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
