@@ -58,6 +58,11 @@ cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUN
 cargo run --release -- compile hello.tex --synctex
 ```
 
+`ferritex compile` uses exit code 0 for successful compiles, 1 for warning-only
+diagnostics, and 2 for fatal diagnostics. Unsupported Unicode code points such
+as CJK characters currently emit a fatal diagnostic that identifies the
+unsupported character and exits with code 2.
+
 ### 4. Other subcommands
 
 ```sh
