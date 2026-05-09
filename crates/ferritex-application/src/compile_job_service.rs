@@ -761,12 +761,14 @@ impl<'a> CompileJobService<'a> {
     fn try_generate_bibliography(
         &self,
         bibliography_context: &BibliographyContext,
+        project_root: &Path,
         output_dir: &Path,
         jobname: &str,
     ) -> Option<Diagnostic> {
         match bibliography_context.toolchain() {
             Some(BibliographyToolchain::Bibtex) => {
-                let aux_contents = bibliography_context.bibtex_aux_contents()?;
+                let aux_contents =
+                    bibliography_context.bibtex_aux_contents(project_root, output_dir)?;
                 let aux_path = output_dir.join(format!("{jobname}.aux"));
                 if let Err(error) = self
                     .file_access_gate
@@ -1211,6 +1213,7 @@ impl<'a> CompileJobService<'a> {
         if bibliography_issue.is_some() && execution_policy.shell_escape_allowed {
             if let Some(diagnostic) = self.try_generate_bibliography(
                 &bibliography_context,
+                &project_root,
                 &options.output_dir,
                 &options.jobname,
             ) {
@@ -5403,7 +5406,7 @@ impl BibliographyContext {
         })
     }
 
-    fn bibtex_aux_contents(&self) -> Option<String> {
+    fn bibtex_aux_contents(&self, project_root: &Path, output_dir: &Path) -> Option<String> {
         if self.toolchain() != Some(BibliographyToolchain::Bibtex) || self.declarations.is_empty() {
             return None;
         }
@@ -5417,9 +5420,63 @@ impl BibliographyContext {
             "\\bibstyle{{{}}}",
             self.style.as_deref().unwrap_or("plain")
         ));
-        lines.push(format!("\\bibdata{{{}}}", self.declarations.join(",")));
+        let declarations = self
+            .declarations
+            .iter()
+            .map(|declaration| {
+                bibtex_data_path_from_output_dir(project_root, output_dir, declaration)
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!("\\bibdata{{{}}}", declarations.join(",")));
         Some(format!("{}\n", lines.join("\n")))
     }
+}
+
+fn bibtex_data_path_from_output_dir(
+    project_root: &Path,
+    output_dir: &Path,
+    declaration: &str,
+) -> String {
+    let declaration_path = Path::new(declaration);
+    if declaration_path.is_absolute() {
+        return declaration.replace('\\', "/");
+    }
+
+    let source_path = project_root.join(declaration_path);
+    relative_path_from(&source_path, output_dir)
+        .unwrap_or(source_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn relative_path_from(path: &Path, base: &Path) -> Option<PathBuf> {
+    let path_components = path.components().collect::<Vec<_>>();
+    let base_components = base.components().collect::<Vec<_>>();
+
+    match (path_components.first(), base_components.first()) {
+        (Some(path_root), Some(base_root)) if path_root != base_root => return None,
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => return None,
+    }
+
+    let mut common_len = 0usize;
+    while path_components.get(common_len) == base_components.get(common_len) {
+        common_len += 1;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in &base_components[common_len..] {
+        match component {
+            std::path::Component::Normal(_) => relative.push(".."),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    for component in &path_components[common_len..] {
+        relative.push(component.as_os_str());
+    }
+
+    Some(relative)
 }
 
 fn bibliography_sidecar_path(bbl_path: &Path) -> PathBuf {
@@ -8601,6 +8658,7 @@ mod tests {
     struct MockShellCommandGateway {
         commands: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
         generated_bbl: Mutex<Option<String>>,
+        required_bibdata: Mutex<Option<String>>,
         exit_code: Mutex<i32>,
         error: Mutex<Option<String>>,
     }
@@ -8609,6 +8667,14 @@ mod tests {
         fn with_bbl(bbl: impl Into<String>) -> Self {
             Self {
                 generated_bbl: Mutex::new(Some(bbl.into())),
+                ..Self::default()
+            }
+        }
+
+        fn with_bbl_requiring_bibdata(bbl: impl Into<String>, bibdata: impl Into<String>) -> Self {
+            Self {
+                generated_bbl: Mutex::new(Some(bbl.into())),
+                required_bibdata: Mutex::new(Some(bibdata.into())),
                 ..Self::default()
             }
         }
@@ -8635,8 +8701,30 @@ mod tests {
                 return Err(error);
             }
 
+            let jobname = args.first().copied().unwrap_or("main");
+            if let Some(required_bibdata) = self
+                .required_bibdata
+                .lock()
+                .expect("required bibdata lock")
+                .clone()
+            {
+                let aux_path = working_dir.join(format!("{jobname}.aux"));
+                let aux = fs::read_to_string(&aux_path).unwrap_or_default();
+                let required_aux_line = format!("\\bibdata{{{required_bibdata}}}");
+                let required_bib_path = working_dir.join(format!("{required_bibdata}.bib"));
+                if !aux.contains(&required_aux_line) || !required_bib_path.exists() {
+                    return Ok(ShellCommandOutput {
+                        exit_code: 2,
+                        stdout: Vec::new(),
+                        stderr: format!(
+                            "required bibliography data not reachable: {required_bibdata}"
+                        )
+                        .into_bytes(),
+                    });
+                }
+            }
+
             if let Some(bbl) = self.generated_bbl.lock().expect("bbl lock").clone() {
-                let jobname = args.first().copied().unwrap_or("main");
                 fs::write(working_dir.join(format!("{jobname}.bbl")), bbl)
                     .expect("write generated bbl");
             }
@@ -13433,6 +13521,54 @@ mod tests {
         let sidecar = fs::read_to_string(options.output_dir.join("main.bbl.ferritex.json"))
             .expect("read sidecar");
         assert!(sidecar.contains("\"toolchain\": \"bibtex\""));
+    }
+
+    #[test]
+    fn shell_escape_bibtex_finds_bib_file_when_output_dir_is_sibling() {
+        let dir = tempdir().expect("create tempdir");
+        let project_dir = dir.path().join("project");
+        let output_dir = dir.path().join("out");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let input_file = project_dir.join("main.tex");
+        let bib_path = project_dir.join("refs.bib");
+        fs::write(
+            &input_file,
+            document("See \\cite{key}.\n\\bibliographystyle{plain}\n\\bibliography{refs}"),
+        )
+        .expect("write input");
+        fs::write(
+            &bib_path,
+            "@book{key,\n  title = {Sibling output reference}\n}\n",
+        )
+        .expect("write bib");
+
+        let mut options = runtime_options(input_file, output_dir);
+        options.shell_escape = ShellEscapeMode::Enabled;
+        let loader = MockAssetBundleLoader::valid();
+        let expected_bibdata = "../project/refs";
+        let shell_gateway = MockShellCommandGateway::with_bbl_requiring_bibdata(
+            "\\begin{thebibliography}{99}\n\\bibitem{key} Sibling output reference\n\\end{thebibliography}\n",
+            expected_bibdata,
+        );
+
+        let result =
+            service_with_shell(&FsTestFileAccessGate, &loader, &shell_gateway).compile(&options);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            shell_gateway.commands(),
+            vec![(
+                "bibtex".to_string(),
+                vec!["main".to_string()],
+                options.output_dir.clone()
+            )]
+        );
+        let aux = fs::read_to_string(options.output_dir.join("main.aux")).expect("read aux");
+        assert!(aux.contains(&format!("\\bibdata{{{expected_bibdata}}}")));
+        let pdf = read_pdf(&options.output_dir.join("main.pdf"));
+        assert!(pdf.contains("See [1]."));
+        assert!(pdf.contains("[1] Sibling output reference"));
     }
 
     #[test]
