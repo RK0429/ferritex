@@ -1031,6 +1031,14 @@ fn compile_with_unsupported_cjk_character_emits_error() {
         "stderr should include the unsupported-code-point message, got: {stderr}"
     );
     assert!(
+        stderr.contains("current font stack (WinAnsi + Symbol)"),
+        "stderr should retain the actionable font-stack detail, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not yet support non-Latin Unicode code points"),
+        "stderr should retain the actionable Unicode limitation detail, got: {stderr}"
+    );
+    assert!(
         stderr.contains("U+6F22"),
         "stderr should include the code point, got: {stderr}"
     );
