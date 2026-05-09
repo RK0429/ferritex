@@ -298,6 +298,13 @@ fn partition_bench_output_identity_across_jobs_1_and_jobs_4() {
 
     let report = harness.run();
 
+    if let Some(failure) = report
+        .failures
+        .iter()
+        .find(|failure| matches!(failure, BenchFailure::EnvironmentBlocked { .. }))
+    {
+        panic!("partition bench environment blocked before jobs=1/jobs=4 comparison: {failure}");
+    }
     assert!(
         report.failures.is_empty(),
         "partition bench compilation failed: {:?}",
