@@ -1545,6 +1545,7 @@ impl<'a> CompileJobService<'a> {
             pass_count,
         } = parse_pass_result;
         stage_timing.pass_count = Some(pass_count);
+        let has_fatal_parse_error = errors.iter().any(is_fatal_parse_error);
         let mut parse_diagnostics: Vec<Diagnostic> = errors
             .into_iter()
             .map(|error| diagnostic_for_parse_error(error, input_path.clone()))
@@ -1639,6 +1640,18 @@ impl<'a> CompileJobService<'a> {
                     Vec::new(),
                 ));
             }
+        }
+        if has_fatal_parse_error {
+            let mut diagnostics = cache_diagnostics.clone();
+            diagnostics.extend(parse_diagnostics.clone());
+            remove_stale_output_pdf(&output_pdf, &mut diagnostics);
+            return CompileResult {
+                exit_code: exit_code_for(&diagnostics),
+                diagnostics,
+                output_pdf: None,
+                stable_compile_state: None,
+                stage_timing,
+            };
         }
         let typeset_document = typeset_document.expect("parsed documents should always typeset");
         let graphics_diagnostics = graphics_resolver.take_diagnostics();
@@ -6153,6 +6166,25 @@ fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnost
             .with_suggestion(format!(
                 "remove \\usepackage{{{name}}} or provide a .sty for it"
             )),
+    }
+}
+
+fn is_fatal_parse_error(error: &ParseError) -> bool {
+    matches!(error, ParseError::ShellEscapeError { .. })
+}
+
+fn remove_stale_output_pdf(output_pdf: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    match std::fs::remove_file(output_pdf) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => diagnostics.push(
+            Diagnostic::new(
+                Severity::Error,
+                format!("failed to remove stale output PDF: {error}"),
+            )
+            .with_file(output_pdf.to_string_lossy().into_owned())
+            .with_context("fatal compile errors must not leave a stale PDF artifact"),
+        ),
     }
 }
 
@@ -13596,6 +13628,8 @@ mod tests {
 
         let mut options = runtime_options(input_file, dir.path().join("out"));
         options.shell_escape = ShellEscapeMode::Enabled;
+        fs::create_dir_all(&options.output_dir).expect("create output dir");
+        fs::write(options.output_dir.join("main.pdf"), b"stale pdf").expect("write stale pdf");
         let loader = MockAssetBundleLoader::valid();
         let shell_gateway = MockShellCommandGateway::default();
 
@@ -13627,6 +13661,11 @@ mod tests {
                 )
             });
         assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(result.output_pdf, None);
+        assert!(
+            !options.output_dir.join("main.pdf").exists(),
+            "fatal shell escape validation must remove stale PDF artifacts"
+        );
         assert!(
             !dir.path().join("shell-escape-result.txt").exists(),
             "no file should be created when shell syntax is rejected"
