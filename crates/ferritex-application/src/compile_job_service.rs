@@ -111,6 +111,7 @@ pub struct CompileResult {
     pub output_pdf: Option<PathBuf>,
     pub stable_compile_state: Option<StableCompileState>,
     pub stage_timing: StageTiming,
+    pub elapsed: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1047,6 +1048,7 @@ impl<'a> CompileJobService<'a> {
         options: &RuntimeOptions,
         changed_paths_hint: &[PathBuf],
     ) -> CompileResult {
+        let compile_start = std::time::Instant::now();
         let input_path = options.input_file.to_string_lossy().into_owned();
         let execution_policy = ExecutionPolicyFactory::create(options);
         let project_root = project_root_for_policy(&execution_policy, &options.input_file);
@@ -1071,6 +1073,7 @@ impl<'a> CompileJobService<'a> {
                     output_pdf: None,
                     stable_compile_state: None,
                     stage_timing,
+                    elapsed: compile_start.elapsed(),
                 };
             }
 
@@ -1086,6 +1089,7 @@ impl<'a> CompileJobService<'a> {
                     output_pdf: None,
                     stable_compile_state: None,
                     stage_timing,
+                    elapsed: compile_start.elapsed(),
                 };
             }
         }
@@ -1101,6 +1105,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
 
@@ -1120,6 +1125,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
 
@@ -1137,6 +1143,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
 
@@ -1153,6 +1160,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
 
@@ -1214,6 +1222,7 @@ impl<'a> CompileJobService<'a> {
                         output_pdf: None,
                         stable_compile_state: None,
                         stage_timing,
+                        elapsed: compile_start.elapsed(),
                     };
                 }
                 let warm_cache = lookup.into_warm_cache();
@@ -1228,6 +1237,7 @@ impl<'a> CompileJobService<'a> {
                     output_pdf: Some(cached_artifact.output_pdf),
                     stable_compile_state: Some(cached_artifact.stable_compile_state),
                     stage_timing,
+                    elapsed: compile_start.elapsed(),
                 };
             }
 
@@ -1282,6 +1292,7 @@ impl<'a> CompileJobService<'a> {
                     output_pdf: None,
                     stable_compile_state: None,
                     stage_timing,
+                    elapsed: compile_start.elapsed(),
                 };
             }
         };
@@ -1686,6 +1697,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
         if let Some(loaded_bibliography_state) = &loaded_bibliography_state {
@@ -1750,6 +1762,7 @@ impl<'a> CompileJobService<'a> {
                         diagnostics,
                     )),
                     stage_timing,
+                    elapsed: compile_start.elapsed(),
                 };
             }
         };
@@ -1777,6 +1790,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
         let typeset_document = typeset_document.expect("parsed documents should always typeset");
@@ -1795,6 +1809,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
         let cross_reference_seed =
@@ -1822,6 +1837,7 @@ impl<'a> CompileJobService<'a> {
                     output_pdf: None,
                     stable_compile_state: None,
                     stage_timing,
+                    elapsed: compile_start.elapsed(),
                 };
             }
         };
@@ -1881,6 +1897,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
         if has_error_diagnostics(&diagnostics) {
@@ -1891,6 +1908,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
         let cached_typeset_fragments = cached_typeset_fragments_for(
@@ -1917,6 +1935,7 @@ impl<'a> CompileJobService<'a> {
                 output_pdf: None,
                 stable_compile_state: None,
                 stage_timing,
+                elapsed: compile_start.elapsed(),
             };
         }
 
@@ -2061,6 +2080,7 @@ impl<'a> CompileJobService<'a> {
             output_pdf: Some(output_pdf),
             stable_compile_state: Some(stable_compile_state),
             stage_timing,
+            elapsed: compile_start.elapsed(),
         }
     }
 

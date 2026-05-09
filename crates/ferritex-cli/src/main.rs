@@ -4,10 +4,13 @@ use std::{
     path::PathBuf,
     process,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ferritex_application::compile_job_service::{CompileJobService, CompileResult};
+use ferritex_application::compile_job_service::{
+    CompileJobService, CompileResult, PartitionTypesetFallbackReason, PartitionTypesetReuseType,
+};
 use ferritex_application::execution_policy_factory::ExecutionPolicyFactory;
 use ferritex_application::ports::{
     PreviewTransportPort, TransportRevisionEvent, TransportViewStateUpdate,
@@ -244,6 +247,7 @@ fn print_compile_json_result(result: &CompileResult) {
         .as_ref()
         .map(|state| state.page_count);
     let classification = compile_result_classification(result);
+    let summary = compile_result_summary_json(result);
     let payload = serde_json::json!({
         "schemaVersion": "ferritex.compileResult.v1",
         "command": "compile",
@@ -254,12 +258,87 @@ fn print_compile_json_result(result: &CompileResult) {
             "pdfPath": result.output_pdf.as_ref().map(|path| path.to_string_lossy().into_owned()),
             "pageCount": page_count,
         },
+        "summary": summary,
         "diagnostics": result.diagnostics,
     });
 
     let mut stdout = io::stdout().lock();
     let _ = serde_json::to_writer(&mut stdout, &payload);
     let _ = writeln!(stdout);
+}
+
+fn compile_result_summary_json(result: &CompileResult) -> serde_json::Value {
+    serde_json::json!({
+        "elapsedMicros": duration_micros(result.elapsed),
+        "stageTotalMicros": duration_micros(result.stage_timing.total()),
+        "cache": {
+            "status": compile_cache_status(result),
+        },
+        "stageTimingsMicros": {
+            "cacheLoad": result.stage_timing.cache_load.map(duration_micros),
+            "sourceTreeLoad": result.stage_timing.source_tree_load.map(duration_micros),
+            "parse": result.stage_timing.parse.map(duration_micros),
+            "typeset": result.stage_timing.typeset.map(duration_micros),
+            "pdfRender": result.stage_timing.pdf_render.map(duration_micros),
+            "cacheStore": result.stage_timing.cache_store.map(duration_micros),
+        },
+        "passCount": result.stage_timing.pass_count,
+        "typesetPartitions": result.stage_timing.typeset_partition_details.as_ref().map(|details| {
+            details
+                .iter()
+                .map(|detail| {
+                    serde_json::json!({
+                        "partitionId": detail.partition_id,
+                        "reuseType": partition_reuse_type_name(detail.reuse_type),
+                        "suffixBlockCount": detail.suffix_block_count,
+                        "totalBlockCount": detail.total_block_count,
+                        "elapsedMicros": detail.elapsed.map(duration_micros),
+                        "fallbackReason": detail.fallback_reason.map(partition_fallback_reason_name),
+                    })
+                })
+                .collect::<Vec<_>>()
+        }),
+    })
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn compile_cache_status(result: &CompileResult) -> &'static str {
+    if result.stage_timing.cache_load.is_none() {
+        "disabled"
+    } else if result.output_pdf.is_some()
+        && result.stage_timing.source_tree_load.is_none()
+        && result.stage_timing.cache_store.is_none()
+    {
+        "hit"
+    } else {
+        "miss"
+    }
+}
+
+fn partition_reuse_type_name(reuse_type: PartitionTypesetReuseType) -> &'static str {
+    match reuse_type {
+        PartitionTypesetReuseType::BlockReuse => "blockReuse",
+        PartitionTypesetReuseType::SuffixRebuild => "suffixRebuild",
+        PartitionTypesetReuseType::FullRebuild => "fullRebuild",
+        PartitionTypesetReuseType::Cached => "cached",
+    }
+}
+
+fn partition_fallback_reason_name(reason: PartitionTypesetFallbackReason) -> &'static str {
+    match reason {
+        PartitionTypesetFallbackReason::Pageref => "pageref",
+        PartitionTypesetFallbackReason::TypesetCallbackCount => "typesetCallbackCount",
+        PartitionTypesetFallbackReason::ReusePlanRequiresFull => "reusePlanRequiresFull",
+        PartitionTypesetFallbackReason::NoPartitionsToRebuild => "noPartitionsToRebuild",
+        PartitionTypesetFallbackReason::CheckpointMissing => "checkpointMissing",
+        PartitionTypesetFallbackReason::BlockStructureChanged => "blockStructureChanged",
+        PartitionTypesetFallbackReason::AffectedBlockIndexZero => "affectedBlockIndexZero",
+        PartitionTypesetFallbackReason::SuffixValidationFailed(_) => "suffixValidationFailed",
+        PartitionTypesetFallbackReason::ParallelPartialTypeset => "parallelPartialTypeset",
+    }
 }
 
 fn compile_result_classification(result: &CompileResult) -> &'static str {
@@ -1015,8 +1094,7 @@ mod tests {
 
     #[test]
     fn preview_and_watch_reject_compile_format_flag() {
-        let preview =
-            Cli::try_parse_from(["ferritex", "preview", "notes.tex", "--format", "json"]);
+        let preview = Cli::try_parse_from(["ferritex", "preview", "notes.tex", "--format", "json"]);
         let watch = Cli::try_parse_from(["ferritex", "watch", "notes.tex", "--format", "json"]);
 
         assert!(preview.is_err(), "preview must not accept compile --format");
