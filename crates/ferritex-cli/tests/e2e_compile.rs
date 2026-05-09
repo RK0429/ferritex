@@ -2817,7 +2817,10 @@ fn compile_reports_issue_1_diagnostics_and_exits_nonzero() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("undefined control sequence `\\nonexistentcommand`"));
     assert!(stderr.contains("unclosed environment `unclosedenv`"));
-    assert!(dir.path().join("broken.pdf").exists());
+    assert!(
+        !dir.path().join("broken.pdf").exists(),
+        "fatal compile errors must not leave a PDF artifact"
+    );
 }
 
 #[test]
@@ -2893,6 +2896,51 @@ fn compile_batchmode_suppresses_stderr_diagnostics() {
 }
 
 #[test]
+fn compile_interaction_error_modes_do_not_leave_pdf_or_cache_artifacts() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let output_dir = dir.path().join("out");
+    let tex_file = dir.path().join("broken.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\begin{unclosedenv}\ntext\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    for interaction in ["batchmode", "nonstopmode", "scrollmode", "errorstopmode"] {
+        let output = ferritex_bin()
+            .args([
+                "compile",
+                tex_file.to_str().expect("utf-8 path"),
+                "--output-dir",
+                output_dir.to_str().expect("utf-8 output path"),
+                "--interaction",
+                interaction,
+            ])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run ferritex {interaction}: {error}"));
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{interaction} should surface fatal diagnostics as exit 2"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "{interaction} must not print a success summary on stdout, got: {stdout}"
+        );
+        assert!(
+            !output_dir.join("broken.pdf").exists(),
+            "{interaction} must not leave a PDF artifact"
+        );
+        assert!(
+            !output_dir.join(".ferritex-cache").exists(),
+            "{interaction} must not leave compile cache artifacts"
+        );
+    }
+}
+
+#[test]
 fn compile_with_errors_suppresses_success_summary_on_stdout() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("broken.tex");
@@ -2908,7 +2956,10 @@ fn compile_with_errors_suppresses_success_summary_on_stdout() {
         .expect("failed to run ferritex");
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(dir.path().join("broken.pdf").exists());
+    assert!(
+        !dir.path().join("broken.pdf").exists(),
+        "fatal compile errors must not leave a PDF artifact"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
