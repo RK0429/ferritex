@@ -845,7 +845,7 @@ fn compile_format_json_includes_diagnostics_for_failure_result() {
 }
 
 #[test]
-fn compile_format_json_batchmode_keeps_failure_structured_on_stdout() {
+fn compile_batchmode_format_json_keeps_silent_human_channel_exit_code_contract() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("broken_json_batchmode.tex");
     std::fs::write(
@@ -885,8 +885,8 @@ fn compile_format_json_batchmode_keeps_failure_structured_on_stdout() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("ferritex compile failed"),
-        "json batchmode failure must not receive the human summary on stderr, got: {stderr}"
+        stderr.trim().is_empty(),
+        "json batchmode keeps the human diagnostic channel silent while stdout carries the machine-readable failure contract, got: {stderr}"
     );
 }
 
