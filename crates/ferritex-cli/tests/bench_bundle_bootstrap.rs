@@ -1070,6 +1070,80 @@ fn bundle_archive_smoke_proof() {
 }
 
 #[test]
+fn bundle_archive_path_compiles_without_manual_extraction() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("cli crate should live under crates/")
+        .to_path_buf();
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let archive_path = temp_dir.path().join("FTX-ASSET-BUNDLE-001.tar.gz");
+    let output = Command::new("sh")
+        .arg(repo_root.join("scripts/build_bundle_archive.sh"))
+        .arg(&archive_path)
+        .output()
+        .expect("run bundle archive builder");
+    assert!(
+        output.status.success(),
+        "bundle archive builder failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        archive_path.is_file(),
+        "bundle archive should exist at {}",
+        archive_path.display()
+    );
+
+    let bench_fixtures = bench_fixtures_root();
+    let base_case = bundle_reproducible_cases(&bench_fixtures)
+        .into_iter()
+        .find(|case| case.name == "layout-core-article-bundle-reproducible")
+        .expect("article reproducible case should exist");
+    let temp_input = temp_dir.path().join(
+        base_case
+            .input_fixture
+            .file_name()
+            .expect("fixture should have filename"),
+    );
+    std::fs::copy(&base_case.input_fixture, &temp_input).expect("copy fixture to temp dir");
+
+    let case = BenchCase {
+        input_fixture: temp_input.clone(),
+        asset_bundle: Some(archive_path.clone()),
+        ..base_case
+    };
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        vec![case.clone()],
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: false,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "bundle archive path compile failed: {:?}",
+        report.failures
+    );
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(
+        report.results[0].case.asset_bundle.as_deref(),
+        Some(archive_path.as_path())
+    );
+    let pdf_path = temp_input.with_extension("pdf");
+    let metadata = std::fs::metadata(&pdf_path).unwrap_or_else(|error| {
+        panic!("failed to stat output PDF {}: {error}", pdf_path.display())
+    });
+    assert!(metadata.len() > 0);
+}
+
+#[test]
 fn bundle_corrupted_manifest_reports_diagnostic() {
     let bench_fixtures = bench_fixtures_root();
     let base_case = bundle_reproducible_cases(&bench_fixtures)

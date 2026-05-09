@@ -1,4 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::json;
 
@@ -7,6 +12,7 @@ const BUILTIN_BASIC_ASSET_BUNDLE_VERSION: &str = "0.1.0";
 const BUILTIN_BASIC_BUNDLED_TEX: &str = "Bundled from built-in asset bundle.\n";
 const BUILTIN_BASIC_ASSET_INDEX_PATH: &str = "asset-index.json";
 const BUILTIN_BASIC_CMR10_TFM_PATH: &str = "texmf/fonts/tfm/public/cm/cmr10.tfm";
+const TAR_BLOCK_SIZE: usize = 512;
 
 /// CLI から受け取る compile サブコマンド引数
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,8 +140,289 @@ pub fn default_lsp_asset_bundle() -> Option<PathBuf> {
 pub fn resolve_asset_bundle_ref(bundle_ref: &Path) -> PathBuf {
     if bundle_ref == Path::new(BUILTIN_BASIC_ASSET_BUNDLE_ID) {
         materialize_builtin_basic_asset_bundle()
+    } else if is_asset_bundle_archive(bundle_ref) {
+        match materialize_archive_asset_bundle(bundle_ref) {
+            Ok(path) => path,
+            Err(reason) => materialize_archive_error_bundle(bundle_ref, &reason)
+                .unwrap_or_else(|_| bundle_ref.to_path_buf()),
+        }
     } else {
         bundle_ref.to_path_buf()
+    }
+}
+
+fn is_asset_bundle_archive(bundle_ref: &Path) -> bool {
+    let value = bundle_ref.to_string_lossy();
+    value.ends_with(".tar.gz") || value.ends_with(".tgz")
+}
+
+fn materialize_archive_asset_bundle(bundle_ref: &Path) -> Result<PathBuf, String> {
+    if !bundle_ref.is_file() {
+        return Err(format!(
+            "archive does not exist at {}",
+            bundle_ref.display()
+        ));
+    }
+
+    let staging_root =
+        std::env::temp_dir().join(format!("ferritex-asset-bundle-{}", unique_temp_suffix()));
+    let _ = std::fs::remove_dir_all(&staging_root);
+    std::fs::create_dir_all(&staging_root).map_err(|error| {
+        format!(
+            "failed to prepare archive staging root {}: {error}",
+            staging_root.display()
+        )
+    })?;
+
+    let tar_bytes = decompress_gzip_archive(bundle_ref).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&staging_root);
+    })?;
+    extract_checked_tar(&tar_bytes, &staging_root).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&staging_root);
+    })?;
+
+    let Some(extracted_root) = find_extracted_bundle_root(&staging_root) else {
+        let _ = std::fs::remove_dir_all(&staging_root);
+        return Err("archive does not contain a single asset bundle root".to_string());
+    };
+
+    Ok(extracted_root)
+}
+
+fn decompress_gzip_archive(bundle_ref: &Path) -> Result<Vec<u8>, String> {
+    let output = Command::new("gzip")
+        .arg("-cd")
+        .arg(bundle_ref)
+        .output()
+        .map_err(|error| format!("failed to run gzip: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to decompress archive with gzip: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn extract_checked_tar(bytes: &[u8], staging_root: &Path) -> Result<(), String> {
+    let canonical_staging = staging_root.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize archive staging root {}: {error}",
+            staging_root.display()
+        )
+    })?;
+    let mut offset = 0;
+    while offset + TAR_BLOCK_SIZE <= bytes.len() {
+        let header = &bytes[offset..offset + TAR_BLOCK_SIZE];
+        offset += TAR_BLOCK_SIZE;
+        if header.iter().all(|byte| *byte == 0) {
+            return Ok(());
+        }
+
+        let path = tar_entry_path(header)?;
+        let size = parse_tar_octal(&header[124..136])?;
+        let entry_type = header[156];
+        let data_end = offset
+            .checked_add(size)
+            .ok_or_else(|| format!("archive entry {} is too large", path.display()))?;
+        if data_end > bytes.len() {
+            return Err(format!("archive entry {} is truncated", path.display()));
+        }
+
+        let destination = checked_archive_destination(&canonical_staging, &path)?;
+        match entry_type {
+            0 | b'0' => {
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "failed to create archive entry directory {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+                    verify_under_root(parent, &canonical_staging)?;
+                }
+                let mut file = std::fs::File::create(&destination).map_err(|error| {
+                    format!(
+                        "failed to create archive entry {}: {error}",
+                        destination.display()
+                    )
+                })?;
+                file.write_all(&bytes[offset..data_end]).map_err(|error| {
+                    format!(
+                        "failed to write archive entry {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            }
+            b'5' => {
+                std::fs::create_dir_all(&destination).map_err(|error| {
+                    format!(
+                        "failed to create archive directory {}: {error}",
+                        destination.display()
+                    )
+                })?;
+                verify_under_root(&destination, &canonical_staging)?;
+            }
+            b'x' | b'g' => {}
+            other => {
+                return Err(format!(
+                    "unsupported archive entry type `{}` for {}",
+                    other as char,
+                    path.display()
+                ));
+            }
+        }
+
+        offset = align_tar_offset(data_end)?;
+    }
+
+    Err("archive ended before the tar end marker".to_string())
+}
+
+fn tar_entry_path(header: &[u8]) -> Result<PathBuf, String> {
+    let name = tar_string(&header[0..100])?;
+    if name.is_empty() {
+        return Err("archive entry has an empty path".to_string());
+    }
+    let prefix = tar_string(&header[345..500])?;
+    let path = if prefix.is_empty() {
+        PathBuf::from(name)
+    } else {
+        PathBuf::from(prefix).join(name)
+    };
+    validate_archive_relative_path(&path)?;
+    Ok(path)
+}
+
+fn tar_string(bytes: &[u8]) -> Result<String, String> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end])
+        .map(str::to_string)
+        .map_err(|error| format!("archive entry path is not UTF-8: {error}"))
+}
+
+fn parse_tar_octal(bytes: &[u8]) -> Result<usize, String> {
+    let value = bytes
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .filter(|byte| *byte != b' ')
+        .collect::<Vec<_>>();
+    let value = std::str::from_utf8(&value)
+        .map_err(|error| format!("archive entry size is not UTF-8: {error}"))?;
+    usize::from_str_radix(value.trim(), 8)
+        .map_err(|error| format!("archive entry has invalid size `{value}`: {error}"))
+}
+
+fn validate_archive_relative_path(path: &Path) -> Result<(), String> {
+    if path.is_absolute() {
+        return Err(format!(
+            "archive entry path `{}` must be relative",
+            path.display()
+        ));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(format!(
+            "archive entry path `{}` must not escape the bundle root",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn checked_archive_destination(root: &Path, relative_path: &Path) -> Result<PathBuf, String> {
+    validate_archive_relative_path(relative_path)?;
+    let destination = root.join(relative_path);
+    if !destination.starts_with(root) {
+        return Err(format!(
+            "archive entry destination `{}` escapes staging root",
+            destination.display()
+        ));
+    }
+    Ok(destination)
+}
+
+fn verify_under_root(path: &Path, root: &Path) -> Result<(), String> {
+    let canonical = path.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize archive destination {}: {error}",
+            path.display()
+        )
+    })?;
+    if canonical.starts_with(root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "archive destination `{}` escapes staging root",
+            canonical.display()
+        ))
+    }
+}
+
+fn align_tar_offset(offset: usize) -> Result<usize, String> {
+    offset
+        .checked_add(TAR_BLOCK_SIZE - 1)
+        .map(|value| value / TAR_BLOCK_SIZE * TAR_BLOCK_SIZE)
+        .ok_or_else(|| "archive offset overflow".to_string())
+}
+
+fn unique_temp_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
+}
+
+fn materialize_archive_error_bundle(bundle_ref: &Path, reason: &str) -> std::io::Result<PathBuf> {
+    let root = std::env::temp_dir().join(format!(
+        "ferritex-invalid-asset-bundle-{}",
+        unique_temp_suffix()
+    ));
+    std::fs::create_dir_all(&root)?;
+    let message = format!(
+        "archive extraction failed for {}: {reason}",
+        bundle_ref.display()
+    );
+    std::fs::write(
+        root.join("manifest.json"),
+        serde_json::to_vec(&message).expect("serialize archive extraction error"),
+    )?;
+    Ok(root)
+}
+
+fn find_extracted_bundle_root(staging_root: &Path) -> Option<PathBuf> {
+    if staging_root.join("manifest.json").is_file()
+        && staging_root.join("asset-index.json").is_file()
+    {
+        return Some(staging_root.to_path_buf());
+    }
+
+    let mut candidates = std::fs::read_dir(staging_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path.join("manifest.json").is_file()
+                && path.join("asset-index.json").is_file()
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
     }
 }
 
@@ -309,7 +596,11 @@ fn builtin_basic_cmr10_tfm() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        io::Write,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+    };
 
     use super::{
         default_lsp_asset_bundle, resolve_asset_bundle_ref, CompileArgs, CompileInteraction,
@@ -332,6 +623,64 @@ mod tests {
             shell_escape: false,
             no_shell_escape: false,
         }
+    }
+
+    fn tar_header(path: &str, entry_type: u8, size: usize) -> [u8; super::TAR_BLOCK_SIZE] {
+        let mut header = [0_u8; super::TAR_BLOCK_SIZE];
+        let path_bytes = path.as_bytes();
+        header[..path_bytes.len()].copy_from_slice(path_bytes);
+        header[100..108].copy_from_slice(b"0000777\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{size:011o}\0");
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].fill(b' ');
+        header[156] = entry_type;
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum = header.iter().map(|byte| u32::from(*byte)).sum::<u32>();
+        let checksum = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        header
+    }
+
+    fn tar_archive(entries: &[(&str, u8, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        for (path, entry_type, content) in entries {
+            archive.extend_from_slice(&tar_header(path, *entry_type, content.len()));
+            archive.extend_from_slice(content);
+            let padding = (super::TAR_BLOCK_SIZE - content.len() % super::TAR_BLOCK_SIZE)
+                % super::TAR_BLOCK_SIZE;
+            archive.extend(std::iter::repeat(0).take(padding));
+        }
+        archive.extend_from_slice(&[0_u8; super::TAR_BLOCK_SIZE]);
+        archive.extend_from_slice(&[0_u8; super::TAR_BLOCK_SIZE]);
+        archive
+    }
+
+    fn gzip_bytes(input: &[u8]) -> Vec<u8> {
+        let mut child = Command::new("gzip")
+            .arg("-n")
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn gzip");
+        let mut stdin = child.stdin.take().expect("gzip stdin");
+        stdin.write_all(input).expect("write gzip stdin");
+        drop(stdin);
+        let output = child.wait_with_output().expect("wait gzip");
+        assert!(
+            output.status.success(),
+            "gzip failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn write_archive(path: &Path, entries: &[(&str, u8, &[u8])]) {
+        std::fs::write(path, gzip_bytes(&tar_archive(entries))).expect("write archive");
     }
 
     #[test]
@@ -464,6 +813,54 @@ mod tests {
             .exists());
         assert!(resolved.join("texmf/bundled.tex").exists());
         assert!(resolved.join(super::BUILTIN_BASIC_CMR10_TFM_PATH).exists());
+    }
+
+    #[test]
+    fn rejects_malicious_asset_bundle_archive_entries() {
+        let cases = [
+            (
+                "../evil",
+                b'0',
+                b"evil".as_slice(),
+                "must not escape the bundle root",
+            ),
+            ("/absolute", b'0', b"evil".as_slice(), "must be relative"),
+            (
+                "FTX-ASSET-BUNDLE-001/link",
+                b'2',
+                b"target".as_slice(),
+                "unsupported archive entry type",
+            ),
+            (
+                "FTX-ASSET-BUNDLE-001/hardlink",
+                b'1',
+                b"target".as_slice(),
+                "unsupported archive entry type",
+            ),
+            (
+                "FTX-ASSET-BUNDLE-001/device",
+                b'3',
+                b"".as_slice(),
+                "unsupported archive entry type",
+            ),
+        ];
+
+        for (entry_path, entry_type, content, expected_error) in cases {
+            let temp_dir = tempfile::tempdir().expect("create tempdir");
+            let archive_path = temp_dir.path().join("FTX-ASSET-BUNDLE-001.tar.gz");
+            write_archive(&archive_path, &[(entry_path, entry_type, content)]);
+
+            let resolved = resolve_asset_bundle_ref(&archive_path);
+
+            assert_ne!(resolved, archive_path);
+            let manifest = std::fs::read_to_string(resolved.join("manifest.json"))
+                .expect("read error manifest");
+            assert!(manifest.contains("archive extraction failed"));
+            assert!(
+                manifest.contains(expected_error),
+                "error manifest should contain `{expected_error}` but was {manifest}"
+            );
+        }
     }
 
     #[test]
