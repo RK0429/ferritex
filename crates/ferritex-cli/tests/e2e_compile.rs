@@ -447,6 +447,97 @@ fn compile_existing_file_writes_pdf_with_document_content() {
 }
 
 #[test]
+fn compile_format_json_emits_machine_readable_success_result() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello_json.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello, JSON!\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("no asset bundle specified"),
+        "json output must not include human fallback warning, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("->"),
+        "json output must not include human success summary, got: {stdout}"
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("parse json stdout");
+    assert_eq!(value["schemaVersion"], "ferritex.compileResult.v1");
+    assert_eq!(value["command"], "compile");
+    assert_eq!(value["classification"], "success");
+    assert_eq!(value["exitCode"], 0);
+    assert_eq!(value["success"], true);
+    assert!(value["output"]["pdfPath"]
+        .as_str()
+        .expect("pdf path")
+        .ends_with("hello_json.pdf"));
+    assert_eq!(value["output"]["pageCount"], 1);
+    assert_eq!(
+        value["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn compile_format_json_includes_diagnostics_for_failure_result() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("broken_json.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\nonexistentcommand{foo}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("parse json stdout");
+    assert_eq!(value["schemaVersion"], "ferritex.compileResult.v1");
+    assert_eq!(value["command"], "compile");
+    assert_eq!(value["classification"], "error");
+    assert_eq!(value["exitCode"], 2);
+    assert_eq!(value["success"], false);
+    assert_eq!(value["output"]["pdfPath"], Value::Null);
+    assert_eq!(value["output"]["pageCount"], Value::Null);
+    let diagnostics = value["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["severity"] == "Error"
+                && diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("\\nonexistentcommand"))
+        }),
+        "json diagnostics should include the undefined command error, got: {diagnostics:?}"
+    );
+}
+
+#[test]
 fn compile_with_asset_bundle_does_not_print_fallback_warning() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello.tex");
@@ -5068,12 +5159,20 @@ fn compile_and_preview_help_hide_watch_verbose_flag() {
     let compile_stdout = String::from_utf8_lossy(&compile.stdout);
     let preview_stdout = String::from_utf8_lossy(&preview.stdout);
     assert!(
+        compile_stdout.contains("--format"),
+        "compile help should show compile-only --format"
+    );
+    assert!(
         !compile_stdout.contains("--verbose"),
         "compile help must not show watch-only --verbose"
     );
     assert!(
         !preview_stdout.contains("--verbose"),
         "preview help must not show watch-only --verbose"
+    );
+    assert!(
+        !preview_stdout.contains("--format"),
+        "preview help must not show compile-only --format"
     );
 }
 
@@ -5093,6 +5192,10 @@ fn watch_help_shows_verbose_flag() {
     assert!(
         stdout.contains("watched file path"),
         "watch help should describe --verbose"
+    );
+    assert!(
+        !stdout.contains("--format"),
+        "watch help must not show compile-only --format"
     );
 }
 
