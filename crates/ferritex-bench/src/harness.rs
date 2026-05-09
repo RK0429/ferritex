@@ -2490,7 +2490,9 @@ mod tests {
     #[test]
     fn corpus_embedded_assets_documents_compile_successfully() {
         let fixture_base = fixtures_root();
-        let cases = corpus_embedded_assets_cases(&fixture_base);
+        let base_cases = corpus_embedded_assets_cases(&fixture_base);
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let cases = stage_cases_in_tempdir(&base_cases, temp_dir.path());
         let backend = ServiceCompileBackend;
 
         assert!(cases.len() >= 2);
