@@ -43,7 +43,12 @@ pub fn run_lsp() -> i32 {
                 emit_diagnostic(
                     &Diagnostic::new(
                         Severity::Error,
-                        format!("failed to read LSP message: {error}"),
+                        format!(
+                            "failed to read LSP Content-Length framed JSON-RPC message: {error}. \
+                             ferritex lsp reads stdio messages framed as \
+                             `Content-Length: <N>\\r\\n\\r\\n<JSON>`; run `ferritex lsp --help` \
+                             or see README.md for the framing contract before retrying."
+                        ),
                     ),
                     LSP_DIAGNOSTIC_MODE,
                 );
