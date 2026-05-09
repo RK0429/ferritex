@@ -1370,8 +1370,17 @@ fn compile_renders_itemize_environment_as_bulleted_text() {
 
     assert_eq!(output.status.code(), Some(0));
     let pdf = std::fs::read_to_string(dir.path().join("itemize.pdf")).expect("read output pdf");
-    assert!(pdf.contains("• First item"));
-    assert!(pdf.contains("• Second item"));
+    let payloads = actual_text_payloads(&pdf);
+
+    assert!(
+        payloads.contains(&r"(\225 First item)"),
+        "expected first item ActualText payload, got: {payloads:?}"
+    );
+    assert!(
+        payloads.contains(&r"(\225 Second item)"),
+        "expected second item ActualText payload, got: {payloads:?}"
+    );
+    assert!(!pdf.contains("% FerritexText:"));
 }
 
 #[test]

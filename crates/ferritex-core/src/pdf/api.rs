@@ -1501,16 +1501,27 @@ fn render_text_line(
 
     let primary_font_number = usize::from(line.font_index) + 1;
     let font_size = line.font_size;
+    let rendered_text = strip_math_script_markers(&line.text);
+    let actual_text = bulleted_list_item_actual_text(&rendered_text);
+    if let Some(actual_text) = actual_text {
+        stream.push_str(&format!(
+            "/Span <</ActualText {}>> BDC\n",
+            encode_pdf_actual_text(actual_text)
+        ));
+    }
 
     let Some(link_color) = active_link_color(link_style) else {
         emit_text_with_font_runs(
             stream,
-            &strip_math_script_markers(&line.text),
+            &rendered_text,
             primary_font_number,
             math_font_number,
             font_size,
             warning_chars,
         );
+        if actual_text.is_some() {
+            stream.push_str("EMC\n");
+        }
         return;
     };
 
@@ -1522,17 +1533,19 @@ fn render_text_line(
     if links.is_empty() {
         emit_text_with_font_runs(
             stream,
-            &strip_math_script_markers(&line.text),
+            &rendered_text,
             primary_font_number,
             math_font_number,
             font_size,
             warning_chars,
         );
+        if actual_text.is_some() {
+            stream.push_str("EMC\n");
+        }
         return;
     }
 
     links.sort_by_key(|link| (link.start_char, link.end_char));
-    let rendered_text = strip_math_script_markers(&line.text);
     let boundaries = char_boundaries(&rendered_text);
     let char_count = boundaries.len().saturating_sub(1);
     let mut cursor = 0usize;
@@ -1575,6 +1588,18 @@ fn render_text_line(
             warning_chars,
         );
     }
+
+    if actual_text.is_some() {
+        stream.push_str("EMC\n");
+    }
+}
+
+fn bulleted_list_item_actual_text(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("• ")?;
+    rest.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric())
+        .then_some(text)
 }
 
 fn render_text_line_with_scripts(
@@ -3303,6 +3328,20 @@ mod tests {
         assert!(content.contains("-3 Ts"));
         assert!(content.contains("\n3 Ts\n"));
         assert_eq!(content.matches("0 Ts").count(), 3);
+    }
+
+    #[test]
+    fn renders_bulleted_list_lines_with_actual_text() {
+        let pdf = PdfRenderer::default().render(&single_page(&["• First item"]));
+        let content = String::from_utf8_lossy(&pdf.bytes);
+        let payloads = actual_text_payloads(&content);
+        let expected = encode_pdf_actual_text("• First item");
+
+        assert!(
+            payloads.contains(&expected.as_str()),
+            "expected bullet ActualText payload, got: {payloads:?}"
+        );
+        assert!(!content.contains("% FerritexText:"));
     }
 
     #[test]
