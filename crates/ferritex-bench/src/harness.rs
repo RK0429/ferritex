@@ -491,6 +491,8 @@ pub enum BenchFailure {
     CompileError { case_name: String, message: String },
     #[error("environment blocked for {case_name}: {message}")]
     EnvironmentBlocked { case_name: String, message: String },
+    #[error("preflight blocked for {case_name}: {message}")]
+    PreflightBlocked { case_name: String, message: String },
     #[error("missing fixture: {}", path.display())]
     MissingFixture { path: PathBuf },
 }
@@ -561,6 +563,15 @@ impl BenchHarness {
     }
 
     pub fn run(&self) -> BenchReport {
+        let failures = self.known_preflight_failures();
+        if !failures.is_empty() {
+            return BenchReport {
+                results: Vec::new(),
+                comparisons: Vec::new(),
+                failures,
+            };
+        }
+
         let mut results = Vec::new();
         let mut failures = Vec::new();
 
@@ -584,6 +595,7 @@ impl BenchHarness {
         if let Some(bundle) = case.asset_bundle.as_deref() {
             self.ensure_fixture(bundle)?;
         }
+        self.ensure_case_supported(case)?;
 
         let output_dir = IsolatedOutputDir::create(case.input_fixture.as_path())
             .map_err(|message| classify_compile_failure(&case.name, message))?;
@@ -678,6 +690,41 @@ impl BenchHarness {
                 path: path.to_path_buf(),
             })
         }
+    }
+
+    fn ensure_case_supported(&self, case: &BenchCase) -> Result<(), BenchFailure> {
+        if let Some(message) = known_preflight_blocker(case) {
+            Err(BenchFailure::PreflightBlocked {
+                case_name: case.name.clone(),
+                message: message.to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn known_preflight_failures(&self) -> Vec<BenchFailure> {
+        self.cases
+            .iter()
+            .filter_map(|case| {
+                known_preflight_blocker(case).map(|message| BenchFailure::PreflightBlocked {
+                    case_name: case.name.clone(),
+                    message: message.to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+fn known_preflight_blocker(case: &BenchCase) -> Option<&'static str> {
+    match case.name.as_str() {
+        "corpus-bibliography-multi_cite" => Some(
+            "known unsupported/preflight blocker: bibliography multi_cite uses TeX/LaTeX logo control sequences that ferritex does not support yet",
+        ),
+        "corpus-navigation-features-custom_metadata" => Some(
+            "known unsupported/preflight blocker: navigation custom_metadata uses hyperref metadata surfaces that ferritex does not support yet",
+        ),
+        _ => None,
     }
 }
 
@@ -1508,6 +1555,69 @@ done
                     && message.contains("os error 28")
                     && message.contains("chapters_crossref.pdf")
         ));
+    }
+
+    #[test]
+    fn test_known_unsupported_case_preflight_blocks_before_backend_compile() {
+        let fixture_base = fixtures_root();
+        let bibliography_blocker = corpus_bibliography_cases(&fixture_base)
+            .into_iter()
+            .find(|case| case.name == "corpus-bibliography-multi_cite")
+            .expect("bibliography corpus factory should include multi_cite blocker");
+        let navigation_blocker = corpus_navigation_cases(&fixture_base)
+            .into_iter()
+            .find(|case| case.name == "corpus-navigation-features-custom_metadata")
+            .expect("navigation corpus factory should include custom_metadata blocker");
+        let cases = vec![
+            sample_case(
+                "supported-layout",
+                "minimal_article.tex",
+                BenchProfile::CorpusCompat,
+                1,
+            ),
+            bibliography_blocker,
+            navigation_blocker,
+        ];
+        let backend = MockCompileBackend::with_outputs(vec![
+            Ok(output(4, b"supported-should-not-run")),
+            Ok(output(5, b"blocked-should-not-run")),
+            Ok(output(6, b"blocked-should-not-run")),
+        ]);
+        let harness = BenchHarness::new(
+            cases.clone(),
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(backend.clone());
+
+        let report = harness.run();
+
+        assert_eq!(backend.call_count(), 0);
+        assert!(report.results.is_empty());
+        assert!(report.comparisons.is_empty());
+        assert_eq!(report.failures.len(), 2);
+        let summary = report.summary();
+        assert!(summary.contains("preflight blocked for corpus-bibliography-multi_cite"));
+        assert!(
+            summary.contains("preflight blocked for corpus-navigation-features-custom_metadata")
+        );
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            BenchFailure::PreflightBlocked { case_name, message }
+                if case_name == "corpus-bibliography-multi_cite"
+                    && message.contains("known unsupported/preflight blocker")
+                    && message.contains("bibliography multi_cite")
+        )));
+        assert!(report.failures.iter().any(|failure| matches!(
+            failure,
+            BenchFailure::PreflightBlocked { case_name, message }
+                if case_name == "corpus-navigation-features-custom_metadata"
+                    && message.contains("known unsupported/preflight blocker")
+                    && message.contains("navigation custom_metadata")
+        )));
     }
 
     #[test]
