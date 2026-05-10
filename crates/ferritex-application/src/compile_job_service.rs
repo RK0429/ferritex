@@ -1209,7 +1209,7 @@ impl<'a> CompileJobService<'a> {
                     );
                 }
                 let diagnostics = cached_artifact.stable_compile_state.diagnostics.clone();
-                if has_error_diagnostics(&diagnostics) {
+                if has_blocking_error_diagnostics(&diagnostics) {
                     let mut diagnostics = diagnostics;
                     remove_failed_compile_artifacts(
                         &cached_artifact.output_pdf,
@@ -1900,7 +1900,7 @@ impl<'a> CompileJobService<'a> {
                 elapsed: compile_start.elapsed(),
             };
         }
-        if has_error_diagnostics(&diagnostics) {
+        if has_blocking_error_diagnostics(&diagnostics) {
             remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
@@ -6386,10 +6386,17 @@ fn is_fatal_parse_error(error: &ParseError) -> bool {
     matches!(error, ParseError::ShellEscapeError { .. })
 }
 
-fn has_error_diagnostics(diagnostics: &[Diagnostic]) -> bool {
-    diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == Severity::Error)
+fn has_blocking_error_diagnostics(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == Severity::Error && !is_recoverable_font_fallback(diagnostic)
+    })
+}
+
+fn is_recoverable_font_fallback(diagnostic: &Diagnostic) -> bool {
+    diagnostic
+        .suggestion
+        .as_deref()
+        .is_some_and(|suggestion| suggestion.contains("will fall back"))
 }
 
 fn remove_failed_compile_artifacts(
