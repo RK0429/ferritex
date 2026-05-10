@@ -51,6 +51,9 @@ bash scripts/build_bundle_archive.sh tmp/FTX-ASSET-BUNDLE-001.tar.gz
 # Compile with the asset bundle (recommended)
 cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUNDLE-001
 
+# Emit machine-readable compile results for automation
+cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUNDLE-001 --format json
+
 # Omitting --asset-bundle is supported for development, but ferritex will warn
 # that it is using built-in/host asset fallback and output may differ from the
 # release asset bundle path.
@@ -66,6 +69,10 @@ cargo run --release -- compile hello.tex --synctex
 warning-only diagnostics, and 2 for fatal diagnostics. Unsupported Unicode code
 points such as CJK characters currently emit a fatal diagnostic that identifies
 the unsupported character and exits with code 2.
+
+The `compile --format json` output is the compile result JSON for a single
+document compile. It is separate from the `perf-evidence` JSON artifact
+described below, which records bounded performance evidence.
 
 ### 4. Other subcommands
 
