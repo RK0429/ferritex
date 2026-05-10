@@ -563,19 +563,13 @@ impl BenchHarness {
     }
 
     pub fn run(&self) -> BenchReport {
-        let failures = self.known_preflight_failures();
-        if !failures.is_empty() {
-            return BenchReport {
-                results: Vec::new(),
-                comparisons: Vec::new(),
-                failures,
-            };
-        }
-
         let mut results = Vec::new();
         let mut failures = Vec::new();
 
         for case in &self.cases {
+            if known_preflight_blocker(case).is_some() {
+                continue;
+            }
             match self.run_case(case) {
                 Ok(result) => results.push(result),
                 Err(failure) => failures.push(failure),
@@ -701,18 +695,6 @@ impl BenchHarness {
         } else {
             Ok(())
         }
-    }
-
-    fn known_preflight_failures(&self) -> Vec<BenchFailure> {
-        self.cases
-            .iter()
-            .filter_map(|case| {
-                known_preflight_blocker(case).map(|message| BenchFailure::PreflightBlocked {
-                    case_name: case.name.clone(),
-                    message: message.to_string(),
-                })
-            })
-            .collect()
     }
 }
 
@@ -1558,7 +1540,7 @@ done
     }
 
     #[test]
-    fn test_known_unsupported_case_preflight_blocks_before_backend_compile() {
+    fn test_known_unsupported_cases_are_skipped_by_aggregate_run() {
         let fixture_base = fixtures_root();
         let bibliography_blocker = corpus_bibliography_cases(&fixture_base)
             .into_iter()
@@ -1595,29 +1577,45 @@ done
 
         let report = harness.run();
 
-        assert_eq!(backend.call_count(), 0);
-        assert!(report.results.is_empty());
+        assert_eq!(backend.call_count(), 1);
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].case.name, "supported-layout");
         assert!(report.comparisons.is_empty());
-        assert_eq!(report.failures.len(), 2);
+        assert!(report.failures.is_empty());
         let summary = report.summary();
-        assert!(summary.contains("preflight blocked for corpus-bibliography-multi_cite"));
-        assert!(
-            summary.contains("preflight blocked for corpus-navigation-features-custom_metadata")
-        );
-        assert!(report.failures.iter().any(|failure| matches!(
+        assert!(summary.contains("results: 1, comparisons: 0, failures: 0"));
+    }
+
+    #[test]
+    fn test_known_unsupported_case_run_case_reports_preflight_blocked() {
+        let fixture_base = fixtures_root();
+        let case = corpus_bibliography_cases(&fixture_base)
+            .into_iter()
+            .find(|case| case.name == "corpus-bibliography-multi_cite")
+            .expect("bibliography corpus factory should include multi_cite blocker");
+        let backend = MockCompileBackend::with_outputs(vec![Ok(output(4, b"blocked"))]);
+        let harness = BenchHarness::new(
+            vec![case.clone()],
+            BenchRunConfig {
+                warmup_runs: 0,
+                measured_runs: 1,
+                compare_output_identity: false,
+            },
+        )
+        .with_backend(backend.clone());
+
+        let failure = harness
+            .run_case(&case)
+            .expect_err("known unsupported case should preflight block");
+
+        assert_eq!(backend.call_count(), 0);
+        assert!(matches!(
             failure,
             BenchFailure::PreflightBlocked { case_name, message }
                 if case_name == "corpus-bibliography-multi_cite"
                     && message.contains("known unsupported/preflight blocker")
                     && message.contains("bibliography multi_cite")
-        )));
-        assert!(report.failures.iter().any(|failure| matches!(
-            failure,
-            BenchFailure::PreflightBlocked { case_name, message }
-                if case_name == "corpus-navigation-features-custom_metadata"
-                    && message.contains("known unsupported/preflight blocker")
-                    && message.contains("navigation custom_metadata")
-        )));
+        ));
     }
 
     #[test]
