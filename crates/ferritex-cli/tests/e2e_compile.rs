@@ -4371,6 +4371,76 @@ fn preview_reuses_successful_initial_compile_when_starting_watch_loop() {
 }
 
 #[test]
+fn preview_bootstrap_format_json_emits_stable_manifest() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("hello.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args([
+            "preview",
+            "--bootstrap-format",
+            "json",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex preview");
+    let (stderr_buf, stderr_handle) =
+        spawn_streaming_collector(child.stderr.take().expect("captured stderr"));
+
+    let stdout = child.stdout.take().expect("preview stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut manifest_line = String::new();
+    stdout
+        .read_line(&mut manifest_line)
+        .expect("read preview bootstrap manifest");
+    let manifest: Value =
+        serde_json::from_str(manifest_line.trim()).expect("parse preview bootstrap manifest");
+
+    assert_eq!(manifest["schemaVersion"], "ferritex.previewBootstrap.v1");
+    assert_eq!(manifest["command"], "preview");
+    assert_eq!(manifest["sessionId"], "preview-session-1");
+    assert_eq!(
+        manifest["target"]["inputFile"],
+        tex_file.to_string_lossy().as_ref()
+    );
+    assert_eq!(manifest["target"]["jobname"], Value::Null);
+    assert_eq!(manifest["output"]["pageCount"], 1);
+    assert_eq!(manifest["summary"]["cache"]["status"], "miss");
+
+    let document_url = manifest["urls"]["document"]
+        .as_str()
+        .expect("manifest document URL");
+    let events_url = manifest["urls"]["events"]
+        .as_str()
+        .expect("manifest events URL");
+    assert!(document_url.starts_with("http://127.0.0.1:"));
+    assert!(events_url.starts_with("ws://127.0.0.1:"));
+    assert!(document_url.ends_with("/document"));
+    assert!(events_url.ends_with("/events"));
+    assert!(manifest["output"]["pdfPath"]
+        .as_str()
+        .expect("manifest PDF path")
+        .ends_with("hello.pdf"));
+
+    wait_until(
+        || buffer_contains(&stderr_buf, "tracking 1 file"),
+        Duration::from_secs(5),
+        "preview should enter the watch loop after emitting bootstrap JSON",
+    );
+
+    child.kill().expect("kill preview process");
+    child.wait().expect("wait for preview process");
+    stderr_handle.join().expect("join stderr collector");
+}
+
+#[test]
 fn watch_refreshes_dependency_set_after_new_input_is_added() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
@@ -6173,9 +6243,10 @@ fn preview_help_documents_compile_side_effects_and_loopback_scope() {
         "preview help should document external network behavior, got: {stdout}"
     );
     assert!(
-        stdout.contains("human-readable only")
-            && stdout.contains("does not emit a stable JSON or NDJSON event stream"),
-        "preview help should document that continuous output is not machine-readable, got: {stdout}"
+        stdout.contains("human-readable by default")
+            && stdout.contains("Pass --bootstrap-format json")
+            && stdout.contains("does not emit a stable continuous JSON or NDJSON event stream"),
+        "preview help should document bootstrap JSON and continuous output limits, got: {stdout}"
     );
 }
 

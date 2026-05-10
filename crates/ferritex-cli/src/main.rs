@@ -16,8 +16,8 @@ use ferritex_application::ports::{
     PreviewTransportPort, TransportRevisionEvent, TransportViewStateUpdate,
 };
 use ferritex_application::preview_session_service::{
-    PreviewSessionService, PreviewTarget, PreviewViewState, PublishDecision, SessionErrorResponse,
-    SessionId,
+    PreviewSessionService, PreviewTarget, PreviewViewState, PublishDecision,
+    SessionBootstrapPayload, SessionErrorResponse, SessionId,
 };
 use ferritex_application::runtime_options::{
     CompileArgs, CompileInteraction, InteractionMode, RuntimeOptions,
@@ -60,10 +60,10 @@ Side effects: writes generated artifacts to --output-dir, or to the input file's
 
 Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile. After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session. Preview binds a loopback-only listener on 127.0.0.1 and does not publish to external network interfaces.
 
-Output: preview status logs are human-readable only. The command does not emit a stable JSON or NDJSON event stream.",
+Output: preview status logs are human-readable by default. Pass --bootstrap-format json to emit the initial document URL, events URL, session ID, and compile summary as a stable JSON manifest. The command does not emit a stable continuous JSON or NDJSON event stream.",
         after_help = "Examples:\n  ferritex preview document.tex"
     )]
-    Preview(SharedCompileCommand),
+    Preview(PreviewCommand),
     /// Watch for changes and recompile automatically
     #[command(long_about = "Watch for changes and recompile automatically.
 
@@ -152,6 +152,15 @@ struct SharedCompileCommand {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct PreviewCommand {
+    #[command(flatten)]
+    compile: SharedCompileCommand,
+    /// Output format for the initial preview bootstrap surface
+    #[arg(long = "bootstrap-format", value_enum, default_value_t = PreviewBootstrapFormat::Text)]
+    bootstrap_format: PreviewBootstrapFormat,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
 struct WatchCommand {
     #[command(flatten)]
     compile: SharedCompileCommand,
@@ -187,6 +196,12 @@ enum InteractionArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum CompileOutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum PreviewBootstrapFormat {
     Text,
     Json,
 }
@@ -772,6 +787,39 @@ fn print_preview_initial_compile_success_summary(
     );
 }
 
+fn print_preview_bootstrap_manifest(
+    command: &SharedCompileCommand,
+    result: &CompileResult,
+    bootstrap: &SessionBootstrapPayload,
+) {
+    let page_count = result
+        .stable_compile_state
+        .as_ref()
+        .map_or(0, |state| state.page_count);
+    let payload = serde_json::json!({
+        "schemaVersion": "ferritex.previewBootstrap.v1",
+        "command": "preview",
+        "sessionId": bootstrap.session_id.to_string(),
+        "urls": {
+            "document": bootstrap.document_url,
+            "events": bootstrap.events_url,
+        },
+        "target": {
+            "inputFile": command.file.to_string_lossy().into_owned(),
+            "jobname": command.jobname.clone(),
+        },
+        "output": {
+            "pdfPath": result.output_pdf.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            "pageCount": page_count,
+        },
+        "summary": compile_result_summary_json(result),
+    });
+
+    let mut stdout = io::stdout().lock();
+    let _ = serde_json::to_writer(&mut stdout, &payload);
+    let _ = writeln!(stdout);
+}
+
 fn handle_watch(command: &WatchCommand) -> i32 {
     eprintln!("watching {}", command.compile.file.display());
     eprintln!("press Ctrl+C to stop");
@@ -781,8 +829,9 @@ fn handle_watch(command: &WatchCommand) -> i32 {
     })
 }
 
-fn handle_preview(command: &SharedCompileCommand) -> i32 {
-    let options = runtime_options_from_command(command);
+fn handle_preview(command: &PreviewCommand) -> i32 {
+    let compile_command = &command.compile;
+    let options = runtime_options_from_command(compile_command);
     let policy = ExecutionPolicyFactory::create(&options);
     let Some(_preview_policy) = &policy.preview_publication else {
         let diagnostics = vec![Diagnostic::new(
@@ -900,9 +949,16 @@ fn handle_preview(command: &SharedCompileCommand) -> i32 {
                 }
             };
 
-            println!("{}", bootstrap.document_url);
-            println!("{}", bootstrap.events_url);
-            print_preview_initial_compile_success_summary(command, result);
+            match command.bootstrap_format {
+                PreviewBootstrapFormat::Text => {
+                    println!("{}", bootstrap.document_url);
+                    println!("{}", bootstrap.events_url);
+                    print_preview_initial_compile_success_summary(compile_command, result);
+                }
+                PreviewBootstrapFormat::Json => {
+                    print_preview_bootstrap_manifest(compile_command, result, &bootstrap);
+                }
+            }
 
             let svc = Arc::clone(&callback_service);
             callback_transport.set_view_state_handler(Arc::new(move |session_id, update| {
@@ -985,7 +1041,7 @@ fn handle_preview(command: &SharedCompileCommand) -> i32 {
     }
 
     let watch_command = WatchCommand {
-        compile: command.clone(),
+        compile: compile_command.clone(),
         verbose: false,
     };
     watch_runner::run_watch_loop_after_initial_compile(&watch_command, initial_result, on_compile)
@@ -1253,7 +1309,7 @@ mod tests {
     use super::{
         emit_diagnostics_to, execute_preview, format_view_state_diagnostic,
         runtime_options_from_command, Cli, Commands, CompileOutputFormat, InteractionArg,
-        SharedCompileCommand,
+        PreviewBootstrapFormat, SharedCompileCommand,
     };
     use clap::Parser;
     use ferritex_application::ports::TransportViewStateUpdate;
@@ -1413,9 +1469,29 @@ mod tests {
             panic!("expected preview subcommand");
         };
 
-        assert_eq!(command.file, PathBuf::from("notes.tex"));
-        assert_eq!(command.output_dir, Some(PathBuf::from("out")));
-        assert_eq!(command.jobs, NonZeroUsize::new(2));
+        assert_eq!(command.compile.file, PathBuf::from("notes.tex"));
+        assert_eq!(command.compile.output_dir, Some(PathBuf::from("out")));
+        assert_eq!(command.compile.jobs, NonZeroUsize::new(2));
+        assert_eq!(command.bootstrap_format, PreviewBootstrapFormat::Text);
+    }
+
+    #[test]
+    fn preview_accepts_bootstrap_json_format() {
+        let cli = Cli::try_parse_from([
+            "ferritex",
+            "preview",
+            "--bootstrap-format",
+            "json",
+            "notes.tex",
+        ])
+        .expect("parse CLI");
+
+        let Commands::Preview(command) = cli.command else {
+            panic!("expected preview subcommand");
+        };
+
+        assert_eq!(command.compile.file, PathBuf::from("notes.tex"));
+        assert_eq!(command.bootstrap_format, PreviewBootstrapFormat::Json);
     }
 
     #[test]
