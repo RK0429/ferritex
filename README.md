@@ -108,11 +108,16 @@ Minimal `publishDiagnostics` notification payload:
     "diagnostics": [
       {
         "range": {
-          "start": { "line": 0, "character": 0 },
-          "end": { "line": 0, "character": 5 }
+          "start": { "line": 2, "character": 0 },
+          "end": { "line": 2, "character": 16 }
         },
         "severity": 1,
-        "message": "Undefined control sequence"
+        "source": "ferritex",
+        "message": "unclosed environment `equation`",
+        "data": {
+          "context": "\\begin{equation}",
+          "suggestion": "insert \\end{equation} before the document ends"
+        }
       }
     ]
   }
