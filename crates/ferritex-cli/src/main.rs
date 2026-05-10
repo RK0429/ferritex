@@ -339,6 +339,7 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
             }
         };
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let compile_result = parse_compile_result_stdout(&output.stdout);
 
         if run_kind == "measured" {
             measured_runs.push(serde_json::json!({
@@ -352,6 +353,7 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
                     "binary": binary_path.clone(),
                     "args": child_args.clone(),
                 },
+                "compile_result": compile_result.clone(),
                 "stdout": bounded_utf8(&output.stdout, PERF_EVIDENCE_STDIO_LIMIT),
                 "stderr": bounded_utf8(&output.stderr, PERF_EVIDENCE_STDIO_LIMIT),
             }));
@@ -365,6 +367,7 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
                     "binary": binary_path.clone(),
                     "args": child_args.clone(),
                 },
+                "compile_result": compile_result,
                 "stdout": bounded_utf8(&output.stdout, PERF_EVIDENCE_STDIO_LIMIT),
                 "stderr": bounded_utf8(&output.stderr, PERF_EVIDENCE_STDIO_LIMIT),
             }));
@@ -466,6 +469,11 @@ fn bounded_utf8(bytes: &[u8], limit: usize) -> String {
         }
         format!("{}...[truncated]", &text[..end])
     }
+}
+
+fn parse_compile_result_stdout(bytes: &[u8]) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    (value["schemaVersion"].as_str() == Some("ferritex.compileResult.v1")).then_some(value)
 }
 
 fn median_f64(values: &[f64]) -> Option<f64> {
