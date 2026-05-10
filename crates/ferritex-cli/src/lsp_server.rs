@@ -22,6 +22,9 @@ use serde_json::{json, Value};
 use crate::emit_diagnostic;
 
 const MAX_LSP_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_LSP_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_LSP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_LSP_HEADER_COUNT: usize = 100;
 const LSP_DIAGNOSTIC_MODE: InteractionMode = InteractionMode::Nonstopmode;
 
 pub fn run_lsp() -> i32 {
@@ -640,18 +643,44 @@ fn severity_to_lsp(severity: Severity) -> u8 {
     }
 }
 
-fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
+fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
     let mut content_length = None;
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
 
     loop {
         let mut header = String::new();
-        let bytes = reader.read_line(&mut header)?;
+        let bytes = {
+            let mut limited_reader =
+                std::io::Read::take(&mut *reader, MAX_LSP_HEADER_LINE_BYTES as u64);
+            limited_reader.read_line(&mut header)?
+        };
         if bytes == 0 {
             return Ok(None);
+        }
+        if bytes == MAX_LSP_HEADER_LINE_BYTES && !header.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("LSP header line exceeds limit {MAX_LSP_HEADER_LINE_BYTES}"),
+            ));
+        }
+        header_bytes += bytes;
+        if header_bytes > MAX_LSP_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("LSP headers exceed limit {MAX_LSP_HEADER_BYTES}"),
+            ));
         }
 
         if header == "\r\n" {
             break;
+        }
+        header_count += 1;
+        if header_count > MAX_LSP_HEADER_COUNT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("LSP header count exceeds limit {MAX_LSP_HEADER_COUNT}"),
+            ));
         }
 
         if let Some(value) = header.strip_prefix("Content-Length:") {
@@ -724,4 +753,61 @@ fn write_message(writer: &mut impl Write, value: &Value) -> io::Result<()> {
     write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
     writer.write_all(&body)?;
     writer.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::{
+        read_message, MAX_LSP_HEADER_BYTES, MAX_LSP_HEADER_COUNT, MAX_LSP_HEADER_LINE_BYTES,
+    };
+
+    #[test]
+    fn read_message_accepts_max_header_count() {
+        let mut input = String::from("Content-Length: 2\r\n");
+        for index in 0..(MAX_LSP_HEADER_COUNT - 1) {
+            input.push_str(&format!("X-Ferritex-Test-{index}: ok\r\n"));
+        }
+        input.push_str("\r\n{}");
+        let mut reader = Cursor::new(input.into_bytes());
+
+        let message = read_message(&mut reader)
+            .expect("read message")
+            .expect("message");
+
+        assert_eq!(message, serde_json::json!({}));
+    }
+
+    #[test]
+    fn read_message_rejects_header_count_over_limit() {
+        let mut input = String::from("Content-Length: 2\r\n");
+        for index in 0..MAX_LSP_HEADER_COUNT {
+            input.push_str(&format!("X-Ferritex-Test-{index}: ok\r\n"));
+        }
+        input.push_str("\r\n{}");
+        let mut reader = Cursor::new(input.into_bytes());
+
+        let error = read_message(&mut reader).expect_err("header count should fail");
+
+        assert!(error.to_string().contains("header count exceeds limit"));
+    }
+
+    #[test]
+    fn read_message_rejects_total_header_bytes_over_limit() {
+        let mut input = String::from("Content-Length: 2\r\n");
+        for index in 0..90 {
+            input.push_str(&format!(
+                "X-Ferritex-Test-{index}: {}\r\n",
+                "a".repeat(MAX_LSP_HEADER_LINE_BYTES / 10)
+            ));
+        }
+        input.push_str("\r\n{}");
+        assert!(input.len() > MAX_LSP_HEADER_BYTES);
+        let mut reader = Cursor::new(input.into_bytes());
+
+        let error = read_message(&mut reader).expect_err("header bytes should fail");
+
+        assert!(error.to_string().contains("headers exceed limit"));
+    }
 }
