@@ -172,23 +172,32 @@ fn open_preview_events_websocket(host: &str, port: u16, path: &str) -> TcpStream
     )
     .expect("write preview events websocket handshake");
 
-    let mut response = Vec::new();
-    let mut chunk = [0; 1024];
-    loop {
-        let read = stream
-            .read(&mut chunk)
-            .expect("read preview events websocket handshake");
-        response.extend_from_slice(&chunk[..read]);
-        if response.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
+    let response = read_preview_events_websocket_handshake(&mut stream);
     assert!(
         response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"),
         "preview events websocket handshake failed: {}",
         String::from_utf8_lossy(&response)
     );
     stream
+}
+
+fn read_preview_events_websocket_handshake(reader: &mut impl Read) -> Vec<u8> {
+    let mut response = Vec::new();
+    let mut byte = [0; 1];
+    loop {
+        let read = reader
+            .read(&mut byte)
+            .expect("read preview events websocket handshake");
+        assert!(
+            read != 0,
+            "preview events websocket handshake ended before headers completed: {}",
+            String::from_utf8_lossy(&response)
+        );
+        response.push(byte[0]);
+        if response.ends_with(b"\r\n\r\n") {
+            return response;
+        }
+    }
 }
 
 fn read_preview_revision_event(stream: &mut TcpStream) -> Value {
@@ -219,6 +228,26 @@ fn read_preview_revision_event(stream: &mut TcpStream) -> Value {
         .read_exact(&mut payload)
         .expect("read preview events payload");
     serde_json::from_slice(&payload).expect("parse preview revision event")
+}
+
+#[test]
+fn preview_events_websocket_handshake_reader_preserves_first_frame() {
+    let response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\x81\x02{}";
+    let mut cursor = std::io::Cursor::new(response);
+
+    let handshake = read_preview_events_websocket_handshake(&mut cursor);
+
+    assert_eq!(
+        handshake,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
+    );
+    assert_eq!(cursor.position() as usize, handshake.len());
+
+    let mut frame_head = [0u8; 2];
+    cursor
+        .read_exact(&mut frame_head)
+        .expect("read preserved frame head");
+    assert_eq!(frame_head, [0x81, 0x02]);
 }
 
 fn http_response_body(response: &[u8]) -> &[u8] {
