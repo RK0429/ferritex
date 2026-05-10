@@ -387,6 +387,53 @@ fn partition_bench_appendix_chapters_output_identity_across_jobs_1_and_jobs_4() 
     );
 }
 
+#[test]
+fn partition_bench_multicol_article_output_identity_across_jobs_1_and_jobs_4() {
+    let bench_fixtures = bench_fixtures_root();
+    let input_fixture = bench_fixtures
+        .join("corpus")
+        .join("partition-article")
+        .join("multicol_article.tex");
+    let cases = [1, 4]
+        .into_iter()
+        .map(|jobs| BenchCase {
+            name: format!("partition-partition-article-multicol_article-jobs{jobs}"),
+            profile: BenchProfile::PartitionBench,
+            input_fixture: input_fixture.clone(),
+            asset_bundle: None,
+            jobs,
+            reproducible: false,
+            no_cache: false,
+        })
+        .collect::<Vec<_>>();
+
+    let backend = CliCompileBackend::new(ferritex_bin());
+    let harness = BenchHarness::new(
+        cases,
+        BenchRunConfig {
+            warmup_runs: 0,
+            measured_runs: 1,
+            compare_output_identity: true,
+        },
+    )
+    .with_backend(backend);
+
+    let report = harness.run();
+
+    assert!(
+        report.failures.is_empty(),
+        "multicol_article partition bench compilation failed: {:?}",
+        report.failures
+    );
+    assert_eq!(report.results.len(), 2);
+    assert_eq!(report.results[0].case.jobs, 1);
+    assert_eq!(report.results[1].case.jobs, 4);
+    assert_eq!(
+        report.results[0].timings[0].output_hash, report.results[1].timings[0].output_hash,
+        "multicol_article partition bench output should be identical across jobs=1 and jobs=4"
+    );
+}
+
 /// FTX-PARTITION-BENCH-001 canonical strict multi-second speedup assertion for
 /// REQ-FUNC-032 using the `heavy_` partition corpus.
 ///
