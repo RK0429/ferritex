@@ -32,7 +32,7 @@ cargo build --release
 
 Ferritex uses a pre-indexed asset bundle (`FTX-ASSET-BUNDLE-001`) for class, package, and font assets instead of depending on a TeX Live installation at runtime.
 
-For normal use, download the official `FTX-ASSET-BUNDLE-001.tar.gz` archive published for the Ferritex build you are running, then extract it:
+For normal use, download the official `FTX-ASSET-BUNDLE-001.tar.gz` archive from the GitHub Actions `Bundle CI` artifact named `ferritex-bundle-archive` for the Ferritex commit/build you are running, then extract it:
 
 ```sh
 mkdir -p tmp/bundle
@@ -49,7 +49,11 @@ bash scripts/build_bundle_archive.sh tmp/FTX-ASSET-BUNDLE-001.tar.gz
 
 ```sh
 # Compile with the asset bundle (recommended)
-cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUNDLE-001
+cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUNDLE-001 --output-dir artifacts/hello
+
+# The command above writes generated PDFs, cache files, and sidecars under
+# artifacts/hello. If --output-dir is omitted, outputs are written next to the
+# input file.
 
 # Emit machine-readable compile results for automation
 cargo run --release -- compile hello.tex --asset-bundle tmp/bundle/FTX-ASSET-BUNDLE-001 --format json
