@@ -123,7 +123,7 @@ Minimal `publishDiagnostics` notification payload:
 
 | Crate | Role |
 |---|---|
-| `ferritex-cli` | CLI binary (`compile` / `watch` / `preview` / `lsp` subcommands) |
+| `ferritex-cli` | CLI binary (`compile` / `watch` / `preview` / `lsp` / `perf-evidence` subcommands) |
 | `ferritex-application` | Application services for compile/watch/lsp/preview orchestration, runtime options, scheduler, diagnostics/snapshot services |
 | `ferritex-core` | Domain modules and shared model for parser, typesetting, PDF, policy, compilation, diagnostics, kernel utilities |
 | `ferritex-infra` | OS/FS/network adapters (file access gate, shell command gateway, asset bundle loader, loopback preview transport, polling watcher) |
