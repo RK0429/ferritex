@@ -724,6 +724,53 @@ fn compile_format_json_emits_machine_readable_success_result() {
 }
 
 #[test]
+fn compile_format_json_reports_warning_diagnostics_with_exit_code_0() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("warn_json.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\usepackage{definitelyunknownpkg}\n\\begin{document}\nHello.\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            tex_file.to_str().expect("utf-8 path"),
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "warning-only json compile should exit with code 0"
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("parse json stdout");
+    assert_eq!(value["schemaVersion"], "ferritex.compileResult.v1");
+    assert_eq!(value["command"], "compile");
+    assert_eq!(value["classification"], "warning");
+    assert_eq!(value["exitCode"], 0);
+    assert_eq!(value["success"], true);
+    assert!(value["output"]["pdfPath"]
+        .as_str()
+        .expect("pdf path")
+        .ends_with("warn_json.pdf"));
+    let diagnostics = value["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic["severity"] == "Warning"
+                && diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("definitelyunknownpkg"))
+        }),
+        "json diagnostics should include the package warning, got: {diagnostics:?}"
+    );
+}
+
+#[test]
 fn compile_format_json_with_synctex_reports_sidecar_path() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let output_dir = dir.path().join("out");
