@@ -444,8 +444,11 @@ fn partition_bench_multicol_article_output_identity_across_jobs_1_and_jobs_4() {
 /// It uses `--reproducible` to reduce metadata jitter, prints per-case
 /// evidence, and hard-fails unless every heavy case preserves output identity
 /// while still achieving a measurable speedup for both the book and article
-/// partition corpora.
+/// partition corpora. It is ignored by default because the strict no-cache
+/// multi-run proof is intentionally long-running; use `--ignored` when
+/// recording explicit REQ-FUNC-032 evidence.
 #[test]
+#[ignore = "REQ-FUNC-032 strict no-cache multi-second speedup proof; run explicitly via --ignored"]
 fn partition_bench_multisecond_speedup_evidence() {
     let has_benchmark_precondition =
         std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4);
