@@ -6649,6 +6649,7 @@ fn expand_inputs(
                                 source_path,
                                 command.line,
                                 &command.value,
+                                &resolved,
                             )
                         })?;
                     merge_loaded_subtree(source_files, labels, citations, &nested);
@@ -6711,6 +6712,7 @@ fn expand_inputs(
                                 source_path,
                                 command.line,
                                 &command.value,
+                                &resolved,
                             )
                         })?;
                     merge_loaded_subtree(source_files, labels, citations, &nested);
@@ -6770,6 +6772,7 @@ fn expand_inputs(
                                     source_path,
                                     command.line,
                                     &command.value,
+                                    &resolved,
                                 )
                             })?;
                         merge_loaded_subtree(source_files, labels, citations, &nested);
@@ -8458,14 +8461,23 @@ fn diagnostic_for_nested_input_error(
     source_path: &Path,
     line: u32,
     input_value: &str,
+    resolved_path: &Path,
 ) -> Diagnostic {
     let detail = match diagnostic.file {
         Some(file) => format!("{} ({file})", diagnostic.message),
         None => diagnostic.message,
     };
+    let target = if Path::new(input_value) == resolved_path {
+        format!("`{input_value}`")
+    } else {
+        format!(
+            "`{input_value}` resolved as `{}`",
+            resolved_path.to_string_lossy()
+        )
+    };
     Diagnostic::new(
         Severity::Error,
-        format!("failed to resolve \\input/\\include target `{input_value}`"),
+        format!("failed to resolve \\input/\\include target {target}"),
     )
     .with_file(source_path.to_string_lossy().into_owned())
     .with_line(line)
@@ -15065,6 +15077,39 @@ mod tests {
         let context = diagnostic.context.as_deref().expect("nested input context");
         assert!(context.contains("input file access denied"));
         assert!(context.contains(denied_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn absolute_input_access_denied_diagnostic_shows_resolved_target() {
+        let dir = tempdir().expect("create tempdir");
+        let src = dir.path().join("src");
+        let out = dir.path().join("out");
+        fs::create_dir_all(&src).expect("create src");
+        fs::write(src.join("main.tex"), document("\\input{/etc/passwd}")).expect("write main");
+
+        let gate = ScopedFsFileAccessGate {
+            allowed_read_root: src.clone(),
+            allowed_write_root: out.clone(),
+        };
+        let loader = MockAssetBundleLoader::valid();
+        let options = runtime_options(src.join("main.tex"), out);
+
+        let result = service(&gate, &loader).compile(&options);
+
+        assert_eq!(result.exit_code, 2);
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("\\input/\\include target"))
+            .expect("absolute input diagnostic");
+        assert!(diagnostic
+            .message
+            .contains("target `/etc/passwd` resolved as `/etc/passwd.tex`"));
+        let context = diagnostic
+            .context
+            .as_deref()
+            .expect("absolute input context");
+        assert_eq!(context, "input file access denied (/etc/passwd.tex)");
     }
 
     #[test]
