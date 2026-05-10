@@ -176,7 +176,7 @@ The test is gated with `#[ignore]` so the default `cargo test` run stays fast; i
 
 Formal verification (proptest, miri, etc.) is not required by the current requirements and is out of scope.
 
-See `docs/planning_report.md` for the full implementation history and `tmp/ferritex-completion-audit.md` for the detailed audit.
+See `docs/planning_report.md` for the full implementation history and detailed audit.
 
 ## Testing
 
