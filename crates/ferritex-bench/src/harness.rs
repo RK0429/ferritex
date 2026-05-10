@@ -710,6 +710,10 @@ fn known_preflight_blocker(case: &BenchCase) -> Option<&'static str> {
     }
 }
 
+pub fn is_known_preflight_blocker_case(case: &BenchCase) -> bool {
+    known_preflight_blocker(case).is_some()
+}
+
 fn classify_compile_failure(case_name: &str, message: String) -> BenchFailure {
     if is_environment_blocked_message(&message) {
         BenchFailure::EnvironmentBlocked {
@@ -958,9 +962,9 @@ mod tests {
         corpus_embedded_assets_cases, corpus_navigation_cases, corpus_partition_article_cases,
         corpus_partition_book_cases, corpus_partition_book_parity_cases,
         corpus_tikz_basic_shapes_cases, corpus_tikz_nested_cases, full_bench_cases,
-        full_bench_strict_cases, stress_bench_cases, BenchCase, BenchComparison, BenchFailure,
-        BenchHarness, BenchProfile, BenchResult, BenchRunConfig, BenchTiming, CliCompileBackend,
-        CompileBackend, CompileOutput,
+        full_bench_strict_cases, is_known_preflight_blocker_case, stress_bench_cases, BenchCase,
+        BenchComparison, BenchFailure, BenchHarness, BenchProfile, BenchResult, BenchRunConfig,
+        BenchTiming, CliCompileBackend, CompileBackend, CompileOutput,
     };
 
     const EXPECTED_BUNDLE_TFM: [u8; 64] = [
@@ -1580,6 +1584,18 @@ done
         assert_eq!(backend.call_count(), 1);
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].case.name, "supported-layout");
+        let skipped = cases
+            .iter()
+            .filter(|case| is_known_preflight_blocker_case(case))
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            skipped,
+            vec![
+                "corpus-bibliography-multi_cite",
+                "corpus-navigation-features-custom_metadata"
+            ]
+        );
         assert!(report.comparisons.is_empty());
         assert!(report.failures.is_empty());
         let summary = report.summary();
@@ -2249,10 +2265,23 @@ done
             "navigation parity compilation failed: {:?}",
             report.failures
         );
-        assert_eq!(report.results.len(), cases.len());
+        let supported_cases = cases
+            .iter()
+            .filter(|case| !is_known_preflight_blocker_case(case))
+            .collect::<Vec<_>>();
+        let skipped_cases = cases
+            .iter()
+            .filter(|case| is_known_preflight_blocker_case(case))
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            skipped_cases,
+            vec!["corpus-navigation-features-custom_metadata"]
+        );
+        assert_eq!(report.results.len(), supported_cases.len());
 
-        let mut results = Vec::with_capacity(cases.len());
-        for case in &cases {
+        let mut results = Vec::with_capacity(supported_cases.len());
+        for case in &supported_cases {
             let document_name = case
                 .input_fixture
                 .file_stem()
@@ -2307,7 +2336,7 @@ done
             .filter(|result| result.error.is_some())
             .count();
 
-        assert_eq!(results.len(), base_cases.len());
+        assert_eq!(results.len(), supported_cases.len());
         assert!(summary.contains("REQ-NF-007 Navigation Parity Summary"));
         assert!(summary.contains("Document"));
         assert!(
@@ -2382,10 +2411,14 @@ done
             "bibliography parity compilation failed: {:?}",
             report.failures
         );
-        assert_eq!(report.results.len(), cases.len());
+        let supported_cases = cases
+            .iter()
+            .filter(|case| !is_known_preflight_blocker_case(case))
+            .collect::<Vec<_>>();
+        assert_eq!(report.results.len(), supported_cases.len());
 
-        let mut results = Vec::with_capacity(cases.len());
-        for case in &cases {
+        let mut results = Vec::with_capacity(supported_cases.len());
+        for case in &supported_cases {
             let document_name = case
                 .input_fixture
                 .file_stem()
@@ -2440,7 +2473,7 @@ done
             .filter(|result| result.error.is_some())
             .count();
 
-        assert_eq!(results.len(), base_cases.len());
+        assert_eq!(results.len(), supported_cases.len());
         assert!(summary.contains("REQ-NF-007 Bibliography Parity Summary"));
         assert!(summary.contains("Document"));
         assert!(
