@@ -967,6 +967,11 @@ fn compile_format_json_includes_diagnostics_for_failure_result() {
         }),
         "json diagnostics should include the undefined command error, got: {diagnostics:?}"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "json format keeps the human diagnostic channel silent while stdout carries the machine-readable failure contract, got: {stderr}"
+    );
 }
 
 #[test]
