@@ -1,8 +1,10 @@
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::json;
@@ -13,6 +15,8 @@ const BUILTIN_BASIC_BUNDLED_TEX: &str = "Bundled from built-in asset bundle.\n";
 const BUILTIN_BASIC_ASSET_INDEX_PATH: &str = "asset-index.json";
 const BUILTIN_BASIC_CMR10_TFM_PATH: &str = "texmf/fonts/tfm/public/cm/cmr10.tfm";
 const TAR_BLOCK_SIZE: usize = 512;
+const MAX_ARCHIVE_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+const ARCHIVE_DECOMPRESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// CLI から受け取る compile サブコマンド引数
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,18 +194,104 @@ fn materialize_archive_asset_bundle(bundle_ref: &Path) -> Result<PathBuf, String
 }
 
 fn decompress_gzip_archive(bundle_ref: &Path) -> Result<Vec<u8>, String> {
-    let output = Command::new("gzip")
+    decompress_gzip_archive_with_limits(
+        bundle_ref,
+        MAX_ARCHIVE_DECOMPRESSED_BYTES,
+        ARCHIVE_DECOMPRESSION_TIMEOUT,
+    )
+}
+
+fn decompress_gzip_archive_with_limits(
+    bundle_ref: &Path,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut child = Command::new("gzip")
         .arg("-cd")
         .arg(bundle_ref)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|error| format!("failed to run gzip: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to decompress archive with gzip: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture gzip stdout".to_string())?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = read_bounded(stdout, max_bytes);
+        let _ = sender.send(result);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut output_result = None;
+    loop {
+        if output_result.is_none() {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    if result.is_err() {
+                        let _ = child.kill();
+                    }
+                    output_result = Some(result);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    output_result = Some(Err(
+                        "failed to read decompressed archive from gzip".to_string()
+                    ));
+                }
+            }
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to wait for gzip: {error}"))?
+        {
+            let bytes = match output_result {
+                Some(result) => result?,
+                None => receiver
+                    .recv()
+                    .map_err(|_| "failed to read decompressed archive from gzip".to_string())??,
+            };
+            if !status.success() {
+                return Err("failed to decompress archive with gzip".to_string());
+            }
+            return Ok(bytes);
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "archive decompression exceeded {} seconds",
+                timeout.as_secs()
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(10));
     }
-    Ok(output.stdout)
+}
+
+fn read_bounded(mut reader: impl Read, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("failed to read decompressed archive: {error}"))?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(count) > max_bytes {
+            return Err(format!(
+                "archive decompressed size exceeds {} bytes",
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
 }
 
 fn extract_checked_tar(bytes: &[u8], staging_root: &Path) -> Result<(), String> {
@@ -861,6 +951,28 @@ mod tests {
                 "error manifest should contain `{expected_error}` but was {manifest}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_asset_bundle_archive_when_decompressed_size_exceeds_limit() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let archive_path = temp_dir.path().join("FTX-ASSET-BUNDLE-001.tar.gz");
+        write_archive(
+            &archive_path,
+            &[("FTX-ASSET-BUNDLE-001/manifest.json", b'0', b"{}".as_slice())],
+        );
+
+        let error = super::decompress_gzip_archive_with_limits(
+            &archive_path,
+            128,
+            std::time::Duration::from_secs(5),
+        )
+        .expect_err("archive should exceed decompressed size limit");
+
+        assert!(
+            error.contains("archive decompressed size exceeds 128 bytes"),
+            "error should report the direct size limit but was {error}"
+        );
     }
 
     #[test]
