@@ -502,10 +502,18 @@ fn handle_compile(command: &CompileCommand) -> i32 {
         &shell_command_gateway,
     );
     let result = service.compile(&options);
-    emit_diagnostics(&result.diagnostics, options.interaction_mode);
+    emit_diagnostics(
+        &result.diagnostics,
+        options.interaction_mode,
+        options.trace_font_tasks,
+    );
     match command.format {
         CompileOutputFormat::Text => {
-            emit_batchmode_failure_summary(&result, options.interaction_mode);
+            emit_batchmode_failure_summary(
+                &result,
+                options.interaction_mode,
+                options.trace_font_tasks,
+            );
             print_compile_success_summary(&command.shared, &result, true)
         }
         CompileOutputFormat::Json => print_compile_json_result(&command.shared, &result),
@@ -738,8 +746,15 @@ fn compile_existing_sidecar_paths(output_pdf: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-fn emit_batchmode_failure_summary(result: &CompileResult, mode: InteractionMode) {
-    if mode != InteractionMode::Batchmode || compile_result_classification(result) != "error" {
+fn emit_batchmode_failure_summary(
+    result: &CompileResult,
+    mode: InteractionMode,
+    trace_font_tasks: bool,
+) {
+    if trace_font_tasks
+        || mode != InteractionMode::Batchmode
+        || compile_result_classification(result) != "error"
+    {
         return;
     }
 
@@ -853,7 +868,7 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
         )
         .with_file(options.input_file.to_string_lossy().into_owned())
         .with_suggestion("rerun with preview publication enabled")];
-        emit_diagnostics(&diagnostics, options.interaction_mode);
+        emit_diagnostics(&diagnostics, options.interaction_mode, false);
         return diagnostics_exit_code(&diagnostics);
     };
 
@@ -867,7 +882,7 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
     );
     watch_runner::start_shutdown_signal_management();
     let initial_result = service.compile(&options);
-    emit_diagnostics(&initial_result.diagnostics, options.interaction_mode);
+    emit_diagnostics(&initial_result.diagnostics, options.interaction_mode, false);
     if watch_runner::shutdown_requested() {
         watch_runner::emit_shutdown_complete();
         service.flush_cache();
@@ -883,7 +898,7 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
         )
         .with_file(options.input_file.to_string_lossy().into_owned())
         .with_suggestion("inspect the compile pipeline and retry the preview command")];
-        emit_diagnostics(&diagnostics, options.interaction_mode);
+        emit_diagnostics(&diagnostics, options.interaction_mode, false);
         return diagnostics_exit_code(&diagnostics);
     }
 
@@ -897,7 +912,7 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
             )
             .with_file(options.input_file.to_string_lossy().into_owned())
             .with_suggestion("retry after ensuring loopback TCP ports are available")];
-            emit_diagnostics(&diagnostics, options.interaction_mode);
+            emit_diagnostics(&diagnostics, options.interaction_mode, false);
             return diagnostics_exit_code(&diagnostics);
         }
     });
@@ -1069,20 +1084,34 @@ fn runtime_options_from_command(command: &SharedCompileCommand) -> RuntimeOption
     RuntimeOptions::from_compile_args(&compile_args)
 }
 
-fn emit_diagnostics(diagnostics: &[Diagnostic], mode: InteractionMode) {
+fn emit_diagnostics(diagnostics: &[Diagnostic], mode: InteractionMode, as_ndjson: bool) {
     let mut stderr = io::stderr().lock();
-    let _ = emit_diagnostics_to(&mut stderr, diagnostics, mode);
+    let _ = emit_diagnostics_to(&mut stderr, diagnostics, mode, as_ndjson);
 }
 
 fn emit_diagnostics_to<W: Write>(
     writer: &mut W,
     diagnostics: &[Diagnostic],
     mode: InteractionMode,
+    as_ndjson: bool,
 ) -> io::Result<()> {
     for diagnostic in diagnostics {
-        emit_diagnostic_to(writer, diagnostic, mode)?;
+        if as_ndjson {
+            emit_diagnostic_ndjson_to(writer, diagnostic)?;
+        } else {
+            emit_diagnostic_to(writer, diagnostic, mode)?;
+        }
     }
     Ok(())
+}
+
+fn emit_diagnostic_ndjson_to<W: Write>(writer: &mut W, diagnostic: &Diagnostic) -> io::Result<()> {
+    let payload = serde_json::json!({
+        "schemaVersion": "ferritex.diagnostic.v1",
+        "diagnostic": diagnostic,
+    });
+    serde_json::to_writer(&mut *writer, &payload)?;
+    writeln!(writer)
 }
 
 fn emit_diagnostic(diagnostic: &Diagnostic, mode: InteractionMode) {
@@ -1606,7 +1635,7 @@ mod tests {
         let diagnostics = vec![Diagnostic::new(Severity::Error, "broken document")];
         let mut stderr = Vec::new();
 
-        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Batchmode)
+        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Batchmode, false)
             .expect("write diagnostics");
 
         assert!(stderr.is_empty());
@@ -1617,10 +1646,31 @@ mod tests {
         let diagnostics = vec![Diagnostic::new(Severity::Error, "broken document")];
         let mut stderr = Vec::new();
 
-        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Nonstopmode)
-            .expect("write diagnostics");
+        emit_diagnostics_to(
+            &mut stderr,
+            &diagnostics,
+            InteractionMode::Nonstopmode,
+            false,
+        )
+        .expect("write diagnostics");
 
         let output = String::from_utf8(stderr).expect("utf-8 stderr");
         assert!(output.contains("error: broken document"));
+    }
+
+    #[test]
+    fn emit_diagnostics_to_can_emit_parseable_ndjson_in_batchmode() {
+        let diagnostics = vec![Diagnostic::new(Severity::Error, "broken document")];
+        let mut stderr = Vec::new();
+
+        emit_diagnostics_to(&mut stderr, &diagnostics, InteractionMode::Batchmode, true)
+            .expect("write diagnostics");
+
+        let output = String::from_utf8(stderr).expect("utf-8 stderr");
+        let value: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("diagnostic line should be valid JSON");
+        assert_eq!(value["schemaVersion"], "ferritex.diagnostic.v1");
+        assert_eq!(value["diagnostic"]["severity"], "Error");
+        assert_eq!(value["diagnostic"]["message"], "broken document");
     }
 }

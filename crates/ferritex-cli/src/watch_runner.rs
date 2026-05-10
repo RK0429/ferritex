@@ -77,7 +77,7 @@ where
         Some(initial_result) => initial_result,
         None => {
             let result = scheduler.run(workspace_root, || service.compile(&options));
-            emit_diagnostics(&result.diagnostics, interaction_mode);
+            emit_diagnostics(&result.diagnostics, interaction_mode, false);
             on_compile(&result);
             result
         }
@@ -145,7 +145,7 @@ where
             let result = scheduler.run(workspace_root, || {
                 service.compile_with_changed_paths(&options, &hint)
             });
-            emit_diagnostics(&result.diagnostics, interaction_mode);
+            emit_diagnostics(&result.diagnostics, interaction_mode, false);
             on_compile(&result);
             emit_recompile_end(&result);
             recompile_scheduler.finish_current();
