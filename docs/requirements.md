@@ -1065,6 +1065,7 @@
 - **定量基準**: `FTX-BENCH-001` を一度フルコンパイルしてキャッシュと依存グラフを構築した状態で、本文 1 段落だけを変更した差分コンパイル完了時間の中央値が 100ms 未満である
 - **計測方法**: `FTX-BENCH-001` を同一マシンでフルコンパイル済みの状態から、本文 1 段落の変更を適用して 5 回計測し中央値を採用する
 - **優先度**: Must
+- **検証状況**: Must 要件として未完了。1000-section staged input（`FTX-STRESS-2000`-class proxy、`incremental_stage_timing_*` tests）では 66ms / 70ms の 5-run median を観測済みだが、これは internal proxy evidence であり public CLI latency guarantee ではない。Issue #45 の public CLI UX reproduction fixture では 8.13s median を記録している。canonical `FTX-BENCH-001` での 5-run median 計測は未実施であり、formal verification は open item として保持する
 - **出典**: ユーザー確認済み（2026-03-16）
 
 #### REQ-NF-003: メモリ使用量

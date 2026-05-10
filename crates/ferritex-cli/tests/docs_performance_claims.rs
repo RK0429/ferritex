@@ -18,7 +18,24 @@ fn readme_qualifies_warm_incremental_proxy_claim_against_public_cli_latency() {
     assert!(
         readme.contains("current release-build public CLI warm incremental median of **8.13s**")
     );
+    assert!(readme.contains("5 of 11 non-functional requirements are fully verified"));
+    assert!(readme.contains("canonical `FTX-BENCH-001` verification remains open"));
     assert!(!readme.contains("clears its 100ms threshold"));
+    assert!(!readme.contains("All Must requirements in `docs/requirements.md` are satisfied"));
+    assert!(!readme.contains("6 of 11 non-functional requirements are fully verified"));
+}
+
+#[test]
+fn requirements_marks_req_nf_002_canonical_verification_as_open() {
+    let requirements = std::fs::read_to_string(workspace_root().join("docs/requirements.md"))
+        .expect("read requirements");
+
+    assert!(requirements.contains("#### REQ-NF-002: 差分コンパイル速度"));
+    assert!(requirements.contains("Must 要件として未完了"));
+    assert!(requirements.contains("internal proxy evidence"));
+    assert!(requirements.contains("public CLI latency guarantee ではない"));
+    assert!(requirements.contains("canonical `FTX-BENCH-001`"));
+    assert!(requirements.contains("formal verification は open item"));
 }
 
 #[test]
