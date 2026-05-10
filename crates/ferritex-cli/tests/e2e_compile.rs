@@ -3680,6 +3680,56 @@ fn watch_writes_initial_pdf_and_recompiles_on_change() {
 }
 
 #[test]
+fn watch_failed_recompile_preserves_prior_stable_pdf() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("watch.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nStable\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let mut child = ferritex_bin()
+        .args(["watch", tex_file.to_str().expect("utf-8 path")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex watch");
+    let (stderr_buf, stderr_handle) =
+        spawn_streaming_collector(child.stderr.take().expect("captured stderr"));
+
+    let pdf_file = dir.path().join("watch.pdf");
+    wait_until(
+        || pdf_file.exists(),
+        Duration::from_secs(2),
+        "watch should emit the initial stable PDF",
+    );
+    let stable_pdf = std::fs::read(&pdf_file).expect("read stable PDF");
+
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nBroken\n\\end{document}\nTrailing\n",
+    )
+    .expect("rewrite input with trailing content");
+
+    wait_until(
+        || buffer_contains(&stderr_buf, "unexpected content after \\end{document}"),
+        Duration::from_secs(3),
+        "watch should report the failed recompile",
+    );
+
+    let retained_pdf = std::fs::read(&pdf_file).expect("prior stable PDF should remain readable");
+    assert_eq!(
+        retained_pdf, stable_pdf,
+        "failed watch recompile should not replace or remove the prior stable PDF",
+    );
+
+    child.kill().expect("kill watch process");
+    child.wait().expect("wait for watch process");
+    stderr_handle.join().expect("join stderr collector");
+}
+
+#[test]
 fn watch_prints_startup_banner_and_tracked_count_by_default() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("main.tex");
