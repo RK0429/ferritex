@@ -6414,6 +6414,35 @@ fn lsp_malformed_input_reports_framing_recovery_hint() {
     );
 }
 
+#[test]
+fn lsp_oversized_header_reports_framing_error() {
+    let mut child = ferritex_bin()
+        .args(["lsp"])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex lsp");
+    let mut stdin = child.stdin.take().expect("lsp stdin");
+    let oversized_header = format!("X-Ferritex-Test: {}\r\n\r\n", "a".repeat(9 * 1024));
+
+    stdin
+        .write_all(oversized_header.as_bytes())
+        .expect("write oversized LSP header");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait ferritex lsp");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to read LSP Content-Length framed JSON-RPC message"),
+        "stderr should identify the failed LSP framing/parsing step, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("header line exceeds limit"),
+        "stderr should report the bounded header failure, got: {stderr}"
+    );
+}
+
 fn pdf_page_count(pdf: &str) -> usize {
     let marker = "/Count ";
     let start = pdf.find(marker).expect("pdf page count marker");

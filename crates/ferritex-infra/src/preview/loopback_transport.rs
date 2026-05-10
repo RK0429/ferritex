@@ -13,8 +13,13 @@ const LOOPBACK_HTTP_BASE: &str = "http://127.0.0.1/preview";
 const LOOPBACK_WS_BASE: &str = "ws://127.0.0.1/preview";
 const NO_STORE_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HEADER_COUNT: usize = 100;
+const MAX_EVENT_SUBSCRIBERS_PER_SESSION: usize = 8;
 const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
 const NOT_FOUND_RESPONSE: &[u8] = b"HTTP/1.1 404 Not Found\r\n\r\n";
+const SERVICE_UNAVAILABLE_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\r\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreviewDocumentResponse {
@@ -269,7 +274,6 @@ impl LoopbackPreviewTransport {
             return Err("preview loopback request did not contain a request line".to_string());
         }
         if bytes_read == MAX_REQUEST_LINE_BYTES && !request_line.ends_with('\n') {
-            Self::discard_until_newline(reader)?;
             return Err("preview loopback request line exceeded the maximum size".to_string());
         }
 
@@ -280,19 +284,35 @@ impl LoopbackPreviewTransport {
         reader: &mut BufReader<TcpStream>,
     ) -> Result<LoopbackRequestHeaders, String> {
         let mut headers = LoopbackRequestHeaders::default();
+        let mut header_bytes = 0usize;
+        let mut header_count = 0usize;
         loop {
             let mut header_line = String::new();
-            let bytes_read = reader
-                .read_line(&mut header_line)
-                .map_err(|error| format!("failed to read preview loopback headers: {error}"))?;
+            let bytes_read = {
+                let mut limited_reader = reader.by_ref().take(MAX_HEADER_LINE_BYTES as u64);
+                limited_reader
+                    .read_line(&mut header_line)
+                    .map_err(|error| format!("failed to read preview loopback headers: {error}"))?
+            };
 
             if bytes_read == 0 {
                 return Err(
                     "preview loopback request ended before the header terminator".to_string(),
                 );
             }
+            if bytes_read == MAX_HEADER_LINE_BYTES && !header_line.ends_with('\n') {
+                return Err("preview loopback header line exceeded the maximum size".to_string());
+            }
+            header_bytes += bytes_read;
+            if header_bytes > MAX_HEADER_BYTES {
+                return Err("preview loopback headers exceeded the maximum size".to_string());
+            }
             if header_line == "\r\n" || header_line == "\n" {
                 return Ok(headers);
+            }
+            header_count += 1;
+            if header_count > MAX_HEADER_COUNT {
+                return Err("preview loopback headers exceeded the maximum count".to_string());
             }
 
             let trimmed = header_line.trim_end_matches(['\r', '\n']);
@@ -307,19 +327,6 @@ impl LoopbackPreviewTransport {
                 } else if name.eq_ignore_ascii_case("sec-websocket-version") {
                     headers.sec_websocket_version = Some(value);
                 }
-            }
-        }
-    }
-
-    fn discard_until_newline(reader: &mut BufReader<TcpStream>) -> Result<(), String> {
-        loop {
-            let mut discarded = Vec::new();
-            let bytes_read = reader
-                .read_until(b'\n', &mut discarded)
-                .map_err(|error| format!("failed to discard preview loopback request: {error}"))?;
-
-            if bytes_read == 0 || discarded.ends_with(b"\n") {
-                return Ok(());
             }
         }
     }
@@ -425,23 +432,32 @@ impl LoopbackPreviewTransport {
             return Ok(());
         };
 
+        let local_addr = stream.local_addr().ok();
+        let peer_addr = stream.peer_addr().ok();
+        {
+            let mut subscribers = self.event_subscribers.lock().map_err(|_| {
+                "failed to acquire preview transport event subscribers lock".to_string()
+            })?;
+            let streams = subscribers.entry(session_id.to_string()).or_default();
+            if streams.len() >= MAX_EVENT_SUBSCRIBERS_PER_SESSION {
+                Self::write_response(&mut stream, SERVICE_UNAVAILABLE_RESPONSE)?;
+                return Ok(());
+            }
+            streams.push(
+                stream
+                    .try_clone()
+                    .map_err(|error| format!("failed to clone websocket subscriber: {error}"))?,
+            );
+        }
+
         let response = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
             ws_accept_key(client_key)
         );
-        Self::write_response(&mut stream, response.as_bytes())?;
-
-        let local_addr = stream.local_addr().ok();
-        let peer_addr = stream.peer_addr().ok();
-        let mut subscribers = self.event_subscribers.lock().map_err(|_| {
-            "failed to acquire preview transport event subscribers lock".to_string()
-        })?;
-        subscribers.entry(session_id.to_string()).or_default().push(
-            stream
-                .try_clone()
-                .map_err(|error| format!("failed to clone websocket subscriber: {error}"))?,
-        );
-        drop(subscribers);
+        if let Err(error) = Self::write_response(&mut stream, response.as_bytes()) {
+            self.remove_event_subscriber(session_id, local_addr, peer_addr);
+            return Err(error);
+        }
 
         let pending_events = {
             let mut pending_events = self.pending_events.lock().map_err(|_| {
@@ -1668,18 +1684,154 @@ mod tests {
         assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n\r\n"));
     }
 
+    #[test]
+    fn header_line_too_large_returns_bad_request() {
+        let transport =
+            Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
+        transport.start_background();
+
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", transport.port())).expect("connect to preview");
+        write!(
+            stream,
+            "GET /preview/preview-session-1/document HTTP/1.1\r\nX-Ferritex-Test: {}\r\n\r\n",
+            "a".repeat(super::MAX_HEADER_LINE_BYTES)
+        )
+        .expect("write oversized header");
+        stream.shutdown(Shutdown::Write).expect("shutdown write");
+
+        let response = read_until_response_or_reset(&mut stream);
+
+        assert!(response.is_empty() || response.starts_with(b"HTTP/1.1 400 Bad Request\r\n\r\n"));
+    }
+
+    #[test]
+    fn newline_less_header_line_too_large_returns_bad_request_without_discarding() {
+        let transport =
+            Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
+        transport.start_background();
+
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", transport.port())).expect("connect to preview");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+        write!(
+            stream,
+            "GET /preview/preview-session-1/document HTTP/1.1\r\nX-Ferritex-Test: {}",
+            "a".repeat(super::MAX_HEADER_LINE_BYTES * 2)
+        )
+        .expect("write newline-less oversized header");
+
+        let response = read_until_response_or_reset(&mut stream);
+
+        assert!(response.is_empty() || response.starts_with(b"HTTP/1.1 400 Bad Request\r\n\r\n"));
+    }
+
+    #[test]
+    fn max_header_count_is_accepted() {
+        let transport =
+            Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
+        let pdf = b"%PDF-1.4\nhello\n";
+        transport
+            .publish_pdf("preview-session-1", pdf)
+            .expect("publish pdf");
+        transport.start_background();
+
+        let mut request = String::from("GET /preview/preview-session-1/document HTTP/1.1\r\n");
+        for index in 0..super::MAX_HEADER_COUNT {
+            request.push_str(&format!("X-Ferritex-Test-{index}: ok\r\n"));
+        }
+        request.push_str("\r\n");
+
+        let response = issue_raw_request(transport.port(), &request);
+
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let (_, body) = split_http_response(&response);
+        assert_eq!(body, pdf);
+    }
+
+    #[test]
+    fn header_count_too_large_returns_bad_request() {
+        let transport =
+            Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
+        transport.start_background();
+
+        let mut request = String::from("GET /preview/preview-session-1/document HTTP/1.1\r\n");
+        for index in 0..=super::MAX_HEADER_COUNT {
+            request.push_str(&format!("X-Ferritex-Test-{index}: ok\r\n"));
+        }
+        request.push_str("\r\n");
+
+        let response = issue_raw_request(transport.port(), &request);
+
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n\r\n"));
+    }
+
+    #[test]
+    fn header_bytes_too_large_returns_bad_request() {
+        let transport =
+            Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
+        transport.start_background();
+
+        let mut request = String::from("GET /preview/preview-session-1/document HTTP/1.1\r\n");
+        for index in 0..90 {
+            request.push_str(&format!("X-Ferritex-Test-{index}: {}\r\n", "a".repeat(760)));
+        }
+        request.push_str("\r\n");
+
+        let response = issue_raw_request(transport.port(), &request);
+
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n\r\n"));
+    }
+
+    #[test]
+    fn events_websocket_subscribers_are_capped_per_session() {
+        let transport =
+            Arc::new(LoopbackPreviewTransport::bind().expect("bind loopback transport"));
+        let session_id = "preview-session-1";
+        let _ = transport.events_url(session_id);
+        transport.start_background();
+
+        let mut subscribers = Vec::new();
+        for _ in 0..super::MAX_EVENT_SUBSCRIBERS_PER_SESSION {
+            let (stream, response) =
+                open_websocket(transport.port(), "/preview/preview-session-1/events");
+            assert!(response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+            subscribers.push(stream);
+        }
+        wait_for_subscriber_count(
+            &transport,
+            session_id,
+            super::MAX_EVENT_SUBSCRIBERS_PER_SESSION,
+        );
+
+        let response = issue_websocket_upgrade_request_once(
+            transport.port(),
+            "/preview/preview-session-1/events",
+        );
+
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"));
+        drop(subscribers);
+    }
+
     fn issue_get_request(port: u16, path: &str) -> Vec<u8> {
         issue_request(port, "GET", path)
     }
 
     fn issue_request(port: u16, method: &str, path: &str) -> Vec<u8> {
+        issue_raw_request(
+            port,
+            &format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+    }
+
+    fn issue_raw_request(port: u16, request: &str) -> Vec<u8> {
         let mut stream =
             TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback preview server");
-        write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-        )
-        .expect("write request");
+        stream.write_all(request.as_bytes()).expect("write request");
         stream.shutdown(Shutdown::Write).expect("shutdown write");
 
         let mut response = Vec::new();
@@ -1733,6 +1885,21 @@ mod tests {
                     return response;
                 }
                 Err(error) => panic!("read available response: {error}"),
+            }
+        }
+    }
+
+    fn read_until_response_or_reset(stream: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => return response,
+                Ok(read) => response.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    return response;
+                }
+                Err(error) => panic!("read response or reset: {error}"),
             }
         }
     }
@@ -1815,6 +1982,27 @@ mod tests {
         }
 
         panic!("subscriber was not registered for session {session_id}");
+    }
+
+    fn wait_for_subscriber_count(
+        transport: &LoopbackPreviewTransport,
+        session_id: &str,
+        expected_count: usize,
+    ) {
+        for _ in 0..20 {
+            if transport
+                .event_subscribers
+                .lock()
+                .expect("event subscribers lock")
+                .get(session_id)
+                .is_some_and(|subscribers| subscribers.len() == expected_count)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        panic!("subscriber count for session {session_id} did not reach {expected_count}");
     }
 
     fn wait_for_view_updates(
