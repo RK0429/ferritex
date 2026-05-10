@@ -6159,6 +6159,10 @@ fn compile_help_documents_file_cache_temp_and_network_side_effects() {
         "compile help should document temp materialization, got: {stdout}"
     );
     assert!(
+        stdout.contains("system_profiler") && stdout.contains("fc-list"),
+        "compile help should document host font discovery helper processes, got: {stdout}"
+    );
+    assert!(
         stdout.contains("does not open network listeners"),
         "compile help should document network behavior, got: {stdout}"
     );
@@ -6268,6 +6272,10 @@ fn watch_help_documents_repeated_compile_side_effects() {
         stdout.contains("human-readable only")
             && stdout.contains("does not emit a stable JSON or NDJSON event stream"),
         "watch help should document that continuous output is not machine-readable, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("previously generated PDF on disk"),
+        "watch help should document failed recompile PDF retention, got: {stdout}"
     );
 }
 

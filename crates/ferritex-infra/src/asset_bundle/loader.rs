@@ -161,10 +161,14 @@ fn load_manifest(bundle_path: &Path) -> Result<AssetBundleManifest, AssetBundleE
     }
 
     let content = std::fs::read_to_string(&manifest_path)?;
-    let manifest: AssetBundleManifest =
-        serde_json::from_str(&content).map_err(|source| AssetBundleError::InvalidManifest {
-            reason: source.to_string(),
-        })?;
+    let manifest: AssetBundleManifest = serde_json::from_str(&content).map_err(|source| {
+        let reason = serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .filter(|value| value.starts_with("archive extraction failed"))
+            .unwrap_or_else(|| source.to_string());
+        AssetBundleError::InvalidManifest { reason }
+    })?;
 
     validate_manifest(&manifest)?;
     ensure_version_compatible(&manifest)?;
@@ -486,6 +490,26 @@ mod tests {
         let error = AssetBundleLoader::load(&bundle_root).expect_err("bundle should be rejected");
 
         assert!(matches!(error, AssetBundleError::AssetIndexNotFound { .. }));
+    }
+
+    #[test]
+    fn surfaces_archive_extraction_error_manifest_directly() {
+        let bundle_root = fixture_root();
+        std::fs::create_dir_all(&bundle_root).expect("create bundle directory");
+        std::fs::write(
+            bundle_root.join("manifest.json"),
+            serde_json::to_vec("archive extraction failed for bundle.tar.gz: bad gzip")
+                .expect("serialize manifest string"),
+        )
+        .expect("write manifest");
+
+        let error = AssetBundleLoader::load(&bundle_root).expect_err("bundle should be rejected");
+
+        assert!(matches!(
+            error,
+            AssetBundleError::InvalidManifest { reason }
+                if reason == "archive extraction failed for bundle.tar.gz: bad gzip"
+        ));
     }
 
     #[test]

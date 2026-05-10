@@ -50,7 +50,7 @@ enum Commands {
     #[command(
         long_about = "Compile a LaTeX document to PDF.
 
-Side effects: writes generated artifacts to --output-dir, or to the input file's directory when --output-dir is omitted. The main PDF is <jobname>.pdf, where --jobname defaults to the input file stem. Depending on document features and flags, ferritex can also write sidecars such as <jobname>.toc, <jobname>.lof, <jobname>.lot, <jobname>.aux, <jobname>.bbl, <jobname>.bbl.ferritex.json, and <jobname>.synctex. Compilation cache records are stored under <output-dir>/.ferritex-cache unless --no-cache is set. Built-in asset bundles may be materialized in the system temp directory. The compile command does not open network listeners.",
+Side effects: writes generated artifacts to --output-dir, or to the input file's directory when --output-dir is omitted. The main PDF is <jobname>.pdf, where --jobname defaults to the input file stem. Depending on document features and flags, ferritex can also write sidecars such as <jobname>.toc, <jobname>.lof, <jobname>.lot, <jobname>.aux, <jobname>.bbl, <jobname>.bbl.ferritex.json, and <jobname>.synctex. Compilation cache records are stored under <output-dir>/.ferritex-cache unless --no-cache is set. Built-in asset bundles may be materialized in the system temp directory. Unless --reproducible is set, host font discovery may inspect platform font roots and invoke platform catalog helpers such as system_profiler on macOS or fc-list on Linux. The compile command does not open network listeners.",
         after_help = "Examples:\n  ferritex compile document.tex"
     )]
     Compile(CompileCommand),
@@ -69,7 +69,7 @@ Output: preview status logs are human-readable by default. Pass --bootstrap-form
 
 Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile on the initial build and each recompile. The default output root is --output-dir, or the input file's directory when --output-dir is omitted. Watch keeps running until interrupted and does not open network listeners.
 
-Output: watch status logs are human-readable only. The command does not emit a stable JSON or NDJSON event stream.")]
+Output: watch status logs are human-readable only. A failed recompile leaves the previously generated PDF on disk and logs the failure instead of deleting that prior successful output. The command does not emit a stable JSON or NDJSON event stream.")]
     Watch(WatchCommand),
     /// Start the Language Server Protocol server
     #[command(
@@ -381,7 +381,7 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
         .collect::<Vec<_>>();
     let median_duration_ms = median_f64(&successful_durations);
     let report = serde_json::json!({
-        "schema_version": "ferritex.perfEvidence.v1",
+        "schemaVersion": "ferritex.perfEvidence.v1",
         "fixture": {
             "source": "embedded",
             "path": fixture_path,

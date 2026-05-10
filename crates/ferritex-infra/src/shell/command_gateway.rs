@@ -14,6 +14,7 @@ pub struct ShellCommandGateway {
     timeout_secs: u64,
     max_processes: usize,
     max_output_bytes: usize,
+    active_processes: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +32,8 @@ pub enum ShellCommandError {
     Timeout { timeout_secs: u64 },
     #[error("output exceeded {max_bytes} bytes")]
     OutputTooLarge { max_bytes: usize },
+    #[error("process limit reached: max {max_processes} concurrent process(es)")]
+    ProcessLimitReached { max_processes: usize },
     #[error("I/O error: {source}")]
     Io {
         #[from]
@@ -45,6 +48,7 @@ impl Default for ShellCommandGateway {
             timeout_secs: 30,
             max_processes: 1,
             max_output_bytes: 4 * 1024 * 1024,
+            active_processes: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -68,6 +72,7 @@ impl ShellCommandGateway {
             timeout_secs,
             max_processes,
             max_output_bytes,
+            active_processes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -96,6 +101,7 @@ impl ShellCommandGateway {
         if !self.allowed {
             return Err(ShellCommandError::NotAllowed);
         }
+        let _process_slot = self.acquire_process_slot()?;
 
         let mut child = Command::new(program)
             .args(args)
@@ -178,6 +184,36 @@ impl ShellCommandGateway {
             stdout,
             stderr,
         })
+    }
+
+    fn acquire_process_slot(&self) -> Result<ProcessSlot, ShellCommandError> {
+        loop {
+            let current = self.active_processes.load(Ordering::SeqCst);
+            if current >= self.max_processes {
+                return Err(ShellCommandError::ProcessLimitReached {
+                    max_processes: self.max_processes,
+                });
+            }
+            if self
+                .active_processes
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Ok(ProcessSlot {
+                    active_processes: Arc::clone(&self.active_processes),
+                });
+            }
+        }
+    }
+}
+
+struct ProcessSlot {
+    active_processes: Arc<AtomicUsize>,
+}
+
+impl Drop for ProcessSlot {
+    fn drop(&mut self) {
+        self.active_processes.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -320,5 +356,43 @@ mod tests {
             error,
             ShellCommandError::OutputTooLarge { max_bytes: 4 }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_commands_when_process_limit_is_reached() {
+        let gateway = std::sync::Arc::new(ShellCommandGateway::with_limits(
+            true,
+            30,
+            1,
+            4 * 1024 * 1024,
+        ));
+        let running_gateway = std::sync::Arc::clone(&gateway);
+        let running = std::thread::spawn(move || {
+            running_gateway.execute("/bin/sh", &["-c", "sleep 0.2"], Path::new("."))
+        });
+        while gateway
+            .active_processes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            std::thread::yield_now();
+        }
+
+        let error = gateway
+            .execute("/bin/sh", &["-c", "printf second"], Path::new("."))
+            .expect_err("second command should be rejected while first is running");
+
+        assert!(matches!(
+            error,
+            ShellCommandError::ProcessLimitReached { max_processes: 1 }
+        ));
+        let first_result = running
+            .join()
+            .expect("running command thread should finish");
+        assert!(
+            first_result.is_ok(),
+            "first command should be allowed to complete: {first_result:?}"
+        );
     }
 }

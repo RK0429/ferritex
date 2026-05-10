@@ -72,7 +72,9 @@ the unsupported character and exits with code 2.
 
 The `compile --format json` output is the compile result JSON for a single
 document compile. It is separate from the `perf-evidence` JSON artifact
-described below, which records bounded performance evidence.
+described below, which records bounded performance evidence. Versioned JSON
+contracts use `schemaVersion`; see `docs/json-contracts.md` for the external
+contract summary.
 
 ### 4. Other subcommands
 
@@ -83,7 +85,9 @@ cargo run --release -- lsp                 # starts an LSP server over stdio
 ```
 
 `watch` and `preview` status output is human-readable only. These continuous
-commands do not emit a stable JSON or NDJSON event stream.
+commands do not emit a stable JSON or NDJSON event stream. If `watch` has
+already produced a PDF and a later recompile fails, the previous PDF remains on
+disk while the failure is reported in logs.
 
 ### 5. Reproduce bounded performance evidence
 

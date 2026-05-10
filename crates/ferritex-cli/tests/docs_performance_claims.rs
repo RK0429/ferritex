@@ -64,3 +64,28 @@ fn optimization_design_marks_66ms_70ms_as_proxy_not_public_cli_guarantee() {
         );
     }
 }
+
+#[test]
+fn json_contract_doc_records_public_schema_versions_and_human_channel_limits() {
+    let contracts = std::fs::read_to_string(workspace_root().join("docs/json-contracts.md"))
+        .expect("read JSON contract doc");
+    let readme = std::fs::read_to_string(workspace_root().join("README.md")).expect("read README");
+
+    for schema in [
+        "ferritex.compileResult.v1",
+        "ferritex.previewBootstrap.v1",
+        "ferritex.perfEvidence.v1",
+        "ferritex.fontTaskTrace.v1",
+    ] {
+        assert!(
+            contracts.contains(schema),
+            "JSON contract doc must mention {schema}"
+        );
+    }
+    assert!(contracts.contains("`schemaVersion`"));
+    assert!(!contracts.contains("schema_version"));
+    assert!(contracts.contains("one single-line failure summary"));
+    assert!(contracts.contains("previous PDF remains on disk"));
+    assert!(contracts.contains("archive extraction failure reason"));
+    assert!(readme.contains("docs/json-contracts.md"));
+}

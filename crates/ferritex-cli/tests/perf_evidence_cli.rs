@@ -48,6 +48,14 @@ fn perf_evidence_command_writes_parseable_bounded_artifacts() {
     let json = std::fs::read_to_string(&json_path).expect("read JSON artifact");
     let parsed: serde_json::Value =
         serde_json::from_str(&json).expect("JSON artifact should parse");
+    assert_eq!(
+        parsed["schemaVersion"].as_str(),
+        Some("ferritex.perfEvidence.v1")
+    );
+    assert!(
+        parsed.get("schema_version").is_none(),
+        "perf evidence must use the shared schemaVersion JSON field"
+    );
     let expected_run_dir = output_dir.join("run").join("measured-0");
     let expected_fixture_path = output_dir.join("perf-evidence-smoke.tex");
     assert_eq!(parsed["fixture"]["source"].as_str(), Some("embedded"));
