@@ -6042,6 +6042,42 @@ fn compile_help_warns_about_high_jobs_rss() {
 }
 
 #[test]
+fn compile_help_documents_shell_escape_command_execution_risk() {
+    let output = ferritex_bin()
+        .args(["compile", "--help"])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("document-controlled external command execution"),
+        "compile help should describe shell escape as document-controlled command execution, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("disabled by default"),
+        "compile help should document that shell escape is disabled by default, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("bounded by ferritex's file access gates and process stdio limits"),
+        "compile help should document shell escape safety bounds, got: {stdout}"
+    );
+    let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized_stdout.contains("30s"),
+        "compile help should document the shell escape timeout bound, got: {stdout}"
+    );
+    assert!(
+        normalized_stdout.contains("one concurrent process per compilation job"),
+        "compile help should document the shell escape process concurrency bound, got: {stdout}"
+    );
+    assert!(
+        normalized_stdout.contains("4 MiB captured output"),
+        "compile help should document the shell escape captured output bound, got: {stdout}"
+    );
+}
+
+#[test]
 fn compile_help_documents_file_cache_temp_and_network_side_effects() {
     let output = ferritex_bin()
         .args(["compile", "--help"])
