@@ -4161,6 +4161,9 @@ fn try_parallel_full_typeset(
     if parallelism <= 1 || partition_plan.work_units.len() < 2 {
         return Err("parallel full typeset requires at least two partitions");
     }
+    if section_partitions_cross_multicols(document, partition_plan) {
+        return Err("parallel section partitioning across multicols is not supported");
+    }
 
     let body_ranges =
         partition_body_ranges(document, partition_plan).ok_or("partition body slicing failed")?;
@@ -4876,6 +4879,20 @@ fn partition_merge_preserves_openright(
             .work_units
             .iter()
             .all(|work_unit| work_unit.kind == PartitionKind::Chapter)
+}
+
+fn section_partitions_cross_multicols(
+    document: &ParsedDocument,
+    partition_plan: &DocumentPartitionPlan,
+) -> bool {
+    partition_plan
+        .work_units
+        .iter()
+        .any(|work_unit| work_unit.kind == PartitionKind::Section)
+        && document
+            .body_nodes()
+            .iter()
+            .any(|node| matches!(node, DocumentNode::Multicols { .. }))
 }
 
 fn float_counters_before_body_range(document: &ParsedDocument, body_start: usize) -> FloatCounters {
@@ -12522,6 +12539,60 @@ mod tests {
         assert!(trace_messages
             .iter()
             .any(|message| message.contains("full typeset executing in parallel")));
+        let parallel_pdf =
+            fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
+
+        assert_eq!(sequential_pdf, parallel_pdf);
+    }
+
+    #[test]
+    fn parallel_full_typeset_falls_back_for_section_partitions_inside_multicols() {
+        let loader = MockAssetBundleLoader::valid();
+        let source = "\\documentclass{article}\n\
+            \\usepackage{multicol}\n\
+            \\begin{document}\n\
+            \\begin{multicols}{2}\n\
+            \\section{Editorial Summary}\n\
+            This fixture splits the article body into two columns.\n\
+            \\section{Working Notes}\n\
+            Narrow columns change line wrapping and page composition.\n\
+            \\section{Outcome}\n\
+            The closing section keeps the source short and readable.\n\
+            \\end{multicols}\n\
+            \\end{document}\n";
+
+        let sequential_dir = tempdir().expect("create sequential tempdir");
+        let sequential_input = sequential_dir.path().join("main.tex");
+        fs::write(&sequential_input, source).expect("write sequential input");
+        let mut sequential_options =
+            runtime_options(sequential_input, sequential_dir.path().join("out"));
+        sequential_options.no_cache = true;
+        sequential_options.parallelism = 1;
+
+        let sequential = service(&FsTestFileAccessGate, &loader).compile(&sequential_options);
+        assert_eq!(sequential.exit_code, 0);
+        let sequential_pdf =
+            fs::read(sequential_options.output_dir.join("main.pdf")).expect("read sequential pdf");
+
+        let parallel_dir = tempdir().expect("create parallel tempdir");
+        let parallel_input = parallel_dir.path().join("main.tex");
+        fs::write(&parallel_input, source).expect("write parallel input");
+        let mut parallel_options = runtime_options(parallel_input, parallel_dir.path().join("out"));
+        parallel_options.no_cache = true;
+        parallel_options.parallelism = 4;
+
+        let (parallel, trace_messages) =
+            compile_with_trace_messages(&FsTestFileAccessGate, &loader, &parallel_options);
+        assert_eq!(parallel.exit_code, 0);
+        assert!(
+            trace_messages.iter().any(|message| message.contains(
+                "full typeset fallback to sequential (parallel section partitioning across multicols is not supported)"
+            )),
+            "{trace_messages:?}"
+        );
+        assert!(trace_messages
+            .iter()
+            .all(|message| !message.contains("full typeset executing in parallel")));
         let parallel_pdf =
             fs::read(parallel_options.output_dir.join("main.pdf")).expect("read parallel pdf");
 
