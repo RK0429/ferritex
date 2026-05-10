@@ -1436,7 +1436,7 @@ pub fn assemble_typeset_document(
     pages: Vec<TypesetPage>,
 ) -> TypesetDocument {
     let outlines = collect_outlines(document, &pages);
-    let named_destinations = collect_named_destinations(document, &pages);
+    let named_destinations = collect_named_destinations(document, &pages, &outlines);
     let index_entries = resolve_index_entries(&pages);
 
     TypesetDocument {
@@ -3230,6 +3230,7 @@ fn collect_outlines(document: &ParsedDocument, pages: &[TypesetPage]) -> Vec<Typ
 fn collect_named_destinations(
     document: &ParsedDocument,
     pages: &[TypesetPage],
+    outlines: &[TypesetOutline],
 ) -> Vec<TypesetNamedDestination> {
     let mut destinations = BTreeMap::new();
 
@@ -3252,7 +3253,16 @@ fn collect_named_destinations(
         if name.is_empty() || destinations.contains_key(&name) {
             continue;
         }
-        if let Some((page_index, y)) = resolve_destination_anchor(pages, &title, false) {
+        if let Some(outline) = outlines.iter().find(|outline| outline.title == title) {
+            destinations.insert(
+                name.clone(),
+                TypesetNamedDestination {
+                    name,
+                    page_index: outline.page_index,
+                    y: outline.y,
+                },
+            );
+        } else if let Some((page_index, y)) = resolve_destination_anchor(pages, &title, false) {
             destinations.insert(
                 name.clone(),
                 TypesetNamedDestination {
@@ -5127,7 +5137,8 @@ mod tests {
             index_entries: Vec::new(),
         }];
 
-        let destinations = super::collect_named_destinations(&parsed, &pages);
+        let outlines = super::collect_outlines(&parsed, &pages);
+        let destinations = super::collect_named_destinations(&parsed, &pages, &outlines);
 
         assert!(destinations
             .iter()
@@ -5138,6 +5149,57 @@ mod tests {
         assert!(destinations
             .iter()
             .any(|destination| { destination.name == "bib:knuth" && destination.page_index == 0 }));
+    }
+
+    #[test]
+    fn collect_named_destinations_prefers_outline_anchor_over_toc_duplicate() {
+        let mut parsed = parsed_document("");
+        parsed.section_entries.push(SectionEntry {
+            level: 0,
+            number: "1".to_string(),
+            title: "Main Discussion".to_string(),
+            span: None,
+        });
+        let page_box = page_box_for_class("book");
+        let pages = vec![
+            TypesetPage {
+                lines: vec![TextLine {
+                    text: "1 Main Discussion".to_string(),
+                    x: DimensionValue::zero(),
+                    y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT),
+                    links: Vec::new(),
+                    font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+                    source_span: None,
+                }],
+                images: Vec::new(),
+                page_box: page_box.clone(),
+                float_placements: Vec::new(),
+                index_entries: Vec::new(),
+            },
+            TypesetPage {
+                lines: vec![TextLine {
+                    text: "1 Main Discussion".to_string(),
+                    x: DimensionValue::zero(),
+                    y: points(PAGE_HEIGHT_PT - TOP_MARGIN_PT - LINE_HEIGHT_PT),
+                    links: Vec::new(),
+                    font_index: 0,
+                    font_size: points(DEFAULT_BODY_FONT_SIZE_PT),
+                    source_span: None,
+                }],
+                images: Vec::new(),
+                page_box,
+                float_placements: Vec::new(),
+                index_entries: Vec::new(),
+            },
+        ];
+
+        let outlines = super::collect_outlines(&parsed, &pages);
+        let destinations = super::collect_named_destinations(&parsed, &pages, &outlines);
+
+        assert!(destinations.iter().any(|destination| {
+            destination.name == "section:1 Main Discussion" && destination.page_index == 1
+        }));
     }
 
     #[test]
