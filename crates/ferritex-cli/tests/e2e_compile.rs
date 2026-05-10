@@ -6102,6 +6102,11 @@ fn watch_help_documents_repeated_compile_side_effects() {
         stdout.contains("does not open network listeners"),
         "watch help should document network behavior, got: {stdout}"
     );
+    assert!(
+        stdout.contains("human-readable only")
+            && stdout.contains("does not emit a stable JSON or NDJSON event stream"),
+        "watch help should document that continuous output is not machine-readable, got: {stdout}"
+    );
 }
 
 #[test]
@@ -6166,6 +6171,11 @@ fn preview_help_documents_compile_side_effects_and_loopback_scope() {
     assert!(
         stdout.contains("does not publish to external network interfaces"),
         "preview help should document external network behavior, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("human-readable only")
+            && stdout.contains("does not emit a stable JSON or NDJSON event stream"),
+        "preview help should document that continuous output is not machine-readable, got: {stdout}"
     );
 }
 
