@@ -58,14 +58,18 @@ Side effects: writes generated artifacts to --output-dir, or to the input file's
     #[command(
         long_about = "Compile the input document and publish it through a loopback preview transport.
 
-Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile. After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session. Preview binds a loopback-only listener on 127.0.0.1 and does not publish to external network interfaces.",
+Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile. After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session. Preview binds a loopback-only listener on 127.0.0.1 and does not publish to external network interfaces.
+
+Output: preview status logs are human-readable only. The command does not emit a stable JSON or NDJSON event stream.",
         after_help = "Examples:\n  ferritex preview document.tex"
     )]
     Preview(SharedCompileCommand),
     /// Watch for changes and recompile automatically
     #[command(long_about = "Watch for changes and recompile automatically.
 
-Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile on the initial build and each recompile. The default output root is --output-dir, or the input file's directory when --output-dir is omitted. Watch keeps running until interrupted and does not open network listeners.")]
+Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile on the initial build and each recompile. The default output root is --output-dir, or the input file's directory when --output-dir is omitted. Watch keeps running until interrupted and does not open network listeners.
+
+Output: watch status logs are human-readable only. The command does not emit a stable JSON or NDJSON event stream.")]
     Watch(WatchCommand),
     /// Start the Language Server Protocol server
     #[command(

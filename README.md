@@ -71,6 +71,9 @@ cargo run --release -- preview hello.tex   # live preview: recompiles on source 
 cargo run --release -- lsp                 # starts an LSP server over stdio
 ```
 
+`watch` and `preview` status output is human-readable only. These continuous
+commands do not emit a stable JSON or NDJSON event stream.
+
 ### 5. Reproduce bounded performance evidence
 
 The release binary exposes a bounded performance evidence workflow that runs a
