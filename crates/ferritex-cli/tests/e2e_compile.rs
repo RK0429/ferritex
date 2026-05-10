@@ -1278,6 +1278,62 @@ fn compile_with_trace_font_tasks_emits_font_task_trace_to_stderr() {
 }
 
 #[test]
+fn compile_with_trace_font_tasks_keeps_failure_stderr_parseable_ndjson() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let tex_file = dir.path().join("trace-fonts-broken.tex");
+    std::fs::write(
+        &tex_file,
+        "\\documentclass{article}\n\\begin{document}\nTrace me\n\\nonexistentcommand{foo}\n\\end{document}\n",
+    )
+    .expect("write input file");
+
+    let output = ferritex_bin()
+        .args([
+            "compile",
+            "--trace-font-tasks",
+            "--interaction",
+            "batchmode",
+            tex_file.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("failed to run ferritex");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.trim().is_empty(), "stderr should contain NDJSON");
+    assert!(
+        !stderr.contains("ferritex compile failed") && !stderr.contains("error:"),
+        "trace stderr must not mix human diagnostics into NDJSON: {stderr}"
+    );
+
+    let mut saw_trace = false;
+    let mut saw_diagnostic = false;
+    for line in stderr.lines() {
+        let value: Value = serde_json::from_str(line).expect("stderr line should be valid JSON");
+        match value["schemaVersion"].as_str() {
+            Some("ferritex.fontTaskTrace.v1") => saw_trace = true,
+            Some("ferritex.diagnostic.v1") => {
+                saw_diagnostic = true;
+                assert_eq!(value["diagnostic"]["severity"], "Error");
+                assert!(value["diagnostic"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("\\nonexistentcommand")));
+            }
+            other => panic!("unexpected trace stderr schema {other:?}: {value}"),
+        }
+    }
+
+    assert!(
+        saw_trace,
+        "expected at least one font task trace line: {stderr}"
+    );
+    assert!(
+        saw_diagnostic,
+        "expected a structured diagnostic line in trace stderr: {stderr}"
+    );
+}
+
+#[test]
 fn compile_with_trace_font_tasks_emits_trace_on_warm_cache_hit() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let tex_file = dir.path().join("hello.tex");
