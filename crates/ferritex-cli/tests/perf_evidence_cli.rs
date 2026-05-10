@@ -53,6 +53,38 @@ fn perf_evidence_command_writes_parseable_bounded_artifacts() {
     assert_eq!(parsed["failures"].as_array().map(Vec::len), Some(0));
     assert_eq!(parsed["config"]["measured_runs"].as_u64(), Some(1));
     assert_eq!(parsed["results"][0]["success"].as_bool(), Some(true));
+    assert_eq!(parsed["command"]["args_kind"].as_str(), Some("template"));
+    assert_eq!(
+        parsed["command"]["actual_invocation"].as_str(),
+        Some("results[].command and failures[].command")
+    );
+    assert_eq!(
+        parsed["results"][0]["command"]["binary"].as_str(),
+        Some(ferritex_bin().to_str().expect("UTF-8 ferritex binary path"))
+    );
+    let actual_args = parsed["results"][0]["command"]["args"]
+        .as_array()
+        .expect("measured result should record actual child args")
+        .iter()
+        .map(|value| value.as_str().expect("command args should be strings"))
+        .collect::<Vec<_>>();
+    let expected_run_dir = output_dir.join("run").join("measured-0");
+    let expected_fixture_path = output_dir.join("perf-evidence-smoke.tex");
+    assert_eq!(
+        actual_args,
+        vec![
+            "compile",
+            "--format",
+            "json",
+            "--no-cache",
+            "--reproducible",
+            "--output-dir",
+            expected_run_dir.to_str().expect("UTF-8 run dir"),
+            expected_fixture_path.to_str().expect("UTF-8 fixture path"),
+        ]
+    );
+    assert!(!actual_args.contains(&"<run-dir>"));
+    assert!(!actual_args.contains(&"perf-evidence-smoke.tex"));
     assert!(output_dir.join("perf-evidence-smoke.tex").exists());
     assert!(output_dir
         .join("run")
