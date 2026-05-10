@@ -296,18 +296,18 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
             return 2;
         }
 
+        let child_args = vec![
+            "compile".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--no-cache".to_string(),
+            "--reproducible".to_string(),
+            "--output-dir".to_string(),
+            run_dir.to_string_lossy().into_owned(),
+            fixture_path.to_string_lossy().into_owned(),
+        ];
         let started = Instant::now();
-        let output = match Command::new(&binary_path)
-            .arg("compile")
-            .arg("--format")
-            .arg("json")
-            .arg("--no-cache")
-            .arg("--reproducible")
-            .arg("--output-dir")
-            .arg(&run_dir)
-            .arg(&fixture_path)
-            .output()
-        {
+        let output = match Command::new(&binary_path).args(&child_args).output() {
             Ok(output) => output,
             Err(error) => {
                 eprintln!("failed to run ferritex compile child process: {error}");
@@ -324,6 +324,10 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
                 "exit_code": output.status.code(),
                 "output_dir": run_dir,
                 "pdf_path": run_dir.join("perf-evidence-smoke.pdf"),
+                "command": {
+                    "binary": binary_path.clone(),
+                    "args": child_args.clone(),
+                },
                 "stdout": bounded_utf8(&output.stdout, PERF_EVIDENCE_STDIO_LIMIT),
                 "stderr": bounded_utf8(&output.stderr, PERF_EVIDENCE_STDIO_LIMIT),
             }));
@@ -333,6 +337,10 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
                 "run_kind": run_kind,
                 "run_index": run_index,
                 "exit_code": output.status.code(),
+                "command": {
+                    "binary": binary_path.clone(),
+                    "args": child_args.clone(),
+                },
                 "stdout": bounded_utf8(&output.stdout, PERF_EVIDENCE_STDIO_LIMIT),
                 "stderr": bounded_utf8(&output.stderr, PERF_EVIDENCE_STDIO_LIMIT),
             }));
@@ -353,6 +361,8 @@ fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
         },
         "command": {
             "binary": binary_path,
+            "args_kind": "template",
+            "actual_invocation": "results[].command and failures[].command",
             "args": [
                 "compile",
                 "--format", "json",
