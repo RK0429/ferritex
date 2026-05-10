@@ -1054,6 +1054,8 @@ impl<'a> CompileJobService<'a> {
         let project_root = project_root_for_policy(&execution_policy, &options.input_file);
         let input_dir = input_dir_for_input(&options.input_file, &project_root);
         let mut stage_timing = StageTiming::default();
+        let failed_artifact_policy =
+            FailedCompileArtifactPolicy::from_changed_paths_hint(changed_paths_hint);
 
         if let Some(bundle_path) = &options.asset_bundle {
             let manifest_path = bundle_path.join("manifest.json");
@@ -1215,6 +1217,7 @@ impl<'a> CompileJobService<'a> {
                         &cached_artifact.output_pdf,
                         &options.output_dir,
                         &mut diagnostics,
+                        failed_artifact_policy,
                     );
                     return CompileResult {
                         exit_code: exit_code_for(&diagnostics),
@@ -1284,7 +1287,12 @@ impl<'a> CompileJobService<'a> {
                 stage_timing.source_tree_load = Some(source_tree_load_start.elapsed());
                 let mut diagnostics = cache_diagnostics;
                 diagnostics.push(diagnostic);
-                remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+                remove_failed_compile_artifacts(
+                    &output_pdf,
+                    &options.output_dir,
+                    &mut diagnostics,
+                    failed_artifact_policy,
+                );
 
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -1690,7 +1698,12 @@ impl<'a> CompileJobService<'a> {
         if font_resolution_fatal {
             let mut diagnostics = cache_diagnostics.clone();
             diagnostics.extend(parse_diagnostics.clone());
-            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+            remove_failed_compile_artifacts(
+                &output_pdf,
+                &options.output_dir,
+                &mut diagnostics,
+                failed_artifact_policy,
+            );
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -1746,7 +1759,12 @@ impl<'a> CompileJobService<'a> {
                 );
                 let mut diagnostics = cache_diagnostics.clone();
                 diagnostics.extend(parse_diagnostics.clone());
-                remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+                remove_failed_compile_artifacts(
+                    &output_pdf,
+                    &options.output_dir,
+                    &mut diagnostics,
+                    failed_artifact_policy,
+                );
 
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -1783,7 +1801,12 @@ impl<'a> CompileJobService<'a> {
         if has_fatal_parse_error {
             let mut diagnostics = cache_diagnostics.clone();
             diagnostics.extend(parse_diagnostics.clone());
-            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+            remove_failed_compile_artifacts(
+                &output_pdf,
+                &options.output_dir,
+                &mut diagnostics,
+                failed_artifact_policy,
+            );
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -1802,7 +1825,12 @@ impl<'a> CompileJobService<'a> {
             let mut diagnostics = cache_diagnostics.clone();
             diagnostics.extend(parse_diagnostics.clone());
             diagnostics.extend(graphics_diagnostics);
-            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+            remove_failed_compile_artifacts(
+                &output_pdf,
+                &options.output_dir,
+                &mut diagnostics,
+                failed_artifact_policy,
+            );
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -1829,7 +1857,12 @@ impl<'a> CompileJobService<'a> {
                 let mut diagnostics = cache_diagnostics.clone();
                 diagnostics.extend(parse_diagnostics.clone());
                 diagnostics.push(diagnostic);
-                remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+                remove_failed_compile_artifacts(
+                    &output_pdf,
+                    &options.output_dir,
+                    &mut diagnostics,
+                    failed_artifact_policy,
+                );
 
                 return CompileResult {
                     exit_code: exit_code_for(&diagnostics),
@@ -1890,7 +1923,12 @@ impl<'a> CompileJobService<'a> {
         let mut diagnostics = cache_diagnostics;
         diagnostics.extend(cacheable_diagnostics.clone());
         if !pdf_document.document.encoding_errors.is_empty() {
-            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+            remove_failed_compile_artifacts(
+                &output_pdf,
+                &options.output_dir,
+                &mut diagnostics,
+                failed_artifact_policy,
+            );
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -1901,7 +1939,12 @@ impl<'a> CompileJobService<'a> {
             };
         }
         if has_blocking_error_diagnostics(&diagnostics) {
-            remove_failed_compile_artifacts(&output_pdf, &options.output_dir, &mut diagnostics);
+            remove_failed_compile_artifacts(
+                &output_pdf,
+                &options.output_dir,
+                &mut diagnostics,
+                failed_artifact_policy,
+            );
             return CompileResult {
                 exit_code: exit_code_for(&diagnostics),
                 diagnostics,
@@ -6399,12 +6442,31 @@ fn is_recoverable_font_fallback(diagnostic: &Diagnostic) -> bool {
         .is_some_and(|suggestion| suggestion.contains("will fall back"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedCompileArtifactPolicy {
+    RemoveOutputPdf,
+    PreserveOutputPdf,
+}
+
+impl FailedCompileArtifactPolicy {
+    fn from_changed_paths_hint(changed_paths_hint: &[PathBuf]) -> Self {
+        if changed_paths_hint.is_empty() {
+            Self::RemoveOutputPdf
+        } else {
+            Self::PreserveOutputPdf
+        }
+    }
+}
+
 fn remove_failed_compile_artifacts(
     output_pdf: &Path,
     output_dir: &Path,
     diagnostics: &mut Vec<Diagnostic>,
+    policy: FailedCompileArtifactPolicy,
 ) {
-    remove_stale_output_pdf(output_pdf, diagnostics);
+    if policy == FailedCompileArtifactPolicy::RemoveOutputPdf {
+        remove_stale_output_pdf(output_pdf, diagnostics);
+    }
     remove_compile_cache_artifacts(output_dir, diagnostics);
 }
 
