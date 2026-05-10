@@ -36,6 +36,8 @@
 
 `math_equations` regression: `contains_footnote_markers` → `contains_script_markers` へのリネームにより全 6 マーカー（footnote + superscript + subscript）の検出を復元。document_diff_rate は 0.286 → 0.000 に改善。`math_equations_parity_regression` テストで regression baseline (0.286) 未満かつ threshold (0.10) 以内であることを assert。
 
+`full_bench_parity_evidence` の aggregate pass/fail 判定は、known unsupported/preflight blocker として管理される `corpus-navigation-features-custom_metadata` と `corpus-bibliography-multi_cite` を対象外にする。これらは parity evidence の失敗として集計せず、個別 `run_case` では `PreflightBlocked` として報告されるため、未対応 corpus case と supported parity evidence の合否を分離して追跡する。
+
 ### 実装完了領域（旧: 主要な残ギャップ）
 
 以下の領域はすべて実装完了済み。残差分なし。
