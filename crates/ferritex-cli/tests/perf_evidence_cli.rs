@@ -48,11 +48,34 @@ fn perf_evidence_command_writes_parseable_bounded_artifacts() {
     let json = std::fs::read_to_string(&json_path).expect("read JSON artifact");
     let parsed: serde_json::Value =
         serde_json::from_str(&json).expect("JSON artifact should parse");
+    let expected_run_dir = output_dir.join("run").join("measured-0");
+    let expected_fixture_path = output_dir.join("perf-evidence-smoke.tex");
     assert_eq!(parsed["fixture"]["source"].as_str(), Some("embedded"));
     assert_eq!(parsed["results"].as_array().map(Vec::len), Some(1));
     assert_eq!(parsed["failures"].as_array().map(Vec::len), Some(0));
     assert_eq!(parsed["config"]["measured_runs"].as_u64(), Some(1));
     assert_eq!(parsed["results"][0]["success"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["results"][0]["compile_result"]["schemaVersion"].as_str(),
+        Some("ferritex.compileResult.v1")
+    );
+    assert_eq!(
+        parsed["results"][0]["compile_result"]["command"].as_str(),
+        Some("compile")
+    );
+    assert_eq!(
+        parsed["results"][0]["compile_result"]["success"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        parsed["results"][0]["compile_result"]["output"]["pdfPath"].as_str(),
+        Some(
+            expected_run_dir
+                .join("perf-evidence-smoke.pdf")
+                .to_str()
+                .expect("UTF-8 pdf path")
+        )
+    );
     assert_eq!(parsed["command"]["args_kind"].as_str(), Some("template"));
     assert_eq!(
         parsed["command"]["actual_invocation"].as_str(),
@@ -68,8 +91,6 @@ fn perf_evidence_command_writes_parseable_bounded_artifacts() {
         .iter()
         .map(|value| value.as_str().expect("command args should be strings"))
         .collect::<Vec<_>>();
-    let expected_run_dir = output_dir.join("run").join("measured-0");
-    let expected_fixture_path = output_dir.join("perf-evidence-smoke.tex");
     assert_eq!(
         actual_args,
         vec![
