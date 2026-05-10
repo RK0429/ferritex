@@ -502,11 +502,13 @@ fn handle_compile(command: &CompileCommand) -> i32 {
         &shell_command_gateway,
     );
     let result = service.compile(&options);
-    emit_diagnostics(
-        &result.diagnostics,
-        options.interaction_mode,
-        options.trace_font_tasks,
-    );
+    if command.format == CompileOutputFormat::Text || options.trace_font_tasks {
+        emit_diagnostics(
+            &result.diagnostics,
+            options.interaction_mode,
+            options.trace_font_tasks,
+        );
+    }
     match command.format {
         CompileOutputFormat::Text => {
             emit_batchmode_failure_summary(
