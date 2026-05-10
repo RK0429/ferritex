@@ -143,7 +143,12 @@ struct SharedCompileCommand {
     /// Emit public font task trace NDJSON to stderr using schemaVersion ferritex.fontTaskTrace.v1
     #[arg(long)]
     trace_font_tasks: bool,
-    /// Enable shell escape for \write18 commands
+    /// Enable shell escape for \write18 commands.
+    ///
+    /// This allows document-controlled external command execution and is disabled
+    /// by default. Execution remains bounded by ferritex's file access gates and
+    /// process stdio limits (30s, one concurrent process per compilation job, 4 MiB captured
+    /// output).
     #[arg(long)]
     shell_escape: bool,
     /// Disable shell escape (overrides --shell-escape)
