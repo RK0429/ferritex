@@ -904,7 +904,7 @@
   - 入力ファイルの読み込みとコンパイルパイプラインの実行
   - `--output-dir` 未指定時は `primaryInput` の親ディレクトリを既定 `artifactRoot` とし、同ディレクトリを current job の output root として `ExecutionPolicy` に組み込む
   - 進捗表示（ページ数、処理中ファイル名）
-  - 終了コード: 0（成功）、1（警告あり成功）、2（エラー）
+  - 終了コード: 0（成功。警告のみの場合を含む）、2（エラー）
 - **出力**: PDF ファイル、コンパイルログ。`--format json` 指定時は標準出力に versioned compile result object（`schemaVersion`, `command`, `classification`, `exitCode`, `success`, `output.pdfPath`, `output.pageCount`, `diagnostics`）を 1 件だけ出力し、人間向け成功サマリは出力しない。
 - **受け入れ基準**:
   - Given 有効な LaTeX ファイル, When `ferritex compile main.tex` を実行, Then カレントディレクトリに `main.pdf` が生成される

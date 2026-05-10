@@ -596,11 +596,10 @@ fn compile_result_classification(result: &CompileResult) -> &'static str {
             .any(|diagnostic| diagnostic.severity == Severity::Error)
     {
         "error"
-    } else if result.exit_code == 1
-        || result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == Severity::Warning)
+    } else if result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Warning)
     {
         "warning"
     } else {
