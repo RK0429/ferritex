@@ -1916,7 +1916,9 @@ impl<'a> CompileJobService<'a> {
             .document
             .encoding_errors
             .iter()
-            .map(|encoding_error| Diagnostic::new(Severity::Error, encoding_error.clone()))
+            .map(|encoding_error| {
+                diagnostic_for_pdf_encoding_error(encoding_error.clone(), &source_tree.source_lines)
+            })
             .collect::<Vec<_>>();
         let mut cacheable_diagnostics = parse_diagnostics;
         cacheable_diagnostics.extend(encoding_error_diagnostics.clone());
@@ -6326,6 +6328,32 @@ fn diagnostic_for_bibliography(
                 .with_suggestion("ensure the bibliography contains the cited key")
         }
     }
+}
+
+fn diagnostic_for_pdf_encoding_error(
+    message: String,
+    source_lines: &[SourceLineTrace],
+) -> Diagnostic {
+    let diagnostic = Diagnostic::new(Severity::Error, message.clone())
+        .with_suggestion("use a font stack or output path with Unicode/CJK PDF text support");
+    let Some(ch) = pdf_encoding_error_character(&message) else {
+        return diagnostic;
+    };
+    let Some(source_line) = source_lines.iter().find(|line| line.text.contains(ch)) else {
+        return diagnostic;
+    };
+
+    diagnostic
+        .with_file(source_line.file.clone())
+        .with_line(source_line.line)
+        .with_context(source_line.text.clone())
+}
+
+fn pdf_encoding_error_character(message: &str) -> Option<char> {
+    message
+        .strip_prefix("PDF encoding: character '")?
+        .chars()
+        .next()
 }
 
 fn diagnostic_for_parse_error(error: ParseError, input_path: String) -> Diagnostic {
@@ -13941,6 +13969,16 @@ mod tests {
             .expect("pdf encoding error diagnostic");
         assert!(diagnostic.message.contains("is not supported"));
         assert!(diagnostic.message.contains("replaced with '?'"));
+        assert!(diagnostic
+            .file
+            .as_deref()
+            .is_some_and(|file| file.ends_with("main.tex")));
+        assert_eq!(diagnostic.line, Some(3));
+        assert_eq!(diagnostic.context.as_deref(), Some("Hello 漢"));
+        assert_eq!(
+            diagnostic.suggestion.as_deref(),
+            Some("use a font stack or output path with Unicode/CJK PDF text support")
+        );
     }
 
     #[test]

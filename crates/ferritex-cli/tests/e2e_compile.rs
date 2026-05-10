@@ -1168,6 +1168,20 @@ fn compile_with_unsupported_cjk_character_emits_error() {
         "stderr should include the code point, got: {stderr}"
     );
     assert!(
+        stderr.contains("cjk.tex:3: error"),
+        "stderr should include source file and line, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("context: Hello 漢"),
+        "stderr should include the offending source context, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "suggestion: use a font stack or output path with Unicode/CJK PDF text support"
+        ),
+        "stderr should include the actionable suggestion, got: {stderr}"
+    );
+    assert!(
         !stdout.contains("->"),
         "error path should not print a success summary, got: {stdout}"
     );
@@ -5914,10 +5928,7 @@ fn compile_help_shows_option_descriptions() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Usage:"),
-        "compile help should show usage"
-    );
+    assert!(stdout.contains("Usage:"), "compile help should show usage");
     assert!(
         stdout.contains("--output-dir"),
         "compile help should show --output-dir"
