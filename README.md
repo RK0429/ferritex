@@ -32,13 +32,17 @@ cargo build --release
 
 Ferritex uses a pre-indexed asset bundle (`FTX-ASSET-BUNDLE-001`) for class, package, and font assets instead of depending on a TeX Live installation at runtime.
 
-```sh
-# Generate the bundle archive from the bundled fixtures
-bash scripts/build_bundle_archive.sh tmp/FTX-ASSET-BUNDLE-001.tar.gz
+For normal use, download the official `FTX-ASSET-BUNDLE-001.tar.gz` archive published for the Ferritex build you are running, then extract it:
 
-# Extract the archive
+```sh
 mkdir -p tmp/bundle
 tar -xzf tmp/FTX-ASSET-BUNDLE-001.tar.gz -C tmp/bundle
+```
+
+Developers who are working from a source checkout can regenerate the archive from the bundled fixtures before extracting it:
+
+```sh
+bash scripts/build_bundle_archive.sh tmp/FTX-ASSET-BUNDLE-001.tar.gz
 ```
 
 ### 3. Compile a document
