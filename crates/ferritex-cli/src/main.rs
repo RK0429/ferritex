@@ -699,8 +699,11 @@ fn print_compile_success_summary(
         );
     }
     print_compile_artifact_paths(command, output_pdf);
-    if print_asset_bundle_fallback_warning && command.asset_bundle.is_none() {
-        println!(
+    if print_asset_bundle_fallback_warning
+        && command.asset_bundle.is_none()
+        && !command.trace_font_tasks
+    {
+        eprintln!(
             "warning: no asset bundle specified; using built-in/host asset fallback. Pass --asset-bundle <PATH> to use the release asset bundle."
         );
     }
