@@ -85,6 +85,10 @@ stdout.
 `watch` status output is human-readable only. If a recompile fails after a
 previous successful compile, the previous PDF remains on disk and the failed
 recompile is reported in logs; no stable JSON event is emitted for this state.
+`watch` and `preview` treat Ctrl+C/SIGINT as an intentional normal stop:
+stderr includes `shutdown complete (exit=0)` and the process exits 0. External
+non-SIGINT termination, such as SIGALRM from an alarm wrapper or SIGKILL, is
+outside the normal-stop contract and may report the signal-derived exit status.
 
 Invalid asset bundle archives are reported through an error diagnostic whose
 message includes the archive extraction failure reason and the standard

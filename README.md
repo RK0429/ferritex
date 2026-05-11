@@ -91,7 +91,11 @@ cargo run --release -- lsp                 # starts an LSP server over stdio
 `watch` and `preview` status output is human-readable only. These continuous
 commands do not emit a stable JSON or NDJSON event stream. If `watch` has
 already produced a PDF and a later recompile fails, the previous PDF remains on
-disk while the failure is reported in logs.
+disk while the failure is reported in logs. Pressing Ctrl+C/SIGINT is an
+intentional normal stop: stderr includes `shutdown complete (exit=0)` and the
+process exits 0. External non-SIGINT termination, such as SIGALRM from an alarm
+wrapper or SIGKILL, is not a normal stop and may report the signal-derived exit
+status.
 
 ### 5. Reproduce bounded performance evidence
 
