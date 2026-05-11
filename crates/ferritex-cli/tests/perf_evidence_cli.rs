@@ -22,6 +22,31 @@ fn perf_evidence_command_is_visible_in_help() {
 }
 
 #[test]
+fn perf_evidence_rejects_zero_measured_runs_with_guidance() {
+    let temp_dir = tempfile::tempdir().expect("create tempdir");
+    let output_dir = temp_dir.path().join("perf-evidence");
+
+    let output = Command::new(ferritex_bin())
+        .current_dir(temp_dir.path())
+        .arg("perf-evidence")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--measured-runs")
+        .arg("0")
+        .output()
+        .expect("run ferritex perf-evidence");
+
+    assert!(
+        !output.status.success(),
+        "perf-evidence should reject zero measured runs"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--measured-runs must be greater than 0"));
+    assert!(stderr.contains("allowed range: 1.."));
+    assert!(stderr.contains("ferritex perf-evidence --measured-runs 1 --output-dir <DIR>"));
+}
+
+#[test]
 fn perf_evidence_command_writes_parseable_bounded_artifacts() {
     let temp_dir = tempfile::tempdir().expect("create tempdir");
     let output_dir = temp_dir.path().join("perf-evidence");

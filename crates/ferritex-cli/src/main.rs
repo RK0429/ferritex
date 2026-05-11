@@ -272,7 +272,9 @@ fn run(cli: Cli) -> i32 {
 
 fn handle_perf_evidence(command: &PerfEvidenceCommand) -> i32 {
     if command.measured_runs == 0 {
-        eprintln!("--measured-runs must be greater than 0");
+        eprintln!(
+            "--measured-runs must be greater than 0 (allowed range: 1..). Try: ferritex perf-evidence --measured-runs 1 --output-dir <DIR>"
+        );
         return 2;
     }
 
