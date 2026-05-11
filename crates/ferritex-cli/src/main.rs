@@ -60,7 +60,7 @@ Side effects: writes generated artifacts to --output-dir, or to the input file's
 
 Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile. After the first successful compile, ferritex prints a loopback HTTP document URL and a WebSocket event URL. The document URL serves the current PDF over 127.0.0.1, while the events URL streams revision notifications and accepts view-state updates for the active preview session. Preview binds a loopback-only listener on 127.0.0.1 and does not publish to external network interfaces.
 
-Output: preview status logs are human-readable by default. Pass --bootstrap-format json to emit the initial document URL, events URL, session ID, and compile summary as a stable JSON manifest. The command does not emit a stable continuous JSON or NDJSON event stream.",
+Output: preview status logs are human-readable by default. Pass --bootstrap-format json to emit the initial document URL, events URL, session ID, and compile summary as a stable JSON manifest. The command does not emit a stable continuous JSON or NDJSON event stream. Ctrl+C/SIGINT is treated as an intentional normal stop: stderr includes 'shutdown complete (exit=0)' and the process exits 0. External non-SIGINT termination, such as SIGALRM from an alarm wrapper or SIGKILL, is not a normal stop and may report the signal-derived exit status.",
         after_help = "Examples:\n  ferritex preview document.tex"
     )]
     Preview(PreviewCommand),
@@ -69,7 +69,7 @@ Output: preview status logs are human-readable by default. Pass --bootstrap-form
 
 Side effects: uses the same write roots, generated artifacts, sidecars, cache directory, and temp materialization as compile on the initial build and each recompile. The default output root is --output-dir, or the input file's directory when --output-dir is omitted. Watch keeps running until interrupted and does not open network listeners.
 
-Output: watch status logs are human-readable only. A failed recompile leaves the previously generated PDF on disk and logs the failure instead of deleting that prior successful output. The command does not emit a stable JSON or NDJSON event stream.")]
+Output: watch status logs are human-readable only. A failed recompile leaves the previously generated PDF on disk and logs the failure instead of deleting that prior successful output. The command does not emit a stable JSON or NDJSON event stream. Ctrl+C/SIGINT is treated as an intentional normal stop: stderr includes 'shutdown complete (exit=0)' and the process exits 0. External non-SIGINT termination, such as SIGALRM from an alarm wrapper or SIGKILL, is not a normal stop and may report the signal-derived exit status.")]
     Watch(WatchCommand),
     /// Start the Language Server Protocol server
     #[command(

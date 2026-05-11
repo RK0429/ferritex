@@ -6283,6 +6283,13 @@ fn watch_help_documents_repeated_compile_side_effects() {
         stdout.contains("previously generated PDF on disk"),
         "watch help should document failed recompile PDF retention, got: {stdout}"
     );
+    assert!(
+        stdout.contains("Ctrl+C/SIGINT is treated as an intentional normal stop")
+            && stdout.contains("shutdown complete (exit=0)")
+            && stdout.contains("process exits 0")
+            && stdout.contains("External non-SIGINT termination"),
+        "watch help should distinguish normal SIGINT shutdown from forced termination, got: {stdout}"
+    );
 }
 
 #[test]
@@ -6353,6 +6360,13 @@ fn preview_help_documents_compile_side_effects_and_loopback_scope() {
             && stdout.contains("Pass --bootstrap-format json")
             && stdout.contains("does not emit a stable continuous JSON or NDJSON event stream"),
         "preview help should document bootstrap JSON and continuous output limits, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Ctrl+C/SIGINT is treated as an intentional normal stop")
+            && stdout.contains("shutdown complete (exit=0)")
+            && stdout.contains("process exits 0")
+            && stdout.contains("External non-SIGINT termination"),
+        "preview help should distinguish normal SIGINT shutdown from forced termination, got: {stdout}"
     );
 }
 
