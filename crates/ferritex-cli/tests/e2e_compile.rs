@@ -6383,10 +6383,72 @@ fn lsp_help_documents_jsonrpc_protocol() {
 }
 
 #[test]
-fn lsp_malformed_input_reports_framing_recovery_hint() {
+fn lsp_stdin_eof_reports_fatal_reason() {
     let mut child = ferritex_bin()
         .args(["lsp"])
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex lsp");
+    drop(child.stdin.take().expect("lsp stdin"));
+
+    let output = child.wait_with_output().expect("wait ferritex lsp");
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should remain empty on fatal LSP EOF"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fatal LSP termination"),
+        "stderr should identify fatal LSP termination, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("stdin reached EOF"),
+        "stderr should distinguish stdin EOF, got: {stderr}"
+    );
+}
+
+#[test]
+fn lsp_malformed_content_length_reports_fatal_reason() {
+    let mut child = ferritex_bin()
+        .args(["lsp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferritex lsp");
+    let mut stdin = child.stdin.take().expect("lsp stdin");
+
+    stdin
+        .write_all(b"Content-Length: nope\r\n\r\n{}")
+        .expect("write malformed LSP input");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("wait ferritex lsp");
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should remain empty on malformed LSP Content-Length"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fatal LSP termination"),
+        "stderr should identify fatal LSP termination, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("malformed Content-Length header"),
+        "stderr should distinguish malformed Content-Length, got: {stderr}"
+    );
+}
+
+#[test]
+fn lsp_malformed_frame_reports_fatal_reason_and_recovery_hint() {
+    let mut child = ferritex_bin()
+        .args(["lsp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn ferritex lsp");
@@ -6399,10 +6461,18 @@ fn lsp_malformed_input_reports_framing_recovery_hint() {
 
     let output = child.wait_with_output().expect("wait ferritex lsp");
     assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should remain empty on malformed LSP frame"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to read LSP Content-Length framed JSON-RPC message"),
-        "stderr should identify the failed LSP framing/parsing step, got: {stderr}"
+        stderr.contains("fatal LSP termination"),
+        "stderr should identify fatal LSP termination, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to parse LSP frame body as JSON"),
+        "stderr should distinguish frame parse failures, got: {stderr}"
     );
     assert!(
         stderr.contains("Content-Length: <N>"),
@@ -6434,8 +6504,8 @@ fn lsp_oversized_header_reports_framing_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to read LSP Content-Length framed JSON-RPC message"),
-        "stderr should identify the failed LSP framing/parsing step, got: {stderr}"
+        stderr.contains("fatal LSP termination"),
+        "stderr should identify fatal LSP termination, got: {stderr}"
     );
     assert!(
         stderr.contains("header line exceeds limit"),

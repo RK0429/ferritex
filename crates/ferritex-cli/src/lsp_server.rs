@@ -41,20 +41,15 @@ pub fn run_lsp() -> i32 {
     loop {
         let message = match read_message(&mut reader) {
             Ok(Some(message)) => message,
-            Ok(None) => return if shutdown_requested { 0 } else { 1 },
+            Ok(None) => {
+                if shutdown_requested {
+                    return 0;
+                }
+                emit_lsp_fatal_read_error("stdin reached EOF before LSP shutdown");
+                return 1;
+            }
             Err(error) => {
-                emit_diagnostic(
-                    &Diagnostic::new(
-                        Severity::Error,
-                        format!(
-                            "failed to read LSP Content-Length framed JSON-RPC message: {error}. \
-                             ferritex lsp reads stdio messages framed as \
-                             `Content-Length: <N>\\r\\n\\r\\n<JSON>`; run `ferritex lsp --help` \
-                             or see README.md for the framing contract before retrying."
-                        ),
-                    ),
-                    LSP_DIAGNOSTIC_MODE,
-                );
+                emit_lsp_fatal_read_error(&error.to_string());
                 return 2;
             }
         };
@@ -643,6 +638,20 @@ fn severity_to_lsp(severity: Severity) -> u8 {
     }
 }
 
+fn emit_lsp_fatal_read_error(reason: &str) {
+    emit_diagnostic(
+        &Diagnostic::new(
+            Severity::Error,
+            format!(
+                "fatal LSP termination: {reason}. ferritex lsp reads stdio messages framed as \
+                 `Content-Length: <N>\\r\\n\\r\\n<JSON>`; run `ferritex lsp --help` or see \
+                 README.md for the framing contract before retrying."
+            ),
+        ),
+        LSP_DIAGNOSTIC_MODE,
+    );
+}
+
 fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
     let mut content_length = None;
     let mut header_bytes = 0usize;
@@ -687,7 +696,7 @@ fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
             let parsed = value.trim().parse::<usize>().map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("invalid content length: {error}"),
+                    format!("malformed Content-Length header: {error}"),
                 )
             })?;
             if parsed > MAX_LSP_MESSAGE_BYTES {
@@ -708,10 +717,18 @@ fn read_message<R: BufRead>(reader: &mut R) -> io::Result<Option<Value>> {
     };
 
     let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
-    serde_json::from_slice(&body)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    reader.read_exact(&mut body).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to read LSP frame body: {error}"),
+        )
+    })?;
+    serde_json::from_slice(&body).map(Some).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse LSP frame body as JSON: {error}"),
+        )
+    })
 }
 
 fn write_response(writer: &mut impl Write, id: Value, result: Value) -> io::Result<()> {
