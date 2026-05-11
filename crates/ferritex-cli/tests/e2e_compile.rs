@@ -20,6 +20,7 @@ const PNG_1X1_RGB: &[u8] = &[
 ];
 const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /ProcSet [/PDF] >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 18 >>\nstream\n0 0 m\n200 100 l\nS\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n";
 const CORRUPT_PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /MediaBox [0 0 200] >>\n";
+const ASSET_BUNDLE_FALLBACK_WARNING: &str = "warning: no asset bundle specified; using built-in/host asset fallback. Pass --asset-bundle <PATH> to use the release asset bundle.";
 
 fn ferritex_bin() -> Command {
     let bin = env!("CARGO_BIN_EXE_ferritex");
@@ -126,6 +127,14 @@ fn buffer_snapshot(buffer: &Arc<Mutex<String>>) -> String {
         .lock()
         .expect("streaming collector buffer poisoned")
         .clone()
+}
+
+fn assert_only_asset_bundle_fallback_warning(stderr: &str) {
+    assert_eq!(
+        stderr.trim(),
+        ASSET_BUNDLE_FALLBACK_WARNING,
+        "stderr should contain only the asset bundle fallback warning, got: {stderr}"
+    );
 }
 
 fn issue_get_request(host: &str, port: u16, path: &str) -> Vec<u8> {
@@ -569,17 +578,20 @@ fn compile_existing_file_writes_pdf_with_document_content() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.trim().is_empty());
     assert!(stdout.contains(tex_file.to_str().expect("utf-8 path")));
     assert!(stdout.contains("hello.pdf"));
     assert!(stdout.contains("(1 page)"));
     assert!(
-        stdout.contains("no asset bundle specified"),
-        "compile without --asset-bundle should surface fallback risk, got: {stdout}"
+        !stdout.contains("no asset bundle specified"),
+        "compile fallback warning must not pollute stdout, got: {stdout}"
     );
     assert!(
-        stdout.contains("--asset-bundle"),
-        "fallback warning should tell users how to opt into bundle-backed assets, got: {stdout}"
+        stderr.contains("no asset bundle specified"),
+        "compile without --asset-bundle should surface fallback risk on stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--asset-bundle"),
+        "fallback warning should tell users how to opt into bundle-backed assets, got: {stderr}"
     );
 
     let pdf_file = dir.path().join("hello.pdf");
@@ -665,9 +677,14 @@ fn compile_format_json_emits_machine_readable_success_result() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stdout.contains("no asset bundle specified"),
         "json output must not include human fallback warning, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("no asset bundle specified"),
+        "json stderr must not include human fallback warning, got: {stderr}"
     );
     assert!(
         !stdout.contains("->"),
@@ -5408,7 +5425,7 @@ fn compile_tikz_basic_shapes_emits_vector_pdf_operators() {
 
     assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.trim().is_empty());
+    assert_only_asset_bundle_fallback_warning(&stderr);
 
     let pdf_file = dir.path().join("tikz-basic.pdf");
     let pdf_bytes = std::fs::read(&pdf_file).expect("read output pdf");
@@ -5446,7 +5463,7 @@ fn compile_tikz_nested_style_transform_clip_arrow_emits_pdf_operators() {
 
     assert_eq!(output.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.trim().is_empty());
+    assert_only_asset_bundle_fallback_warning(&stderr);
 
     let pdf_file = dir.path().join("tikz-nested.pdf");
     let pdf_bytes = std::fs::read(&pdf_file).expect("read output pdf");
@@ -5487,11 +5504,7 @@ fn corpus_tikz_basic_shapes_fixtures_emit_vector_operators() {
             .expect("utf-8 fixture stem");
         let (stderr, pdf) = compile_fixture_via_cli(&fixture, None);
 
-        assert!(
-            stderr.trim().is_empty(),
-            "fixture {} stderr: {stderr}",
-            fixture.display()
-        );
+        assert_only_asset_bundle_fallback_warning(&stderr);
         assert!(
             pdf.starts_with("%PDF-1.4"),
             "fixture {} pdf: {pdf}",
@@ -5723,11 +5736,7 @@ fn corpus_tikz_nested_fixtures_emit_expected_operators() {
             .expect("utf-8 fixture stem");
         let (stderr, pdf) = compile_fixture_via_cli(&fixture, None);
 
-        assert!(
-            stderr.trim().is_empty(),
-            "fixture {} stderr: {stderr}",
-            fixture.display()
-        );
+        assert_only_asset_bundle_fallback_warning(&stderr);
         assert!(
             pdf.starts_with("%PDF-1.4"),
             "fixture {} pdf: {pdf}",
@@ -5899,11 +5908,7 @@ fn corpus_partition_book_fixtures_compile_via_cli() {
     for fixture in fixtures {
         let (stderr, pdf) = compile_fixture_via_cli(&fixture, Some("4"));
 
-        assert!(
-            stderr.trim().is_empty(),
-            "fixture {} stderr: {stderr}",
-            fixture.display()
-        );
+        assert_only_asset_bundle_fallback_warning(&stderr);
         assert!(
             pdf.starts_with("%PDF-1.4"),
             "fixture {} pdf: {pdf}",
@@ -5926,11 +5931,7 @@ fn corpus_partition_article_fixtures_compile_via_cli() {
     for fixture in fixtures {
         let (stderr, pdf) = compile_fixture_via_cli(&fixture, None);
 
-        assert!(
-            stderr.trim().is_empty(),
-            "fixture {} stderr: {stderr}",
-            fixture.display()
-        );
+        assert_only_asset_bundle_fallback_warning(&stderr);
         assert!(
             pdf.starts_with("%PDF-1.4"),
             "fixture {} pdf: {pdf}",
