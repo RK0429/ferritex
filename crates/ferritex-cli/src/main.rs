@@ -951,18 +951,18 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
     let mut session_id: Option<SessionId> = None;
     let mut on_compile = move |result: &CompileResult| {
         if result.exit_code != 0 {
-            return;
+            return None;
         }
 
         let Some(output_pdf) = result.output_pdf.as_ref() else {
-            return;
+            return None;
         };
 
         let pdf_bytes = match std::fs::read(output_pdf) {
             Ok(bytes) => bytes,
             Err(error) => {
                 eprintln!("warning: failed to read compiled PDF for preview publish: {error}");
-                return;
+                return None;
             }
         };
         let page_count = estimate_pdf_page_count(&pdf_bytes);
@@ -979,7 +979,7 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
                             "warning: failed to create preview session: {} ({})",
                             error.error_kind, error.recovery_instruction
                         );
-                        return;
+                        return None;
                     }
                 }
             };
@@ -1023,7 +1023,7 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
                 "warning: failed to authorize preview publish: {} ({})",
                 error.error_kind, error.recovery_instruction
             );
-            return;
+            return None;
         }
 
         if callback_service
@@ -1036,13 +1036,13 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
                 "warning: failed to apply preview page fallback for session {}",
                 current_session_id
             );
-            return;
+            return None;
         }
 
         if let Err(error) = callback_transport.publish_pdf(current_session_id.as_str(), &pdf_bytes)
         {
             eprintln!("warning: failed to publish preview PDF: {error}");
-            return;
+            return None;
         }
 
         let Some(revision) = callback_service
@@ -1054,7 +1054,7 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
                 "warning: failed to advance preview revision for session {}",
                 current_session_id
             );
-            return;
+            return None;
         };
 
         if let Err(error) = callback_transport.publish_revision_event(&TransportRevisionEvent {
@@ -1066,9 +1066,10 @@ fn handle_preview(command: &PreviewCommand) -> i32 {
         }) {
             eprintln!("warning: failed to publish preview revision event: {error}");
         }
+        Some(revision.revision)
     };
 
-    on_compile(&initial_result);
+    let _ = on_compile(&initial_result);
     if watch_runner::shutdown_requested() {
         watch_runner::emit_shutdown_complete();
         service.flush_cache();

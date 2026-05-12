@@ -114,9 +114,13 @@ has a human-readable failure boundary. `compile --format json` keeps the human
 diagnostic channel silent and carries the machine-readable failure contract on
 stdout.
 
-`watch` status output is human-readable only. If a recompile fails after a
-previous successful compile, the previous PDF remains on disk and the failed
-recompile is reported in logs; no stable JSON event is emitted for this state.
+`watch` and `preview` status output is human-readable only. Recompile status
+lines include stable `event_id`, `revision`, and `duration_ms` fields so
+external tools can correlate a recompile without relying on a JSON stream.
+`preview` uses the published preview revision when available. If a recompile
+fails after a previous successful compile, the previous PDF remains on disk and
+the failed recompile is reported in logs; no stable JSON event is emitted for
+this state.
 `watch` and `preview` treat Ctrl+C/SIGINT as an intentional normal stop:
 stderr includes `shutdown complete (exit=0)` and the process exits 0. External
 non-SIGINT termination, such as SIGALRM from an alarm wrapper or SIGKILL, is

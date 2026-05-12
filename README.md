@@ -89,7 +89,10 @@ cargo run --release -- lsp                 # starts an LSP server over stdio
 ```
 
 `watch` and `preview` status output is human-readable only. These continuous
-commands do not emit a stable JSON or NDJSON event stream. If `watch` has
+commands do not emit a stable JSON or NDJSON event stream. Recompile status
+lines include stable `event_id`, `revision`, and `duration_ms` fields for
+correlating human logs with automation and performance evidence; `preview`
+uses the published preview revision when available. If `watch` has
 already produced a PDF and a later recompile fails, the previous PDF remains on
 disk while the failure is reported in logs. Pressing Ctrl+C/SIGINT is an
 intentional normal stop: stderr includes `shutdown complete (exit=0)` and the
