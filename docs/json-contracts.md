@@ -80,6 +80,9 @@ Required top-level fields:
 - `schemaVersion`: always `ferritex.diagnostic.v1`
 - `diagnostic`: structured diagnostic object with `severity`, `message`, and
   optional `file`, `line`, `column`, `context`, and `suggestion`
+- `diagnostic.severity`: one of `Error`, `Warning`, or `Info`; casing is part
+  of the `ferritex.diagnostic.v1` contract, so casing changes require a new
+  schema version
 
 ## Human-Readable Channels
 
