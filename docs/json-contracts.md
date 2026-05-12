@@ -61,7 +61,14 @@ Required top-level fields:
 - `schemaVersion`: always `ferritex.fontTaskTrace.v1`
 - `fontTaskId`: public font task identifier
 - `fontAsset`: font asset identifier
-- `phase`: task phase
+- `startedAt`: unsigned integer Unix timestamp in microseconds captured when
+  the font task starts
+- `finishedAt`: unsigned integer Unix timestamp in microseconds captured when
+  the font task finishes; it is greater than or equal to `startedAt`
+- `workerId`: unsigned integer identifier of the worker that emitted the trace
+
+All listed fields are required. Consumers must treat unrecognized additional
+fields as additive metadata.
 
 ## `ferritex.diagnostic.v1`
 
