@@ -72,8 +72,15 @@ pub enum InteractionMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellEscapeMode {
+    /// Shell escape is explicitly disabled.
     Disabled,
+    /// The CLI default when neither `--shell-escape` nor `--no-shell-escape`
+    /// is passed.
+    ///
+    /// Ferritex currently treats this as no shell escape support; only
+    /// [`ShellEscapeMode::Enabled`] allows shell escape execution.
     Restricted,
+    /// Shell escape is explicitly enabled.
     Enabled,
 }
 
