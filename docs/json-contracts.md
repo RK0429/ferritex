@@ -20,6 +20,28 @@ Required top-level fields:
 - `summary`: timing and cache summary
 - `diagnostics`: structured diagnostics
 
+Stable nested fields:
+
+- `output.pdfPath`: generated PDF path, or `null` when no PDF was produced
+- `output.cacheDir`: cache directory path, or `null` when cache is disabled or no
+  PDF was produced
+- `output.syncTexPath`: generated SyncTeX sidecar path, or `null` when SyncTeX is
+  disabled or no PDF was produced
+- `output.sidecarPaths`: array of generated sidecar artifact paths
+- `output.pageCount`: rendered page count, or `null` when unavailable
+- `summary.elapsedMicros`: total elapsed duration in microseconds
+- `summary.stageTotalMicros`: total measured stage duration in microseconds
+- `summary.cache.status`: `disabled`, `hit`, or `miss`
+- `summary.stageTimingsMicros`: per-stage timings in microseconds with
+  `cacheLoad`, `sourceTreeLoad`, `parse`, `typeset`, `pdfRender`, and
+  `cacheStore`; a stage value may be `null` when the stage did not run
+- `summary.passCount`: typesetting pass count
+
+Consumers must treat unrecognized additional fields in this object and nested
+objects as additive metadata. The listed nested fields are stable; unlisted
+nested fields are opaque unless documented by a later schema version or by an
+explicit additive contract.
+
 ## `ferritex.previewBootstrap.v1`
 
 Produced by `ferritex preview --bootstrap-format json` for the initial preview
