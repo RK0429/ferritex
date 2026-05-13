@@ -4145,7 +4145,13 @@ fn preview_events_websocket_emits_initial_and_updated_revision_events() {
 
     child.kill().expect("kill preview process");
     child.wait().expect("wait for preview process");
-    stderr_handle.join().expect("join preview stderr collector");
+    let stderr = stderr_handle.join().expect("join preview stderr collector");
+    assert!(
+        stderr.contains("event_id=recompile-000001")
+            && stderr.contains("revision=2")
+            && stderr.contains("duration_ms="),
+        "preview recompile logs should include correlation fields and the published revision, got: {stderr}"
+    );
 }
 
 #[test]
@@ -4827,6 +4833,12 @@ fn watch_emits_status_logs_for_startup_recompile_and_dependency_updates() {
         final_stderr.matches("press Ctrl+C to stop").count(),
         1,
         "press Ctrl+C to stop should appear exactly once, got: {final_stderr}"
+    );
+    assert!(
+        final_stderr.contains("event_id=recompile-000001")
+            && final_stderr.contains("revision=1")
+            && final_stderr.contains("duration_ms="),
+        "recompile logs should include stable correlation fields, got: {final_stderr}"
     );
 }
 

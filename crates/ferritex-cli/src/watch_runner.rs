@@ -29,7 +29,11 @@ pub fn run_watch_loop<F>(command: &WatchCommand, mut on_compile: F) -> i32
 where
     F: FnMut(&CompileResult),
 {
-    run_watch_loop_inner(command, None, true, &mut on_compile)
+    let mut on_compile_with_revision = |result: &CompileResult| {
+        on_compile(result);
+        None
+    };
+    run_watch_loop_inner(command, None, true, &mut on_compile_with_revision)
 }
 
 pub fn run_watch_loop_after_initial_compile<F>(
@@ -38,7 +42,7 @@ pub fn run_watch_loop_after_initial_compile<F>(
     mut on_compile: F,
 ) -> i32
 where
-    F: FnMut(&CompileResult),
+    F: FnMut(&CompileResult) -> Option<u64>,
 {
     run_watch_loop_inner(command, Some(initial_result), false, &mut on_compile)
 }
@@ -50,7 +54,7 @@ fn run_watch_loop_inner<F>(
     on_compile: &mut F,
 ) -> i32
 where
-    F: FnMut(&CompileResult),
+    F: FnMut(&CompileResult) -> Option<u64>,
 {
     if install_shutdown_handler {
         start_shutdown_signal_management();
@@ -112,6 +116,7 @@ where
     };
     let mut recompile_scheduler =
         RecompileScheduler::with_settle_window(Duration::from_millis(150));
+    let mut recompile_revision = 0u64;
 
     loop {
         if shutdown_requested() {
@@ -141,13 +146,19 @@ where
 
         while let Some(coalesced_changes) = recompile_scheduler.start_next() {
             let hint = coalesced_changes;
-            emit_recompile_start(&hint);
+            recompile_revision += 1;
+            let event_id = recompile_event_id(recompile_revision);
+            emit_recompile_start(&hint, &event_id, recompile_revision);
             let result = scheduler.run(workspace_root, || {
                 service.compile_with_changed_paths(&options, &hint)
             });
             emit_diagnostics(&result.diagnostics, interaction_mode, false);
-            on_compile(&result);
-            emit_recompile_end(&result);
+            let published_revision = on_compile(&result);
+            emit_recompile_end(
+                &result,
+                &event_id,
+                published_revision.unwrap_or(recompile_revision),
+            );
             recompile_scheduler.finish_current();
 
             let new_watched_paths =
@@ -233,14 +244,14 @@ fn watcher_io_diagnostic(error: &io::Error, fallback_context: &str) -> Diagnosti
     }
 }
 
-fn emit_recompile_start(changes: &[PathBuf]) {
+fn emit_recompile_start(changes: &[PathBuf], event_id: &str, revision: u64) {
     let descriptor = describe_changed_paths(changes);
-    eprintln!("recompiling ({descriptor})");
+    eprintln!("recompiling ({descriptor}; event_id={event_id}; revision={revision})");
 }
 
-fn emit_recompile_end(result: &CompileResult) {
+fn emit_recompile_end(result: &CompileResult, event_id: &str, revision: u64) {
     if result.exit_code == 0 {
-        eprintln!("recompiled output");
+        eprintln!("{}", recompile_success_log(result, event_id, revision));
     } else {
         let error_count = result
             .diagnostics
@@ -248,11 +259,29 @@ fn emit_recompile_end(result: &CompileResult) {
             .filter(|diagnostic| diagnostic.severity == Severity::Error)
             .count();
         eprintln!(
-            "recompile failed ({} error{})",
+            "recompile failed ({} error{}; event_id={}; revision={}; duration_ms={})",
             error_count,
-            if error_count == 1 { "" } else { "s" }
+            if error_count == 1 { "" } else { "s" },
+            event_id,
+            revision,
+            duration_ms(result.elapsed)
         );
     }
+}
+
+fn recompile_success_log(result: &CompileResult, event_id: &str, revision: u64) -> String {
+    format!(
+        "recompiled output (event_id={event_id}; revision={revision}; duration_ms={})",
+        duration_ms(result.elapsed)
+    )
+}
+
+fn recompile_event_id(revision: u64) -> String {
+    format!("recompile-{revision:06}")
+}
+
+fn duration_ms(duration: Duration) -> u128 {
+    duration.as_millis()
 }
 
 fn describe_changed_paths(changes: &[PathBuf]) -> String {
@@ -434,8 +463,12 @@ fn same_path_set(left: &[PathBuf], right: &[PathBuf]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::time::Duration;
 
-    use super::{discover_watched_paths, watcher_io_diagnostic};
+    use super::{
+        discover_watched_paths, recompile_event_id, recompile_success_log, watcher_io_diagnostic,
+    };
+    use ferritex_application::compile_job_service::{CompileResult, StageTiming};
     use ferritex_core::diagnostics::Severity;
 
     #[test]
@@ -498,5 +531,37 @@ mod tests {
         assert!(watched.contains(&main));
         assert!(watched.contains(&chapter));
         assert!(watched.contains(&appendix));
+    }
+
+    #[test]
+    fn recompile_success_log_includes_stable_correlation_fields() {
+        let result = CompileResult {
+            diagnostics: Vec::new(),
+            exit_code: 0,
+            output_pdf: None,
+            stable_compile_state: None,
+            stage_timing: StageTiming::default(),
+            elapsed: Duration::from_millis(42),
+        };
+        let event_id = recompile_event_id(7);
+
+        let log = recompile_success_log(&result, &event_id, 7);
+
+        assert!(
+            log.starts_with("recompiled output"),
+            "existing human-readable status prefix should remain: {log}",
+        );
+        assert!(
+            log.contains("event_id=recompile-000007"),
+            "log should expose a stable event id: {log}",
+        );
+        assert!(
+            log.contains("revision=7"),
+            "log should expose the recompile revision id: {log}",
+        );
+        assert!(
+            log.contains("duration_ms=42"),
+            "log should expose recompile duration evidence: {log}",
+        );
     }
 }
